@@ -1,0 +1,19 @@
+[package]
+name = "attention-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", branch = "candle-main" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", branch = "candle-main" }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", branch = "candle-main", optional = true }
+serde = { version = "1.0.190", features = ["serde_derive"] }
+serde_json = "1.0.108"
+cudarc = {version = "0.13.9", features = ["f16", "cuda-version-from-build-system"], optional = true }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+tracing = "0.1.40"
+kernels = {path = "./src/kernels", version="0.1.0", optional = true}
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
+flash = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels", "dep:candle-flash-attn"]
