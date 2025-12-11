@@ -1,15 +1,15 @@
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, Result, Storage, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
 pub mod mask;
 #[cfg(feature = "cuda")]
 pub mod sort;
 pub mod topk;
-#[cfg(feature = "cuda")]
-pub use kernels;
+#[cfg(feature = "gcu")]
+pub use gcu_kernels;
 #[cfg(feature = "metal")]
 pub use metal_kernels;
 pub mod cache;
@@ -183,7 +183,7 @@ impl PagedAttention {
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
         if self.sliding_window.is_some() {
-            candle_flash_attn::flash_attn_varlen_windowed_softcap(
+            gcu_kernels::flash_attn_varlen(
                 query,
                 key,
                 value,
@@ -194,11 +194,17 @@ impl PagedAttention {
                 input_metadata.max_seqlen_k,
                 self.scale as f32,
                 Some(softcapping.unwrap_or(0.0f64) as f32),
-                self.sliding_window,
+                &None,
+                if self.sliding_window.is_some() {
+                    Some(self.sliding_window.unwrap() as i32)
+                } else {
+                    None
+                },
                 Some(0),
+                true,
             )
         } else {
-            candle_flash_attn::flash_attn_varlen_softcap(
+            gcu_kernels::flash_attn_varlen(
                 query,
                 key,
                 value,
@@ -209,6 +215,9 @@ impl PagedAttention {
                 input_metadata.max_seqlen_k,
                 self.scale as f32,
                 Some(softcapping.unwrap_or(0.0f64) as f32),
+                &None,
+                None,
+                None,
                 true,
             )
         }
@@ -268,7 +277,7 @@ impl PagedAttention {
         {
             let block_tables = input_metadata.block_tables.as_ref().unwrap();
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
-            candle_flash_attn::flash_attn_with_kvcache(
+            gcu_kernels::flash_attn_with_kvcache(
                 &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),

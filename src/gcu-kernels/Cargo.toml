@@ -1,0 +1,14 @@
+[package]
+name = "gcu-kernels"
+version = "0.1.6"
+edition = "2021"
+description = "Paged and flash attention kernels for Rust"
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="37ddf37" }
+
+[build-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }

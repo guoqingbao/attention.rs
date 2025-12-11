@@ -4,25 +4,22 @@ version = "0.1.7"
 edition = "2021"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "8e43e56" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "8e43e56" }
-candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "8e43e56", optional = true }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="37ddf37" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="37ddf37" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
-kernels = {path = "./src/kernels", version="0.1.0", optional = true}
+gcu-kernels = {path = "./src/gcu-kernels", version="0.1.6", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = {path = "./src/metal-kernels", version="0.1.0", optional = true}
 
 [features]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
-graph = ["cuda", "candle-core/graph"]
-flash-attn = ["dep:candle-flash-attn"]
-flash-decoding = ["dep:candle-flash-attn", "candle-flash-attn/flash-decoding", "kernels/no-fp8-kvcache"]
-flash-context = ["dep:candle-flash-attn", "candle-flash-attn/flash-context", "kernels/no-fp8-kvcache"]
-no-marlin = ["dep:kernels", "kernels/no-marlin"]
-no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]
+gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "dep:gcu-kernels"]
+graph = ["gcu", "candle-core/graph"]
+flash-attn = []
+flash-decoding = []
+flash-context = []
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]

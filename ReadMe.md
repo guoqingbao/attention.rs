@@ -1,4 +1,4 @@
-# 🚀 Paged Attention with Chunked Prefill (CUDA & Metal)
+# 🚀 Paged Attention with Chunked Prefill (GCU)
 
 > Efficient, cross-platform chunked prefill attention for LLM inference with paged KV caching.
 
@@ -50,6 +50,11 @@ This project is a collection of high-performance **paged attention** implementat
 ---
 
 ## 🛠️ How to Use
+
+### 0. Install Flash Attention on GCU platform
+```
+dpkg -i flash-attn-gcu_0.1.0-1_amd64.deb
+```
 
 ### 1. **Cargo.toml Dependencies**
 

@@ -1,3 +1,4 @@
+use candle_core as candle;
 use candle_core::quantized::QTensor;
 use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -144,7 +145,7 @@ pub fn moe_gemm(
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "metal")]
 pub fn moe_gemm(
     _: &Tensor,
     _: &Tensor,
@@ -332,4 +333,153 @@ pub fn moe_gemm_gguf(
     _: candle_core::DType,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_gguf is not implemented on this platform!")
+}
+
+//example:
+//input [3355, 1, 2048]
+//weight [128, 768, 2048]
+//indices [3355, 8]
+//output [3355, 8, 768]
+#[cfg(feature = "gcu")]
+fn indexed_moe_func<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    input: &Tensor,
+    weight: &Tensor,
+    indices: &Tensor,
+) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::{indexed_moe_bf16, indexed_moe_f16};
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
+    use candle_core::DType;
+    use half::{bf16, f16};
+    let dev = input.device().as_gcu_device()?;
+    let (input_value, input_l) = input.storage_and_layout();
+    // let (out_value, out_l) = out.storage_and_layout();
+    let (weight_value, weight_l) = weight.storage_and_layout();
+    let (indices_value, indices_l) = indices.storage_and_layout();
+
+    assert!(
+        input.dims().len() == 3 && weight.dims().len() == 3 && indices.dims().len() == 2,
+        "Invalid input dims!"
+    );
+    let (b1, topk) = indices.dims2()?;
+    let (batch, m, k) = input.dims3()?;
+    let (num_experts, n, k1) = weight.dims3()?;
+    let tile_size = if batch > 12 { 128 } else { 64 };
+    assert!(
+        k % tile_size == 0,
+        "indexed_moe: k dim must be aligned to {}!",
+        tile_size
+    );
+    assert!(
+        n % tile_size == 0,
+        "indexed_moe: n dim must be aligned to {}!",
+        tile_size
+    );
+
+    // let (b2, _, n1) = out_l.dims3()?;
+
+    let out = dev.alloc::<T>(batch * topk * n).w()?;
+
+    // assert!(n == n1, "weight and expert out should have same last dim!");
+    assert!(
+        b1 == batch,
+        "the first dim of indices tensor should match input and expert out!"
+    );
+    assert!(
+        k == k1,
+        "weight tensor should match input tensor for matmul!"
+    );
+    // assert!(
+    //     n == n1,
+    //     "weight tensor should match output tensor for matmul!"
+    // );
+
+    // let el_count = shape.elem_count();
+    let stream = dev.stream_inner().unwrap();
+    let input_value = match &*input_value {
+        Storage::Gcu(s) => s,
+        _ => candle::bail!("tensor must be a gcu tensor"),
+    };
+    let input_value = input_value.as_gcu_slice::<T>()?;
+    let input_value = input_value.slice(input_l.start_offset()..);
+
+    let weight_value = match &*weight_value {
+        Storage::Gcu(s) => s,
+        _ => candle::bail!("tensor must be a gcu tensor"),
+    };
+    let weight_value = weight_value.as_gcu_slice::<T>()?;
+    let weight_value = weight_value.slice(weight_l.start_offset()..);
+
+    let indices_value = match &*indices_value {
+        Storage::Gcu(s) => s,
+        _ => candle::bail!("tensor must be a gcu tensor"),
+    };
+    let indices_value = indices_value.as_gcu_slice::<u32>()?;
+    let indices_value = indices_value.slice(indices_l.start_offset()..);
+
+    match input.dtype() {
+        DType::F16 => unsafe {
+            indexed_moe_f16(
+                input_value.device_ptr() as *mut f16,
+                weight_value.device_ptr() as *mut f16,
+                out.device_ptr() as *mut f16,
+                indices_value.device_ptr() as *mut u32,
+                n as i32,
+                k as i32,
+                m as i32,
+                batch as i32,
+                topk as i32,
+                num_experts as i32,
+                stream as *mut core::ffi::c_void,
+            );
+        },
+        DType::BF16 => unsafe {
+            indexed_moe_bf16(
+                input_value.device_ptr() as *mut bf16,
+                weight_value.device_ptr() as *mut bf16,
+                out.device_ptr() as *mut bf16,
+                indices_value.device_ptr() as *mut u32,
+                n as i32,
+                k as i32,
+                m as i32,
+                batch as i32,
+                topk as i32,
+                num_experts as i32,
+                stream as *mut core::ffi::c_void,
+            );
+        },
+        _ => {
+            panic!("not supported data type!")
+        }
+    }
+    let s_out = candle::GcuStorage::wrap_gcu_slice(out, dev.clone());
+    Ok(Tensor::from_storage(
+        candle::Storage::Gcu(s_out),
+        (batch, topk, n),
+    )?)
+}
+
+#[cfg(feature = "gcu")]
+pub fn moe_gemm(
+    input: &Tensor,
+    weights: &Tensor,
+    // topk_weights: &Option<Tensor>,
+    // sorted_token_ids: &Tensor,
+    indices: &Tensor,
+    // experts_ids: &Tensor,
+    // topk: usize,
+    // is_prefill: bool,
+) -> Result<Tensor> {
+    use candle_core::DType;
+    use half::{bf16, f16};
+    match input.dtype() {
+        DType::F16 => indexed_moe_func::<f16>(input, weights, indices),
+        DType::BF16 => indexed_moe_func::<bf16>(input, weights, indices),
+        dt => {
+            candle::bail!("indexed_moe is only supported for f16 and bf16 ({dt:?})")
+        }
+    }
 }

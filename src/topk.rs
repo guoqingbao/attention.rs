@@ -79,7 +79,7 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "metal")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     let routing_weights = candle_nn::ops::softmax_last_dim(&logits)?;
     let indices = routing_weights
@@ -89,4 +89,108 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
 
     let scores = routing_weights.gather(&indices, candle::D::Minus1)?;
     Ok((scores, indices))
+}
+
+#[cfg(feature = "gcu")]
+fn gcu_topk_func<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    input: &Tensor,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::{topk_bf16, topk_f16, topk_f32};
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
+    use half::{bf16, f16};
+    let dev = input.device().as_gcu_device()?;
+    let (value, input_l) = input.storage_and_layout();
+    let shape = input_l.shape();
+    let el_count = shape.elem_count();
+    let stream = dev.stream_inner().unwrap();
+    let value = match &*value {
+        Storage::Gcu(k) => k,
+        _ => candle::bail!("tensor must be a gcu tensor"),
+    };
+
+    let rank = input_l.dims().len();
+    assert!(rank <= 3);
+    let value = value.as_gcu_slice::<T>()?;
+    let value = value.slice(input_l.start_offset()..);
+    let (chunks, dims) = if rank == 3 {
+        (shape.dims()[0] * shape.dims()[1], shape.dims().to_vec())
+    } else if rank == 2 {
+        (
+            shape.dims()[0],
+            [1usize, shape.dims()[0], shape.dims()[1]].to_vec(),
+        )
+    } else {
+        (1usize, [1usize, 1usize, shape.dims()[0]].to_vec())
+    };
+
+    let indices = dev.alloc::<u32>(chunks * k).w()?;
+    let out = dev.alloc::<T>(chunks * k).w()?;
+    match input.dtype() {
+        DType::F16 => unsafe {
+            topk_f16(
+                value.device_ptr() as *mut f16,
+                out.device_ptr() as *mut f16,
+                indices.device_ptr() as *mut u32,
+                dims[0] as i32,
+                dims[1] as i32,
+                dims[2] as i32,
+                k as i32,
+                stream as *mut core::ffi::c_void,
+            );
+        },
+        DType::BF16 => unsafe {
+            topk_bf16(
+                value.device_ptr() as *mut bf16,
+                out.device_ptr() as *mut bf16,
+                indices.device_ptr() as *mut u32,
+                dims[0] as i32,
+                dims[1] as i32,
+                dims[2] as i32,
+                k as i32,
+                stream as *mut core::ffi::c_void,
+            );
+        },
+        DType::F32 => unsafe {
+            topk_f32(
+                value.device_ptr() as *mut f32,
+                out.device_ptr() as *mut f32,
+                indices.device_ptr() as *mut u32,
+                dims[0] as i32,
+                dims[1] as i32,
+                dims[2] as i32,
+                k as i32,
+                stream as *mut core::ffi::c_void,
+            );
+        },
+        _ => {
+            panic!("not supported data type!")
+        }
+    }
+    let s_out = candle::GcuStorage::wrap_gcu_slice(out, dev.clone());
+    let s_indices = candle::GcuStorage::wrap_gcu_slice(indices, dev.clone());
+    let mut out_dims = shape.dims().to_vec();
+    let last_dim = out_dims.len() - 1;
+    out_dims[last_dim] = k;
+    Ok((
+        Tensor::from_storage(candle::Storage::Gcu(s_out), out_dims.clone())?,
+        Tensor::from_storage(candle::Storage::Gcu(s_indices), out_dims.clone())?,
+    ))
+}
+
+#[cfg(feature = "gcu")]
+pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
+    use half::{bf16, f16};
+    match logits.dtype() {
+        DType::F16 => gcu_topk_func::<f16>(logits, topk),
+        DType::BF16 => gcu_topk_func::<bf16>(logits, topk),
+        DType::F32 => gcu_topk_func::<f32>(logits, topk),
+        dt => {
+            candle::bail!("topk is only supported for f32, f16 and bf16 ({dt:?})")
+        }
+    }
 }

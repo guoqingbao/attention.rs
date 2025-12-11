@@ -1,6 +1,8 @@
 use candle::backend::BackendStorage;
 #[cfg(feature = "cuda")]
 use candle::CudaStorage;
+#[cfg(feature = "gcu")]
+use candle::GcuStorage;
 #[cfg(feature = "metal")]
 use candle::MetalStorage;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
@@ -655,6 +657,39 @@ impl candle::CustomOp1 for PagedAttention {
             dt => candle::bail!("paged-attention is only supported for f32/f16/bf16 ({dt:?})"),
         }
     }
+
+    #[cfg(feature = "gcu")]
+    fn gcu_fwd(&self, q: &GcuStorage, q_l: &Layout) -> Result<(GcuStorage, Shape)> {
+        match q.dtype() {
+            DType::F16 => gcu_paged_attention::<half::f16>(
+                q,
+                q_l,
+                &self.key_cache,
+                &self.value_cache,
+                &self.block_tables,
+                &self.context_lens,
+                self.alibi_slopes.as_ref(),
+                self.max_context_len,
+                self.softmax_scale,
+                self.softcapping,
+            ),
+            DType::BF16 => gcu_paged_attention::<half::bf16>(
+                q,
+                q_l,
+                &self.key_cache,
+                &self.value_cache,
+                &self.block_tables,
+                &self.context_lens,
+                self.alibi_slopes.as_ref(),
+                self.max_context_len,
+                self.softmax_scale,
+                self.softcapping,
+            ),
+            dt => {
+                candle::bail!("reshape_and_cache is only supported for f16 and bf16 ({dt:?})")
+            }
+        }
+    }
 }
 
 /// Paged Attention layer.
@@ -1184,6 +1219,7 @@ impl candle::InplaceOp1 for ReshapeCache {
 ///   with `x` being the size of an element in bytes.
 /// * `value_cache` - Value cache paged tensor of shape `(num_blocks, num_heads, head_size, block_size)`.
 /// * `slot_mapping` - Mapping associating a slot to each token of shape `(num_tokens)`.
+#[cfg(not(feature = "gcu"))]
 pub fn reshape_and_cache(
     key: &Tensor,
     value: &Tensor,
@@ -1202,4 +1238,331 @@ pub fn reshape_and_cache(
         slot_mapping: slot_mapping.to_owned(),
     };
     key.inplace_op1(&op)
+}
+
+#[cfg(feature = "gcu")]
+pub fn gcu_paged_attention<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    q: &candle::GcuStorage,
+    q_l: &Layout,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    alibi_slopes: Option<&Tensor>,
+    max_context_len: usize,
+    softmax_scale: f32,
+    softcapping: f32,
+) -> Result<(GcuStorage, Shape)> {
+    use candle::gcu_backend::ubridge;
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
+    use candle::gcu_backend::{kernel_name, WrapErr};
+    use candle::GcuStorage;
+    use candle::Storage;
+    let dev = q.device();
+    let out_shape = q_l.shape().clone();
+
+    let (kc, kc_l) = key_cache.storage_and_layout();
+    let kc = match &*kc {
+        Storage::Gcu(kc) => kc,
+        _ => candle::bail!("key_cache must be a gcu tensor"),
+    };
+
+    let (vc, vc_l) = value_cache.storage_and_layout();
+    let vc = match &*vc {
+        Storage::Gcu(vc) => vc,
+        _ => candle::bail!("value_cache must be a gcu tensor"),
+    };
+
+    let (bt, bt_l) = block_tables.storage_and_layout();
+    let bt = match &*bt {
+        Storage::Gcu(bt) => bt,
+        _ => candle::bail!("block_tables must be a gcu tensor"),
+    };
+
+    let (cl, cl_l) = context_lens.storage_and_layout();
+    let cl = match &*cl {
+        Storage::Gcu(cl) => cl,
+        _ => candle::bail!("context_lens must be a gcu tensor"),
+    };
+
+    let q_rank = q_l.stride().len();
+    let kc_rank = kc_l.stride().len();
+    let vc_rank = vc_l.stride().len();
+
+    if q_rank != 3 {
+        candle::bail!(
+            "paged-attention expects `q` tensor to be of rank 3 \
+            (q: {q_l:?})"
+        )
+    }
+
+    if kc_rank != 5 {
+        candle::bail!(
+            "paged-attention expects `key_cache` tensor to be of rank 5 \
+            (key_cache: {kc_l:?})"
+        )
+    }
+
+    if vc_rank != 4 {
+        candle::bail!(
+            "paged-attention expects `value_cache` tensor to be of rank 4 \
+            (value_cache: {vc_l:?})"
+        )
+    }
+
+    let q = q.as_gcu_slice::<T>()?;
+    let kc = kc.as_gcu_slice::<T>()?;
+    let vc = vc.as_gcu_slice::<T>()?;
+    let cl = cl.as_gcu_slice::<u32>()?; // Should be i32!
+    let bt = bt.as_gcu_slice::<u32>()?; // Should be i32!
+
+    // Get cuda views for all tensors
+    let q = q.slice(q_l.start_offset()..);
+    let kc = kc.slice(kc_l.start_offset()..);
+    let vc = vc.slice(vc_l.start_offset()..);
+    let cl = cl.slice(cl_l.start_offset()..);
+    let bt = bt.slice(bt_l.start_offset()..);
+
+    let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
+    if !(head_size == 64
+        || head_size == 80
+        || head_size == 96
+        || head_size == 112
+        || head_size == 128
+        || head_size == 192
+        || head_size == 256)
+    {
+        candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128 or 256");
+    }
+
+    let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
+
+    if num_seqs_bt != num_seqs {
+        candle::bail!(
+            "shape mismatch block_tables {:?}, expected {:?}",
+            bt_l.shape(),
+            (num_seqs, max_num_blocks_per_seq)
+        )
+    }
+
+    let (num_blocks, num_kv_heads, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+    if head_size_kc != head_size / x {
+        candle::bail!(
+            "shape mismatch value_cache {:?}, expected {:?}",
+            vc_l.shape(),
+            (num_blocks, num_heads, head_size / x, block_size, x)
+        )
+    }
+
+    if (num_blocks, num_kv_heads, head_size, block_size) != vc_l.shape().dims4()? {
+        candle::bail!(
+            "shape mismatch key_cache {:?} and value_cache {:?}",
+            kc_l.shape(),
+            vc_l.shape()
+        )
+    }
+
+    if (num_seqs) != cl_l.shape().dims1()? {
+        candle::bail!(
+            "shape mismatch context_lens {:?}, expected {:?}",
+            cl_l.shape(),
+            (num_seqs)
+        )
+    }
+
+    let q_stride = q_l.stride()[0];
+    let kv_block_stride = kc_l.stride()[0];
+    let kv_head_stride = kc_l.stride()[1];
+
+    // let partition_size = 512;
+    // let max_num_partitions = (self.max_context_len + partition_size - 1) / partition_size;
+    // let use_v1 = (max_num_partitions == 1 || num_seqs * num_heads > 512)
+    //     && partition_size % block_size == 0;
+
+    let elem_count = out_shape.elem_count();
+    let out = dev.alloc::<T>(elem_count).w()?;
+    let func = dev.get_or_load_func(&kernel_name::<T>("paged_attention_v1"), ubridge::ATTENTION)?;
+    let params = (
+        out.device_ptr(),
+        q.device_ptr(),
+        kc.device_ptr(),
+        vc.device_ptr(),
+        num_kv_heads as i32,
+        softmax_scale,
+        bt.device_ptr(),
+        cl.device_ptr(),
+        block_size as i32,
+        max_context_len as i32,
+        num_seqs as i32,
+        num_heads as i32,
+        head_size as i32,
+        max_num_blocks_per_seq as i32,
+        q_stride as i32,
+        kv_block_stride as i32,
+        kv_head_stride as i32,
+        num_blocks as i32,
+        softcapping,
+    );
+    unsafe { func.launch(&dev.launch_cfg, params) }.w()?;
+
+    let storage = GcuStorage::wrap_gcu_slice(out, dev.clone());
+    Ok((storage, out_shape))
+}
+
+#[cfg(feature = "gcu")]
+fn gcu_update_cache<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    use candle::gcu_backend::ubridge;
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
+    use candle::gcu_backend::{kernel_name, Map1, WrapErr};
+    use candle::Storage;
+    let dev = key.device().as_gcu_device()?;
+    let (k, k_l) = key.storage_and_layout();
+    let k = match &*k {
+        Storage::Gcu(k) => k,
+        _ => candle::bail!("key must be a gcu tensor"),
+    };
+
+    let (v, v_l) = value.storage_and_layout();
+    let v = match &*v {
+        Storage::Gcu(v) => v,
+        _ => candle::bail!("value must be a gcu tensor"),
+    };
+
+    let (kc, kc_l) = key_cache.storage_and_layout();
+    let kc = match &*kc {
+        Storage::Gcu(kc) => kc,
+        _ => candle::bail!("key_cache must be a gcu tensor"),
+    };
+
+    let (vc, vc_l) = value_cache.storage_and_layout();
+    let vc = match &*vc {
+        Storage::Gcu(vc) => vc,
+        _ => candle::bail!("value_cache must be a gcu tensor"),
+    };
+
+    let (s, s_l) = slot_mapping.storage_and_layout();
+    let s = match &*s {
+        Storage::Gcu(s) => s,
+        _ => candle::bail!("slot_mapping must be a gcu tensor"),
+    };
+
+    let k_rank = k_l.stride().len();
+    let v_rank = v_l.stride().len();
+    let kc_rank = kc_l.stride().len();
+    let vc_rank = vc_l.stride().len();
+
+    if k_rank != 3 || v_rank != 3 {
+        candle::bail!("paged-attention expects input tensors of rank 3 (k: {k_l:?}, v: {v_l:?})")
+    }
+
+    if kc_rank != 5 {
+        candle::bail!(
+            "paged-attention expects `key_cache` tensor to be of rank 5 \
+                (key_cache: {kc_l:?})"
+        )
+    }
+
+    if vc_rank != 4 {
+        candle::bail!(
+            "paged-attention expects `value_cache` tensor to be of rank 4 \
+                (value_cache: {vc_l:?})"
+        )
+    }
+
+    let k = k.as_gcu_slice::<T>()?;
+    let v = v.as_gcu_slice::<T>()?;
+    let kc = kc.as_gcu_slice::<T>()?;
+    let vc = vc.as_gcu_slice::<T>()?;
+    let s = s.as_gcu_slice::<i64>()?;
+
+    // Get cuda views for all tensors
+    let k = k.slice(k_l.start_offset()..);
+    let v = v.slice(v_l.start_offset()..);
+    let kc = kc.slice(kc_l.start_offset()..);
+    let vc = vc.slice(vc_l.start_offset()..);
+    let s = s.slice(s_l.start_offset()..);
+
+    let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
+    if (num_tokens, num_heads, head_size) != v_l.shape().dims3()? {
+        candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
+    }
+
+    let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+    if num_heads_kc != num_heads || head_size_kc != head_size / x {
+        candle::bail!(
+            "shape mismatch value_cache {:?}, expected {:?}",
+            vc_l.shape(),
+            (num_blocks, num_heads, head_size / x, block_size, x)
+        )
+    }
+
+    if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+        candle::bail!(
+            "shape mismatch key_cache {:?} and value_cache {:?}",
+            kc_l.shape(),
+            vc_l.shape()
+        )
+    }
+
+    if (num_tokens) != s_l.shape().dims1()? {
+        candle::bail!(
+            "shape mismatch slot_mapping {:?}, expected {:?}",
+            s_l.shape(),
+            (num_tokens)
+        )
+    }
+
+    let key_stride = k_l.stride()[0] as i32;
+    let value_stride = v_l.stride()[0] as i32;
+    let func = dev.get_or_load_func(&kernel_name::<T>("reshape_and_cache"), ubridge::CACHE)?;
+    let params = (
+        k.device_ptr(),
+        v.device_ptr(),
+        kc.device_ptr(),
+        vc.device_ptr(),
+        s.device_ptr(),
+        num_tokens as i32,
+        num_heads as i32,
+        head_size as i32,
+        num_blocks as i32,
+        block_size as i32,
+        x as i32,
+        key_stride,
+        value_stride,
+    );
+    unsafe { func.launch(&dev.launch_cfg, params) }.w()?;
+    Ok(())
+}
+
+#[cfg(feature = "gcu")]
+pub fn reshape_and_cache(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    _: Option<&Tensor>,
+    _: Option<&Tensor>,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    use half::{bf16, f16};
+    match key.dtype() {
+        DType::F16 => gcu_update_cache::<f16>(key, value, key_cache, value_cache, slot_mapping),
+        DType::BF16 => gcu_update_cache::<bf16>(key, value, key_cache, value_cache, slot_mapping),
+        DType::F32 => gcu_update_cache::<f32>(key, value, key_cache, value_cache, slot_mapping),
+        dt => {
+            candle::bail!("reshape_and_cache is only supported for f32, f16 and bf16 ({dt:?})")
+        }
+    }
 }
