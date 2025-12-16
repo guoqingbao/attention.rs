@@ -1467,6 +1467,15 @@ fn gcu_update_cache<
         candle::bail!("paged-attention expects input tensors of rank 3 (k: {k_l:?}, v: {v_l:?})")
     }
 
+    #[cfg(feature = "flash-decoding")]
+    if kc_rank != 4 {
+        candle::bail!(
+            "flash-attention expects `key_cache` tensor to be of rank 4 \
+                (key_cache: {kc_l:?})"
+        )
+    }
+
+    #[cfg(not(feature = "flash-decoding"))]
     if kc_rank != 5 {
         candle::bail!(
             "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -1493,28 +1502,40 @@ fn gcu_update_cache<
     let kc = kc.slice(kc_l.start_offset()..);
     let vc = vc.slice(vc_l.start_offset()..);
     let s = s.slice(s_l.start_offset()..);
+    let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
 
     let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
     if (num_tokens, num_heads, head_size) != v_l.shape().dims3()? {
         candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
     }
 
-    let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
-    if num_heads_kc != num_heads || head_size_kc != head_size / x {
-        candle::bail!(
-            "shape mismatch value_cache {:?}, expected {:?}",
-            vc_l.shape(),
-            (num_blocks, num_heads, head_size / x, block_size, x)
-        )
-    }
+    #[cfg(feature = "flash-decoding")]
+    let (block_size, _x) = {
+        // [num_blocks, block_size, num_heads, head_size]
+        let (_, block_size, _, _) = kc_l.shape().dims4()?;
+        (block_size, 1)
+    };
 
-    if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
-        candle::bail!(
-            "shape mismatch key_cache {:?} and value_cache {:?}",
-            kc_l.shape(),
-            vc_l.shape()
-        )
-    }
+    #[cfg(not(feature = "flash-decoding"))]
+    let (block_size, x) = {
+        let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+        if num_heads_kc != num_heads || head_size_kc != head_size / x {
+            candle::bail!(
+                "shape mismatch value_cache {:?}, expected {:?}",
+                vc_l.shape(),
+                (num_blocks, num_heads, head_size / x, block_size, x)
+            )
+        }
+
+        if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+            candle::bail!(
+                "shape mismatch key_cache {:?} and value_cache {:?}",
+                kc_l.shape(),
+                vc_l.shape()
+            )
+        }
+        (block_size, x)
+    };
 
     if (num_tokens) != s_l.shape().dims1()? {
         candle::bail!(
@@ -1524,25 +1545,66 @@ fn gcu_update_cache<
         )
     }
 
-    let key_stride = k_l.stride()[0] as i32;
-    let value_stride = v_l.stride()[0] as i32;
-    let func = dev.get_or_load_func(&kernel_name::<T>("reshape_and_cache"), ubridge::CACHE)?;
-    let params = (
-        k.device_ptr(),
-        v.device_ptr(),
-        kc.device_ptr(),
-        vc.device_ptr(),
-        s.device_ptr(),
-        num_tokens as i32,
-        num_heads as i32,
-        head_size as i32,
-        num_blocks as i32,
-        block_size as i32,
-        x as i32,
-        key_stride,
-        value_stride,
-    );
-    unsafe { func.launch(&dev.launch_cfg, params) }.w()?;
+    #[cfg(feature = "flash-decoding")]
+    {
+        let block_stride = kc_l.stride()[0];
+        let page_stride = kc_l.stride()[1];
+        let head_stride = kc_l.stride()[2];
+        let stream = dev.stream_inner().expect("Unable to obtain stream");
+
+        use gcu_kernels::param::topsopDataType;
+        let data_type = match query.dtype() {
+            DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
+            DType::BF16 => topsopDataType::TOPSOP_DATA_BF16,
+            _ => candle_core::bail!("Unsupport data type for flash attention!"),
+        };
+
+        gcu_kernels::ffi::reshape_and_cache_flash_host(
+            dim3 { x: 2, y: 1, z: 1 },
+            dim3 { x: 12, y: 1, z: 1 },
+            *k.device_ptr() as c_void,
+            *v.device_ptr() as c_void,
+            *s.device_ptr() as c_void,
+            *kc.device_ptr() as c_void,
+            *vc.device_ptr() as c_void,
+            data_type as i32,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_size as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            key_stride as c_int,
+            value_stride as c_int,
+            block_stride as c_int,
+            page_stride as c_int,
+            head_stride as c_int,
+            stream,
+        );
+    }
+
+    #[cfg(not(feature = "flash-decoding"))]
+    {
+        let key_stride = k_l.stride()[0] as i32;
+        let value_stride = v_l.stride()[0] as i32;
+        let func = dev.get_or_load_func(&kernel_name::<T>("reshape_and_cache"), ubridge::CACHE)?;
+        let params = (
+            k.device_ptr(),
+            v.device_ptr(),
+            kc.device_ptr(),
+            vc.device_ptr(),
+            s.device_ptr(),
+            num_tokens as i32,
+            num_heads as i32,
+            head_size as i32,
+            num_blocks as i32,
+            block_size as i32,
+            x as i32,
+            key_stride,
+            value_stride,
+        );
+        unsafe { func.launch(&dev.launch_cfg, params) }.w()?;
+    }
+
     Ok(())
 }
 

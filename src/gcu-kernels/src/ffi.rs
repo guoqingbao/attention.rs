@@ -86,4 +86,26 @@ extern "C" {
         params: FWD_KVCACHE_ATTN_OP_PARAS,
         stream: driv::topsStream_t,
     ) -> i32;
+
+    pub fn reshape_and_cache_flash_host(
+        dimBlocks: dim3,
+        dimThreads: dim3,
+        key: *const c_void,          // [num_tokens, num_heads, head_size]
+        value: *const c_void,        // [num_tokens, num_heads, head_size]
+        slot_mapping: *const c_void, // [num_tokens]
+        key_cache: *const c_void,    // [num_blocks, block_size, num_heads, head_size]
+        value_cache: *const c_void,  // [num_blocks, block_size, num_heads, head_size]
+        dataType: i32,
+        num_tokens: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        key_stride: c_int,
+        value_stride: c_int,
+        block_stride: c_int,
+        page_stride: c_int,
+        head_stride: c_int,
+        stream: driv::topsStream_t,
+    );
 }

@@ -281,9 +281,14 @@ impl PagedAttention {
                 &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
-                context_lens,
+                input_metadata.cu_seqlens_k.as_ref().unwrap(),
                 block_tables,
                 self.scale as f32,
+                Some(softcapping.unwrap_or(0.0f64) as f32),
+                &None,
+                None,
+                None,
+                false,
             )
         }
         #[cfg(not(feature = "flash-decoding"))]

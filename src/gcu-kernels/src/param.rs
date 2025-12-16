@@ -386,3 +386,168 @@ pub fn build_varlen_params(
 
     Ok(params)
 }
+
+pub fn build_kvcache_params(
+    query: &Tensor,  // [B, Sq, Hq, D]
+    kcache: &Tensor, // [Bc, Sk, Hkv, D]
+    vcache: &Tensor,
+    key: &Option<Tensor>, // new KV (optional)
+    value: &Option<Tensor>,
+    seqlens_k: &Option<Tensor>,
+    rotary_cos: &Option<Tensor>,
+    rotary_sin: &Option<Tensor>,
+    cache_batch_idx: &Option<Tensor>,
+    leftpad_k: &Option<Tensor>,
+    block_table: &Option<Tensor>,
+    alibi_slopes: &Option<Tensor>,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    is_causal: bool,
+    window_size_left: Option<i32>,
+    window_size_right: Option<i32>,
+    is_rotary_interleaved: bool,
+    num_splits: i32,
+    dim_blocks: dim3,
+    dim_threads: dim3,
+) -> Result<FWD_KVCACHE_ATTN_OP_PARAS> {
+    /* ---------------- flags ---------------- */
+    let kv_en = key.is_some();
+    let seqlens_k_en = seqlens_k.is_some();
+    let rotary_en = rotary_cos.is_some();
+    let cache_batch_idx_en = cache_batch_idx.is_some();
+    let leftpad_k_en = leftpad_k.is_some();
+    let bt_en = block_table.is_some();
+    let alibi_en = alibi_slopes.is_some();
+
+    /* ---------------- shapes ---------------- */
+    let batch = query.dim(0)? as i32;
+    let seqlen_q = query.dim(1)? as i32;
+    let q_num_heads = query.dim(2)? as i32;
+    let head_size = query.dim(3)? as i32;
+
+    let batch_size_cache = kcache.dim(0)? as i32;
+    let mut seqlen_k = kcache.dim(1)? as i32;
+    let kv_num_heads = kcache.dim(2)? as i32;
+
+    /* ---------------- block table ---------------- */
+    let (num_blocks, page_block_size, max_num_blocks_per_seq) = if bt_en {
+        let bt = block_table.as_ref().unwrap();
+        let max_blocks = bt.dim(1)? as i32;
+        let block_size = kcache.dim(1)? as i32;
+        seqlen_k = max_blocks * block_size;
+        (kcache.dim(0)? as i32, block_size, max_blocks)
+    } else {
+        (0, 0, 0)
+    };
+
+    /* ---------------- rotary ---------------- */
+    let (seqlen_ro, rotary_dim) = if rotary_en {
+        let cos = rotary_cos.as_ref().unwrap();
+        (cos.dim(0)? as i32, (cos.dim(1)? * 2) as i32)
+    } else {
+        (0, 0)
+    };
+
+    let seqlen_knew = if kv_en {
+        key.as_ref().unwrap().dim(1)? as i32
+    } else {
+        0
+    };
+
+    /* ---------------- alibi ---------------- */
+    let alibi_rank = if alibi_en {
+        alibi_slopes.as_ref().unwrap().rank() as i32
+    } else {
+        0
+    };
+
+    /* ---------------- window logic ---------------- */
+    let mut window_l = window_size_left.unwrap_or(-1);
+    let mut window_r = window_size_right.unwrap_or(-1);
+    if window_l >= seqlen_k {
+        window_l = -1;
+    }
+    if window_r >= seqlen_k {
+        window_r = -1;
+    }
+
+    let mut window_size_en = !(window_l == -1 && window_r == -1);
+
+    if is_causal {
+        window_r = 0;
+        if window_l == -1 {
+            window_size_en = false;
+        }
+    }
+
+    /* ---------------- q_rotary_mode ---------------- */
+    let q_rotary_mode = if is_causal || window_size_en { 1 } else { 0 };
+
+    /* ---------------- shared memory & threading ---------------- */
+    let q_seq_sub = 64;
+    let mut kv_seq_sub = 512;
+    let bpe = match query.dtype() {
+        DType::F16 | DType::BF16 => 2,
+        _ => return Err(anyhow!("unsupported dtype")),
+    };
+
+    let thread_group = 2; // C++ runtime chooses 1 or 2; 2 is safe default
+    let pingpong = 2;
+    let shared_size = (2 * kv_seq_sub * head_size * bpe * 3 * pingpong)
+        + (thread_group * q_seq_sub * head_size * bpe);
+
+    /* ---------------- SMALL_SIZE heuristic ---------------- */
+    let total_task = batch * kv_num_heads;
+    let threads = (dim_blocks.x * dim_threads.x * 2) as i32;
+    let small_size = if total_task >= threads / 2 { 3072 } else { 512 };
+
+    let data_type = match query.dtype() {
+        DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
+        DType::BF16 => topsopDataType::TOPSOP_DATA_BF16,
+        _ => candle_core::bail!("Unsupport data type for flash attention!"),
+    };
+
+    /* ---------------- final params ---------------- */
+    Ok(FWD_KVCACHE_ATTN_OP_PARAS {
+        data_type: data_type as i32,
+        softmax_scale,
+        is_causal,
+        window_size_en,
+        window_size_left: window_l,
+        window_size_right: window_r,
+        softcap: softcap.unwrap_or(0.0),
+        num_splits,
+        is_rotary_interleaved,
+        q_rotary_mode,
+        seqlens_k_en,
+        kv_en,
+        cache_batch_idx_en,
+        rotary_en,
+        leftpad_k_en,
+        bt_en,
+        alibi_en,
+        alibi_rank,
+        seqlen_knew,
+        seqlen_ro,
+        rotary_dim,
+        page_block_size,
+        seqlen_k,
+        num_blocks,
+        max_num_blocks_per_seq,
+        batch,
+        seqlen_q,
+        q_num_heads,
+        head_size,
+        batch_size_cache,
+        kv_num_heads,
+        q_seq_sub,
+        kv_seq_sub,
+        shared_size,
+        mode: 0,
+        thread_group,
+        workspace: ptr::null_mut(),
+        q_stride0: query.stride()[0] as i32,
+        o_stride0: query.stride()[0] as i32,
+        SMALL_SIZE: small_size,
+    })
+}
