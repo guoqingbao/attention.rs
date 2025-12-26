@@ -54,6 +54,10 @@ __device__ inline T make_zero_opt() {
 
 /**
  * @brief Optimized Kernel with shared memory tiling and binary search
+ * 
+ * Key insight: All 128 tokens in a chunk should be from the same sequence,
+ * so they share the same KV blocks. We use lane 0 to find the sequence and
+ * broadcast to all threads via shared memory.
  */
 template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE>
 __global__ void chunked_prefill_paged_attention_kernel_opt(
@@ -83,62 +87,91 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 ) {
     const bool is_quantized = !std::is_same<scalar_t, cache_t>::value;
     
-    // --- Shared Memory Allocation ---
-    // We allocate enough space to hold one block of K and one block of V.
-    // Dimensions: [HEAD_SIZE * BLOCK_SIZE] elements per array.
-    // alignas(16) ensures vectorized loads work correctly from smem.
+    // --- Shared Memory Layout ---
+    // First: sequence info broadcast from lane 0 (16 bytes)
+    // Then: K cache tile and V cache tile
     extern __shared__ char smem_buffer[];
-    cache_t* k_smem = reinterpret_cast<cache_t*>(smem_buffer);
+    
+    // Sequence info shared by all threads (computed by lane 0)
+    struct SeqInfo {
+        int seq_idx;
+        int num_blocks;
+        int start_block_idx;
+        int start_token_idx;
+    };
+    SeqInfo* shared_seq_info = reinterpret_cast<SeqInfo*>(smem_buffer);
+    
+    // K/V tiles after seq info (aligned to 16 bytes)
+    cache_t* k_smem = reinterpret_cast<cache_t*>(smem_buffer + 32);
     cache_t* v_smem = k_smem + (HEAD_SIZE * BLOCK_SIZE);
 
     constexpr int THREAD_GROUP_SIZE = 1;
     constexpr int VEC_SIZE = 16 / sizeof(scalar_t);
     constexpr int NUM_VECS  = HEAD_SIZE / VEC_SIZE;
-    
-    // Sub-vector size for K cache layout (PagedAttention standard)
-    constexpr int X = 16 / sizeof(cache_t); 
+    constexpr int X = 16 / sizeof(cache_t);
 
-    const int tid     = threadIdx.x;
-    const int lane    = tid % TOKEN_CHUNK_SIZE;
+    const int tid = threadIdx.x;
+    const int lane = tid % TOKEN_CHUNK_SIZE;
     const int block_dim = blockDim.x;
 
     const int NUM_BLOCK_VECS = BLOCK_SIZE / VEC_SIZE;
     const int qh_base_idx = blockIdx.x;
     const int kv_head_idx = blockIdx.y;
-    const int token_start = blockIdx.z * TOKEN_CHUNK_SIZE + lane;
+    const int chunk_start = blockIdx.z * TOKEN_CHUNK_SIZE;
+    const int token_start = chunk_start + lane;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
     const bool use_alibi = (alibi_slopes != nullptr);
-    const bool use_sinks  = (sinks != nullptr);
+    const bool use_sinks = (sinks != nullptr);
 
     const int64_t q_stride_tokens = (int64_t)num_query_heads * (int64_t)HEAD_SIZE;
-    const int64_t q_stride_heads  = (int64_t)HEAD_SIZE;
-    const int64_t o_stride_heads  = (int64_t)HEAD_SIZE;
+    const int64_t q_stride_heads = (int64_t)HEAD_SIZE;
+    const int64_t o_stride_heads = (int64_t)HEAD_SIZE;
 
-    // --- Optimization: Binary Search for Sequence Index ---
-    int seq_idx = 0;
-    int left = 0, right = num_seqs - 1;
-    
-    // Check bounds first to avoid search if out of range
-    if (token_start >= query_start_len[num_seqs] || token_start < query_start_len[0]) return;
-
-    while (left <= right) {
-        int mid = (left + right) / 2;
-        if (query_start_len[mid + 1] <= token_start) {
-            left = mid + 1;
-        } else if (query_start_len[mid] > token_start) {
-            right = mid - 1;
-        } else {
-            seq_idx = mid;
-            break;
+    // --- Lane 0 computes sequence info and broadcasts via shared memory ---
+    if (lane == 0) {
+        int seq_idx = 0;
+        // Binary search for sequence index using chunk_start (first token in chunk)
+        if (chunk_start < (int)query_start_len[num_seqs] && chunk_start >= (int)query_start_len[0]) {
+            int left = 0, right = num_seqs - 1;
+            while (left <= right) {
+                int mid = (left + right) / 2;
+                if ((int)query_start_len[mid + 1] <= chunk_start) {
+                    left = mid + 1;
+                } else if ((int)query_start_len[mid] > chunk_start) {
+                    right = mid - 1;
+                } else {
+                    seq_idx = mid;
+                    break;
+                }
+            }
         }
+        
+        uint32_t seq_len_full = seq_lens[seq_idx];
+        int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        
+        int start_token_idx = 0;
+        int start_block_idx = 0;
+        if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
+            start_token_idx = (int)seq_len_full - sliding_window;
+            start_block_idx = start_token_idx / BLOCK_SIZE;
+        }
+        
+        shared_seq_info->seq_idx = seq_idx;
+        shared_seq_info->num_blocks = num_blocks;
+        shared_seq_info->start_block_idx = start_block_idx;
+        shared_seq_info->start_token_idx = start_token_idx;
     }
-
-    // Sequence metadata
-    const uint32_t seq_len_full = seq_lens[seq_idx];
-    const int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
+    __syncthreads();
     
+    // All threads read the shared sequence info
+    const int seq_idx = shared_seq_info->seq_idx;
+    const int num_blocks = shared_seq_info->num_blocks;
+    const int start_block_idx = shared_seq_info->start_block_idx;
+    const int start_token_idx = shared_seq_info->start_token_idx;
+    const uint32_t seq_len_full = seq_lens[seq_idx];
+    const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
+
     // Vector types
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
@@ -150,51 +183,43 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
-    const bool lane_active = token_start < num_query_tokens;
+    const bool lane_active = (token_start < num_query_tokens);
 
     // Load Q
     const int64_t q_off = (int64_t)token_start * q_stride_tokens + (int64_t)query_head_idx * q_stride_heads;
     const int64_t o_off = (int64_t)token_start * (int64_t)o_stride_tokens + (int64_t)query_head_idx * o_stride_heads;
     
     if (head_active && lane_active) {
-      #pragma unroll
-      for (int k = 0; k < NUM_VECS; k++) {
-        int d_base = k * VEC_SIZE;
-        q_vec[k] = *reinterpret_cast<const Q_vec*>(&q[q_off + d_base]);
-      }
+        #pragma unroll
+        for (int k = 0; k < NUM_VECS; k++) {
+            int d_base = k * VEC_SIZE;
+            q_vec[k] = *reinterpret_cast<const Q_vec*>(&q[q_off + d_base]);
+        }
     }
 
     float acc_vec[HEAD_SIZE] = { 0.f };
-    float M = use_sinks && head_active && lane_active ? sinks[query_head_idx] : -INFINITY;
+    float M = (use_sinks && head_active && lane_active) ? sinks[query_head_idx] : -INFINITY;
     float alibi = (use_alibi && head_active && lane_active) ? alibi_slopes[query_head_idx] : 0.f;
     float L = 1.f;
-
-    // Sliding Window
-    int start_token_idx = 0;
-    int start_block_idx = 0;
-    if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
-        start_token_idx = (int)seq_len_full - sliding_window;
-        start_block_idx = start_token_idx / BLOCK_SIZE;
-    }
 
     const int elems_per_block = HEAD_SIZE * BLOCK_SIZE;
 
     // --- Main Loop Over KV Blocks ---
+    // ALL threads iterate the same number of times (num_blocks is shared)
     for (int blk = start_block_idx; blk < num_blocks; ++blk) {
         const uint32_t physical_block = block_table_for_seq[blk];
         const bool valid_block = (physical_block != UINT32_MAX) && 
                                  ((uint64_t)physical_block < (uint64_t)total_num_blocks);
 
-        // --- Optimization: Cooperative Load to Shared Memory ---
+        // --- Cooperative Load to Shared Memory ---
+        // ALL threads participate in loading
         if (valid_block) {
-            // Load K Block
             const int64_t k_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
             const cache_t* k_src = k_cache + k_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
                 k_smem[i] = k_src[i];
             }
 
-            // Load V Block
             const int64_t v_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
             const cache_t* v_src = v_cache + v_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
@@ -202,12 +227,9 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
             }
         }
         
-        // Ensure all threads have finished loading before computing
         __syncthreads();
 
-        // If block was invalid, we skip comp but we had to sync above
         if (!valid_block) {
-            // Need another sync before next iteration to ensure coherent state
             __syncthreads();
             continue;
         }
@@ -215,7 +237,7 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
         const int block_in_full = blk * BLOCK_SIZE;
         bool in_contexts[BLOCK_SIZE];
 
-        // --- Compute Q * K (Reading from Shared Memory) ---
+        // --- Compute Q * K ---
         for (int b = 0; b < BLOCK_SIZE; ++b) {
             const int token_idx_in_full = block_in_full + b;
             
@@ -224,33 +246,30 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
             in_contexts[b] = in_context && in_window;
 
             if (!in_context || !in_window || !lane_active) {
-              qk_block[b] = -INFINITY;
-              continue;
+                qk_block[b] = -INFINITY;
+                continue;
             }
 
             K_vec k_vec_local[NUM_VECS];
 
-            // Reconstruct the interleaved layout index logic, but map to flat smem
             #pragma unroll
             for (int k = 0; k < NUM_VECS; k++) {
-              int d = k * VEC_SIZE;
-              int gy = d / X;
-              int gx = d % X;
-              // Original global offset logic: offset + b * X + gy * (BLOCK_SIZE * X) + gx;
-              // Smem offset (relative to block start):
-              int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
+                int d = k * VEC_SIZE;
+                int gy = d / X;
+                int gx = d % X;
+                int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
 
-              if constexpr (!is_quantized) {
-                k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
-              } else {
-                Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
-                k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
-              }
+                if constexpr (!is_quantized) {
+                    k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
+                } else {
+                    Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
+                    k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
+                }
             }
 
             float qk = Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
             if (softscapping != 1.0) {
-              qk = fast_tanh_opt(qk / softscapping) * softscapping;
+                qk = fast_tanh_opt(qk / softscapping) * softscapping;
             }
             if (use_alibi) {
                 qk += alibi * float(token_idx_in_full - ((int)seq_len_full - 1));
@@ -259,7 +278,6 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
         }
 
         if (!head_active || !lane_active) {
-            // Need sync before next iteration
             __syncthreads();
             continue;
         }
@@ -277,43 +295,40 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
         #pragma unroll
         for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
 
-        Float_vec p_vec[NUM_BLOCK_VECS]; // Stores P values in vector format for P*V dot product
+        Float_vec p_vec[NUM_BLOCK_VECS];
 
         float acc_lane = 0.f;
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
-          if (in_contexts[b]) {
-              const float P = __expf(qk_block[b] - M);
-              reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
-              acc_lane += P;
-          } else {
-              reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
-          }
+            if (in_contexts[b]) {
+                const float P = __expf(qk_block[b] - M);
+                reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
+                acc_lane += P;
+            } else {
+                reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
+            }
         }
         L += acc_lane;
 
-        // --- Compute P * V (Reading from Shared Memory) ---
-        // V cache layout in smem is flat copy of global: [HEAD, BLOCK_SIZE] (row major)
+        // --- Compute P * V ---
         for (int k = 0; k < HEAD_SIZE; ++k) {
-          // Calculate pointer to the start of the 'k'-th row in V block (in Smem)
-          const cache_t* v_row_ptr = &v_smem[(int64_t)k * BLOCK_SIZE];
-          
-          for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
-            const cache_t* src = v_row_ptr + b_vec * VEC_SIZE;
+            const cache_t* v_row_ptr = &v_smem[(int64_t)k * BLOCK_SIZE];
             
-            Float_vec v_val_vec;
-            if constexpr (!is_quantized) {
-               v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
-            } else {
-               Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec *>(src);
-               v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+            for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
+                const cache_t* src = v_row_ptr + b_vec * VEC_SIZE;
+                
+                Float_vec v_val_vec;
+                if constexpr (!is_quantized) {
+                    v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
+                } else {
+                    Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec*>(src);
+                    v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+                }
+                
+                acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
             }
-            
-            acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
-          }
         }
         
-        // Ensure all threads finish using smem before loading next block
         __syncthreads();
     } // End Block Loop
 
@@ -321,16 +336,16 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 
     // Write output
     if (head_active && lane_active) {
-      O_vec o_vec[NUM_VECS];
-      #pragma unroll
-      for (int k = 0; k < HEAD_SIZE; k++) {
-        float outv = acc_vec[k] / (L + 1e-6f);
-        from_float(reinterpret_cast<scalar_t*>(&o_vec[k / VEC_SIZE])[k % VEC_SIZE], outv);
-      }
-      #pragma unroll
-      for (int k = 0; k < NUM_VECS; k++) {
-        *reinterpret_cast<O_vec*>(out + o_off + k * VEC_SIZE) = o_vec[k];
-      }
+        O_vec o_vec[NUM_VECS];
+        #pragma unroll
+        for (int k = 0; k < HEAD_SIZE; k++) {
+            float outv = acc_vec[k] / (L + 1e-6f);
+            from_float(reinterpret_cast<scalar_t*>(&o_vec[k / VEC_SIZE])[k % VEC_SIZE], outv);
+        }
+        #pragma unroll
+        for (int k = 0; k < NUM_VECS; k++) {
+            *reinterpret_cast<O_vec*>(out + o_off + k * VEC_SIZE) = o_vec[k];
+        }
     }
 }
 
@@ -403,7 +418,8 @@ void paged_attention_prefill_opt_launcher(
   dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);
   dim3 block(TOKEN_CHUNK_SIZE);
   const cudaStream_t stream = (cudaStream_t)stream_;
-  size_t smem_size = 2 * head_size * BLOCK_SIZE * sizeof(cache_T); \
+  // Shared memory: 32 bytes for SeqInfo + K tile + V tile
+  size_t smem_size = 32 + 2 * head_size * BLOCK_SIZE * sizeof(cache_T);
   
   switch (head_size) {
     case 64:
