@@ -352,34 +352,41 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 // --- Launcher Code ---
 
 #define LAUNCH_PAGED_ATTENTION_PREFILL_OPT(HEAD_SIZE)                                      \
-  cudaFuncSetAttribute(                                                                    \
-    vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE>,\
-    cudaFuncAttributeMaxDynamicSharedMemorySize,                                           \
-    smem_size);                                                                            \
-  vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE>   \
-  <<<grid, block, smem_size, stream>>>(                                                    \
-    reinterpret_cast<T*>(out),                                                             \
-    reinterpret_cast<T*>(query),                                                           \
-    reinterpret_cast<cache_T*>(key_cache),                                                 \
-    reinterpret_cast<cache_T*>(value_cache),                                               \
-    k_scales, v_scales,                                                                    \
-    num_kv_heads,                                                                          \
-    scale,                                                                                 \
-    block_tables,                                                                          \
-    context_lens,                                                                          \
-    max_num_blocks_per_seq,                                                                \
-    num_seqs,                                                                              \
-    num_query_heads,                                                                       \
-    num_query_tokens,                                                                      \
-    softscapping,                                                                          \
-    o_stride_tokens,                                                                       \
-    query_start_len,                                                                       \
-    alibi_slopes_ptr,                                                                      \
-    sinks,                                                                                 \
-    sliding_window,                                                                        \
-    num_blocks,                                                                            \
-    kv_block_stride,                                                                       \
-    kv_head_stride);
+  do {                                                                                     \
+    /* Only request extended shared memory if we need more than 48KB default */            \
+    if (smem_size > 48 * 1024) {                                                           \
+      cudaFuncSetAttribute(                                                                \
+        vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE>,\
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                       \
+        smem_size);                                                                        \
+      /* Clear any error from unsupported config - kernel will fail properly if needed */  \
+      cudaGetLastError();                                                                  \
+    }                                                                                      \
+    vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE> \
+    <<<grid, block, smem_size, stream>>>(                                                  \
+      reinterpret_cast<T*>(out),                                                           \
+      reinterpret_cast<T*>(query),                                                         \
+      reinterpret_cast<cache_T*>(key_cache),                                               \
+      reinterpret_cast<cache_T*>(value_cache),                                             \
+      k_scales, v_scales,                                                                  \
+      num_kv_heads,                                                                        \
+      scale,                                                                               \
+      block_tables,                                                                        \
+      context_lens,                                                                        \
+      max_num_blocks_per_seq,                                                              \
+      num_seqs,                                                                            \
+      num_query_heads,                                                                     \
+      num_query_tokens,                                                                    \
+      softscapping,                                                                        \
+      o_stride_tokens,                                                                     \
+      query_start_len,                                                                     \
+      alibi_slopes_ptr,                                                                    \
+      sinks,                                                                               \
+      sliding_window,                                                                      \
+      num_blocks,                                                                          \
+      kv_block_stride,                                                                     \
+      kv_head_stride);                                                                     \
+  } while (0)
 
 
 template<
