@@ -228,8 +228,10 @@ impl PagedAttention {
             };
 
             unsafe {
-                // Use optimized kernel with shared memory tiling when KV cache is large (>4096 tokens)
-                if false {
+                // Use optimized kernel with shared memory tiling when:
+                // 1. KV cache is large (num_blocks > 64, i.e., >4096 tokens with block_size=64)
+                // 2. Single sequence (optimized kernel assumes all tokens in chunk share same KV blocks)
+                if num_blocks > 64 && num_seqs_bt == 1 {
                     kernels::ffi::paged_attention_prefill_opt(
                         out_ptr,
                         q_ptr,

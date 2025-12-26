@@ -1,9 +1,37 @@
 /**
  * @brief Optimized CUDA kernel for chunked prefill attention with paged KV-cache.
- * * Optimizations applied:
- * 1. Shared Memory Tiling: Cooperative loading of K/V blocks to reduce global memory bandwidth.
- * 2. Binary Search: O(log N) sequence lookup instead of O(N) linear scan.
- * * Original Copyright (c) 2025, Guoqing Bao.
+ * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
+ * 
+ * This is an optimized version of the prefill_paged_attn.cu kernel designed for
+ * large KV-cache scenarios (num_blocks > 64). It uses shared memory tiling for
+ * cooperative K/V block loading and binary search for O(log N) sequence lookup.
+ *
+ * This CUDA kernel is part of the vllm.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/prefill_paged_attn_opt.cu
+ * 
+ * Optimizations:
+ *  - Shared Memory Tiling: Cooperative loading of K/V blocks reduces global memory bandwidth.
+ *  - Binary Search: O(log N) sequence lookup instead of O(N) linear scan.
+ *  - Chunk Processing: Multiple tokens share the same KV blocks via shared memory.
+ *
+ * Features:
+ *  - Support Chunked Prefill (prefilled attention with kvcache)
+ *  - Supports paged KV-cache (blocks of tokens stored in memory)
+ *  - Handles sliding window attention
+ *  - Uses online softmax for numerical stability
+ *  - Extended shared memory support for large models (up to 96KB on V100/A100)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <stdint.h>
@@ -26,7 +54,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
-#define TOKEN_CHUNK_SIZE 1024
+#define TOKEN_CHUNK_SIZE 256
 using namespace vllm;
 
 namespace vllm_rs {
@@ -53,11 +81,29 @@ __device__ inline T make_zero_opt() {
 }
 
 /**
- * @brief Optimized Kernel with shared memory tiling and binary search
- * 
- * Key insight: All 128 tokens in a chunk should be from the same sequence,
- * so they share the same KV blocks. We use lane 0 to find the sequence and
- * broadcast to all threads via shared memory.
+ * @brief Optimized chunked prefill paged attention kernel with shared memory tiling.
+ *
+ * This kernel processes a chunk of query tokens that attend to the same paged KV-cache.
+ * All threads in a block cooperatively load K/V tiles into shared memory, then each
+ * thread computes attention for its assigned token.
+ *
+ * Key design decisions:
+ *  - Lane 0 computes sequence info (via binary search) and broadcasts to all threads
+ *  - All threads share the same KV blocks, enabling cooperative shared memory loading
+ *  - Two __syncthreads() per block iteration ensure correct data dependencies
+ *
+ * @tparam scalar_t    Scalar type for Q/K/V/O tensors (half, bfloat16)
+ * @tparam cache_t     Cache storage type (same as scalar_t, or uint8_t for FP8)
+ * @tparam HEAD_SIZE   Number of elements per head (64, 96, 128, 192, 256)
+ * @tparam BLOCK_SIZE  Tokens per KV-cache block (32, 64)
+ *
+ * @param out           Output tensor [num_query_tokens, num_heads, head_size]
+ * @param q             Query tensor [num_query_tokens, num_heads, head_size]
+ * @param k_cache       Paged K cache [num_blocks, num_kv_heads, head_size/x, block_size, x]
+ * @param v_cache       Paged V cache [num_blocks, num_kv_heads, head_size, block_size]
+ * @param k_scales      K scale for FP8 quantization (nullptr if not quantized)
+ * @param v_scales      V scale for FP8 quantization (nullptr if not quantized)
+ * @param query_start_len  Cumulative sum of query lengths per sequence [num_seqs+1]
  */
 template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE>
 __global__ void chunked_prefill_paged_attention_kernel_opt(
