@@ -212,7 +212,7 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
                                  ((uint64_t)physical_block < (uint64_t)total_num_blocks);
 
         // --- Cooperative Load to Shared Memory ---
-        // ALL threads participate in loading
+        // ALL threads participate in loading (valid_block is same for all)
         if (valid_block) {
             const int64_t k_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
             const cache_t* k_src = k_cache + k_base;
@@ -227,108 +227,106 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
             }
         }
         
+        // SYNC 1: All threads must hit this after loading
         __syncthreads();
 
-        if (!valid_block) {
-            __syncthreads();
-            continue;
-        }
+        // Skip computation if block invalid, but DO NOT use continue
+        // All threads still proceed to SYNC 2 at the end
+        if (valid_block) {
+            const int block_in_full = blk * BLOCK_SIZE;
+            bool in_contexts[BLOCK_SIZE];
 
-        const int block_in_full = blk * BLOCK_SIZE;
-        bool in_contexts[BLOCK_SIZE];
+            // --- Compute Q * K ---
+            for (int b = 0; b < BLOCK_SIZE; ++b) {
+                const int token_idx_in_full = block_in_full + b;
+                
+                bool in_context = (token_idx_in_full < (int)seq_len_full);
+                bool in_window = (token_idx_in_full >= start_token_idx);
+                in_contexts[b] = in_context && in_window;
 
-        // --- Compute Q * K ---
-        for (int b = 0; b < BLOCK_SIZE; ++b) {
-            const int token_idx_in_full = block_in_full + b;
-            
-            bool in_context = (token_idx_in_full < (int)seq_len_full);
-            bool in_window = (token_idx_in_full >= start_token_idx);
-            in_contexts[b] = in_context && in_window;
-
-            if (!in_context || !in_window || !lane_active) {
-                qk_block[b] = -INFINITY;
-                continue;
-            }
-
-            K_vec k_vec_local[NUM_VECS];
-
-            #pragma unroll
-            for (int k = 0; k < NUM_VECS; k++) {
-                int d = k * VEC_SIZE;
-                int gy = d / X;
-                int gx = d % X;
-                int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
-
-                if constexpr (!is_quantized) {
-                    k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
+                if (!in_context || !in_window || !lane_active) {
+                    qk_block[b] = -INFINITY;
                 } else {
-                    Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
-                    k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
+                    K_vec k_vec_local[NUM_VECS];
+
+                    #pragma unroll
+                    for (int k = 0; k < NUM_VECS; k++) {
+                        int d = k * VEC_SIZE;
+                        int gy = d / X;
+                        int gx = d % X;
+                        int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
+
+                        if constexpr (!is_quantized) {
+                            k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
+                        } else {
+                            Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
+                            k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
+                        }
+                    }
+
+                    float qk = Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
+                    if (softscapping != 1.0) {
+                        qk = fast_tanh_opt(qk / softscapping) * softscapping;
+                    }
+                    if (use_alibi) {
+                        qk += alibi * float(token_idx_in_full - ((int)seq_len_full - 1));
+                    }
+                    qk_block[b] = qk;
                 }
             }
 
-            float qk = Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
-            if (softscapping != 1.0) {
-                qk = fast_tanh_opt(qk / softscapping) * softscapping;
-            }
-            if (use_alibi) {
-                qk += alibi * float(token_idx_in_full - ((int)seq_len_full - 1));
-            }
-            qk_block[b] = qk;
-        }
+            // Only active threads do softmax and accumulation
+            if (head_active && lane_active) {
+                // --- Softmax (Online) ---
+                float Smax = -INFINITY;
+                #pragma unroll
+                for (int b = 0; b < BLOCK_SIZE; ++b) Smax = fmaxf(Smax, qk_block[b]);
 
-        if (!head_active || !lane_active) {
-            __syncthreads();
-            continue;
-        }
-
-        // --- Softmax (Online) ---
-        float Smax = -INFINITY;
-        #pragma unroll
-        for (int b = 0; b < BLOCK_SIZE; ++b) Smax = fmaxf(Smax, qk_block[b]);
-
-        const float m_j = fmaxf(M, Smax);
-        const float alpha = __expf(M - m_j);
-        M = m_j;
-        L = L * alpha;
-        
-        #pragma unroll
-        for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
-
-        Float_vec p_vec[NUM_BLOCK_VECS];
-
-        float acc_lane = 0.f;
-        #pragma unroll
-        for (int b = 0; b < BLOCK_SIZE; ++b) {
-            if (in_contexts[b]) {
-                const float P = __expf(qk_block[b] - M);
-                reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
-                acc_lane += P;
-            } else {
-                reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
-            }
-        }
-        L += acc_lane;
-
-        // --- Compute P * V ---
-        for (int k = 0; k < HEAD_SIZE; ++k) {
-            const cache_t* v_row_ptr = &v_smem[(int64_t)k * BLOCK_SIZE];
-            
-            for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
-                const cache_t* src = v_row_ptr + b_vec * VEC_SIZE;
+                const float m_j = fmaxf(M, Smax);
+                const float alpha = __expf(M - m_j);
+                M = m_j;
+                L = L * alpha;
                 
-                Float_vec v_val_vec;
-                if constexpr (!is_quantized) {
-                    v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
-                } else {
-                    Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec*>(src);
-                    v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+                #pragma unroll
+                for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
+
+                Float_vec p_vec[NUM_BLOCK_VECS];
+
+                float acc_lane = 0.f;
+                #pragma unroll
+                for (int b = 0; b < BLOCK_SIZE; ++b) {
+                    if (in_contexts[b]) {
+                        const float P = __expf(qk_block[b] - M);
+                        reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
+                        acc_lane += P;
+                    } else {
+                        reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
+                    }
                 }
-                
-                acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
-            }
-        }
+                L += acc_lane;
+
+                // --- Compute P * V ---
+                for (int k = 0; k < HEAD_SIZE; ++k) {
+                    const cache_t* v_row_ptr = &v_smem[(int64_t)k * BLOCK_SIZE];
+                    
+                    for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
+                        const cache_t* src = v_row_ptr + b_vec * VEC_SIZE;
+                        
+                        Float_vec v_val_vec;
+                        if constexpr (!is_quantized) {
+                            v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
+                        } else {
+                            Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec*>(src);
+                            v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+                        }
+                        
+                        acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
+                    }
+                }
+            } // end if head_active && lane_active
+        } // end if valid_block
         
+        // SYNC 2: ALL threads must hit this before next iteration
         __syncthreads();
     } // End Block Loop
 
