@@ -136,6 +136,41 @@ extern "C" {
         stream: i64,
     );
 
+    // Optimized prefill kernel with shared memory tiling (for large KV cache)
+    pub fn paged_attention_prefill_opt(
+        out: *const c_void,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        k_scale: *const c_void,
+        v_scale: *const c_void,
+        num_kv_heads: c_int,
+        scale: f32,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        block_size: c_int,
+        max_context_len: c_int,
+
+        num_seqs: c_int,
+        num_heads: c_int,
+        num_query_tokens: c_int,
+        head_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        q_stride: c_int,
+        num_blocks: c_int,
+        kv_block_stride: c_int,
+        kv_head_stride: c_int,
+
+        dtype: u32,
+        softscapping: f32,
+
+        o_stride_tokens: c_int,
+        query_start_len: *const u32,
+        sinks: *const f32,
+        sliding_window: c_int,
+        stream: i64,
+    );
+
     pub fn update_kv_scales_f32(
         k: *const c_void,
         v: *const c_void,
