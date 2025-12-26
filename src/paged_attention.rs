@@ -228,10 +228,17 @@ impl PagedAttention {
             };
 
             unsafe {
+                // Calculate shared memory requirement for optimized kernel:
+                // smem_size = 32 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
+                // sizeof(cache_t) = 2 for fp16/bf16, 1 for fp8
+                let cache_elem_size = if k_scales_ptr.is_null() { 2usize } else { 1usize };
+                let smem_size = 32 + 2 * head_size * block_size * cache_elem_size;
+
                 // Use optimized kernel with shared memory tiling when:
                 // 1. KV cache is large (num_blocks > 64, i.e., >4096 tokens with block_size=64)
                 // 2. Single sequence (optimized kernel assumes all tokens in chunk share same KV blocks)
-                if num_blocks > 64 && num_seqs_bt == 1 {
+                // 3. Shared memory fits within 64KB (minimum on modern GPUs, extended via cudaFuncSetAttribute)
+                if num_seqs > 1024 && num_seqs_bt == 1 && smem_size <= 64 * 1024 {
                     kernels::ffi::paged_attention_prefill_opt(
                         out_ptr,
                         q_ptr,
