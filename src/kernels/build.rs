@@ -21,6 +21,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/gpu_sampling.cu");
     println!("cargo:rerun-if-changed=src/fused_rope.cu");
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
+    println!("cargo:rerun-if-changed=src/fp8_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/fp8_scale_pack.cu");
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or("".to_string()));
@@ -66,12 +68,34 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
+    if compute_cap >= 1200 {
+        builder = builder.arg("--gpu-architecture=sm_120");
+    } else if compute_cap >= 1000 {
+        builder = builder.arg("--gpu-architecture=sm_100");
+    } else if compute_cap >= 900 {
+        builder = builder.arg("--gpu-architecture=sm_90a");
+    }
+
     if marlin_disabled {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
 
     if fp8_kvcache_disabled {
         builder = builder.arg("-DNO_FP8_KVCACHE");
+    }
+
+    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok() {
+        let cutlass_dir = std::env::var("CUTLASS_DIR")
+            .expect("CUTLASS_DIR must be set when enabling the cutlass feature");
+        let include_root = Box::leak(format!("-I{cutlass_dir}").into_boxed_str());
+        let include_main = Box::leak(format!("-I{cutlass_dir}/include").into_boxed_str());
+        let include_tools =
+            Box::leak(format!("-I{cutlass_dir}/tools/util/include").into_boxed_str());
+        builder = builder
+            .arg("-DUSE_CUTLASS")
+            .arg(include_root)
+            .arg(include_main)
+            .arg(include_tools);
     }
 
     let mut is_target_msvc = false;
@@ -91,6 +115,6 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
-
+    println!("cargo:rustc-link-lib=dylib=stdc++");
     Ok(())
 }

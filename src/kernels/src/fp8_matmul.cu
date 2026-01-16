@@ -27,13 +27,18 @@ __device__ __forceinline__ float get_scale(const float *__restrict__ scale,
   return __ldg(&scale[sr * scale_stride + sc]);
 }
 
+__device__ __forceinline__ size_t weight_index(int n, int k, int N, int K,
+                                               bool col_major) {
+  return col_major ? (size_t)k * N + n : (size_t)n * K + k;
+}
+
 template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
 __global__ void fp8_matmul_kernel(const T *__restrict__ input,
                                  const uint8_t *__restrict__ weight,
                                  const float *__restrict__ weight_scale,
                                  T *__restrict__ output, int M, int N, int K,
                                  int scale_row_stride, int block_size_y,
-                                 int block_size_x) {
+                                 int block_size_x, int weight_col_major) {
   __shared__ float s_input[BLOCK_M][BLOCK_K + 4];
   __shared__ float s_weight[BLOCK_N][BLOCK_K + 4];
 
@@ -44,6 +49,7 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
 
   const int row = by * BLOCK_M + ty;
   const int col = bx * BLOCK_N + tx;
+  const bool col_major = weight_col_major != 0;
 
   float acc = 0.0f;
 
@@ -83,7 +89,7 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
 
       float val = 0.0f;
       if (gn < N && gk < K) {
-        uint8_t w_raw = __ldg(&weight[gn * K + gk]);
+        uint8_t w_raw = __ldg(&weight[weight_index(gn, gk, N, K, col_major)]);
         float s = 0.0f;
         if (tile_scale_uniform) {
           int scale_row = gn / block_size_y;
@@ -126,7 +132,8 @@ __global__ void fp8_wmma_matmul(
     const float *__restrict__ weight_scale,
     T *__restrict__ output,
     int M, int N, int K,
-    int scale_row_stride, int block_size_y, int block_size_x) 
+    int scale_row_stride, int block_size_y, int block_size_x,
+    int weight_col_major) 
 {
     // Warps layout:
     int warp_id = threadIdx.x / 32;
@@ -192,6 +199,7 @@ __global__ void fp8_wmma_matmul(
     int bx = blockIdx.x; 
     int by = blockIdx.y;
     int tid = threadIdx.x;
+    const bool weight_col_major_flag = weight_col_major != 0;
 
     // Loop over K in chunks of BK
     for (int k_step = 0; k_step < K; k_step += BK) {
@@ -228,7 +236,7 @@ __global__ void fp8_wmma_matmul(
              
              float val = 0.0f;
              if (gn < N && gk < K) {
-                 uint8_t w = weight[gn * K + gk];
+                 uint8_t w = weight[weight_index(gn, gk, N, K, weight_col_major_flag)];
                  
                  // Scale
                  int sr = gn / block_size_y;
@@ -293,12 +301,37 @@ __global__ void fp8_wmma_matmul(
     }
 }
 
+extern "C" void fp8_matmul_f16_layout(const __half *input,
+                        const uint8_t *weight, const float *weight_scale,
+                        __half *output, int M, int N, int K,
+                        int scale_row_stride, int block_size_y,
+                        int block_size_x, int weight_col_major,
+                        cudaStream_t stream);
+
+extern "C" void fp8_matmul_bf16_layout(const __nv_bfloat16 *input,
+                        const uint8_t *weight, const float *weight_scale,
+                        __nv_bfloat16 *output, int M, int N, int K,
+                        int scale_row_stride, int block_size_y,
+                        int block_size_x, int weight_col_major,
+                        cudaStream_t stream);
+
 extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
                         const float *weight_scale, __half *output, int M,
                         int N, int K, int scale_row_stride, int block_size_y,
                         int block_size_x, cudaStream_t stream) {
 
-  
+  fp8_matmul_f16_layout(input, weight, weight_scale, output, M, N, K,
+                        scale_row_stride, block_size_y, block_size_x, 0,
+                        stream);
+}
+
+extern "C" void fp8_matmul_f16_layout(const __half *input,
+                        const uint8_t *weight, const float *weight_scale,
+                        __half *output, int M, int N, int K,
+                        int scale_row_stride, int block_size_y,
+                        int block_size_x, int weight_col_major,
+                        cudaStream_t stream) {
+
   if (M <= 32) {
       constexpr int TILE = 32; 
       constexpr int TILE_K = 32; 
@@ -308,7 +341,8 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
       
       fp8_matmul_kernel<__half, TILE, TILE, TILE_K>
        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                    scale_row_stride, block_size_y, block_size_x);
+                                    scale_row_stride, block_size_y, block_size_x,
+                                    weight_col_major);
   } else {
       // Default / Prefill
       constexpr int BLOCK_M = 64;
@@ -318,7 +352,8 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
       
       fp8_wmma_matmul<__half, BLOCK_M, BLOCK_N, 16, 16, 16>
        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                    scale_row_stride, block_size_y, block_size_x);
+                                    scale_row_stride, block_size_y, block_size_x,
+                                    weight_col_major);
   }
 }
 
@@ -327,6 +362,17 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
                         int N, int K, int scale_row_stride, int block_size_y,
                         int block_size_x, cudaStream_t stream) {
 
+  fp8_matmul_bf16_layout(input, weight, weight_scale, output, M, N, K,
+                         scale_row_stride, block_size_y, block_size_x, 0,
+                         stream);
+}
+
+extern "C" void fp8_matmul_bf16_layout(const __nv_bfloat16 *input,
+                        const uint8_t *weight, const float *weight_scale,
+                        __nv_bfloat16 *output, int M, int N, int K,
+                        int scale_row_stride, int block_size_y,
+                        int block_size_x, int weight_col_major,
+                        cudaStream_t stream) {
 
 #ifndef NO_BF16_KERNEL
   if (M <= 32) {
@@ -337,7 +383,8 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
       
       fp8_matmul_kernel<__nv_bfloat16, TILE, TILE, TILE_K>
        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                    scale_row_stride, block_size_y, block_size_x);
+                                    scale_row_stride, block_size_y, block_size_x,
+                                    weight_col_major);
   } else {
       constexpr int BLOCK_M = 64;
       constexpr int BLOCK_N = 64;
@@ -345,7 +392,8 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
       dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
       fp8_wmma_matmul<__nv_bfloat16, BLOCK_M, BLOCK_N, 16, 16, 16>
        <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
-                                    scale_row_stride, block_size_y, block_size_x);
+                                    scale_row_stride, block_size_y, block_size_x,
+                                    weight_col_major);
   }
 #endif
 }

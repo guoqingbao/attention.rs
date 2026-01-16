@@ -1,6 +1,6 @@
 [package]
 name = "attention-rs"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,7 @@ half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_di
 tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
-kernels = { path = "./src/kernels", version="0.2.1", optional = true}
+kernels = { path = "./src/kernels", version="0.3.0", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true}
 
@@ -26,3 +26,4 @@ flash-context = ["dep:candle-flash-attn", "candle-flash-attn/flash-context", "ke
 no-marlin = ["dep:kernels", "kernels/no-marlin"]
 no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]
+cutlass = ["dep:kernels", "kernels/cutlass"]

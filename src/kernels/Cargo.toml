@@ -1,6 +1,6 @@
 [package]
 name = "kernels"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Paged attention kernels for Rust"
 categories = ["science"]
@@ -15,3 +15,4 @@ anyhow = { version = "1", features = ["backtrace"] }
 [features]
 no-marlin = []
 no-fp8-kvcache = []
+cutlass = []

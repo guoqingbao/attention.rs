@@ -391,7 +391,7 @@ extern "C" void moe_gemv_transposed(
  * @tparam T Data type for input/output: half or nv_bfloat16
  * @tparam BLOCK_SIZE Number of threads per block
  */
-template <typename T, int BLOCK_SIZE = 256>
+template <typename T, int BLOCK_SIZE = 256, bool COL_MAJOR = false>
 __global__ void moe_gemv_kernel_fp8(
     const T *__restrict__ input,                  // [M, K]
     const uint8_t *__restrict__ weights,          // [num_experts, N, K] FP8
@@ -419,7 +419,8 @@ __global__ void moe_gemv_kernel_fp8(
   const T *input_row = input + (size_t)input_idx * K;
   
   // FP8 weight row for this expert and output row
-  const uint8_t *weight_row = weights + (size_t)expert * N * K + (size_t)row * K;
+  const uint8_t *expert_w = weights + (size_t)expert * N * K;
+  const uint8_t *weight_row = expert_w + (size_t)row * K;
   
   // Scale layout: [num_experts, scale_n_dim, scale_k_dim]
   const int scale_n_dim = CEILDIV(N, block_size_n);
@@ -431,60 +432,70 @@ __global__ void moe_gemv_kernel_fp8(
 
   float sum = 0.0f;
 
-  // Process 4 FP8 values at a time using uint32_t loads
-  const int k_vec4 = K / 4;
-  for (int k = tid; k < k_vec4; k += BLOCK_SIZE) {
-    int k_base = k * 4;
-    
-    // Load 4 FP8 weights as uint32_t
-    uint32_t w4 = __ldg(reinterpret_cast<const uint32_t *>(&weight_row[k_base]));
-    
-    // Get scale for this K block
-    int scale_k_idx = k_base / block_size_k;
-    float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
-    
-    uint8_t w0 = (w4 >> 0) & 0xFF;
-    uint8_t w1 = (w4 >> 8) & 0xFF;
-    uint8_t w2 = (w4 >> 16) & 0xFF;
-    uint8_t w3 = (w4 >> 24) & 0xFF;
+  if constexpr (!COL_MAJOR) {
+    // Process 4 FP8 values at a time using uint32_t loads
+    const int k_vec4 = K / 4;
+    for (int k = tid; k < k_vec4; k += BLOCK_SIZE) {
+      int k_base = k * 4;
+      
+      // Load 4 FP8 weights as uint32_t
+      uint32_t w4 = __ldg(reinterpret_cast<const uint32_t *>(&weight_row[k_base]));
+      
+      // Get scale for this K block
+      int scale_k_idx = k_base / block_size_k;
+      float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+      
+      uint8_t w0 = (w4 >> 0) & 0xFF;
+      uint8_t w1 = (w4 >> 8) & 0xFF;
+      uint8_t w2 = (w4 >> 16) & 0xFF;
+      uint8_t w3 = (w4 >> 24) & 0xFF;
 
-    float4 w = make_float4(
-        vllm::fp8::dispatch_fp8_to_float(w0),
-        vllm::fp8::dispatch_fp8_to_float(w1),
-        vllm::fp8::dispatch_fp8_to_float(w2),
-        vllm::fp8::dispatch_fp8_to_float(w3));
+      float4 w = make_float4(
+          vllm::fp8::dispatch_fp8_to_float(w0),
+          vllm::fp8::dispatch_fp8_to_float(w1),
+          vllm::fp8::dispatch_fp8_to_float(w2),
+          vllm::fp8::dispatch_fp8_to_float(w3));
 
-    float2 i01;
-    float2 i23;
-    if (std::is_same<T, half>::value) {
-      const __half2* in2 = reinterpret_cast<const __half2*>(&input_row[k_base]);
-      i01 = __half22float2(in2[0]);
-      i23 = __half22float2(in2[1]);
-    } else {
+      float2 i01;
+      float2 i23;
+      if (std::is_same<T, half>::value) {
+        const __half2* in2 = reinterpret_cast<const __half2*>(&input_row[k_base]);
+        i01 = __half22float2(in2[0]);
+        i23 = __half22float2(in2[1]);
+      } else {
 #ifndef NO_BF16_KERNEL
-      const __nv_bfloat162* in2 = reinterpret_cast<const __nv_bfloat162*>(&input_row[k_base]);
-      i01 = vllm::bf1622float2(in2[0]);
-      i23 = vllm::bf1622float2(in2[1]);
+        const __nv_bfloat162* in2 = reinterpret_cast<const __nv_bfloat162*>(&input_row[k_base]);
+        i01 = vllm::bf1622float2(in2[0]);
+        i23 = vllm::bf1622float2(in2[1]);
 #endif
+      }
+
+      float partial_sum = 0.0f;
+      partial_sum = fmaf(i01.x, w.x, partial_sum);
+      partial_sum = fmaf(i01.y, w.y, partial_sum);
+      partial_sum = fmaf(i23.x, w.z, partial_sum);
+      partial_sum = fmaf(i23.y, w.w, partial_sum);
+
+      sum += scale * partial_sum;
     }
 
-    float partial_sum = 0.0f;
-    partial_sum = fmaf(i01.x, w.x, partial_sum);
-    partial_sum = fmaf(i01.y, w.y, partial_sum);
-    partial_sum = fmaf(i23.x, w.z, partial_sum);
-    partial_sum = fmaf(i23.y, w.w, partial_sum);
-
-    sum += scale * partial_sum;
-  }
-
-  // Handle remainder
-  const int remainder_start = k_vec4 * 4;
-  for (int k = remainder_start + tid; k < K; k += BLOCK_SIZE) {
-    uint8_t w = weight_row[k];
-    int scale_k_idx = k / block_size_k;
-    float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
-    float wf = vllm::fp8::dispatch_fp8_to_float(w) * scale;
-    sum += vllm::to_float(input_row[k]) * wf;
+    // Handle remainder
+    const int remainder_start = k_vec4 * 4;
+    for (int k = remainder_start + tid; k < K; k += BLOCK_SIZE) {
+      uint8_t w = weight_row[k];
+      int scale_k_idx = k / block_size_k;
+      float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+      float wf = vllm::fp8::dispatch_fp8_to_float(w) * scale;
+      sum += vllm::to_float(input_row[k]) * wf;
+    }
+  } else {
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+      uint8_t w = expert_w[(size_t)k * N + row];
+      int scale_k_idx = k / block_size_k;
+      float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+      float wf = vllm::fp8::dispatch_fp8_to_float(w) * scale;
+      sum += vllm::to_float(input_row[k]) * wf;
+    }
   }
 
   // Warp-level reduction
@@ -522,6 +533,25 @@ __global__ void moe_gemv_kernel_fp8(
   }
 }
 
+extern "C" void moe_gemv_fp8_layout(
+    const void *input,
+    const uint8_t *weights,
+    const float *weight_scales,
+    const int32_t *sorted_token_ids,
+    const int32_t *expert_ids,
+    const float *topk_weights,
+    void *output,
+    int num_experts,
+    int topk,
+    int size_m,
+    int size_n,
+    int size_k,
+    int block_size_n,
+    int block_size_k,
+    int dtype,
+    int weight_col_major,
+    cudaStream_t stream);
+
 extern "C" void moe_gemv_fp8(
     const void *input,                // input [size_m or size_m / topk, size_k]
     const uint8_t *weights,           // weights [num_experts, size_n, size_k] FP8
@@ -540,6 +570,31 @@ extern "C" void moe_gemv_fp8(
     int dtype,                        // 0=float16, 1=bf16 (for input/output)
     cudaStream_t stream) {
 
+  moe_gemv_fp8_layout(input, weights, weight_scales, sorted_token_ids,
+                      expert_ids, topk_weights, output, num_experts, topk,
+                      size_m, size_n, size_k, block_size_n, block_size_k,
+                      dtype, 0, stream);
+}
+
+extern "C" void moe_gemv_fp8_layout(
+    const void *input,
+    const uint8_t *weights,
+    const float *weight_scales,
+    const int32_t *sorted_token_ids,
+    const int32_t *expert_ids,
+    const float *topk_weights,
+    void *output,
+    int num_experts,
+    int topk,
+    int size_m,
+    int size_n,
+    int size_k,
+    int block_size_n,
+    int block_size_k,
+    int dtype,
+    int weight_col_major,
+    cudaStream_t stream) {
+
   constexpr int BLOCK_SIZE = 256;
 
   // Grid: (N, M) - one block per output element per token
@@ -547,19 +602,35 @@ extern "C" void moe_gemv_fp8(
   dim3 block(BLOCK_SIZE);
 
   if (dtype == 0) { // FP16
-    moe_gemv_kernel_fp8<half, BLOCK_SIZE><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const half *>(input),
-        weights, weight_scales, sorted_token_ids, expert_ids,
-        topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
-        size_m, size_n, size_k, block_size_n, block_size_k);
+    if (weight_col_major) {
+      moe_gemv_kernel_fp8<half, BLOCK_SIZE, true><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const half *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
+    } else {
+      moe_gemv_kernel_fp8<half, BLOCK_SIZE, false><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const half *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
+    }
   }
 #ifndef NO_BF16_KERNEL
   else if (dtype == 1) { // BF16
-    moe_gemv_kernel_fp8<nv_bfloat16, BLOCK_SIZE><<<grid, block, 0, stream>>>(
-        reinterpret_cast<const nv_bfloat16 *>(input),
-        weights, weight_scales, sorted_token_ids, expert_ids,
-        topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
-        size_m, size_n, size_k, block_size_n, block_size_k);
+    if (weight_col_major) {
+      moe_gemv_kernel_fp8<nv_bfloat16, BLOCK_SIZE, true><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const nv_bfloat16 *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
+    } else {
+      moe_gemv_kernel_fp8<nv_bfloat16, BLOCK_SIZE, false><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const nv_bfloat16 *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
+    }
   }
 #endif
   else {
