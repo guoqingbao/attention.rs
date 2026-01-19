@@ -166,13 +166,26 @@ cutlass::Status cutlass_gemm_caller(typename GemmKernel::Arguments const& args,
   }
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  void* workspace = nullptr;
+  if (workspace_size > 0) {
+    auto err = cudaMallocAsync(&workspace, workspace_size, stream);
+    if (err != cudaSuccess) {
+      return cutlass::Status::kErrorInternal;
+    }
+  }
 
-  auto init_status = gemm_op.initialize(args, workspace.get(), stream);
+  auto init_status = gemm_op.initialize(args, workspace, stream);
   if (init_status != cutlass::Status::kSuccess) {
+    if (workspace != nullptr) {
+      cudaFreeAsync(workspace, stream);
+    }
     return init_status;
   }
-  return gemm_op.run(stream);
+  auto run_status = gemm_op.run(stream);
+  if (workspace != nullptr) {
+    cudaFreeAsync(workspace, stream);
+  }
+  return run_status;
 }
 
 template <
