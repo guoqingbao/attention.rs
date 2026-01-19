@@ -188,38 +188,6 @@ pub fn moe_gemm_fp8(
     block_size_k: usize,
     is_prefill: bool,
 ) -> Result<Tensor> {
-    moe_gemm_fp8_with_layout(
-        input,
-        weights,
-        weight_scales,
-        topk_weights,
-        sorted_token_ids,
-        experts_ids,
-        topk,
-        block_size_n,
-        block_size_k,
-        is_prefill,
-        false,
-    )
-}
-
-/// MoE GEMM with FP8 weights and explicit layout.
-///
-/// When `weight_col_major` is true, `weights` are expected to be [num_experts, K, N].
-#[cfg(feature = "cuda")]
-pub fn moe_gemm_fp8_with_layout(
-    input: &Tensor,
-    weights: &Tensor,
-    weight_scales: &Tensor,
-    topk_weights: &Option<Tensor>,
-    sorted_token_ids: &Tensor,
-    experts_ids: &Tensor,
-    topk: usize,
-    block_size_n: usize,
-    block_size_k: usize,
-    is_prefill: bool,
-    weight_col_major: bool,
-) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use candle_core::cuda_backend::WrapErr;
@@ -239,7 +207,6 @@ pub fn moe_gemm_fp8_with_layout(
         block_size_n: usize,
         block_size_k: usize,
         is_prefill: bool,
-        weight_col_major: bool,
     ) -> Result<Tensor> {
         let (mut size_m, size_k1) = input.dims2()?;
         if topk_weights.is_none() {
@@ -321,14 +288,11 @@ pub fn moe_gemm_fp8_with_layout(
         let stream = *dev.cu_stream() as i64;
         use core::ffi::c_void;
 
-        // let sm90_plus = cuda_utils::sm_version(dev).map_or(false, |sm| sm >= 90);
-        // let use_cutlass = weight_col_major && cfg!(feature = "cutlass") && sm90_plus && is_prefill;
-
         unsafe {
             if is_prefill || size_m > 8 {
                 let expert_counts = dev.alloc::<u32>(num_experts).w()?;
                 let expert_offsets = dev.alloc::<u32>(num_experts + 1).w()?;
-                ffi::moe_gemm_wmma_fp8_layout(
+                ffi::moe_gemm_wmma_fp8(
                     *input.device_ptr() as *const c_void,
                     *weights.device_ptr() as *const u8,
                     *weight_scales.device_ptr() as *const f32,
@@ -347,11 +311,10 @@ pub fn moe_gemm_fp8_with_layout(
                     block_size_k as i32,
                     data_type as i32,
                     is_prefill,
-                    weight_col_major as i32,
                     stream as i64,
                 );
             } else {
-                ffi::moe_gemv_fp8_layout(
+                ffi::moe_gemv_fp8(
                     *input.device_ptr() as *const c_void,
                     *weights.device_ptr() as *const u8,
                     *weight_scales.device_ptr() as *const f32,
@@ -367,7 +330,6 @@ pub fn moe_gemm_fp8_with_layout(
                     block_size_n as i32,
                     block_size_k as i32,
                     data_type as i32,
-                    weight_col_major as i32,
                     stream as i64,
                 );
             }
@@ -391,7 +353,6 @@ pub fn moe_gemm_fp8_with_layout(
             block_size_n,
             block_size_k,
             is_prefill,
-            weight_col_major,
         ),
         DType::BF16 => cuda_fwd::<bf16>(
             input,
@@ -404,7 +365,6 @@ pub fn moe_gemm_fp8_with_layout(
             block_size_n,
             block_size_k,
             is_prefill,
-            weight_col_major,
         ),
         _ => {
             candle_core::bail!("moe_gemm_fp8 only accepts f16/bf16 inputs!")
@@ -423,23 +383,6 @@ pub fn moe_gemm_fp8(
     _: usize,
     _: usize,
     _: usize,
-    _: bool,
-) -> Result<Tensor> {
-    candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn moe_gemm_fp8_with_layout(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Tensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: usize,
-    _: usize,
-    _: bool,
     _: bool,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")

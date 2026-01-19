@@ -261,7 +261,7 @@ __global__ void moe_gemm_grouped_kernel(
  *  @param block_size_n     Block size in N dimension for scales
  *  @param block_size_k     Block size in K dimension for scales
  */
-template<typename T, int WMMA_M, int WMMA_N, int WARPS_N, bool COL_MAJOR = false>
+template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
 __global__ void moe_gemm_grouped_kernel_fp8(
     const T* __restrict__ input,              // [size_m, size_k]
     const uint8_t* __restrict__ weights,      // [num_experts, size_n, size_k] FP8
@@ -330,7 +330,7 @@ __global__ void moe_gemm_grouped_kernel_fp8(
 
         for (int k_base = 0; k_base < size_k; k_base += K_BLK) {
             // Load B Tile (FP8 Weights) into B_sh, converting to T with scales.
-            // Vectorize along K (4 fp8 values at a time) for row-major weights.
+            // Vectorize along K (4 fp8 values at a time).
             constexpr int K_VEC = K_BLK / 4;
             const int B_VEC_ELEMS = N_BLK * K_VEC;
             for (int i = threadId; i < B_VEC_ELEMS; i += BLOCK_THREADS) {
@@ -346,35 +346,20 @@ __global__ void moe_gemm_grouped_kernel_fp8(
                 bool scale_uniform = block_size_k >= 4 &&
                                      (k_global % block_size_k) <= (block_size_k - 4);
 
-                if constexpr (!COL_MAJOR) {
-                    if (in_bounds && scale_uniform) {
-                        const uint32_t w4 = *reinterpret_cast<const uint32_t*>(
-                            &expert_w[(size_t)n_global * size_k + k_global]
-                        );
-                        int scale_k_idx = k_global / block_size_k;
-                        float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
-                        if constexpr (std::is_same<T, half>::value) {
-                            *reinterpret_cast<uint2*>(&B_sh[n_local * K_BLK + k_local]) = 
-                                vllm::fp8::scaled_convert<uint2, uint32_t>(w4, scale);
-                        } else {
-    #ifndef NO_BF16_KERNEL
-                            *reinterpret_cast<vllm::bf16_4_t*>(&B_sh[n_local * K_BLK + k_local]) =
-                                vllm::fp8::scaled_convert<vllm::bf16_4_t, uint32_t>(w4, scale);
-    #endif
-                        }
+                if (in_bounds && scale_uniform) {
+                    const uint32_t w4 = *reinterpret_cast<const uint32_t*>(
+                        &expert_w[(size_t)n_global * size_k + k_global]
+                    );
+                    int scale_k_idx = k_global / block_size_k;
+                    float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+                    if constexpr (std::is_same<T, half>::value) {
+                        *reinterpret_cast<uint2*>(&B_sh[n_local * K_BLK + k_local]) = 
+                            vllm::fp8::scaled_convert<uint2, uint32_t>(w4, scale);
                     } else {
-                        for (int kk = 0; kk < 4; ++kk) {
-                            int kg = k_global + kk;
-                            if (n_global < size_n && kg < size_k) {
-                                int scale_k_idx = kg / block_size_k;
-                                float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
-                                uint8_t fp8_val = expert_w[(size_t)n_global * size_k + kg];
-                                B_sh[n_local * K_BLK + k_local + kk] =
-                                    static_cast<T>(vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
-                            } else {
-                                B_sh[n_local * K_BLK + k_local + kk] = static_cast<T>(0);
-                            }
-                        }
+#ifndef NO_BF16_KERNEL
+                        *reinterpret_cast<vllm::bf16_4_t*>(&B_sh[n_local * K_BLK + k_local]) =
+                            vllm::fp8::scaled_convert<vllm::bf16_4_t, uint32_t>(w4, scale);
+#endif
                     }
                 } else {
                     for (int kk = 0; kk < 4; ++kk) {
@@ -382,7 +367,7 @@ __global__ void moe_gemm_grouped_kernel_fp8(
                         if (n_global < size_n && kg < size_k) {
                             int scale_k_idx = kg / block_size_k;
                             float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
-                            uint8_t fp8_val = expert_w[(size_t)kg * size_n + n_global];
+                            uint8_t fp8_val = expert_w[(size_t)n_global * size_k + kg];
                             B_sh[n_local * K_BLK + k_local + kk] =
                                 static_cast<T>(vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
                         } else {
@@ -470,8 +455,8 @@ __global__ void moe_gemm_grouped_kernel_fp8(
         size_m, size_n, size_k \
     );\
 
-#define LAUNCH_MOE_WMMA_FP8_LAYOUT(DTYPE, WMMA_M, WMMA_N, WARPS_N, COL_MAJOR)\
-    moe_gemm_grouped_kernel_fp8<DTYPE, WMMA_M, WMMA_N, WARPS_N, COL_MAJOR><<<grid, block, smem_bytes, stream>>>(\
+#define LAUNCH_MOE_WMMA_FP8(DTYPE, WMMA_M, WMMA_N, WARPS_N)\
+    moe_gemm_grouped_kernel_fp8<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
         reinterpret_cast<const DTYPE*>(input),\
         weights_u8,\
         weight_scales,\
@@ -538,7 +523,7 @@ extern "C" void moe_gemm_wmma(
     }
 }
 
-static void moe_gemm_wmma_fp8_impl(
+extern "C" void moe_gemm_wmma_fp8(
     const void* input,                // [size_m, size_k] in half/bf16
     const uint8_t* weights,           // [num_experts, size_n, size_k] FP8 as uint8_t
     const float* weight_scales,       // [num_experts, scale_n_dim, scale_k_dim]
@@ -557,7 +542,6 @@ static void moe_gemm_wmma_fp8_impl(
     int block_size_k,
     int data_type,                    // 0 = half, 1 = bfloat16 (for input/output)
     bool is_prefill,
-    int weight_col_major,
     cudaStream_t stream
 ) {
     if (is_prefill) {
@@ -581,91 +565,18 @@ static void moe_gemm_wmma_fp8_impl(
     const uint8_t* weights_u8 = weights;
 
     if (data_type == 0) { // half
-        if (weight_col_major) {
-            if (is_prefill) {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(half, 16, 16, 2, true)
-            } else {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(half, 8, 32, 1, true)
-            }
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA_FP8(half, 16, 16, 2)
         } else {
-            if (is_prefill) {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(half, 16, 16, 2, false)
-            } else {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(half, 8, 32, 1, false)
-            }
+            LAUNCH_MOE_WMMA_FP8(half, 8, 32, 1)
         }
     } else if (data_type == 1) { // bfloat16
         #ifndef NO_BF16_KERNEL
-        if (weight_col_major) {
-            if (is_prefill) {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(nv_bfloat16, 16, 16, 2, true)
-            } else {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(nv_bfloat16, 8, 32, 1, true)
-            }
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 16, 16, 2)
         } else {
-            if (is_prefill) {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(nv_bfloat16, 16, 16, 2, false)
-            } else {
-                LAUNCH_MOE_WMMA_FP8_LAYOUT(nv_bfloat16, 8, 32, 1, false)
-            }
+            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 8, 32, 1)
         }
         #endif
     }
-}
-
-extern "C" void moe_gemm_wmma_fp8(
-    const void* input,
-    const uint8_t* weights,
-    const float* weight_scales,
-    const int32_t* sorted_token_ids,
-    const int32_t* expert_ids,
-    const float* topk_weights,
-    void* output,
-    int32_t* expert_counts,
-    int32_t* expert_offsets,
-    int num_experts,
-    int topk,
-    int size_m,
-    int size_n,
-    int size_k,
-    int block_size_n,
-    int block_size_k,
-    int data_type,
-    bool is_prefill,
-    cudaStream_t stream
-) {
-    moe_gemm_wmma_fp8_impl(input, weights, weight_scales, sorted_token_ids,
-                           expert_ids, topk_weights, output, expert_counts,
-                           expert_offsets, num_experts, topk, size_m, size_n,
-                           size_k, block_size_n, block_size_k, data_type,
-                           is_prefill, 0, stream);
-}
-
-extern "C" void moe_gemm_wmma_fp8_layout(
-    const void* input,
-    const uint8_t* weights,
-    const float* weight_scales,
-    const int32_t* sorted_token_ids,
-    const int32_t* expert_ids,
-    const float* topk_weights,
-    void* output,
-    int32_t* expert_counts,
-    int32_t* expert_offsets,
-    int num_experts,
-    int topk,
-    int size_m,
-    int size_n,
-    int size_k,
-    int block_size_n,
-    int block_size_k,
-    int data_type,
-    bool is_prefill,
-    int weight_col_major,
-    cudaStream_t stream
-) {
-    moe_gemm_wmma_fp8_impl(input, weights, weight_scales, sorted_token_ids,
-                           expert_ids, topk_weights, output, expert_counts,
-                           expert_offsets, num_experts, topk, size_m, size_n,
-                           size_k, block_size_n, block_size_k, data_type,
-                           is_prefill, weight_col_major, stream);
 }

@@ -1,3 +1,4 @@
+// Adapted from https://github.com/sgl-project/sglang/blob/main/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -723,7 +724,6 @@ extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
                                        int /*scale_row_stride*/, // Unused args
                                        int /*block_size_y*/,
                                        int /*block_size_x*/,
-                                       int /*weight_col_major*/,
                                        int sm_version,
                                        cudaStream_t stream) {
 #if defined(USE_CUTLASS)
@@ -769,7 +769,6 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
                                         int /*scale_row_stride*/,
                                         int /*block_size_y*/,
                                         int /*block_size_x*/,
-                                        int /*weight_col_major*/,
                                         int sm_version,
                                         cudaStream_t stream) {
 #if defined(USE_CUTLASS)
