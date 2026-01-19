@@ -19,7 +19,6 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "cute/tensor.hpp"
-#endif
 
 constexpr int kBlockM = 128;
 constexpr int kBlockK = 128;
@@ -33,123 +32,125 @@ __device__ __forceinline__ float to_float_bf16(__nv_bfloat16 v) {
   return __bfloat162float(v);
 }
 
-template <typename T>
-__global__ void quantize_fp8_blockwise_f32(const T* input,
-                                           uint8_t* output,
-                                           float* scales,
-                                           int M_valid,
-                                           int M_padded,
-                                           int K) {
-  const int k_blocks = (K + kBlockK - 1) / kBlockK;
-  const int m = blockIdx.y;
-  const int k_blk = blockIdx.x;
-  const int tid = threadIdx.x;
+#ifndef MAX_FP8_VALUE
+#define MAX_FP8_VALUE 448.0f
+#endif
 
-  float max_val = 0.0f;
-  for (int kk = tid; kk < kBlockK; kk += blockDim.x) {
-    int k = k_blk * kBlockK + kk;
-    if (m < M_padded && k < K) {
-      float v = 0.0f;
-      if (m < M_valid) {
-        if constexpr (std::is_same<T, half>::value) {
-          v = to_float_half(input[m * K + k]);
-        } else {
-          v = to_float_bf16(input[m * K + k]);
-        }
-      }
-      max_val = fmaxf(max_val, fabsf(v));
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     }
-  }
-
-  __shared__ float sdata[256];
-  sdata[tid] = max_val;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
-    }
-    __syncthreads();
-  }
-
-  float block_max = sdata[0];
-  float scale = block_max > 0.0f ? block_max / MAX_FP8_VALUE : 1.0f;
-  if (tid == 0) {
-    scales[m * k_blocks + k_blk] = scale;
-    // if (m == 0 && k_blk == 0) {
-    //    printf("DEBUG: quantize: m=0 k_blk=0 scale=%f (max_val=%f)\n", scale, block_max);
-    // }
-  }
-  __syncthreads();
-
-  for (int kk = tid; kk < kBlockK; kk += blockDim.x) {
-    int k = k_blk * kBlockK + kk;
-    if (m < M_padded && k < K) {
-      float v = 0.0f;
-      if (m < M_valid) {
-        if constexpr (std::is_same<T, half>::value) {
-          v = to_float_half(input[m * K + k]);
-        } else {
-          v = to_float_bf16(input[m * K + k]);
-        }
-      }
-      float q = v / scale;
-      output[m * K + k] = vllm::fp8::dispatch_float_to_fp8(q);
-      // if (m==0 && k==0) {
-      //     printf("DEBUG: quantize: m=0 k=0 val=%f q=%f out=%u\n", v, q, (unsigned int)output[m*K+k]);
-      // }
-    }
-  }
+    return val;
 }
 
-extern "C" void fp8_matmul_f16_layout(const __half* input,
-                                      const uint8_t* weight,
-                                      const float* weight_scale,
-                                      __half* output,
-                                      int M,
-                                      int N,
-                                      int K,
-                                      int scale_row_stride,
-                                      int block_size_y,
-                                      int block_size_x,
-                                      int weight_col_major,
-                                      cudaStream_t stream);
+__device__ __forceinline__ float group_reduce_max(float val) {
+    unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
+    return val;
+}
 
-extern "C" void fp8_matmul_bf16_layout(const __nv_bfloat16* input,
-                                       const uint8_t* weight,
-                                       const float* weight_scale,
-                                       __nv_bfloat16* output,
-                                       int M,
-                                       int N,
-                                       int K,
-                                       int scale_row_stride,
-                                       int block_size_y,
-                                       int block_size_x,
-                                       int weight_col_major,
-                                       cudaStream_t stream);
+template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR, bool SCALE_UE8M0>
+__global__ void per_token_group_quant_8bit_kernel(
+    const T* __restrict__ input,
+    void* __restrict__ output_q,
+    float* __restrict__ output_s,
 
-extern "C" void moe_gemm_wmma_fp8_layout(
-    const void* input,
-    const uint8_t* weights,
-    const float* weight_scales,
-    const int* sorted_token_ids,
-    const int* expert_ids,
-    const float* topk_weights,
-    void* output,
-    int* expert_counts,
-    int* expert_offsets,
-    int num_experts,
-    int topk,
-    int size_m,
-    int size_n,
-    int size_k,
-    int block_size_n,
-    int block_size_k,
-    int dtype,
-    bool is_prefill,
-    int weight_col_major,
-    cudaStream_t stream);
+    const int group_size,
+    const int num_groups,
+    const int groups_per_block,
+    const float eps,
+    const float min_8bit,
+    const float max_8bit,
+    const int num_groups_per_row = 0,
+    const int scale_stride = 0) {
+    
+    const int threads_per_group = 16;
+    const int64_t local_group_id = threadIdx.x / threads_per_group;
+    const int lane_id = threadIdx.x % threads_per_group;
 
-#if defined(USE_CUTLASS)
+    const int64_t block_group_id = blockIdx.x * groups_per_block;
+    const int64_t global_group_id = block_group_id + local_group_id;
+    
+    if (global_group_id >= num_groups) return;
+
+    const int64_t block_group_offset = global_group_id * group_size;
+
+    float local_absmax = eps;
+
+    const T* group_input = input + block_group_offset;
+    DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+    float* scale_output;
+
+    if constexpr (IS_COLUMN_MAJOR) {
+        // const int num_elems_per_pack = 1; // float is 4 bytes
+        const int row_idx = global_group_id / num_groups_per_row;
+        const int col_idx = global_group_id % num_groups_per_row;
+        // Simplified for float scales (no packing needed for f32)
+        scale_output = output_s + (col_idx * scale_stride + row_idx);
+    } else {
+        scale_output = output_s + global_group_id;
+    }
+
+    // Vectorized Load Logic replacement for flashinfer
+    // Assuming T is half or bfloat16 (2 bytes). 
+    // vec_size = 16 / 2 = 8 elements.
+    using vec_t = float4; // load 16 bytes
+    const int vec_size = 16 / sizeof(T); 
+    const int32_t num_vec_elems = group_size / vec_size;
+
+    for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+        // Load 16 bytes
+        const int4* ptr_int4 = reinterpret_cast<const int4*>(group_input + i * vec_size);
+        int4 loaded = *ptr_int4;
+        
+        // Unpack to check max
+        T* ptr_T = reinterpret_cast<T*>(&loaded);
+        #pragma unroll
+        for (int j = 0; j < vec_size; ++j) {
+            float val;
+            if constexpr (std::is_same_v<T, __half>) {
+                val = __half2float(ptr_T[j]);
+            } else {
+                val = __bfloat162float(ptr_T[j]);
+            }
+            local_absmax = fmaxf(local_absmax, fabsf(val));
+        }
+    }
+
+    local_absmax = group_reduce_max(local_absmax);
+
+    float y_s = local_absmax / max_8bit;
+    // SCALE_UE8M0 is false for us usually
+
+    if (lane_id == 0) {
+        *scale_output = y_s;
+    }
+
+    // Quantize
+    for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+        const int4* ptr_int4 = reinterpret_cast<const int4*>(group_input + i * vec_size);
+        int4 loaded = *ptr_int4;
+        T* ptr_T = reinterpret_cast<T*>(&loaded);
+
+        #pragma unroll
+        for (int j = 0; j < vec_size; ++j) {
+             float val;
+            if constexpr (std::is_same_v<T, __half>) {
+                val = __half2float(ptr_T[j]);
+            } else {
+                val = __bfloat162float(ptr_T[j]);
+            }
+            float q_val = fminf(fmaxf(val / y_s, min_8bit), max_8bit);
+
+            group_output[i * vec_size + j] = static_cast<DST_DTYPE>(q_val);
+        }
+    }
+}
+
+
 using namespace cute;
 
 template <typename GemmKernel>
@@ -173,54 +174,41 @@ cutlass::Status cutlass_gemm_caller(typename GemmKernel::Arguments const& args,
   return gemm_op.run(stream);
 }
 
-template <typename Layout>
-__global__ void pack_sfa_layout(const float* scales_rm,
-                                float* scales_packed,
-                                Layout layout_sfa,
-                                int m_blocks,
-                                int k_blocks) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = m_blocks * k_blocks;
-  if (idx >= total) {
-    return;
-  }
-  int m_blk = idx / k_blocks;
-  int k_blk = idx - m_blk * k_blocks;
-  // Layout expects element coordinates.
-  // Scale A (Activations) has Granularity M=1 (1 scale per row).
-  // m_blk is the row index. LayoutSFA expects row index directly if granularity is 1?
-  // Wait, layout_sfa maps element coordinate -> scale coordinate -> offset.
-  // If ScaleTileShape is <1, 128, 128>. ScaleConfig logic:
-  // Tile M=1. Element M maps to Scale M = M / 1 = M.
-  // So we pass M.
-  // If we pass M*128, we map to scale M*128.
-  // So we SHOULD pass m_blk directly.
-  int packed_idx = layout_sfa(m_blk, k_blk * 128, 0);
-  scales_packed[packed_idx] = scales_rm[idx];
-}
-
-template <typename SchedulerType, typename OutType, int GroupSizeM_, int GroupSizeN_, int GroupSizeK_,
-          int TileSizeM_ = 128, class ClusterShape = Shape<_1, _2, _1>>
+template <
+    typename SchedulerType,
+    typename OutType,
+    int GroupSizeM_,
+    int GroupSizeN_,
+    int GroupSizeK_,
+    int TileSizeM_ = 128,
+    class ClusterShape = Shape<_1, _2, _1>>
 struct cutlass_3x_gemm_fp8_blockwise {
   using GroupSizeM = Int<GroupSizeM_>;
   using GroupSizeN = Int<GroupSizeN_>;
   using GroupSizeK = Int<GroupSizeK_>;
   using TileSizeM = Int<TileSizeM_>;
 
+  static_assert(TileSizeM_ % GroupSizeM_ == 0, "TileSizeM must be a multiple of GroupSizeM");
+
   using ElementAB = cutlass::float_e4m3_t;
+
+  // A matrix configuration
   using ElementA = ElementAB;
-  using ElementB = ElementAB;
-  using ElementC = void;
-  using ElementD = OutType;
-
   using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using LayoutD = cutlass::layout::RowMajor;
-
   static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+
+  // B matrix configuration
+  using ElementB = ElementAB;
+  using LayoutB = cutlass::layout::ColumnMajor;
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  // C/D matrix configuration
+  using ElementC = void;
+  using LayoutC = cutlass::layout::RowMajor;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutType>::value;
+
+  using ElementD = OutType;
+  using LayoutD = cutlass::layout::RowMajor;
   static constexpr int AlignmentD = AlignmentC;
 
   using ScaleTileShape = Shape<_1, _128, _128>;
@@ -228,15 +216,18 @@ struct cutlass_3x_gemm_fp8_blockwise {
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
-  using ElementAccumulator = float;
-  using ElementCompute = float;
-  using TileShape = Shape<TileSizeM, GroupSizeN, GroupSizeK>;
+  // Multiply-accumulate blocking/pipelining details
+  using ElementAccumulator = float;                            // Element type for internal accumulation
+  using ElementCompute = float;                                // Element type for compute
+  using TileShape = Shape<TileSizeM, GroupSizeN, GroupSizeK>;  // Threadblock-level tile size
+
   using ArchTag = cutlass::arch::Sm90;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise;
+  using StoreEpilogueCompute = typename cutlass::epilogue::fusion::Sm90EVT<cutlass::epilogue::fusion::Sm90AccFetch>;
 
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
@@ -251,7 +242,8 @@ struct cutlass_3x_gemm_fp8_blockwise {
       ElementD,
       LayoutD,
       AlignmentD,
-      EpilogueSchedule>::CollectiveOp;
+      EpilogueSchedule,
+      StoreEpilogueCompute>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag,
@@ -265,37 +257,33 @@ struct cutlass_3x_gemm_fp8_blockwise {
       ElementAccumulator,
       TileShape,
       ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>,
+      Shape<int, int, int, int>,  // Indicates ProblemShape
       CollectiveMainloop,
       CollectiveEpilogue,
       SchedulerType>;
 };
 
 template <typename Gemm>
-cutlass::Status run_sm90_blockwise(typename Gemm::ElementD* out,
-                                   const typename Gemm::ElementAB* a,
-                                   const typename Gemm::ElementAB* b,
-                                   float* a_scales_packed,
-                                   const float* a_scales_rm,
-                                   const float* b_scales,
+void cutlass_gemm_caller_blockwise(
+                                typename Gemm::ElementD* c_ptr,
+                                   const typename Gemm::ElementAB* a_ptr,
+                                   const typename Gemm::ElementAB* b_ptr,
+                                   float* a_s_ptr,
+                                   float* b_s_ptr,
                                    int m,
                                    int n,
                                    int k,
                                    cudaStream_t stream) {
   using GemmKernel = typename Gemm::GemmKernel;
-  using ElementD = typename Gemm::ElementD;
-  using ElementBlockScale = float;
-
   using ScaleTileShape = Shape<_1, _128, _128>;
   using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(ScaleTileShape{}));
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
-
   using StrideA = typename GemmKernel::StrideA;
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
@@ -307,30 +295,23 @@ cutlass::Status run_sm90_blockwise(typename Gemm::ElementD* out,
   LayoutSFA layout_sfa = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   LayoutSFB layout_sfb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
-  {
-      int k_blocks = (k + 127) / 128;
-      int m_blocks = m;
-      int total = m_blocks * k_blocks;
-      int threads = 256;
-      int blocks = (total + threads - 1) / threads;
-      pack_sfa_layout<<<blocks, threads, 0, stream>>>(a_scales_rm, a_scales_packed, layout_sfa, m_blocks, k_blocks);
-  }
-
   typename GemmKernel::MainloopArguments mainloop_args{
-      a, a_stride, b, b_stride,
-      reinterpret_cast<ElementBlockScale const*>(a_scales_packed), layout_sfa,
-      reinterpret_cast<ElementBlockScale const*>(b_scales), layout_sfb};
-
-  auto c_ptr = reinterpret_cast<ElementD*>(out);
+      a_ptr, a_stride, b_ptr, b_stride, a_s_ptr, layout_sfa, b_s_ptr, layout_sfb};
   typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, c_stride, c_ptr, c_stride};
 
-  typename GemmKernel::TileSchedulerArguments scheduler{};
-  static constexpr bool UsesStreamK =
+  typename GemmKernel::TileSchedulerArguments scheduler;
+
+  static constexpr bool UsesStreamKScheduler =
       cute::is_same_v<typename GemmKernel::TileSchedulerTag, cutlass::gemm::StreamKScheduler>;
-  if constexpr (UsesStreamK) {
-    using Params = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams;
-    scheduler.decomposition_mode = Params::DecompositionMode::StreamK;
-    scheduler.reduction_mode = Params::ReductionMode::Nondeterministic;
+
+  if constexpr (UsesStreamKScheduler) {
+    using DecompositionMode =
+        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
+    using ReductionMode =
+        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::ReductionMode;
+
+    scheduler.decomposition_mode = DecompositionMode::StreamK;
+    scheduler.reduction_mode = ReductionMode::Nondeterministic;
   }
 
   cutlass::KernelHardwareInfo hw_info;
@@ -349,60 +330,139 @@ cutlass::Status run_sm90_blockwise(typename Gemm::ElementD* out,
       hw_info,
       scheduler};
 
-  return cutlass_gemm_caller<GemmKernel>(args, stream);
+  cutlass_gemm_caller<GemmKernel>(args, stream);
 }
 
-template <typename OutType>
-cutlass::Status fp8_blockwise_sm90_dispatch(OutType* out,
-                                            const cutlass::float_e4m3_t* a,
-                                            const cutlass::float_e4m3_t* b,
-                                            float* a_scales_packed,
-                                            const float* a_scales_rm,
-                                            const float* b_scales,
-                                            int m,
-                                            int n,
-                                            int k,
-                                            cudaStream_t stream) {
-  if (k > 3 * n) {
-    using Gemm = cutlass_3x_gemm_fp8_blockwise<
-        cutlass::gemm::StreamKScheduler, OutType, 1, 128, 128>;
-    return run_sm90_blockwise<Gemm>(out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
-  }
-  using Gemm = cutlass_3x_gemm_fp8_blockwise<
-      cutlass::gemm::PersistentScheduler, OutType, 1, 128, 128>;
-  return run_sm90_blockwise<Gemm>(out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
+
+extern "C" void fp8_quantize_per_token_group_launch(
+    const void* input,
+    void* output_q,
+    float* output_s,
+    int num_groups,
+    int group_size,
+    int num_groups_per_row,
+    int scale_stride,
+    bool is_input_f16,
+    bool is_column_major_stats,
+    cudaStream_t stream
+) {
+    constexpr int THREADS_PER_GROUP = 16;
+    int groups_per_block = 1;
+    if (num_groups % 16 == 0) groups_per_block = 16;
+    else if (num_groups % 8 == 0) groups_per_block = 8;
+    else if (num_groups % 4 == 0) groups_per_block = 4;
+    else if (num_groups % 2 == 0) groups_per_block = 2;
+
+    const int num_blocks = num_groups / groups_per_block;
+    const int num_threads = groups_per_block * THREADS_PER_GROUP;
+
+    // Standard E4M3 range
+    const float min_8bit = -448.0f;
+    const float max_8bit = 448.0f;
+    const float eps = 1e-5f;
+
+    if (is_input_f16) {
+        if (is_column_major_stats) {
+            per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, true, false>
+                <<<num_blocks, num_threads, 0, stream>>>(
+                    (const __half*)input, output_q, output_s, group_size, num_groups, groups_per_block,
+                    eps, min_8bit, max_8bit, num_groups_per_row, scale_stride
+                );
+        } else {
+             per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, false, false>
+                <<<num_blocks, num_threads, 0, stream>>>(
+                    (const __half*)input, output_q, output_s, group_size, num_groups, groups_per_block,
+                    eps, min_8bit, max_8bit
+                );
+        }
+    } else {
+        if (is_column_major_stats) {
+            per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, true, false>
+                <<<num_blocks, num_threads, 0, stream>>>(
+                    (const __nv_bfloat16*)input, output_q, output_s, group_size, num_groups, groups_per_block,
+                    eps, min_8bit, max_8bit, num_groups_per_row, scale_stride
+                );
+        } else {
+             per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, false, false>
+                <<<num_blocks, num_threads, 0, stream>>>(
+                    (const __nv_bfloat16*)input, output_q, output_s, group_size, num_groups, groups_per_block,
+                    eps, min_8bit, max_8bit
+                );
+        }
+    }
 }
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-template <typename OutType, typename MmaTileShape, typename PerSmTileShape,
-          typename EpilogueTileShape, typename ScalesPerTile,
-          int TileSizeM_ = 128, class ClusterShape = Shape<_1, _1, _1>>
-cutlass::Status run_sm100_blockwise(OutType* out,
-                                    const cutlass::float_e4m3_t* a,
-                                    const cutlass::float_e4m3_t* b,
-                                    float* a_scales_packed,
-                                    const float* a_scales_rm,
-                                    const float* b_scales,
-                                    int m,
-                                    int n,
-                                    int k,
-                                    cudaStream_t stream) {
+
+template <typename T_Out>
+void fp8_gemm_launcher_sm90(
+                     const uint8_t* a_fp8,
+                     const float* a_scales,
+                     const uint8_t* b_fp8,
+                     const float* b_scales,
+                     T_Out* output_ptr,
+                     int M, int N, int K,
+                     cudaStream_t stream)
+{
+    if (K > 3 * N) {
+        cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::StreamKScheduler, T_Out, 1, 128, 128>>(
+            output_ptr,
+            reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
+            reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
+            const_cast<float*>(a_scales),
+            const_cast<float*>(b_scales),
+            M, N, K, stream);
+    } else {
+        cutlass_gemm_caller_blockwise<
+            cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, T_Out, 1, 128, 128>>(
+            output_ptr,
+            reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
+            reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
+            const_cast<float*>(a_scales),
+            const_cast<float*>(b_scales),
+            M, N, K, stream);
+    }
+}
+
+#if (defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+template <
+    typename OutType,
+    typename MmaTileShape,
+    typename PerSmTileShape,
+    typename EpilogueTileShape,
+    typename ScalesPerTile,
+    int TileSizeM_ = 128,
+    class ClusterShape = Shape<_1, _1, _1>>
+void launch_sm100_fp8_blockwise_scaled_mm(
+    OutType* out,
+    const cutlass::float_e4m3_t* a,
+    const cutlass::float_e4m3_t* b,
+    float* scales_a,
+    float* scales_b,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
   static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
   static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
   static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
   static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
 
-  using ElementA = cutlass::float_e4m3_t;
-  using ElementB = cutlass::float_e4m3_t;
+  using ElementAB = cutlass::float_e4m3_t;
+  using ElementA = ElementAB;
+  using ElementB = ElementAB;
   using ElementC = void;
   using ElementD = OutType;
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
+  using LayoutC = LayoutD;
   using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
-      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-      cute::UMMA::Major::MN, cute::UMMA::Major::K>;
+      ScaleGranularityM,
+      ScaleGranularityN,
+      ScaleGranularityK,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -417,20 +477,35 @@ cutlass::Status run_sm100_blockwise(OutType* out,
   using OperatorClass = cutlass::arch::OpClassTensorOp;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, PerSmTileShape, ClusterShape,
-      EpilogueTileShape, ElementAccumulator, ElementCompute,
-      ElementC, LayoutC, AlignmentC,
-      ElementD, LayoutD, AlignmentD,
+      ArchTag,
+      OperatorClass,
+      PerSmTileShape,
+      ClusterShape,
+      EpilogueTileShape,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      LayoutC,
+      AlignmentC,
+      ElementD,
+      LayoutD,
+      AlignmentD,
       cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
-      ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutA, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutB, LayoutSFB>,
+      AlignmentB,
       ElementAccumulator,
-      MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -438,9 +513,7 @@ cutlass::Status run_sm100_blockwise(OutType* out,
       CollectiveMainloop,
       CollectiveEpilogue,
       cutlass::gemm::PersistentScheduler>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-  Gemm gemm_op;
   using StrideA = typename GemmKernel::StrideA;
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
@@ -452,88 +525,86 @@ cutlass::Status run_sm100_blockwise(OutType* out,
   LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
-  // PACK SCALES for SM100
-  {
-      int k_blocks = (k + 127) / 128;
-      int m_blocks = m;
-      int total = m_blocks * k_blocks;
-      int threads = 256;
-      int blocks = (total + threads - 1) / threads;
-      pack_sfa_layout<<<blocks, threads, 0, stream>>>(a_scales_rm, a_scales_packed, layout_SFA, m_blocks, k_blocks);
-  }
-
   typename GemmKernel::MainloopArguments mainloop_args{
-      a, a_stride, b, b_stride, reinterpret_cast<float const*>(a_scales_packed), layout_SFA, b_scales, layout_SFB};
+      a, a_stride, b, b_stride, scales_a, layout_SFA, scales_b, layout_SFB};
+
   typename GemmKernel::EpilogueArguments epilogue_args{{}, out, c_stride, out, c_stride};
   epilogue_args.thread.alpha = 1.0f;
 
-  typename GemmKernel::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
-      mainloop_args, epilogue_args};
+  typename GemmKernel::Arguments args = {
+      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, mainloop_args, epilogue_args};
 
-  size_t workspace_size = gemm_op.get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-  auto init_status = gemm_op.initialize(args, workspace.get(), stream);
-  if (init_status != cutlass::Status::kSuccess) {
-    return init_status;
+  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
+  if (status != cutlass::Status::kSuccess) {
+    printf("sm100 fp8 gemm failed: %s\n", cutlassGetStatusString(status));
   }
-  return gemm_op.run(stream);
 }
 
 template <typename OutType>
-cutlass::Status fp8_blockwise_sm100_dispatch(OutType* out,
-                                             const cutlass::float_e4m3_t* a,
-                                             const cutlass::float_e4m3_t* b,
-                                             float* a_scales_packed,
-                                             const float* a_scales_rm,
-                                             const float* b_scales,
-                                             int m,
-                                             int n,
-                                             int k,
-                                             cudaStream_t stream) {
+void sm100_fp8_blockwise_dispatch_shape(
+    OutType* out,
+    const cutlass::float_e4m3_t* a,
+    const cutlass::float_e4m3_t* b,
+    float* scales_a,
+    float* scales_b,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
   if (m <= 128) {
     using MmaTileShape = Shape<_64, _128, _128>;
     using PerSmTileShape = Shape<_64, _128, _128>;
     using EpilogueTileShape = Shape<_64, _64>;
     using ScalesPerTile = Shape<_64, _1, _1>;
-    return run_sm100_blockwise<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-        out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
+    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+        out, a, b, scales_a, scales_b, m, n, k, stream);
+  } else {
+    using MmaTileShape = Shape<_128, _128, _128>;
+    using PerSmTileShape = Shape<_128, _128, _128>;
+    using EpilogueTileShape = Shape<_128, _64>;
+    using ScalesPerTile = Shape<_128, _1, _1>;
+    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+        out, a, b, scales_a, scales_b, m, n, k, stream);
   }
-  using MmaTileShape = Shape<_128, _128, _128>;
-  using PerSmTileShape = Shape<_128, _128, _128>;
-  using EpilogueTileShape = Shape<_128, _64>;
-  using ScalesPerTile = Shape<_128, _1, _1>;
-  return run_sm100_blockwise<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-      out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
 }
 #endif
 
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
-template <typename OutType, typename MmaTileShape, typename PerSmTileShape,
-          typename EpilogueTileShape, typename ScalesPerTile,
-          int TileSizeM_ = 128, class ClusterShape = Shape<_1, _1, _1>>
-cutlass::Status run_sm120_blockwise(OutType* out,
-                                    const cutlass::float_e4m3_t* a,
-                                    const cutlass::float_e4m3_t* b,
-                                    float* a_scales_packed,
-                                    const float* a_scales_rm,
-                                    const float* b_scales,
-                                    int m,
-                                    int n,
-                                    int k,
-                                    cudaStream_t stream) {
+#if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+template <
+    typename OutType,
+    typename MmaTileShape,
+    typename PerSmTileShape,
+    typename EpilogueTileShape,
+    typename ScalesPerTile,
+    int TileSizeM_ = 128,
+    class ClusterShape = Shape<_1, _1, _1>>
+void launch_sm120_fp8_blockwise_scaled_mm(
+    OutType* out,
+    const cutlass::float_e4m3_t* a,
+    const cutlass::float_e4m3_t* b,
+    float* scales_a,
+    float* scales_b,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  using ElementBlockScale = float;
+
   using ElementA = cutlass::float_e4m3_t;
+  using LayoutATag = cutlass::layout::RowMajor;
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+
   using ElementB = cutlass::float_e4m3_t;
-  using ElementC = void;
+  using LayoutBTag = cutlass::layout::ColumnMajor;
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+
   using ElementD = OutType;
-  using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using LayoutD = cutlass::layout::RowMajor;
-  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-  static constexpr int AlignmentC = AlignmentD;
+  using ElementC = void;
+  using LayoutCTag = cutlass::layout::RowMajor;
+  using LayoutDTag = cutlass::layout::RowMajor;
+  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  constexpr int AlignmentC = AlignmentD;
 
   using ElementAccumulator = float;
   using ArchTag = cutlass::arch::Sm120;
@@ -545,27 +616,44 @@ cutlass::Status run_sm120_blockwise(OutType* out,
   static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
 
   using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
-      ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-      cute::UMMA::Major::MN, cute::UMMA::Major::K>;
+      ScaleGranularityM,
+      ScaleGranularityN,
+      ScaleGranularityK,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, PerSmTileShape, ClusterShape,
+      ArchTag,
+      OperatorClass,
+      PerSmTileShape,
+      ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementAccumulator,
-      ElementC, LayoutC, AlignmentC,
-      ElementD, LayoutD, AlignmentD,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutCTag,
+      AlignmentC,
+      ElementD,
+      LayoutDTag,
+      AlignmentD,
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
-      ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutATag, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutBTag, LayoutSFB>,
+      AlignmentB,
       ElementAccumulator,
-      MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -573,8 +661,6 @@ cutlass::Status run_sm120_blockwise(OutType* out,
       CollectiveMainloop,
       CollectiveEpilogue,
       void>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-  Gemm gemm_op;
 
   using StrideA = typename GemmKernel::StrideA;
   using StrideB = typename GemmKernel::StrideB;
@@ -587,356 +673,135 @@ cutlass::Status run_sm120_blockwise(OutType* out,
   LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
-  // PACK SCALES for SM120
-  {
-      int k_blocks = (k + 127) / 128;
-      int m_blocks = m;
-      int total = m_blocks * k_blocks;
-      int threads = 256;
-      int blocks = (total + threads - 1) / threads;
-      pack_sfa_layout<<<blocks, threads, 0, stream>>>(a_scales_rm, a_scales_packed, layout_SFA, m_blocks, k_blocks);
-  }
-
   typename GemmKernel::MainloopArguments mainloop_args{
-      a, stride_a, b, stride_b, reinterpret_cast<float const*>(a_scales_packed), layout_SFA, b_scales, layout_SFB};
+      a, stride_a, b, stride_b, scales_a, layout_SFA, scales_b, layout_SFB};
+
   typename GemmKernel::EpilogueArguments epilogue_args{{}, out, stride_c, out, stride_c};
   epilogue_args.thread.alpha = 1.0f;
 
-  typename Gemm::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
-      mainloop_args, epilogue_args};
+  typename GemmKernel::Arguments args = {
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      mainloop_args,
+      epilogue_args,
+  };
 
-  size_t workspace_size = gemm_op.get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-  auto init_status = gemm_op.initialize(args, workspace.get(), stream);
-  if (init_status != cutlass::Status::kSuccess) {
-    return init_status;
+  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
+  if (status != cutlass::Status::kSuccess) {
+    printf("sm120 fp8 gemm failed: %s\n", cutlassGetStatusString(status));
   }
-  return gemm_op.run(stream);
 }
 
 template <typename OutType>
-cutlass::Status fp8_blockwise_sm120_dispatch(OutType* out,
-                                             const cutlass::float_e4m3_t* a,
-                                             const cutlass::float_e4m3_t* b,
-                                             float* a_scales_packed,
-                                             const float* a_scales_rm,
-                                             const float* b_scales,
-                                             int m,
-                                             int n,
-                                             int k,
-                                             cudaStream_t stream) {
+void sm120_fp8_blockwise_dispatch_shape(
+    OutType* out,
+    const cutlass::float_e4m3_t* a,
+    const cutlass::float_e4m3_t* b,
+    float* scales_a,
+    float* scales_b,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
   using MmaTileShape = Shape<_128, _128, _128>;
   using PerSmTileShape = Shape<_128, _128, _128>;
   using EpilogueTileShape = Shape<_128, _64>;
   using ScalesPerTile = Shape<_128, _1, _1>;
-  return run_sm120_blockwise<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-      out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
+  launch_sm120_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+      out, a, b, scales_a, scales_b, m, n, k, stream);
 }
 #endif
 
-template <typename OutType>
-cutlass::Status fp8_blockwise_dispatch(OutType* out,
-                                       const cutlass::float_e4m3_t* a,
-                                       const cutlass::float_e4m3_t* b,
-                                       float* a_scales_packed,
-                                       const float* a_scales_rm,
-                                       const float* b_scales,
-                                       int m,
-                                       int n,
-                                       int k,
-                                       cudaStream_t stream) {
-  cudaDeviceProp props{};
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  cudaGetDeviceProperties(&props, device_id);
-
-  if (props.major == 9 && props.minor == 0) {
-    return fp8_blockwise_sm90_dispatch(out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
-  }
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  if (props.major == 10) {
-    return fp8_blockwise_sm100_dispatch(out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
-  }
-#endif
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
-  if (props.major == 12) {
-    return fp8_blockwise_sm120_dispatch(out, a, b, a_scales_packed, a_scales_rm, b_scales, m, n, k, stream);
-  }
-#endif
-  return cutlass::Status::kErrorNotSupported;
-}
 #endif
 
-extern "C" void fp8_matmul_f16_cutlass(const __half* input,
+extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
+                                       const float* input_scale,
                                        const uint8_t* weight,
                                        const float* weight_scale,
                                        __half* output,
-                                       int M,
-                                       int N,
-                                       int K,
-                                       int scale_row_stride,
-                                       int block_size_y,
-                                       int block_size_x,
-                                       int weight_col_major,
+                                       int M, int N, int K,
+                                       int /*scale_row_stride*/, // Unused args
+                                       int /*block_size_y*/,
+                                       int /*block_size_x*/,
+                                       int /*weight_col_major*/,
+                                       int sm_version,
                                        cudaStream_t stream) {
 #if defined(USE_CUTLASS)
-  if (!weight_col_major || block_size_y != kBlockM || block_size_x != kBlockK) {
-    fp8_matmul_f16_layout(input, weight, weight_scale, output, M, N, K,
-                          scale_row_stride, block_size_y, block_size_x,
-                          weight_col_major, stream);
-    return;
-  }
+    const auto* a_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(input_q);
+    const auto* b_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(weight);
+    auto* out_ptr = reinterpret_cast<cutlass::half_t*>(output);
+    auto* a_scales = const_cast<float*>(input_scale);
+    auto* b_scales = const_cast<float*>(weight_scale);
 
-  const int M_padded = (M + kBlockM - 1) / kBlockM * kBlockM;
-  const int k_blocks = (K + kBlockK - 1) / kBlockK;
-  const int a_scale_elems = M_padded * k_blocks;
-
-  uint8_t* a_fp8 = nullptr;
-  float* a_scales_rm = nullptr;
-  float* a_scales_packed = nullptr;
-  cudaMallocAsync(&a_fp8, sizeof(uint8_t) * M_padded * K, stream);
-  cudaMallocAsync(&a_scales_rm, sizeof(float) * a_scale_elems, stream);
-  cudaMallocAsync(&a_scales_packed, sizeof(float) * a_scale_elems, stream);
-
-  dim3 grid(k_blocks, M_padded);
-  quantize_fp8_blockwise_f32<<<grid, kPackThreads, 0, stream>>>(
-      input, a_fp8, a_scales_rm, M, M_padded, K);
-
-  auto status = cutlass::Status::kErrorNotSupported;
-  cudaDeviceProp props{};
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  cudaGetDeviceProperties(&props, device_id);
-
-  if (props.major == 9 && props.minor == 0) {
-    cutlass::half_t* out_ptr = reinterpret_cast<cutlass::half_t*>(output);
-    cutlass::half_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::half_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm90_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::half_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  if (props.major == 10) {
-    cutlass::half_t* out_ptr = reinterpret_cast<cutlass::half_t*>(output);
-    cutlass::half_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::half_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm100_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::half_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#endif
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
-  if (props.major == 12) {
-    cutlass::half_t* out_ptr = reinterpret_cast<cutlass::half_t*>(output);
-    cutlass::half_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::half_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm120_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::half_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#endif
-
-  cudaFreeAsync(a_fp8, stream);
-  cudaFreeAsync(a_scales_rm, stream);
-  cudaFreeAsync(a_scales_packed, stream);
-
-  if (status != cutlass::Status::kSuccess) {
-    fp8_matmul_f16_layout(input, weight, weight_scale, output, M, N, K,
-                          scale_row_stride, block_size_y, block_size_x,
-                          weight_col_major, stream);
-  }
+#if (defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+#if CUDA_VERSION >= 12090
+    if (sm_version == 100 || sm_version == 103) {
 #else
-  fp8_matmul_f16_layout(input, weight, weight_scale, output, M, N, K,
-                        scale_row_stride, block_size_y, block_size_x,
-                        weight_col_major, stream);
+    if (sm_version == 100) {
+#endif
+        sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+        return;
+    }
+#endif
+
+#if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+    if (sm_version == 120) {
+        sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+        return;
+    }
+#endif
+
+    fp8_gemm_launcher_sm90<cutlass::half_t>(
+        input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);
 #endif
 }
 
-extern "C" void fp8_matmul_bf16_cutlass(const __nv_bfloat16* input,
+extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
+                                        const float* input_scale,
                                         const uint8_t* weight,
                                         const float* weight_scale,
                                         __nv_bfloat16* output,
-                                        int M,
-                                        int N,
-                                        int K,
-                                        int scale_row_stride,
-                                        int block_size_y,
-                                        int block_size_x,
-                                        int weight_col_major,
+                                        int M, int N, int K,
+                                        int /*scale_row_stride*/,
+                                        int /*block_size_y*/,
+                                        int /*block_size_x*/,
+                                        int /*weight_col_major*/,
+                                        int sm_version,
                                         cudaStream_t stream) {
 #if defined(USE_CUTLASS)
-  if (!weight_col_major || block_size_y != kBlockM || block_size_x != kBlockK) {
-    fp8_matmul_bf16_layout(input, weight, weight_scale, output, M, N, K,
-                           scale_row_stride, block_size_y, block_size_x,
-                           weight_col_major, stream);
-    return;
-  }
+    const auto* a_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(input_q);
+    const auto* b_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(weight);
+    auto* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(output);
+    auto* a_scales = const_cast<float*>(input_scale);
+    auto* b_scales = const_cast<float*>(weight_scale);
 
-  const int M_padded = (M + kBlockM - 1) / kBlockM * kBlockM;
-  const int k_blocks = (K + kBlockK - 1) / kBlockK;
-  const int a_scale_elems = M_padded * k_blocks;
-
-  uint8_t* a_fp8 = nullptr;
-  float* a_scales_rm = nullptr;
-  float* a_scales_packed = nullptr;
-  cudaMallocAsync(&a_fp8, sizeof(uint8_t) * M_padded * K, stream);
-  cudaMallocAsync(&a_scales_rm, sizeof(float) * a_scale_elems, stream);
-  cudaMallocAsync(&a_scales_packed, sizeof(float) * a_scale_elems, stream);
-
-  dim3 grid(k_blocks, M_padded);
-  quantize_fp8_blockwise_f32<<<grid, kPackThreads, 0, stream>>>(
-      input, a_fp8, a_scales_rm, M, M_padded, K);
-
-  auto status = cutlass::Status::kErrorNotSupported;
-  cudaDeviceProp props{};
-  int device_id = 0;
-  cudaGetDevice(&device_id);
-  cudaGetDeviceProperties(&props, device_id);
-
-  if (props.major == 9 && props.minor == 0) {
-    cutlass::bfloat16_t* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(output);
-    cutlass::bfloat16_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::bfloat16_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm90_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::bfloat16_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  if (props.major == 10) {
-    cutlass::bfloat16_t* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(output);
-    cutlass::bfloat16_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::bfloat16_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm100_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::bfloat16_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#endif
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
-  if (props.major == 12) {
-    cutlass::bfloat16_t* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(output);
-    cutlass::bfloat16_t* out_tmp = out_ptr;
-    if (M_padded != M) {
-      cudaMallocAsync(&out_tmp, sizeof(cutlass::bfloat16_t) * M_padded * N, stream);
-    }
-    status = fp8_blockwise_sm120_dispatch(
-        out_tmp,
-        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-        reinterpret_cast<const cutlass::float_e4m3_t*>(weight),
-        a_scales_packed,
-        a_scales_rm,
-        weight_scale,
-        M_padded, N, K, stream);
-    if (status == cutlass::Status::kSuccess && M_padded != M) {
-      cudaMemcpyAsync(out_ptr, out_tmp, sizeof(cutlass::bfloat16_t) * M * N,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaFreeAsync(out_tmp, stream);
-    }
-  }
-#endif
-
-  cudaFreeAsync(a_fp8, stream);
-  cudaFreeAsync(a_scales_rm, stream);
-  cudaFreeAsync(a_scales_packed, stream);
-
-  if (status != cutlass::Status::kSuccess) {
-    fp8_matmul_bf16_layout(input, weight, weight_scale, output, M, N, K,
-                           scale_row_stride, block_size_y, block_size_x,
-                           weight_col_major, stream);
-  }
+#if (defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+#if CUDA_VERSION >= 12090
+    if (sm_version == 100 || sm_version == 103) {
 #else
-  fp8_matmul_bf16_layout(input, weight, weight_scale, output, M, N, K,
-                         scale_row_stride, block_size_y, block_size_x,
-                         weight_col_major, stream);
+    if (sm_version == 100) {
 #endif
-}
+        sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+        return;
+    }
+#endif
 
-extern "C" void moe_gemm_fp8_cutlass(
-    const void* input,
-    const uint8_t* weights,
-    const float* weight_scales,
-    const int* sorted_token_ids,
-    const int* expert_ids,
-    const float* topk_weights,
-    void* output,
-    int* expert_counts,
-    int* expert_offsets,
-    int num_experts,
-    int topk,
-    int size_m,
-    int size_n,
-    int size_k,
-    int block_size_n,
-    int block_size_k,
-    int dtype,
-    bool is_prefill,
-    int weight_col_major,
-    cudaStream_t stream) {
-  moe_gemm_wmma_fp8_layout(input, weights, weight_scales,
-                           sorted_token_ids, expert_ids, topk_weights,
-                           output, expert_counts, expert_offsets,
-                           num_experts, topk, size_m, size_n, size_k,
-                           block_size_n, block_size_k, dtype, is_prefill,
-                           weight_col_major, stream);
+#if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
+    (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
+    if (sm_version == 120) {
+        sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+        return;
+    }
+#endif
+
+    fp8_gemm_launcher_sm90<cutlass::bfloat16_t>(
+        input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);
+#endif
 }

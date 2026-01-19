@@ -64,7 +64,7 @@ fused_rope_i_f32_kernel(
         // Calculate which position and which dimension
         // local_idx = (batch * heads * seq_len * head_dim/2) flattened
         // We need to find: which seq position (t) and which dim (d)
-        const uint32_t pairs_per_seq = half_d;  // head_dim/2 pairs per sequence position
+        // const uint32_t pairs_per_seq = half_d;  // head_dim/2 pairs per sequence position
         const uint32_t t_and_d = local_idx;  // Relative to some (b,h)
         const uint32_t d_idx = t_and_d % half_d;
         const uint32_t t_idx = (t_and_d / half_d) % seq_len;
@@ -214,7 +214,7 @@ fused_rope_f32_kernel(
         
         const bool is_q = (idx < q_pairs);
         const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
-        const uint32_t bh = is_q ? q_bh : k_bh;
+        // const uint32_t bh = is_q ? q_bh : k_bh;
         
         // Decompose index: local_idx = i_bh * (seq_len * half_d) + i_t * half_d + i_d
         const uint32_t pairs_per_bh = seq_len * half_d;

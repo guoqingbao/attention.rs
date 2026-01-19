@@ -1,5 +1,3 @@
-#[cfg(feature = "cuda")]
-use crate::cuda_utils;
 use candle_core::quantized::QTensor;
 use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
@@ -323,60 +321,35 @@ pub fn moe_gemm_fp8_with_layout(
         let stream = *dev.cu_stream() as i64;
         use core::ffi::c_void;
 
-        let sm90_plus = cuda_utils::sm_version(dev).map_or(false, |sm| sm >= 90);
-        let use_cutlass = weight_col_major && cfg!(feature = "cutlass") && sm90_plus && is_prefill;
+        // let sm90_plus = cuda_utils::sm_version(dev).map_or(false, |sm| sm >= 90);
+        // let use_cutlass = weight_col_major && cfg!(feature = "cutlass") && sm90_plus && is_prefill;
 
         unsafe {
             if is_prefill || size_m > 8 {
                 let expert_counts = dev.alloc::<u32>(num_experts).w()?;
                 let expert_offsets = dev.alloc::<u32>(num_experts + 1).w()?;
-                if use_cutlass {
-                    ffi::moe_gemm_fp8_cutlass(
-                        *input.device_ptr() as *const c_void,
-                        *weights.device_ptr() as *const u8,
-                        *weight_scales.device_ptr() as *const f32,
-                        *sorted_token_ids.device_ptr() as *const i32,
-                        *experts_ids.device_ptr() as *const i32,
-                        topk_weights_ptr,
-                        *output.device_ptr() as *mut c_void,
-                        *expert_counts.device_ptr() as *mut i32,
-                        *expert_offsets.device_ptr() as *mut i32,
-                        num_experts as i32,
-                        topk as i32,
-                        size_m as i32,
-                        size_n as i32,
-                        size_k as i32,
-                        block_size_n as i32,
-                        block_size_k as i32,
-                        data_type as i32,
-                        is_prefill,
-                        weight_col_major as i32,
-                        stream as i64,
-                    );
-                } else {
-                    ffi::moe_gemm_wmma_fp8_layout(
-                        *input.device_ptr() as *const c_void,
-                        *weights.device_ptr() as *const u8,
-                        *weight_scales.device_ptr() as *const f32,
-                        *sorted_token_ids.device_ptr() as *const i32,
-                        *experts_ids.device_ptr() as *const i32,
-                        topk_weights_ptr,
-                        *output.device_ptr() as *mut c_void,
-                        *expert_counts.device_ptr() as *mut i32,
-                        *expert_offsets.device_ptr() as *mut i32,
-                        num_experts as i32,
-                        topk as i32,
-                        size_m as i32,
-                        size_n as i32,
-                        size_k as i32,
-                        block_size_n as i32,
-                        block_size_k as i32,
-                        data_type as i32,
-                        is_prefill,
-                        weight_col_major as i32,
-                        stream as i64,
-                    );
-                }
+                ffi::moe_gemm_wmma_fp8_layout(
+                    *input.device_ptr() as *const c_void,
+                    *weights.device_ptr() as *const u8,
+                    *weight_scales.device_ptr() as *const f32,
+                    *sorted_token_ids.device_ptr() as *const i32,
+                    *experts_ids.device_ptr() as *const i32,
+                    topk_weights_ptr,
+                    *output.device_ptr() as *mut c_void,
+                    *expert_counts.device_ptr() as *mut i32,
+                    *expert_offsets.device_ptr() as *mut i32,
+                    num_experts as i32,
+                    topk as i32,
+                    size_m as i32,
+                    size_n as i32,
+                    size_k as i32,
+                    block_size_n as i32,
+                    block_size_k as i32,
+                    data_type as i32,
+                    is_prefill,
+                    weight_col_major as i32,
+                    stream as i64,
+                );
             } else {
                 ffi::moe_gemv_fp8_layout(
                     *input.device_ptr() as *const c_void,

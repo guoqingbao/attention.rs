@@ -654,29 +654,6 @@ extern "C" {
         stream: i64,
     );
 
-    pub fn moe_gemm_fp8_cutlass(
-        input: *const c_void,
-        weights: *const u8,
-        weight_scales: *const f32,
-        sorted_token_ids: *const i32,
-        expert_ids: *const i32,
-        topk_weights: *const f32,
-        output: *mut c_void,
-        expert_counts: *mut i32,
-        expert_offsets: *mut i32,
-        num_experts: i32,
-        topk: i32,
-        size_m: i32,
-        size_n: i32,
-        size_k: i32,
-        block_size_n: i32,
-        block_size_k: i32,
-        dtype: i32,
-        is_prefill: bool,
-        weight_col_major: i32,
-        stream: i64,
-    );
-
     pub fn topk_softmax(
         gating_output: *const f32,        // in： [num_tokens, num_experts]
         token_expert_indices: *const i32, // out: [num_tokens, topk]
@@ -838,7 +815,8 @@ extern "C" {
     );
 
     pub fn fp8_matmul_f16_cutlass(
-        input: *const c_void,
+        input_q: *const u8,
+        input_scale: *const f32,
         weight: *const u8,
         weight_scale: *const f32,
         output: *mut c_void,
@@ -849,6 +827,7 @@ extern "C" {
         block_size_y: c_int,
         block_size_x: c_int,
         weight_col_major: c_int,
+        sm_version: c_int,
         stream: i64,
     );
 
@@ -882,7 +861,8 @@ extern "C" {
     );
 
     pub fn fp8_matmul_bf16_cutlass(
-        input: *const c_void,
+        input_q: *const u8,
+        input_scale: *const f32,
         weight: *const u8,
         weight_scale: *const f32,
         output: *mut c_void,
@@ -893,19 +873,19 @@ extern "C" {
         block_size_y: c_int,
         block_size_x: c_int,
         weight_col_major: c_int,
+        sm_version: c_int,
         stream: i64,
     );
-
-    pub fn fp8_sfb_packed_len(n: c_int, k: c_int) -> c_int;
-
-    pub fn fp8_pack_sfb_scales(
-        scales_rm: *const f32,
-        scales_packed: *mut f32,
-        n: c_int,
-        k: c_int,
-        block_size_n: c_int,
-        block_size_k: c_int,
-        input_k_major: c_int,
+    pub fn fp8_quantize_per_token_group_launch(
+        input: *const c_void,
+        output_q: *mut c_void,
+        output_s: *mut f32,
+        num_groups: c_int,
+        group_size: c_int,
+        num_groups_per_row: c_int,
+        scale_stride: c_int,
+        is_input_f16: bool,
+        is_column_major_stats: bool,
         stream: i64,
     );
 }

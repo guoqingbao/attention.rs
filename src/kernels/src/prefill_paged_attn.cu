@@ -158,8 +158,8 @@ __global__ void chunked_prefill_paged_attention_kernel(
     const int token_start = blockIdx.z * TOKEN_CHUNK_SIZE + lane;
 
      // Total number of elements in K and V cache
-    int64_t k_cache_num_elems = total_num_blocks * kv_block_stride;
-    int64_t v_cache_num_elems = total_num_blocks * kv_block_stride;
+    // int64_t k_cache_num_elems = total_num_blocks * kv_block_stride;
+    // int64_t v_cache_num_elems = total_num_blocks * kv_block_stride;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
     const int X = 16 / sizeof(cache_t); // sub-vector size
@@ -187,7 +187,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     const uint32_t seq_len_full = seq_lens[seq_idx];
     const int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
     const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
-    const int context_len = (int)seq_len_full - 1;
+    // const int context_len = (int)seq_len_full - 1;
 
     // Vectorized types for Q and K
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
@@ -426,7 +426,7 @@ void paged_attention_prefill_launcher(
   const float* alibi_slopes_ptr = nullptr;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
   int VEC_SIZE = 16 / sizeof(T);
-  int NUM_VECS  = head_size / VEC_SIZE;
+  // int NUM_VECS  = head_size / VEC_SIZE;
 
   int num_token_chunks = (num_query_tokens + TOKEN_CHUNK_SIZE - 1) / TOKEN_CHUNK_SIZE;
   dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);

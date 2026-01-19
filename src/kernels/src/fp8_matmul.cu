@@ -137,15 +137,15 @@ __global__ void fp8_wmma_matmul(
 {
     // Warps layout:
     int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    // int lane_id = threadIdx.x % 32;
 
     // Specialized warp mapping
     int warp_row_px, warp_col_px;
     
     // Accumulators
     // Fragments count depends on (BM, BN) vs (WMMA_M, WMMA_N)
-    constexpr int FRAGS_M = BM / WMMA_M;
-    constexpr int FRAGS_N_PER_WARP = (BN / 4) / WMMA_N; // Assuming 1x4 Grid?
+    // constexpr int FRAGS_M = BM / WMMA_M;
+    // constexpr int FRAGS_N_PER_WARP = (BN / 4) / WMMA_N; // Assuming 1x4 Grid?
     
     // Let's make the grid explicit per config
     if constexpr (BM == 64 && BN == 64) {

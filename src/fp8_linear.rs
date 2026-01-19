@@ -8,55 +8,43 @@ use crate::metal_kernels;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Device, Result, Tensor};
 
+#[cfg(feature = "cuda")]
+fn get_cuda_slice<
+    T: candle_core::cuda_backend::cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType,
+>(
+    tensor: &Tensor,
+) -> Result<u64> {
+    let (storage, _) = tensor.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cuda(c) => {
+            let slice = c.as_cuda_slice::<T>()?;
+            Ok(*slice.device_ptr() as u64)
+        }
+        _ => candle_core::bail!("expecting cuda tensor"),
+    }
+}
+
 /// FP8 Matrix Multiplication: C = A * B^T
 ///
 /// # Arguments
 /// * `input` - Input tensor A of shape [M, K]
-/// * `weight` - Weight tensor B of shape [N, K] (stored as u8)
+/// * `weight` - Weight tensor B of shape [K, N] (stored as u8)
 /// * `weight_scale` - Scales for weight tensor
 /// * `block_size` - [block_size_y, block_size_x] for scaling
 ///
 /// The weight tensor is expected to be in FP8 format (e4m3).
+/// FP8 Matrix Multiplication with explicit weight layout.
 #[allow(unused)]
 pub fn fp8_matmul(
-    input: &Tensor,
-    weight: &Tensor,
-    weight_scale: &Tensor,
-    block_size: &[usize], // [block_size_y, block_size_x]
-) -> Result<Tensor> {
-    fp8_matmul_with_layout(input, weight, weight_scale, block_size, false)
-}
-
-/// FP8 Matrix Multiplication with explicit weight layout.
-///
-/// When `weight_col_major` is true, `weight` is expected to be stored as [K, N].
-#[allow(unused)]
-pub fn fp8_matmul_with_layout(
     input: &Tensor,
     weight: &Tensor,
     weight_scale: &Tensor,
     block_size: &[usize],
     weight_col_major: bool,
 ) -> Result<Tensor> {
+    assert!(weight_col_major, "Only weight_col_major is supported");
     let (m, k) = input.dims2()?;
-    let (n, k_w) = if weight_col_major {
-        let (k_w, n) = weight.dims2()?;
-        (n, k_w)
-    } else {
-        weight.dims2()?
-    };
-
-    if k != k_w {
-        //  println!("DEBUG: mismatch k={} k_w={} m={} n={} col={}", k, k_w, m, n, weight_col_major);
-        candle_core::bail!(
-            "Shape mismatch in fp8_matmul: input [{}, {}], weight [{}, {}]",
-            m,
-            k,
-            n,
-            k_w
-        );
-    }
-
+    let (k, n) = weight.dims2()?;
     let dev = input.device();
     let dtype = input.dtype();
     assert!(
@@ -64,87 +52,176 @@ pub fn fp8_matmul_with_layout(
         "fp8_matmul expects f32 scales, got {:?}",
         weight_scale.dtype()
     );
-    let scale_row_stride = (k_w + block_size[1] - 1) / block_size[1];
+    let scale_row_stride = (k + block_size[1] - 1) / block_size[1];
 
-    let output = Tensor::zeros((m, n), dtype, dev)?;
+    #[cfg(feature = "cuda")]
+    let sm_version = if matches!(dev, Device::Cuda(_)) {
+        cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0) as i32
+    } else {
+        0
+    };
+    #[cfg(feature = "cuda")]
+    let sm90_plus = sm_version >= 90;
+    #[cfg(not(feature = "cuda"))]
+    let sm90_plus = false;
 
-    if weight_col_major {
-        match dev {
-            Device::Cuda(_) => {}
-            _ => candle_core::bail!("fp8_matmul_with_layout only supports col-major on CUDA"),
-        }
-    }
-
-    let sm90_plus = matches!(dev, Device::Cuda(_))
-        && cuda_utils::sm_version(dev.as_cuda_device()?).map_or(false, |sm| sm >= 90);
-    let use_cutlass = weight_col_major
-        && cfg!(feature = "cutlass")
+    let use_cutlass = cfg!(feature = "cutlass")
         && sm90_plus
         && block_size.len() == 2
         && block_size[0] == 128
         && block_size[1] == 128;
 
-    if !use_cutlass && weight_scale.dims1().is_ok() {
+    if input.rank() != 2 {
+        candle_core::bail!("mat_a must be a 2D tensor");
+    }
+    if weight.rank() != 2 {
+        candle_core::bail!("mat_b must be a 2D tensor");
+    }
+
+    if !input.is_contiguous() {
+        candle_core::bail!("mat_a must be contiguous (row major)");
+    }
+
+    if use_cutlass && weight.stride()[0] != 1 {
+        candle_core::bail!("mat_b must be a column major tensor (stride(0) == 1)");
+    }
+
+    if k != weight.dim(0)? {
+        // mat_b is [K, N]
         candle_core::bail!(
-            "packed weight_scale requires CUTLASS path; provide row-major scales for this dispatch"
+            "mat_a and mat_b shapes cannot be multiplied: K={} vs mat_b.dim(0)={}",
+            k,
+            weight.dim(0)?
+        );
+    }
+
+    if (k * input.dtype().size_in_bytes()) % 16 != 0 {
+        candle_core::bail!("mat_a (K dim) must be multiple of 16 bytes");
+    }
+    if weight.dim(0)? % 16 != 0 {
+        candle_core::bail!("mat_b (K dim) must be multiple of 16 bytes");
+    }
+
+    if weight_scale.dim(0)? != weight.dim(0)? / 128 || weight_scale.dim(1)? != weight.dim(1)? / 128
+    {
+        candle_core::bail!("scales_b shape mismatch");
+    }
+
+    let weight_scale_stride = weight_scale.stride();
+    let weight_scale_col_major = weight_scale_stride[0] == 1;
+    let weight_scale_row_major = weight_scale.is_contiguous() && weight_scale_stride[1] == 1;
+    if use_cutlass && !(weight_scale_col_major || weight_scale_row_major) {
+        candle_core::bail!("scales_b must be column major or contiguous row major");
+    }
+
+    if !use_cutlass {
+        if weight_scale.dims1().is_ok() {
+            candle_core::bail!("packed weight_scale requires CUTLASS path");
+        }
+    }
+
+    let dev = input.device();
+    let w_ptr = get_cuda_slice::<u8>(&weight)?;
+    let ws_ptr = get_cuda_slice::<f32>(&weight_scale)?;
+
+    let alignment = 4;
+    let m_padded = (m + alignment - 1) / alignment * alignment;
+    let pad_len = m_padded - m;
+
+    let input_padded = if use_cutlass && pad_len > 0 {
+        input.pad_with_zeros(0, 0, pad_len)? // Pad for TMA
+    } else {
+        input.clone()
+    };
+
+    let mut output = Tensor::zeros(
+        (
+            if use_cutlass && pad_len > 0 {
+                m_padded
+            } else {
+                m
+            },
+            n,
+        ),
+        dtype,
+        dev,
+    )?;
+    let cu_dev = dev.as_cuda_device()?;
+    let stream = *cu_dev.cu_stream() as i64;
+    let k_over_128 = (k + 127) / 128;
+
+    let (q_ptr, s_ptr, scale_stride) = if use_cutlass {
+        let input_q = Tensor::zeros((m_padded, k), DType::U8, &dev)?;
+        // Create column-major scales so stride(0) == 1 (matches CUTLASS SFA layout).
+        let input_scale_base = Tensor::zeros((k_over_128, m_padded), DType::F32, &dev)?;
+        let input_scale = input_scale_base.t()?;
+        let scale_stride = input_scale.stride()[1] as i32;
+
+        let q_ptr = get_cuda_slice::<u8>(&input_q)? as *mut std::ffi::c_void;
+        let s_ptr = get_cuda_slice::<f32>(&input_scale)? as *mut f32;
+        (q_ptr, s_ptr, scale_stride)
+    } else {
+        (
+            std::ptr::null_mut() as *mut std::ffi::c_void,
+            std::ptr::null_mut() as *mut f32,
+            0,
+        )
+    };
+
+    let inp_ptr = if dtype == DType::F16 {
+        get_cuda_slice::<half::f16>(&input_padded)?
+    } else {
+        get_cuda_slice::<half::bf16>(&input_padded)?
+    };
+
+    #[cfg(feature = "cutlass")]
+    unsafe {
+        let num_groups = m_padded * k_over_128;
+        let group_size = 128;
+        let num_groups_per_row = k_over_128;
+        ffi::fp8_quantize_per_token_group_launch(
+            inp_ptr as *const std::ffi::c_void,
+            q_ptr,
+            s_ptr,
+            num_groups as i32,
+            group_size as i32,
+            num_groups_per_row as i32,
+            scale_stride,
+            dtype == DType::F16,
+            true,
+            stream as i64,
         );
     }
 
     match (dev, dtype) {
         #[cfg(feature = "cuda")]
         (Device::Cuda(dev), DType::F16) => {
-            let (input_storage, _) = input.storage_and_layout();
-            let input_slice = match &*input_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::f16>()?,
-                _ => candle_core::bail!("input must be a cuda tensor"),
-            };
-            let input_ptr = *input_slice.device_ptr() as *const core::ffi::c_void;
-
-            let (weight_storage, _) = weight.storage_and_layout();
-            let weight_slice = match &*weight_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
-                _ => candle_core::bail!("weight must be a cuda tensor"),
-            };
-            let weight_ptr = *weight_slice.device_ptr() as *const u8;
-
-            let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => candle_core::bail!("weight_scale must be a cuda tensor"),
-            };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
-
-            let (output_storage, _) = output.storage_and_layout();
-            let output_slice = match &*output_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::f16>()?,
-                _ => candle_core::bail!("output allocation failed"),
-            };
-            let output_ptr = *output_slice.device_ptr() as *mut core::ffi::c_void;
-
-            let stream = *dev.cu_stream() as i64;
-
+            // GEMM
+            let out_ptr = get_cuda_slice::<half::f16>(&output)?;
             unsafe {
                 if use_cutlass {
                     ffi::fp8_matmul_f16_cutlass(
-                        input_ptr,
-                        weight_ptr,
-                        weight_scale_ptr,
-                        output_ptr,
-                        m as i32,
+                        q_ptr as *const u8,
+                        s_ptr as *const f32,
+                        w_ptr as *const u8,
+                        ws_ptr as *const f32,
+                        out_ptr as *mut core::ffi::c_void,
+                        m_padded as i32,
                         n as i32,
                         k as i32,
                         scale_row_stride as i32,
                         block_size[0] as i32,
                         block_size[1] as i32,
                         weight_col_major as i32,
+                        sm_version,
                         stream,
                     )
                 } else {
                     ffi::fp8_matmul_f16_layout(
-                        input_ptr,
-                        weight_ptr,
-                        weight_scale_ptr,
-                        output_ptr,
+                        inp_ptr as *const core::ffi::c_void,
+                        w_ptr as *const u8,
+                        ws_ptr as *const f32,
+                        out_ptr as *mut core::ffi::c_void,
                         m as i32,
                         n as i32,
                         k as i32,
@@ -156,61 +233,39 @@ pub fn fp8_matmul_with_layout(
                     )
                 }
             }
+
+            if use_cutlass && pad_len > 0 {
+                output = output.narrow(0, 0, m)?;
+            }
         }
         #[cfg(feature = "cuda")]
         (Device::Cuda(dev), DType::BF16) => {
-            let (input_storage, _) = input.storage_and_layout();
-            let input_slice = match &*input_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::bf16>()?,
-                _ => candle_core::bail!("input must be a cuda tensor"),
-            };
-            let input_ptr = *input_slice.device_ptr() as *const core::ffi::c_void;
-
-            let (weight_storage, _) = weight.storage_and_layout();
-            let weight_slice = match &*weight_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
-                _ => candle_core::bail!("weight must be a cuda tensor"),
-            };
-            let weight_ptr = *weight_slice.device_ptr() as *const u8;
-
-            let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => candle_core::bail!("weight_scale must be a cuda tensor"),
-            };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
-
-            let (output_storage, _) = output.storage_and_layout();
-            let output_slice = match &*output_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::bf16>()?,
-                _ => candle_core::bail!("output allocation failed"),
-            };
-            let output_ptr = *output_slice.device_ptr() as *mut core::ffi::c_void;
-
-            let stream = *dev.cu_stream() as i64;
-
+            // GEMM
+            let out_ptr = get_cuda_slice::<half::bf16>(&output)?;
             unsafe {
                 if use_cutlass {
                     ffi::fp8_matmul_bf16_cutlass(
-                        input_ptr,
-                        weight_ptr,
-                        weight_scale_ptr,
-                        output_ptr,
-                        m as i32,
+                        q_ptr as *const u8,
+                        s_ptr as *const f32,
+                        w_ptr as *const u8,
+                        ws_ptr as *const f32,
+                        out_ptr as *mut core::ffi::c_void,
+                        m_padded as i32,
                         n as i32,
                         k as i32,
                         scale_row_stride as i32,
                         block_size[0] as i32,
                         block_size[1] as i32,
                         weight_col_major as i32,
+                        sm_version,
                         stream,
                     )
                 } else {
                     ffi::fp8_matmul_bf16_layout(
-                        input_ptr,
-                        weight_ptr,
-                        weight_scale_ptr,
-                        output_ptr,
+                        inp_ptr as *const core::ffi::c_void,
+                        w_ptr as *const u8,
+                        ws_ptr as *const f32,
+                        out_ptr as *mut core::ffi::c_void,
                         m as i32,
                         n as i32,
                         k as i32,
@@ -221,6 +276,10 @@ pub fn fp8_matmul_with_layout(
                         stream,
                     )
                 }
+            }
+
+            if use_cutlass && pad_len > 0 {
+                output = output.narrow(0, 0, m)?;
             }
         }
         (Device::Cuda(_), _) => candle_core::bail!("fp8_matmul requires f16 or bf16 input"),
@@ -282,79 +341,4 @@ pub fn fp8_matmul_with_layout(
     }
 
     Ok(output)
-}
-
-/// Pack row-major FP8 weight scales into CUTLASS SFB layout.
-///
-/// `weight_scale` must be a contiguous F32 tensor shaped [ceil(N/by), ceil(K/bx)].
-/// Returns a flat packed tensor to be used with CUTLASS paths.
-#[cfg(feature = "cuda")]
-pub fn pack_fp8_weight_scale_sfb(
-    weight_scale: &Tensor,
-    n: usize,
-    k: usize,
-    block_size: &[usize],
-) -> Result<Tensor> {
-    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-    use candle_core::cuda_backend::WrapErr;
-
-    if block_size.len() != 2 {
-        candle_core::bail!("block_size must be [block_size_n, block_size_k]");
-    }
-    let dev = weight_scale.device().as_cuda_device()?;
-    if weight_scale.dtype() != DType::F32 {
-        candle_core::bail!("weight_scale must be F32");
-    }
-
-    let (scale_0, scale_1) = weight_scale.dims2()?;
-    let expected_n = (n + block_size[0] - 1) / block_size[0];
-    let expected_k = (k + block_size[1] - 1) / block_size[1];
-    let input_k_major;
-
-    // println!("DEBUG: pack_sfb: n={} k={} expected_n={} expected_k={} scale_dims=({}, {})", n, k, expected_n, expected_k, scale_0, scale_1);
-
-    if scale_0 == expected_n && scale_1 == expected_k {
-        input_k_major = false;
-    } else if scale_0 == expected_k && scale_1 == expected_n {
-        input_k_major = true;
-    } else {
-        candle_core::bail!(
-            "weight_scale shape mismatch: expected [{}, {}] or [{}, {}], got [{}, {}]",
-            expected_n,
-            expected_k,
-            expected_k,
-            expected_n,
-            scale_0,
-            scale_1
-        );
-    }
-
-    let packed_len = unsafe { ffi::fp8_sfb_packed_len(n as i32, k as i32) };
-    if packed_len <= 0 {
-        candle_core::bail!("fp8_sfb_packed_len returned 0; CUTLASS not enabled?");
-    }
-
-    let packed = unsafe { dev.alloc::<f32>(packed_len as usize) }.w()?;
-    let (scale_storage, _) = weight_scale.storage_and_layout();
-    let scale_slice = match &*scale_storage {
-        candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-        _ => candle_core::bail!("weight_scale must be a cuda tensor"),
-    };
-
-    let stream = *dev.cu_stream() as i64;
-    unsafe {
-        ffi::fp8_pack_sfb_scales(
-            *scale_slice.device_ptr() as *const f32,
-            *packed.device_ptr() as *mut f32,
-            n as i32,
-            k as i32,
-            block_size[0] as i32,
-            block_size[1] as i32,
-            if input_k_major { 1 } else { 0 },
-            stream,
-        );
-    }
-
-    let packed = candle_core::CudaStorage::wrap_cuda_slice(packed, dev.clone());
-    Tensor::from_storage(candle_core::Storage::Cuda(packed), (packed_len as usize,))
 }
