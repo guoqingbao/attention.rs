@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fused_rope.cu");
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
     println!("cargo:rerun-if-changed=src/fp8_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
 
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     println!("cargo:rerun-if-env-changed=CUTLASS_DIR");

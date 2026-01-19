@@ -800,6 +800,92 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn moe_fp8_calculate_expert_offsets(
+        expert_ids: *const i32,
+        expert_counts: *mut i32,
+        expert_offsets: *mut i32,
+        num_experts: c_int,
+        size_m: c_int,
+        is_prefill: bool,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_shuffle_rows_u8(
+        input: *const u8,
+        dst2src_map: *const i32,
+        output: *mut u8,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        map_divisor: c_int,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_shuffle_rows_f32(
+        input: *const f32,
+        dst2src_map: *const i32,
+        output: *mut f32,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        map_divisor: c_int,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_scatter_rows_f16(
+        input: *const c_void,
+        src2dst_map: *const i32,
+        output: *mut c_void,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        weights: *const f32,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_scatter_rows_bf16(
+        input: *const c_void,
+        src2dst_map: *const i32,
+        output: *mut c_void,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        weights: *const f32,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_grouped_gemm_f16(
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        b_scales: *const f32,
+        expert_offsets: *const i32,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        block_size_n: c_int,
+        block_size_k: c_int,
+        sm_version: c_int,
+        out: *mut c_void,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_grouped_gemm_bf16(
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        b_scales: *const f32,
+        expert_offsets: *const i32,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        block_size_n: c_int,
+        block_size_k: c_int,
+        sm_version: c_int,
+        out: *mut c_void,
+        stream: i64,
+    );
+
     pub fn fp8_quantize_per_token_group_launch(
         input: *const c_void,
         output_q: *mut c_void,
