@@ -27,7 +27,7 @@
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 
-namespace vllm_moe_fp8 {
+namespace vllm_rs_moe {
 
 template <typename T>
 __device__ __forceinline__ float to_float(T v) {
@@ -393,65 +393,29 @@ cutlass::Status launch_grouped_gemm(
       epilogue_args,
       hw_info};
 
-  auto can = gemm_op.can_implement(args);
-  if (can != cutlass::Status::kSuccess) {
-    cudaFreeAsync(a_ptrs, stream);
-    cudaFreeAsync(b_ptrs, stream);
-    cudaFreeAsync(out_ptrs, stream);
-    cudaFreeAsync(a_scales_ptrs, stream);
-    cudaFreeAsync(b_scales_ptrs, stream);
-    cudaFreeAsync(stride_a, stream);
-    cudaFreeAsync(stride_b, stream);
-    cudaFreeAsync(stride_c, stream);
-    cudaFreeAsync(layout_sfa, stream);
-    cudaFreeAsync(layout_sfb, stream);
-    cudaFreeAsync(problem_sizes, stream);
-    return can;
-  }
+  cutlass::Status status = gemm_op.can_implement(args);
 
-  size_t workspace_size = gemm_op.get_workspace_size(args);
   void* workspace = nullptr;
-  if (workspace_size > 0) {
-    if (cudaMallocAsync(&workspace, workspace_size, stream) != cudaSuccess) {
-      cudaFreeAsync(a_ptrs, stream);
-      cudaFreeAsync(b_ptrs, stream);
-      cudaFreeAsync(out_ptrs, stream);
-      cudaFreeAsync(a_scales_ptrs, stream);
-      cudaFreeAsync(b_scales_ptrs, stream);
-      cudaFreeAsync(stride_a, stream);
-      cudaFreeAsync(stride_b, stream);
-      cudaFreeAsync(stride_c, stream);
-      cudaFreeAsync(layout_sfa, stream);
-      cudaFreeAsync(layout_sfb, stream);
-      cudaFreeAsync(problem_sizes, stream);
-      return cutlass::Status::kErrorInternal;
+
+  if (status == cutlass::Status::kSuccess) {
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    if (workspace_size > 0) {
+      if (cudaMallocAsync(&workspace, workspace_size, stream) != cudaSuccess) {
+        status = cutlass::Status::kErrorInternal;
+      }
     }
   }
 
-  auto init_status = gemm_op.initialize(args, workspace, stream);
-  if (init_status != cutlass::Status::kSuccess) {
-    if (workspace != nullptr) {
-      cudaFreeAsync(workspace, stream);
-    }
-    cudaFreeAsync(a_ptrs, stream);
-    cudaFreeAsync(b_ptrs, stream);
-    cudaFreeAsync(out_ptrs, stream);
-    cudaFreeAsync(a_scales_ptrs, stream);
-    cudaFreeAsync(b_scales_ptrs, stream);
-    cudaFreeAsync(stride_a, stream);
-    cudaFreeAsync(stride_b, stream);
-    cudaFreeAsync(stride_c, stream);
-    cudaFreeAsync(layout_sfa, stream);
-    cudaFreeAsync(layout_sfb, stream);
-    cudaFreeAsync(problem_sizes, stream);
-    return init_status;
+  if (status == cutlass::Status::kSuccess) {
+    status = gemm_op.initialize(args, workspace, stream);
   }
 
-  auto run_status = gemm_op.run(stream);
-  if (workspace != nullptr) {
-    cudaFreeAsync(workspace, stream);
+  if (status == cutlass::Status::kSuccess) {
+    status = gemm_op.run(stream);
   }
 
+  // ---- cleanup ----
+  if (workspace) cudaFreeAsync(workspace, stream);
   cudaFreeAsync(a_ptrs, stream);
   cudaFreeAsync(b_ptrs, stream);
   cudaFreeAsync(out_ptrs, stream);
@@ -464,7 +428,7 @@ cutlass::Status launch_grouped_gemm(
   cudaFreeAsync(layout_sfb, stream);
   cudaFreeAsync(problem_sizes, stream);
 
-  return run_status;
+  return status;
 }
 
 struct Sm90GroupConfig {
@@ -506,7 +470,7 @@ struct Sm120GroupConfig {
 };
 #endif
 
-}  // namespace vllm_moe_fp8
+}  // namespace vllm_rs_moe
 
 extern "C" void moe_fp8_calculate_expert_offsets(
     const int32_t* expert_ids,
@@ -534,7 +498,7 @@ extern "C" void moe_fp8_shuffle_rows_u8(
     cudaStream_t stream) {
   dim3 grid(static_cast<uint32_t>(num_dst_rows));
   dim3 block(256);
-  vllm_moe_fp8::gather_rows_kernel<uint8_t><<<grid, block, 0, stream>>>(
+  vllm_rs_moe::gather_rows_kernel<uint8_t><<<grid, block, 0, stream>>>(
       input, dst2src_map, output, num_src_rows, num_dst_rows, num_cols, map_divisor);
 }
 
@@ -549,7 +513,7 @@ extern "C" void moe_fp8_shuffle_rows_f32(
     cudaStream_t stream) {
   dim3 grid(static_cast<uint32_t>(num_dst_rows));
   dim3 block(256);
-  vllm_moe_fp8::gather_rows_kernel<float><<<grid, block, 0, stream>>>(
+  vllm_rs_moe::gather_rows_kernel<float><<<grid, block, 0, stream>>>(
       input, dst2src_map, output, num_src_rows, num_dst_rows, num_cols, map_divisor);
 }
 
@@ -564,7 +528,7 @@ extern "C" void moe_fp8_scatter_rows_f16(
     cudaStream_t stream) {
   dim3 grid(static_cast<uint32_t>(num_src_rows));
   dim3 block(256);
-  vllm_moe_fp8::scatter_rows_kernel<half><<<grid, block, 0, stream>>>(
+  vllm_rs_moe::scatter_rows_kernel<half><<<grid, block, 0, stream>>>(
       input, src2dst_map, output, num_src_rows, num_dst_rows, num_cols, weights);
 }
 
@@ -579,7 +543,7 @@ extern "C" void moe_fp8_scatter_rows_bf16(
     cudaStream_t stream) {
   dim3 grid(static_cast<uint32_t>(num_src_rows));
   dim3 block(256);
-  vllm_moe_fp8::scatter_rows_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+  vllm_rs_moe::scatter_rows_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
       input, src2dst_map, output, num_src_rows, num_dst_rows, num_cols, weights);
 }
 
@@ -612,7 +576,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
 #else
   if (sm_version == 100) {
 #endif
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::half_t, vllm_moe_fp8::Sm100GroupConfig, cutlass::layout::RowMajor>(
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm100GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_f16 sm100 failed: %s\n", cutlassGetStatusString(status));
@@ -624,7 +588,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
 #if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
     (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
   if (sm_version == 120) {
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::half_t, vllm_moe_fp8::Sm120GroupConfig, cutlass::layout::RowMajor>(
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm120GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_f16 sm120 failed: %s\n", cutlassGetStatusString(status));
@@ -635,7 +599,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   if (sm_version == 90) {
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::half_t, vllm_moe_fp8::Sm90GroupConfig, cutlass::layout::RowMajor>(
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_f16 sm90 failed: %s\n", cutlassGetStatusString(status));
@@ -690,7 +654,7 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
 #else
   if (sm_version == 100) {
 #endif
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::bfloat16_t, vllm_moe_fp8::Sm100GroupConfig, cutlass::layout::RowMajor>(
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm100GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_bf16 sm100 failed: %s\n", cutlassGetStatusString(status));
@@ -701,8 +665,8 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
 
 #if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
     (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
-  if (sm_version == 120) {
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::bfloat16_t, vllm_moe_fp8::Sm120GroupConfig, cutlass::layout::RowMajor>(
+  if (sm_version >= 120) {
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm120GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_bf16 sm120 failed: %s\n", cutlassGetStatusString(status));
@@ -713,7 +677,7 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   if (sm_version == 90) {
-    auto status = vllm_moe_fp8::launch_grouped_gemm<cutlass::bfloat16_t, vllm_moe_fp8::Sm90GroupConfig, cutlass::layout::RowMajor>(
+    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_bf16 sm90 failed: %s\n", cutlassGetStatusString(status));

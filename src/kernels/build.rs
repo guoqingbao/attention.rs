@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/gpu_sampling.cu");
     println!("cargo:rerun-if-changed=src/fused_rope.cu");
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
-    println!("cargo:rerun-if-changed=src/fp8_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
 
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // println!("cargo:rustc-link-lib=dylib=stdc++");
 
     Ok(())
 }

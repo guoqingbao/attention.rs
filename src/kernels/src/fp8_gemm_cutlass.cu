@@ -761,7 +761,7 @@ extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
 
 #if (defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)) && \
     (defined(CUDA_VERSION) && CUDA_VERSION >= 12080)
-    if (sm_version == 120) {
+    if (sm_version >= 120) {
         sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
             out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
         return;
