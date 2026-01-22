@@ -459,7 +459,12 @@ struct Sm120GroupConfig {
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
   using KernelSchedule = cutlass::gemm::KernelScheduleSm120Blockwise;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<1, 128, 128>;
+  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
+      1,
+      128,
+      128,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
