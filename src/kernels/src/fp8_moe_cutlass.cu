@@ -212,6 +212,58 @@ __global__ void build_grouped_gemm_args(
   layout_sfb[expert_id] = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
 }
 
+template <typename ScheduleConfig, typename LayoutD, typename ElementD, typename ElementAccumulator, typename ElementC>
+struct GroupedEpilogueSelector {
+  using ArchTag = typename ScheduleConfig::ArchTag;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutD*,
+      AlignmentC,
+      ElementD,
+      LayoutD*,
+      AlignmentC,
+      typename ScheduleConfig::EpilogueSchedule>::CollectiveOp;
+};
+
+template <typename ScheduleConfig, typename LayoutD, typename ElementD, typename ElementAccumulator, typename ElementC>
+struct GroupedEpilogueSelectorSm90 {
+  using ArchTag = typename ScheduleConfig::ArchTag;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+  using CustomEVTIdentity = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Identity, ElementD, ElementAccumulator, RoundStyle>,
+      cutlass::epilogue::fusion::Sm90AccFetch>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutD*,
+      AlignmentC,
+      ElementD,
+      LayoutD*,
+      AlignmentC,
+      typename ScheduleConfig::EpilogueSchedule,
+      CustomEVTIdentity>::CollectiveOp;
+};
+
 template <typename OutType, typename ScheduleConfig, typename LayoutD>
 cutlass::Status launch_grouped_gemm(
     const cutlass::float_e4m3_t* a,
@@ -237,53 +289,14 @@ cutlass::Status launch_grouped_gemm(
 
   static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   using ArchTag = typename ScheduleConfig::ArchTag;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-
-  static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
-  using CustomEVTIdentity = cutlass::epilogue::fusion::Sm90EVT<
-      cutlass::epilogue::fusion::Sm90Compute<cutlass::epilogue::thread::Identity, ElementD, ElementAccumulator, RoundStyle>,
-      cutlass::epilogue::fusion::Sm90AccFetch>;
-
-  using CollectiveEpilogueSm90 = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag,
-      OperatorClass,
-      typename ScheduleConfig::MmaTileShape,
-      typename ScheduleConfig::ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator,
-      ElementAccumulator,
-      ElementC,
-      LayoutC*,
-      AlignmentC,
-      ElementD,
-      LayoutC*,
-      AlignmentC,
-      typename ScheduleConfig::EpilogueSchedule,
-      CustomEVTIdentity>::CollectiveOp;
-
-  using CollectiveEpilogueDefault = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag,
-      OperatorClass,
-      typename ScheduleConfig::MmaTileShape,
-      typename ScheduleConfig::ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator,
-      ElementAccumulator,
-      ElementC,
-      LayoutC*,
-      AlignmentC,
-      ElementD,
-      LayoutC*,
-      AlignmentC,
-      typename ScheduleConfig::EpilogueSchedule>::CollectiveOp;
-
-  using CollectiveEpilogue = std::conditional_t<
+  using EpilogueSelector = std::conditional_t<
       std::is_same_v<ArchTag, cutlass::arch::Sm90>,
-      CollectiveEpilogueSm90,
-      CollectiveEpilogueDefault>;
+      GroupedEpilogueSelectorSm90<ScheduleConfig, LayoutC, ElementD, ElementAccumulator, ElementC>,
+      GroupedEpilogueSelector<ScheduleConfig, LayoutC, ElementD, ElementAccumulator, ElementC>>;
+  using CollectiveEpilogue = typename EpilogueSelector::CollectiveEpilogue;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag,
@@ -448,7 +461,12 @@ struct Sm100GroupConfig {
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
   using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
-  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<1, 128, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+      1,
+      128,
+      128,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
