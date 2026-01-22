@@ -191,7 +191,7 @@ impl PagedAttention {
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
         if self.sliding_window.is_some() {
-            candle_flash_attn::flash_attn_varlen_windowed_softcap(
+            flashattn_rs::flash_attn_varlen_windowed_softcap(
                 query,
                 key,
                 value,
@@ -206,7 +206,7 @@ impl PagedAttention {
                 Some(0),
             )
         } else {
-            candle_flash_attn::flash_attn_varlen_softcap(
+            flashattn_rs::flash_attn_varlen_softcap(
                 query,
                 key,
                 value,
@@ -276,7 +276,7 @@ impl PagedAttention {
         {
             let block_tables = input_metadata.block_tables.as_ref().unwrap();
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
-            candle_flash_attn::flash_attn_with_kvcache(
+            flashattn_rs::flash_attn_with_kvcache(
                 &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
