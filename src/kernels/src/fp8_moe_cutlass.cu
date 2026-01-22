@@ -461,7 +461,12 @@ struct Sm100GroupConfig {
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
   using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm100;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
-  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<1, 128, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+      1,
+      128,
+      128,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
