@@ -464,7 +464,7 @@ struct Sm120GroupConfig {
       128,
       128,
       cute::UMMA::Major::MN,
-      cute::UMMA::Major::K>;
+      cute::UMMA::Major::MN>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
