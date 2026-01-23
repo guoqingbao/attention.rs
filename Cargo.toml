@@ -16,7 +16,7 @@ rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.3.0", optional = true }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true }
-flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "e805901", optional = true }
+flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7d6dae2", optional = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
