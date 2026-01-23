@@ -455,6 +455,7 @@ struct Sm90GroupConfig {
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
 
+#ifdef ENABLE_SM100
 struct Sm100GroupConfig {
   using ArchTag = cutlass::arch::Sm100;
   using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
@@ -470,7 +471,9 @@ struct Sm100GroupConfig {
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
+#endif
 
+#ifdef ENABLE_SM120
 struct Sm120GroupConfig {
   using ArchTag = cutlass::arch::Sm120;
   using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
@@ -486,6 +489,7 @@ struct Sm120GroupConfig {
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
+#endif
 
 }  // namespace vllm_rs_moe
 
@@ -586,32 +590,30 @@ extern "C" void moe_fp8_grouped_gemm_f16(
   int n_blocks = (n + block_size_n - 1) / block_size_n;
   int k_blocks = (k + block_size_k - 1) / block_size_k;
 
-  if (sm_version >= 120) {
+#ifdef ENABLE_SM120
     auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm120GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_f16 sm120 failed: %s\n", cutlassGetStatusString(status));
     }
     return;
-  }
+#endif
 
-  if (sm_version == 100 || sm_version == 103) {
+#ifdef ENABLE_SM100
     auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm100GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_f16 sm100 failed: %s\n", cutlassGetStatusString(status));
     }
     return;
-  }
+#endif
 
-  if (sm_version == 90) {
-    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
+    auto status1 = vllm_rs_moe::launch_grouped_gemm<cutlass::half_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
-    if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_f16 sm90 failed: %s\n", cutlassGetStatusString(status));
+    if (status1 != cutlass::Status::kSuccess) {
+      printf("moe_fp8_grouped_gemm_f16 sm90 failed: %s\n", cutlassGetStatusString(status1));
     }
     return;
-  }
 #endif
   printf("moe_fp8_grouped_gemm_f16 unsupported sm_version %d\n", sm_version);
 }
@@ -638,32 +640,30 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
   int n_blocks = (n + block_size_n - 1) / block_size_n;
   int k_blocks = (k + block_size_k - 1) / block_size_k;
 
-  if (sm_version >= 120) {
+#ifdef ENABLE_SM120
     auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm120GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_bf16 sm120 failed: %s\n", cutlassGetStatusString(status));
     }
     return;
-  }
+#endif
 
-  if (sm_version == 100 || sm_version == 103) {
+#ifdef ENABLE_SM100
     auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm100GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
       printf("moe_fp8_grouped_gemm_bf16 sm100 failed: %s\n", cutlassGetStatusString(status));
     }
     return;
-  }
+#endif
 
-  if (sm_version == 90) {
-    auto status = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
+    auto status1 = vllm_rs_moe::launch_grouped_gemm<cutlass::bfloat16_t, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, n, k, n_blocks, k_blocks, out_ptr, stream);
-    if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_bf16 sm90 failed: %s\n", cutlassGetStatusString(status));
+    if (status1 != cutlass::Status::kSuccess) {
+      printf("moe_fp8_grouped_gemm_bf16 sm90 failed: %s\n", cutlassGetStatusString(status1));
     }
     return;
-  }
 #endif
   printf("moe_fp8_grouped_gemm_bf16 unsupported sm_version %d\n", sm_version);
 }

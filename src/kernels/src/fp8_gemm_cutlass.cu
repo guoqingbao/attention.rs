@@ -740,17 +740,17 @@ extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
     auto* a_scales = const_cast<float*>(input_scale);
     auto* b_scales = const_cast<float*>(weight_scale);
 
-    if (sm_version >= 120) {
-        sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
-        return;
-    }
+#ifdef ENABLE_SM120
+    sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+        out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+    return;
+#endif
 
-    if (sm_version == 100 || sm_version == 103) {
-        sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
-        return;
-    }
+#ifdef ENABLE_SM100
+    sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+        out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+    return;
+#endif
 
     fp8_gemm_launcher_sm90<cutlass::half_t>(
         input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);
@@ -775,17 +775,17 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
     auto* a_scales = const_cast<float*>(input_scale);
     auto* b_scales = const_cast<float*>(weight_scale);
 
-    if (sm_version >= 120) {
-        sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
-        return;
-    }
+#ifdef ENABLE_SM120
+    sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+        out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+    return;
+#endif
 
-    if (sm_version == 100 || sm_version == 103) {
-        sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
-        return;
-    }
+#ifdef ENABLE_SM100
+    sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+        out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+    return;
+#endif
 
     fp8_gemm_launcher_sm90<cutlass::bfloat16_t>(
         input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);

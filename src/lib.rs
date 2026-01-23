@@ -17,7 +17,7 @@ pub use kernels;
 pub use metal_kernels;
 pub mod cache;
 #[cfg(feature = "cuda")]
-pub(crate) mod cuda_utils;
+pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod ops;
 
