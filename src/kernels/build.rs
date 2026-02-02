@@ -58,6 +58,19 @@ fn main() -> Result<()> {
         builder = builder.arg("-DUSE_CUTLASS").with_cutlass(None);
     }
 
+    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+        println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
+        // DO not change this, this featch flashinfer v0.6.2 headers
+        // which is compatible with our code
+        builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
+            "flashinfer",
+            "https://github.com/flashinfer-ai/flashinfer.git",
+            "a49b45336e56e4615eae102cf29d5110293d9130", // v0.6.2
+            vec!["include"],
+            false,
+        );
+    }
+
     // Target handling
     let mut is_target_msvc = false;
     if let Ok(target) = std::env::var("TARGET") {

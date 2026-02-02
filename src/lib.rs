@@ -21,8 +21,23 @@ pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod ops;
 
+#[cfg(feature = "flashinfer")]
+pub mod flashinfer;
+
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(feature = "flashinfer")]
+pub struct FlashInferMetadata {
+    pub indptr: Tensor,
+    pub indptr_host: Vec<u32>,
+    pub indices: Tensor,
+    pub last_len: Tensor,
+    pub cu_seqlens_q_host: Option<Vec<u32>>,
+    pub total_num_rows: Option<u32>,
+    pub batch_indices: Option<Tensor>,
+    pub positions: Option<Tensor>,
+}
+
 pub struct InputMetadata {
     pub is_prefill: bool,
     pub slot_mapping: Tensor,
@@ -35,6 +50,8 @@ pub struct InputMetadata {
     pub max_context_len: usize,
     pub disable_flash_attn: Option<bool>,
     pub seqlens: Option<Vec<u32>>,
+    #[cfg(feature = "flashinfer")]
+    pub flashinfer_metadata: Option<FlashInferMetadata>,
 }
 
 #[allow(dead_code)]
@@ -309,6 +326,64 @@ impl PagedAttention {
                 kv_scale_update(key, value, k_scale, v_scale)?;
                 self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        #[cfg(feature = "flashinfer")]
+        if !input_metadata.disable_flash_attn.unwrap_or(false)
+            && input_metadata.flashinfer_metadata.is_some()
+        {
+            let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
+            if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
+                crate::flashinfer::append_kv_cache(
+                    key,
+                    value,
+                    kc,
+                    vc,
+                    &fm.indices,
+                    &fm.indptr,
+                    &fm.last_len,
+                    fm.batch_indices.as_ref(),
+                    fm.positions.as_ref(),
+                )?;
+            }
+
+            let block_size = if let Some(kc) = key_cache.as_ref() {
+                kc.dim(1)?
+            } else {
+                16
+            };
+
+            return if input_metadata.is_prefill {
+                crate::flashinfer::prefill(
+                    query,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    &fm.indices,
+                    &fm.indptr,
+                    &fm.indptr_host,
+                    &fm.last_len,
+                    input_metadata.cu_seqlens_q.as_ref().unwrap(),
+                    fm.cu_seqlens_q_host.as_ref().unwrap(),
+                    fm.total_num_rows.unwrap(),
+                    block_size,
+                    self.num_attention_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self.scale,
+                )
+            } else {
+                crate::flashinfer::decode(
+                    query,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    &fm.indices,
+                    &fm.indptr,
+                    &fm.indptr_host,
+                    &fm.last_len,
+                    block_size,
+                    self.scale,
+                )
+            };
         }
 
         #[cfg(feature = "flash-decoding")]

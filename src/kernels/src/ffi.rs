@@ -914,4 +914,77 @@ extern "C" {
         is_column_major_stats: bool,
         stream: i64,
     );
+
+    // FlashInfer wrappers
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_append_kv_cache(
+        k_data_ptr: *const c_void,
+        v_data_ptr: *const c_void,
+        new_k_ptr: *const c_void,
+        new_v_ptr: *const c_void,
+        paged_kv_indices: *const i32,
+        paged_kv_indptr: *const i32,
+        paged_kv_last_len: *const i32,
+        batch_indices: *const i32, // Pre-constructed in Rust
+        positions: *const i32,     // Pre-constructed in Rust
+        nnz: i32,                  // Total tokens to append
+        batch_size: i32,
+        num_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        is_fp8: bool,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_decode_wrapper(
+        out_ptr: *mut c_void,
+        q_ptr: *const c_void,
+        k_data: *const c_void,
+        v_data: *const c_void,
+        indices: *const i32,
+        indptr: *const i32,      // Device pointer for paged_kv
+        indptr_host: *const i32, // Host pointer for planning
+        last_len: *const i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        sm_scale: f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        is_fp8: bool,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_prefill_wrapper(
+        out_ptr: *mut c_void,
+        q_ptr: *const c_void,
+        q_cu_seqlens: *const i32,      // Device pointer for kernel params
+        q_cu_seqlens_host: *const i32, // Host pointer for planning
+        total_num_rows: i32,           // Total tokens (from host)
+        k_data: *const c_void,
+        v_data: *const c_void,
+        indices: *const i32,
+        indptr: *const i32,      // Device pointer for paged_kv
+        indptr_host: *const i32, // Host pointer for planning
+        last_len: *const i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        sm_scale: f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        enable_cuda_graph: bool,
+        is_fp8: bool,
+        stream: i64,
+    );
 }
