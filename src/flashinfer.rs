@@ -124,7 +124,7 @@ impl candle::CustomOp1 for FlashInferAppend {
         // Determine batch size from indptr
         let batch_size = indptr_ptr.dim(0)? - 1;
 
-        let (_, _, page_size, _) = kc_ptr.shape().dims4()?;
+        let (_, page_size, _, _) = kc_ptr.shape().dims4()?;
 
         let batch_indices_ptr = if let Some(t) = &self.batch_indices {
             let (t, t_l) = t.storage_and_layout();
