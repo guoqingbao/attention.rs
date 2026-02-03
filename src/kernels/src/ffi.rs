@@ -956,6 +956,9 @@ extern "C" {
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
+        enable_cuda_graph: bool,
         data_type: i32,
         stream: i64,
     );
@@ -983,6 +986,8 @@ extern "C" {
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
         enable_cuda_graph: bool,
         data_type: i32,
         stream: i64,

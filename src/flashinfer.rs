@@ -1,7 +1,7 @@
 use crate::kernels;
 use candle_core as candle;
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
+use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
 use std::cell::RefCell;
@@ -11,14 +11,64 @@ const WORKSPACE_FLOAT_SIZE: usize = 256 * 1024 * 1024; // 256 MB
 const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024; // 128 MB
 
 /// Static workspace buffers for FlashInfer to avoid per-call allocation
+struct PinnedHostBuffer {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+}
+
+impl PinnedHostBuffer {
+    fn new(size: usize) -> Result<Self> {
+        if size == 0 {
+            candle::bail!("Pinned host buffer size must be > 0");
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            sys::lib()
+                .cuMemAllocHost_v2(&mut ptr, size)
+                .result()
+                .map_err(|e| candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}")))?
+        }
+        if ptr.is_null() {
+            candle::bail!("cuMemAllocHost_v2 returned null pointer");
+        }
+        Ok(Self { ptr, size })
+    }
+
+    fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                sys::lib()
+                    .cuMemFreeHost(self.ptr)
+                    .result()
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}"))
+                    })
+                    .unwrap();
+            }
+        }
+    }
+}
+
 struct FlashInferWorkspace {
     float_buffer: CudaSlice<u8>,
     int_buffer: CudaSlice<u8>,
+    pinned_host: PinnedHostBuffer,
     device_ordinal: usize,
 }
 
 thread_local! {
     static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
+    static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
 }
 
 fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
@@ -82,8 +132,19 @@ fn get_cuda_ptr_storage(
 
 fn get_or_init_workspace(
     dev: &candle_core::cuda_backend::CudaDevice,
-) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-    WORKSPACE.with(|ws| {
+    for_cuda_graph: bool,
+) -> Result<(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    usize,
+)> {
+    let ws_cell = if for_cuda_graph {
+        &WORKSPACE_GRAPH
+    } else {
+        &WORKSPACE
+    };
+    ws_cell.with(|ws| {
         let mut ws = ws.borrow_mut();
         let ordinal = dev.ordinal();
 
@@ -96,9 +157,11 @@ fn get_or_init_workspace(
         if needs_init {
             let float_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_FLOAT_SIZE) }.w()?;
             let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
+            let pinned_host = PinnedHostBuffer::new(WORKSPACE_INT_SIZE)?;
             *ws = Some(FlashInferWorkspace {
                 float_buffer,
                 int_buffer,
+                pinned_host,
                 device_ordinal: ordinal,
             });
         }
@@ -107,6 +170,8 @@ fn get_or_init_workspace(
         Ok((
             *workspace.float_buffer.device_ptr() as *mut std::ffi::c_void,
             *workspace.int_buffer.device_ptr() as *mut std::ffi::c_void,
+            workspace.pinned_host.as_ptr(),
+            workspace.pinned_host.size(),
         ))
     })
 }
@@ -276,6 +341,7 @@ pub struct FlashInferDecode {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub sm_scale: f32,
+    pub enable_cuda_graph: bool,
 }
 
 impl candle::CustomOp1 for FlashInferDecode {
@@ -309,7 +375,7 @@ impl FlashInferDecode {
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
-        let (batch_size, num_qo_heads, _head_dim) = q_l.shape().dims3()?;
+        let (batch_size, _, _) = q_l.shape().dims3()?;
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -342,7 +408,8 @@ impl FlashInferDecode {
         };
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
-        let (ws_float_ptr, ws_int_ptr) = get_or_init_workspace(dev)?;
+        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+            get_or_init_workspace(dev, self.enable_cuda_graph)?;
 
         unsafe {
             kernels::ffi::flashinfer_decode_wrapper(
@@ -364,6 +431,9 @@ impl FlashInferDecode {
                 WORKSPACE_FLOAT_SIZE,
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
+                page_locked_ptr,
+                page_locked_size,
+                self.enable_cuda_graph,
                 data_type,
                 *dev.cu_stream() as i64,
             );
@@ -387,6 +457,7 @@ pub fn decode(
     num_kv_heads: usize,
     head_dim: usize,
     sm_scale: f32,
+    enable_cuda_graph: bool,
 ) -> Result<Tensor> {
     let op = FlashInferDecode {
         key_cache: key_cache.clone(),
@@ -400,6 +471,7 @@ pub fn decode(
         num_kv_heads,
         head_dim,
         sm_scale,
+        enable_cuda_graph,
     };
     q.apply_op1(op)
 }
@@ -497,7 +569,8 @@ impl FlashInferPrefill {
         let batch_size = self.q_cu_seqlens_host.len() - 1;
 
         // Use static workspace buffers
-        let (ws_float_ptr, ws_int_ptr) = get_or_init_workspace(dev)?;
+        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+            get_or_init_workspace(dev, false)?;
 
         unsafe {
             kernels::ffi::flashinfer_prefill_wrapper(
@@ -522,7 +595,9 @@ impl FlashInferPrefill {
                 WORKSPACE_FLOAT_SIZE,
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
-                false, // enable_cuda_graph (TODO)
+                page_locked_ptr,
+                page_locked_size,
+                false,
                 data_type,
                 *dev.cu_stream() as i64,
             );

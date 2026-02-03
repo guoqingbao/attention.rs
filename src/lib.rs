@@ -35,6 +35,7 @@ pub struct FlashInferMetadata {
     pub total_num_rows: Option<u32>,
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
+    pub use_cuda_graph: bool,
 }
 
 pub struct InputMetadata {
@@ -332,11 +333,10 @@ impl PagedAttention {
                 Some(candle_core::DType::F16) | Some(candle_core::DType::BF16) => true,
                 _ => false,
             };
-            let use_flashinfer =
-                use_flashinfer
-                    && self.sliding_window.is_none()
-                    && self.alibi_slopes.is_none()
-                    && softcapping.is_none();
+            let use_flashinfer = use_flashinfer
+                && self.sliding_window.is_none()
+                && self.alibi_slopes.is_none()
+                && softcapping.is_none();
             if use_flashinfer {
                 if let Some(kc) = key_cache.as_ref() {
                     if kc.dtype() != query.dtype() {
@@ -350,21 +350,21 @@ impl PagedAttention {
 
                 let (_, attention_heads, _, head_size) = query.shape().dims4()?;
                 let (_, key_value_heads, _, _) = key.shape().dims4()?;
-                let query =
-                    query
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .reshape(((), attention_heads, head_size))?;
+                let query = query.transpose(1, 2)?.contiguous()?.reshape((
+                    (),
+                    attention_heads,
+                    head_size,
+                ))?;
                 let key =
                     key.transpose(1, 2)?
                         .contiguous()?
                         .reshape(((), key_value_heads, head_size))?;
 
-                let value =
-                    value
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .reshape(((), key_value_heads, head_size))?;
+                let value = value.transpose(1, 2)?.contiguous()?.reshape((
+                    (),
+                    key_value_heads,
+                    head_size,
+                ))?;
 
                 let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
                 if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
@@ -419,6 +419,7 @@ impl PagedAttention {
                         key_value_heads,
                         head_size,
                         self.scale as f32,
+                        fm.use_cuda_graph,
                     )
                 };
             }

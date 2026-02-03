@@ -15,20 +15,6 @@
 
 using namespace flashinfer;
 
-// Static page-locked buffer for FlashInfer planning (allocated on demand)
-static void* g_page_locked_buffer = nullptr;
-static size_t g_page_locked_buffer_size = 0;
-
-static void* get_page_locked_buffer(size_t min_size) {
-    if (g_page_locked_buffer == nullptr || g_page_locked_buffer_size < min_size) {
-        if (g_page_locked_buffer != nullptr) {
-            cudaFreeHost(g_page_locked_buffer);
-        }
-        cudaMallocHost(&g_page_locked_buffer, min_size);
-        g_page_locked_buffer_size = min_size;
-    }
-    return g_page_locked_buffer;
-}
 #endif
 
 extern "C" {
@@ -106,6 +92,9 @@ void flashinfer_decode_wrapper(
     size_t workspace_float_size,
     void* workspace_int,
     size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
+    bool enable_cuda_graph,
     int32_t data_type,
     cudaStream_t stream
 ) {
@@ -135,17 +124,19 @@ void flashinfer_decode_wrapper(
                 );
 
                 DecodePlanInfo plan_info;
-                void* page_locked_buffer = get_page_locked_buffer(workspace_int_size); 
+                if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
+                    return;
+                }
+                void* page_locked_buffer = page_locked_int_buffer;
 
                 using AttentionType = DefaultAttention<false, false, false, false>;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
-                // Use host pointer directly - no D2H copy needed
                 DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
                     workspace_float, workspace_float_size,
                     workspace_int, page_locked_buffer, workspace_int_size,
                     plan_info,
-                    indptr_host, batch_size, num_qo_heads, page_size, false /* graph */, stream,
+                    indptr_host, batch_size, num_qo_heads, page_size, enable_cuda_graph, stream,
                     BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
                         GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
                         AttentionType, ParamsType>
@@ -216,6 +207,8 @@ void flashinfer_prefill_wrapper(
     size_t workspace_float_size,
     void* workspace_int,
     size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
     bool enable_cuda_graph,
     int32_t data_type,
     cudaStream_t stream
@@ -243,7 +236,10 @@ void flashinfer_prefill_wrapper(
             );
 
             PrefillPlanInfo plan_info;
-            void* page_locked_buffer = get_page_locked_buffer(workspace_int_size);
+            if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
+                return;
+            }
+            void* page_locked_buffer = page_locked_int_buffer;
 
             // Use host pointers directly - no D2H copy needed
             PrefillPlan<int32_t>(
