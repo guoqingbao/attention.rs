@@ -932,7 +932,7 @@ extern "C" {
         num_heads: i32,
         head_dim: i32,
         page_size: i32,
-        is_fp8: bool,
+        data_type: i32,
         stream: i64,
     );
 
@@ -956,7 +956,7 @@ extern "C" {
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
-        is_fp8: bool,
+        data_type: i32,
         stream: i64,
     );
 
@@ -984,7 +984,7 @@ extern "C" {
         workspace_int: *mut c_void,
         workspace_int_size: usize,
         enable_cuda_graph: bool,
-        is_fp8: bool,
+        data_type: i32,
         stream: i64,
     );
 }

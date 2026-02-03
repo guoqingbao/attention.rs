@@ -25,33 +25,55 @@ fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
     let (s, l) = t.storage_and_layout();
     match (&*s, t.dtype()) {
         (Storage::Cuda(c), DType::U8) => {
-            let ptr = *c.as_cuda_slice::<u8>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *c
+                .as_cuda_slice::<u8>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         (Storage::Cuda(c), DType::BF16) => {
-            let ptr = *c.as_cuda_slice::<half::bf16>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *c
+                .as_cuda_slice::<half::bf16>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         (Storage::Cuda(c), DType::F16) => {
-            let ptr = *c.as_cuda_slice::<half::f16>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *c
+                .as_cuda_slice::<half::f16>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         _ => candle::bail!("Tensor must be on CUDA and have U8, BF16, or F16 dtype"),
     }
 }
 
-fn get_cuda_ptr_storage(s: &CudaStorage, l: &Layout, dtype: DType) -> Result<*const core::ffi::c_void> {
+fn get_cuda_ptr_storage(
+    s: &CudaStorage,
+    l: &Layout,
+    dtype: DType,
+) -> Result<*const core::ffi::c_void> {
     match dtype {
         DType::U8 => {
-            let ptr = *s.as_cuda_slice::<u8>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *s
+                .as_cuda_slice::<u8>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         DType::BF16 => {
-            let ptr = *s.as_cuda_slice::<half::bf16>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *s
+                .as_cuda_slice::<half::bf16>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         DType::F16 => {
-            let ptr = *s.as_cuda_slice::<half::f16>()?.slice(l.start_offset()..).device_ptr();
+            let ptr = *s
+                .as_cuda_slice::<half::f16>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
         _ => candle::bail!("Tensor must be on CUDA and have U8, BF16, or F16 dtype"),
@@ -185,8 +207,12 @@ impl candle::CustomOp1 for FlashInferAppend {
             std::ptr::null()
         };
 
-        // TODO: Handle DType::F8E4M3 when available. Using U8 as proxy for now.
-        let kv_is_fp8 = self.k_cache.dtype() == DType::U8;
+        // 0: F16, 1: BF16, 2: U8 (FP8)
+        let data_type = match self.k_cache.dtype() {
+            DType::U8 => 2,
+            DType::BF16 => 1,
+            _ => 0,
+        };
 
         let kc_ptr = get_cuda_ptr(kc_ptr)?;
         let vc_ptr = get_cuda_ptr(vc_ptr)?;
@@ -227,7 +253,7 @@ impl candle::CustomOp1 for FlashInferAppend {
                 num_heads as i32,
                 head_dim as i32,
                 page_size as i32,
-                kv_is_fp8,
+                data_type,
                 *dev.cu_stream() as i64,
             );
         }
@@ -264,10 +290,26 @@ impl candle::CustomOp1 for FlashInferDecode {
     ) -> Result<(candle::CpuStorage, candle::Shape)> {
         candle::bail!("no cpu support")
     }
-
     fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            DType::U8 => self.cuda_fwd_impl::<u8>(q, q_l),
+            _ => candle::bail!("unsupported dtype"),
+        }
+    }
+}
+
+impl FlashInferDecode {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
-        let (batch_size, _num_heads, _head_dim) = q_l.shape().dims3()?;
+        let (batch_size, num_qo_heads, _head_dim) = q_l.shape().dims3()?;
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -290,14 +332,16 @@ impl candle::CustomOp1 for FlashInferDecode {
             _ => candle::bail!("last_len must be cuda"),
         };
 
-        let q_ptr = get_cuda_ptr_storage(q, q_l, self.key_cache.dtype())?;
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
-        let out = unsafe { dev.alloc::<half::f16>(q_l.shape().elem_count()) }.w()?;
-        let out_ptr = *out.device_ptr() as *mut core::ffi::c_void;
-
-        let kv_is_fp8 = self.key_cache.dtype() == DType::U8;
-
-        // Use static workspace buffers
+        // 0: F16, 1: BF16, 2: U8 (FP8)
+        let data_type = match self.key_cache.dtype() {
+            DType::U8 => 2,
+            DType::BF16 => 1,
+            _ => 0,
+        };
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
         let (ws_float_ptr, ws_int_ptr) = get_or_init_workspace(dev)?;
 
         unsafe {
@@ -320,7 +364,7 @@ impl candle::CustomOp1 for FlashInferDecode {
                 WORKSPACE_FLOAT_SIZE,
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
-                kv_is_fp8,
+                data_type,
                 *dev.cu_stream() as i64,
             );
         }
@@ -339,11 +383,11 @@ pub fn decode(
     indptr_host: &[u32], // Host slice for planning (no D2H copy)
     last_len: &Tensor,
     block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
     sm_scale: f32,
 ) -> Result<Tensor> {
-    let (_batch_size, num_qo_heads, head_dim) = q.dims3()?;
-    let (_, _, num_kv_heads, _) = key_cache.dims4()?;
-
     let op = FlashInferDecode {
         key_cache: key_cache.clone(),
         value_cache: value_cache.clone(),
@@ -391,6 +435,23 @@ impl candle::CustomOp1 for FlashInferPrefill {
     }
 
     fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            DType::U8 => self.cuda_fwd_impl::<u8>(q, q_l),
+            _ => candle::bail!("unsupported dtype"),
+        }
+    }
+}
+
+impl FlashInferPrefill {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
         let (_total_tokens, _num_heads, _head_dim) = q_l.shape().dims3()?;
 
@@ -421,12 +482,19 @@ impl candle::CustomOp1 for FlashInferPrefill {
             _ => candle::bail!("q_cu_seqlens must be cuda"),
         };
 
-        let q_ptr = get_cuda_ptr_storage(q, q_l, self.key_cache.dtype())?;
-        let out = unsafe { dev.alloc::<half::f16>(q_l.shape().elem_count()) }.w()?;
-        let out_ptr = *out.device_ptr() as *mut core::ffi::c_void;
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
-        let kv_is_fp8 = self.key_cache.dtype() == DType::U8;
-        let batch_size = indptr_l.shape().dims1()? - 1;
+        // 0: F16, 1: BF16, 2: U8 (FP8)
+        let data_type = match self.key_cache.dtype() {
+            DType::U8 => 2,
+            DType::BF16 => 1,
+            _ => 0,
+        };
+
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
+
+        let batch_size = self.q_cu_seqlens_host.len() - 1;
 
         // Use static workspace buffers
         let (ws_float_ptr, ws_int_ptr) = get_or_init_workspace(dev)?;
@@ -455,7 +523,7 @@ impl candle::CustomOp1 for FlashInferPrefill {
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
                 false, // enable_cuda_graph (TODO)
-                kv_is_fp8,
+                data_type,
                 *dev.cu_stream() as i64,
             );
         }

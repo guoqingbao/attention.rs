@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <vector>
 #include <algorithm>
 
@@ -14,13 +15,17 @@
 
 using namespace flashinfer;
 
-// Static page-locked buffer for FlashInfer planning (4MB, allocated once)
+// Static page-locked buffer for FlashInfer planning (allocated on demand)
 static void* g_page_locked_buffer = nullptr;
-constexpr size_t PAGE_LOCKED_BUFFER_SIZE = 4 * 1024 * 1024;
+static size_t g_page_locked_buffer_size = 0;
 
-static void* get_page_locked_buffer() {
-    if (g_page_locked_buffer == nullptr) {
-        cudaMallocHost(&g_page_locked_buffer, PAGE_LOCKED_BUFFER_SIZE);
+static void* get_page_locked_buffer(size_t min_size) {
+    if (g_page_locked_buffer == nullptr || g_page_locked_buffer_size < min_size) {
+        if (g_page_locked_buffer != nullptr) {
+            cudaFreeHost(g_page_locked_buffer);
+        }
+        cudaMallocHost(&g_page_locked_buffer, min_size);
+        g_page_locked_buffer_size = min_size;
     }
     return g_page_locked_buffer;
 }
@@ -43,10 +48,15 @@ void flashinfer_append_kv_cache(
     int32_t num_heads,
     int32_t head_dim,
     int32_t page_size,
-    bool is_fp8,
+    int32_t data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
+    if (data_type == 2) {
+        // FP8 KV cache is not supported by this wrapper yet.
+        return;
+    }
+
     auto run = [&](auto dtype_val) {
         using DType = decltype(dtype_val);
         paged_kv_t<DType, int32_t> paged_kv(
@@ -70,8 +80,8 @@ void flashinfer_append_kv_cache(
         }
     };
 
-    if (is_fp8) {
-        run(uint8_t(0));
+    if (data_type == 1) {
+        run(nv_bfloat16(0));
     } else {
         run(half(0));
     }
@@ -96,17 +106,22 @@ void flashinfer_decode_wrapper(
     size_t workspace_float_size,
     void* workspace_int,
     size_t workspace_int_size,
-    bool is_fp8,
+    int32_t data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
 
+    if (data_type == 2) {
+        // FP8 KV cache is not supported by this wrapper yet.
+        return;
+    }
+
     auto run_decode = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
-        using DTypeQ = half;
-        using DTypeOut = half;
+        using DTypeQ = DTypeKV;
+        using DTypeOut = DTypeKV;
         using IdType = int32_t;
         
         uint32_t group_size = num_qo_heads / num_kv_heads;
@@ -120,7 +135,7 @@ void flashinfer_decode_wrapper(
                 );
 
                 DecodePlanInfo plan_info;
-                void* page_locked_buffer = get_page_locked_buffer(); 
+                void* page_locked_buffer = get_page_locked_buffer(workspace_int_size); 
 
                 using AttentionType = DefaultAttention<false, false, false, false>;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
@@ -147,12 +162,19 @@ void flashinfer_decode_wrapper(
                 params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
                 params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
                 params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-                params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
                 params.partition_kv = plan_info.split_kv;
                 params.padded_batch_size = plan_info.padded_batch_size;
+                params.block_valid_mask = nullptr;
+                if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+                    params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+                }
                 
-                DTypeOut* tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-                float* tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+                DTypeOut* tmp_v = nullptr;
+                float* tmp_s = nullptr;
+                if (plan_info.split_kv) {
+                    tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                    tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+                }
 
                 BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
                      AttentionType, ParamsType>(
@@ -165,10 +187,8 @@ void flashinfer_decode_wrapper(
         });
     };
 
-    if (is_fp8) {
-#ifndef NO_FP8_KVCACHE
-        run_decode(__nv_fp8_e4m3{});
-#endif
+    if (data_type == 1) {
+        run_decode(nv_bfloat16{});
     } else {
         run_decode(half{});
     }
@@ -197,17 +217,22 @@ void flashinfer_prefill_wrapper(
     void* workspace_int,
     size_t workspace_int_size,
     bool enable_cuda_graph,
-    bool is_fp8,
+    int32_t data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
 
+    if (data_type == 2) {
+        // FP8 KV cache is not supported by this wrapper yet.
+        return;
+    }
+
     auto run_prefill = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
-        using DTypeQ = half;
-        using DTypeOut = half;
+        using DTypeQ = DTypeKV;
+        using DTypeOut = DTypeKV;
         using IdType = int32_t;
 
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -218,7 +243,7 @@ void flashinfer_prefill_wrapper(
             );
 
             PrefillPlanInfo plan_info;
-            void* page_locked_buffer = get_page_locked_buffer();
+            void* page_locked_buffer = get_page_locked_buffer(workspace_int_size);
 
             // Use host pointers directly - no D2H copy needed
             PrefillPlan<int32_t>(
@@ -246,15 +271,28 @@ void flashinfer_prefill_wrapper(
             params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
             params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
             params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-            params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
-            params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
             params.max_total_num_rows = plan_info.total_num_rows;
             params.padded_batch_size = plan_info.padded_batch_size;
             params.partition_kv = plan_info.split_kv;
-            params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
+            params.merge_indptr = nullptr;
+            params.block_valid_mask = nullptr;
+            if (plan_info.split_kv) {
+                params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
+                if (plan_info.enable_cuda_graph) {
+                    params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+                }
+            }
+            params.total_num_rows = nullptr;
+            if (plan_info.enable_cuda_graph) {
+                params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
+            }
 
-            DTypeOut* tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-            float* tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+            DTypeOut* tmp_v = nullptr;
+            float* tmp_s = nullptr;
+            if (plan_info.split_kv) {
+                tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+            }
             
             using AttentionType = DefaultAttention<false, false, false, false>;
 
@@ -273,10 +311,8 @@ void flashinfer_prefill_wrapper(
         });
     };
 
-    if (is_fp8) {
-#ifndef NO_FP8_KVCACHE
-        run_prefill(__nv_fp8_e4m3{});
-#endif
+    if (data_type == 1) {
+        run_prefill(nv_bfloat16{});
     } else {
         run_prefill(half{});
     }
