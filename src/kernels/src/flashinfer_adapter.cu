@@ -126,13 +126,13 @@ void flashinfer_decode_wrapper(
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 // Use host pointer directly - no D2H copy needed
-                DecodePlan<HEAD_DIM, PosEncodingMode::kRoPELlama, AttentionType, ParamsType>(
+                DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
                     workspace_float, workspace_float_size,
                     workspace_int, page_locked_buffer, workspace_int_size,
                     plan_info,
                     indptr_host, batch_size, num_qo_heads, page_size, false /* graph */, stream,
                     BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-                        GROUP_SIZE, HEAD_DIM, PosEncodingMode::kRoPELlama,
+                        GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
                         AttentionType, ParamsType>
                 );
 
@@ -154,7 +154,7 @@ void flashinfer_decode_wrapper(
                 DTypeOut* tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
                 float* tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
 
-                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kRoPELlama,
+                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
                      AttentionType, ParamsType>(
                      params, tmp_v, tmp_s, false /* pdl */, stream
                 );
@@ -261,7 +261,7 @@ void flashinfer_prefill_wrapper(
             DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                 BatchPrefillWithPagedKVCacheDispatched<
                     CTA_TILE_Q, HEAD_DIM, HEAD_DIM, 
-                    PosEncodingMode::kRoPELlama, false, MaskMode::kCausal,
+                    PosEncodingMode::kNone, false, MaskMode::kCausal,
                     AttentionType,
                     ParamsType>(
                     params, tmp_v, tmp_s, false /* pdl */, stream

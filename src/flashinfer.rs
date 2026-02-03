@@ -21,6 +21,43 @@ thread_local! {
     static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
 }
 
+fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
+    let (s, l) = t.storage_and_layout();
+    match (&*s, t.dtype()) {
+        (Storage::Cuda(c), DType::U8) => {
+            let ptr = *c.as_cuda_slice::<u8>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        (Storage::Cuda(c), DType::BF16) => {
+            let ptr = *c.as_cuda_slice::<half::bf16>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        (Storage::Cuda(c), DType::F16) => {
+            let ptr = *c.as_cuda_slice::<half::f16>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        _ => candle::bail!("Tensor must be on CUDA and have U8, BF16, or F16 dtype"),
+    }
+}
+
+fn get_cuda_ptr_storage(s: &CudaStorage, l: &Layout, dtype: DType) -> Result<*const core::ffi::c_void> {
+    match dtype {
+        DType::U8 => {
+            let ptr = *s.as_cuda_slice::<u8>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        DType::BF16 => {
+            let ptr = *s.as_cuda_slice::<half::bf16>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        DType::F16 => {
+            let ptr = *s.as_cuda_slice::<half::f16>()?.slice(l.start_offset()..).device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        _ => candle::bail!("Tensor must be on CUDA and have U8, BF16, or F16 dtype"),
+    }
+}
+
 fn get_or_init_workspace(
     dev: &candle_core::cuda_backend::CudaDevice,
 ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
@@ -151,29 +188,10 @@ impl candle::CustomOp1 for FlashInferAppend {
         // TODO: Handle DType::F8E4M3 when available. Using U8 as proxy for now.
         let kv_is_fp8 = self.k_cache.dtype() == DType::U8;
 
-        let (kc, kc_l) = kc_ptr.storage_and_layout();
-        let kc = match &*kc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(kc_l.start_offset()..),
-            _ => candle::bail!("k_cache must be cuda"),
-        };
-
-        let (vc, vc_l) = vc_ptr.storage_and_layout();
-        let vc = match &*vc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(vc_l.start_offset()..),
-            _ => candle::bail!("v_cache must be cuda"),
-        };
-
-        let (k_data_s, k_l) = k_ptr.storage_and_layout();
-        let k_data = match &*k_data_s {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(k_l.start_offset()..),
-            _ => candle::bail!("k must be cuda"),
-        };
-
-        let (v_data_s, v_l) = v_ptr.storage_and_layout();
-        let v_data = match &*v_data_s {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(v_l.start_offset()..),
-            _ => candle::bail!("v must be cuda"),
-        };
+        let kc_ptr = get_cuda_ptr(kc_ptr)?;
+        let vc_ptr = get_cuda_ptr(vc_ptr)?;
+        let k_data_ptr = get_cuda_ptr(k_ptr)?;
+        let v_data_ptr = get_cuda_ptr(v_ptr)?;
 
         let (indices_s, indices_l) = indices_ptr.storage_and_layout();
         let indices = match &*indices_s {
@@ -195,10 +213,10 @@ impl candle::CustomOp1 for FlashInferAppend {
 
         unsafe {
             kernels::ffi::flashinfer_append_kv_cache(
-                *kc.device_ptr() as *const _,
-                *vc.device_ptr() as *const _,
-                *k_data.device_ptr() as *const _,
-                *v_data.device_ptr() as *const _,
+                kc_ptr,
+                vc_ptr,
+                k_data_ptr,
+                v_data_ptr,
                 *indices.device_ptr() as *const i32,
                 *indptr.device_ptr() as *const i32,
                 *last_len.device_ptr() as *const i32,
@@ -251,16 +269,8 @@ impl candle::CustomOp1 for FlashInferDecode {
         let dev = q.device();
         let (batch_size, _num_heads, _head_dim) = q_l.shape().dims3()?;
 
-        let (kc, kc_l) = self.key_cache.storage_and_layout();
-        let kc_ptr = match &*kc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(kc_l.start_offset()..),
-            _ => candle::bail!("key_cache must be cuda"),
-        };
-        let (vc, vc_l) = self.value_cache.storage_and_layout();
-        let vc_ptr = match &*vc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(vc_l.start_offset()..),
-            _ => candle::bail!("value_cache must be cuda"),
-        };
+        let kc_ptr = get_cuda_ptr(&self.key_cache)?;
+        let vc_ptr = get_cuda_ptr(&self.value_cache)?;
 
         let (indices, indices_l) = self.indices.storage_and_layout();
         let indices_ptr = match &*indices {
@@ -280,7 +290,7 @@ impl candle::CustomOp1 for FlashInferDecode {
             _ => candle::bail!("last_len must be cuda"),
         };
 
-        let q_ptr = q.as_cuda_slice::<u8>()?.slice(q_l.start_offset()..);
+        let q_ptr = get_cuda_ptr_storage(q, q_l, self.key_cache.dtype())?;
 
         let out = unsafe { dev.alloc::<half::f16>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut core::ffi::c_void;
@@ -293,9 +303,9 @@ impl candle::CustomOp1 for FlashInferDecode {
         unsafe {
             kernels::ffi::flashinfer_decode_wrapper(
                 out_ptr,
-                *q_ptr.device_ptr() as *const _,
-                *kc_ptr.device_ptr() as *const _,
-                *vc_ptr.device_ptr() as *const _,
+                q_ptr,
+                kc_ptr,
+                vc_ptr,
                 *indices_ptr.device_ptr() as *const i32,
                 *indptr_ptr.device_ptr() as *const i32,
                 self.indptr_host.as_ptr().cast(), // Host pointer for planning
@@ -384,16 +394,8 @@ impl candle::CustomOp1 for FlashInferPrefill {
         let dev = q.device();
         let (_total_tokens, _num_heads, _head_dim) = q_l.shape().dims3()?;
 
-        let (kc, kc_l) = self.key_cache.storage_and_layout();
-        let kc_ptr = match &*kc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(kc_l.start_offset()..),
-            _ => candle::bail!("key_cache must be cuda"),
-        };
-        let (vc, vc_l) = self.value_cache.storage_and_layout();
-        let vc_ptr = match &*vc {
-            Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.slice(vc_l.start_offset()..),
-            _ => candle::bail!("value_cache must be cuda"),
-        };
+        let kc_ptr = get_cuda_ptr(&self.key_cache)?;
+        let vc_ptr = get_cuda_ptr(&self.value_cache)?;
 
         let (indices, indices_l) = self.indices.storage_and_layout();
         let indices_ptr = match &*indices {
@@ -419,7 +421,7 @@ impl candle::CustomOp1 for FlashInferPrefill {
             _ => candle::bail!("q_cu_seqlens must be cuda"),
         };
 
-        let q_ptr = q.as_cuda_slice::<u8>()?.slice(q_l.start_offset()..);
+        let q_ptr = get_cuda_ptr_storage(q, q_l, self.key_cache.dtype())?;
         let out = unsafe { dev.alloc::<half::f16>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut core::ffi::c_void;
 
@@ -432,12 +434,12 @@ impl candle::CustomOp1 for FlashInferPrefill {
         unsafe {
             kernels::ffi::flashinfer_prefill_wrapper(
                 out_ptr,
-                *q_ptr.device_ptr() as *const _,
+                q_ptr,
                 *q_lens_ptr.device_ptr() as *const i32,
                 self.q_cu_seqlens_host.as_ptr().cast(), // Host pointer for planning
                 self.total_num_rows as i32,
-                *kc_ptr.device_ptr() as *const _,
-                *vc_ptr.device_ptr() as *const _,
+                kc_ptr,
+                vc_ptr,
                 *indices_ptr.device_ptr() as *const i32,
                 *indptr_ptr.device_ptr() as *const i32,
                 self.indptr_host.as_ptr().cast(), // Host pointer for planning

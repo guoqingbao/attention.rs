@@ -329,14 +329,30 @@ impl PagedAttention {
         }
 
         #[cfg(feature = "flashinfer")]
-        if !input_metadata.disable_flash_attn.unwrap_or(false)
-            && input_metadata.flashinfer_metadata.is_some()
+        if input_metadata.flashinfer_metadata.is_some()
         {
+            let (_, attention_heads, _, head_size) = query.shape().dims4()?;
+            let (_, key_value_heads, _, _) = key.shape().dims4()?;
+            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+            let query = query
+                .transpose(1, 2)?
+                .reshape(((), attention_heads, head_size))?;
+                // .contiguous()?;
+            let key = key
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
+                // .contiguous()?;
+
+            let value = value
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?;
+                // .contiguous()?;
+
             let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
             if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
                 crate::flashinfer::append_kv_cache(
-                    key,
-                    value,
+                    &key,
+                    &value,
                     kc,
                     vc,
                     &fm.indices,
@@ -355,7 +371,7 @@ impl PagedAttention {
 
             return if input_metadata.is_prefill {
                 crate::flashinfer::prefill(
-                    query,
+                    &query,
                     key_cache.as_ref().unwrap(),
                     value_cache.as_ref().unwrap(),
                     &fm.indices,
@@ -366,14 +382,14 @@ impl PagedAttention {
                     fm.cu_seqlens_q_host.as_ref().unwrap(),
                     fm.total_num_rows.unwrap(),
                     block_size,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self.head_dim,
-                    self.scale,
+                    attention_heads,
+                    key_value_heads,
+                    head_size,
+                    self.scale as f32,
                 )
             } else {
                 crate::flashinfer::decode(
-                    query,
+                    &query,
                     key_cache.as_ref().unwrap(),
                     value_cache.as_ref().unwrap(),
                     &fm.indices,
@@ -381,7 +397,7 @@ impl PagedAttention {
                     &fm.indptr_host,
                     &fm.last_len,
                     block_size,
-                    self.scale,
+                    self.scale as f32,
                 )
             };
         }
