@@ -1034,13 +1034,12 @@ pub fn call_update_scales_per_head(
     );
 
     let threads_per_threadgroup = MTLSize {
-        width: 512,
+        width: 256,
         height: 1,
         depth: 1,
     };
-    let blocks = (num_tokens as u64 * head_dim as u64 + 511) / 512;
     let thread_groups_count = MTLSize {
-        width: blocks.max(1),
+        width: 1,
         height: num_heads as u64,
         depth: 1,
     };

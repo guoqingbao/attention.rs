@@ -71,6 +71,16 @@ pub struct PagedAttention {
 }
 
 impl PagedAttention {
+    fn maybe_update_kv_scales(&self, key: &Tensor, value: &Tensor) -> Result<()> {
+        if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
+            if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
+                kv_scale_update(key, value, k_scale, v_scale)?;
+                self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         num_attention_heads: usize,
         head_dim: usize,
@@ -273,6 +283,8 @@ impl PagedAttention {
             .transpose(1, 2)?
             .reshape(((), key_value_heads, head_size))?;
 
+        self.maybe_update_kv_scales(&key, &value)?;
+
         reshape_and_cache(
             &key,
             &value,
@@ -331,13 +343,6 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
-            if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
-                kv_scale_update(key, value, k_scale, v_scale)?;
-                self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
         #[cfg(feature = "flashinfer")]
         if input_metadata.flashinfer_metadata.is_some() {
             let use_flashinfer = self.sliding_window.is_none()
@@ -366,6 +371,8 @@ impl PagedAttention {
                 let value = value
                     .transpose(1, 2)?
                     .reshape(((), key_value_heads, head_size))?;
+
+                self.maybe_update_kv_scales(&key, &value)?;
 
                 let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
                 if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
@@ -496,6 +503,8 @@ impl PagedAttention {
         let value = value
             .transpose(1, 2)?
             .reshape(((), key_value_heads, head_size))?;
+
+        self.maybe_update_kv_scales(&key, &value)?;
 
         if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
             reshape_and_cache(

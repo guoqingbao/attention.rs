@@ -142,7 +142,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
         let _ = k_l.shape().elem_count();
 
         let dev = k.device();
-        let (k_scales, k_scales_layout) = self.k_scales.storage_and_layout();
+        let (k_scales, _) = self.k_scales.storage_and_layout();
         let k_scales = match &*k_scales {
             candle::Storage::Metal(c) => c,
             _ => candle::bail!("k_scales must be a metal tensor"),
