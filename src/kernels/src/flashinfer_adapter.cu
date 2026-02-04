@@ -4,18 +4,222 @@
 #include <algorithm>
 
 #ifdef USE_FLASHINFER
-#include <flashinfer/attention/decode.cuh>
-#include <flashinfer/attention/prefill.cuh>
-#include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/variants.cuh>
-#include <flashinfer/attention/default_decode_params.cuh>
-#include <flashinfer/attention/default_prefill_params.cuh>
-#include <flashinfer/page.cuh>
-#include <flashinfer/pos_enc.cuh>
+    #include <flashinfer/attention/decode.cuh>
+    #include <flashinfer/attention/scheduler.cuh>
+    #if defined(NO_HARDWARE_FP8)
+        #include <flashinfer/attention/prefill.cuh>
+        #include <flashinfer/attention/variants.cuh>
+        #include <flashinfer/attention/default_prefill_params.cuh>
+    #else
+        #include <flashinfer/attention/hopper/prefill_sm90.cuh>
+        #include <flashinfer/attention/hopper/variants.cuh>
+        #include <flashinfer/attention/hopper/default_params.cuh>
+        #if !defined(NO_FP8_KVCACHE)
+            #include <flashinfer/attention/hopper/quantization/prefill_sm90.cuh>
+        #endif
+    #endif
+
+    #include <flashinfer/attention/default_decode_params.cuh>
+    #include <flashinfer/page.cuh>
+    #include <flashinfer/pos_enc.cuh>
 
 using namespace flashinfer;
 
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_ = int32_t>
+struct FP8BatchPrefillPagedParams {
+    using DTypeQ = DTypeQ_;
+    using DTypeKV = DTypeKV_;
+    using DTypeO = DTypeO_;
+    using IdType = IdType_;
+
+    DTypeQ* q_ptr;
+    DTypeKV* k_ptr;
+    DTypeKV* v_ptr;
+    DTypeO* o_ptr;
+    float* lse_ptr;
+
+    IdType* qo_tile_indices;
+    IdType* qo_indptr;
+    IdType* kv_indptr;
+    IdType* kv_indices;
+    IdType* qo_lens;
+    IdType* kv_lens;
+    IdType* head_indices;
+    IdType* work_indptr;
+    IdType* batch_indices;
+
+    struct AdditionalParams {
+        float logits_soft_cap;
+        float sm_scale;
+        float* maybe_scale_q;
+        float* maybe_scale_k;
+        float* maybe_scale_v;
+        float scale_q_scalar;
+        float scale_k_scalar;
+        float scale_v_scalar;
+    } additional_params;
+
+    int64_t q_stride_n;
+    int64_t k_stride_n;
+    int64_t v_stride_n;
+    int64_t o_stride_n;
+    int64_t q_stride_h;
+    int64_t k_stride_h;
+    int64_t v_stride_h;
+    int64_t o_stride_h;
+    int64_t nnz_qo;
+    int64_t k_page_stride;
+    int64_t v_page_stride;
+
+    int num_qo_heads;
+    int num_kv_heads;
+    int group_size;
+    int page_size;
+    int window_left;
+
+    bool causal;
+};
+
+#if !defined(NO_FP8_KVCACHE) && !defined(NO_HARDWARE_FP8)
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+static inline void FillFP8PagedParams(
+    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>& params,
+    void* q_ptr,
+    void* k_data,
+    void* v_data,
+    void* out_ptr,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    int64_t nnz_qo,
+    float sm_scale,
+    const float* q_scale_ptr,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    IdType* indices,
+    void* workspace_int,
+    const PrefillPlanSM90Info& plan_info
+) {
+    params.q_ptr = static_cast<DTypeQ*>(q_ptr);
+    params.k_ptr = static_cast<DTypeKV*>(k_data);
+    params.v_ptr = static_cast<DTypeKV*>(v_data);
+    params.o_ptr = static_cast<DTypeO*>(out_ptr);
+    params.lse_ptr = nullptr;
+    params.q_stride_n = static_cast<int64_t>(num_qo_heads) * head_dim;
+    params.q_stride_h = head_dim;
+    params.o_stride_n = params.q_stride_n;
+    params.o_stride_h = params.q_stride_h;
+    params.k_stride_n = static_cast<int64_t>(num_kv_heads) * head_dim;
+    params.k_stride_h = head_dim;
+    params.v_stride_n = params.k_stride_n;
+    params.v_stride_h = params.k_stride_h;
+    params.k_page_stride = static_cast<int64_t>(page_size) * num_kv_heads * head_dim;
+    params.v_page_stride = params.k_page_stride;
+    params.nnz_qo = nnz_qo;
+    params.num_qo_heads = num_qo_heads;
+    params.num_kv_heads = num_kv_heads;
+    params.group_size = num_qo_heads / num_kv_heads;
+    params.page_size = page_size;
+    params.window_left = -1;
+    params.causal = true;
+    params.additional_params.logits_soft_cap = 0.0f;
+    params.additional_params.sm_scale = sm_scale;
+    params.additional_params.maybe_scale_q = const_cast<float*>(q_scale_ptr);
+    params.additional_params.maybe_scale_k = const_cast<float*>(k_scale_ptr);
+    params.additional_params.maybe_scale_v = const_cast<float*>(v_scale_ptr);
+    params.additional_params.scale_q_scalar = 1.0f;
+    params.additional_params.scale_k_scalar = 1.0f;
+    params.additional_params.scale_v_scalar = 1.0f;
+
+    params.qo_tile_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
+    params.qo_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_indptr_offset);
+    params.kv_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_indptr_offset);
+    params.qo_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_len_offset);
+    params.kv_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_len_offset);
+    params.head_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.head_indices_offset);
+    params.work_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.work_indptr_offset);
+    params.batch_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.batch_indices_offset);
+    params.kv_indices = indices;
+}
 #endif
+
+#if !defined(NO_HARDWARE_FP8)
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+static inline void FillSM90PagedParams(
+    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>& params,
+    void* q_ptr,
+    void* k_data,
+    void* v_data,
+    void* out_ptr,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    int64_t nnz_qo,
+    float sm_scale,
+    IdType* indices,
+    void* workspace_int,
+    const PrefillPlanSM90Info& plan_info
+) {
+    params.q_ptr = static_cast<DTypeQ*>(q_ptr);
+    params.k_ptr = static_cast<DTypeKV*>(k_data);
+    params.v_ptr = static_cast<DTypeKV*>(v_data);
+    params.o_ptr = static_cast<DTypeO*>(out_ptr);
+    params.lse_ptr = nullptr;
+    params.q_stride_n = static_cast<int64_t>(num_qo_heads) * head_dim;
+    params.q_stride_h = head_dim;
+    params.o_stride_n = params.q_stride_n;
+    params.o_stride_h = params.q_stride_h;
+    params.k_stride_n = static_cast<int64_t>(num_kv_heads) * head_dim;
+    params.k_stride_h = head_dim;
+    params.v_stride_n = params.k_stride_n;
+    params.v_stride_h = params.k_stride_h;
+    params.k_page_stride = static_cast<int64_t>(page_size) * num_kv_heads * head_dim;
+    params.v_page_stride = params.k_page_stride;
+    params.nnz_qo = nnz_qo;
+    params.num_qo_heads = num_qo_heads;
+    params.num_kv_heads = num_kv_heads;
+    params.group_size = num_qo_heads / num_kv_heads;
+    params.page_size = page_size;
+    params.window_left = -1;
+    params.causal = true;
+    params.additional_params.logits_soft_cap = 0.0f;
+    params.additional_params.sm_scale = sm_scale;
+    params.additional_params.maybe_prefix_len_ptr = nullptr;
+    params.additional_params.maybe_token_pos_in_items_ptr = nullptr;
+    params.additional_params.token_pos_in_items_len = 0;
+    params.additional_params.maybe_max_item_len_ptr = nullptr;
+
+    params.qo_tile_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
+    params.qo_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_indptr_offset);
+    params.kv_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_indptr_offset);
+    params.qo_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_len_offset);
+    params.kv_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_len_offset);
+    params.head_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.head_indices_offset);
+    params.work_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.work_indptr_offset);
+    params.batch_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.batch_indices_offset);
+    params.kv_indices = indices;
+}
+#endif
+
+#endif // Flashinfer
 
 extern "C" {
 
@@ -38,11 +242,6 @@ void flashinfer_append_kv_cache(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
-    if (data_type == 2) {
-        // FP8 KV cache is not supported by this wrapper yet.
-        return;
-    }
-
     auto run = [&](auto dtype_val) {
         using DType = decltype(dtype_val);
         paged_kv_t<DType, int32_t> paged_kv(
@@ -68,6 +267,8 @@ void flashinfer_append_kv_cache(
 
     if (data_type == 1) {
         run(nv_bfloat16(0));
+    } else if (data_type == 2) {
+        run(uint8_t(0));
     } else {
         run(half(0));
     }
@@ -76,6 +277,8 @@ void flashinfer_append_kv_cache(
 
 void flashinfer_decode_plan_wrapper(
     int32_t* indptr_host,      // Host pointer for planning
+    int32_t* qo_indptr_host,   // Host pointer for fp8 decode planning (optional)
+    int32_t* kv_len_arr_host,  // Host pointer for fp8 decode planning (optional)
     int32_t batch_size,
     int32_t num_qo_heads,
     int32_t num_kv_heads,
@@ -89,17 +292,43 @@ void flashinfer_decode_plan_wrapper(
     size_t page_locked_int_size,
     bool enable_cuda_graph,
     int32_t data_type,
+    int32_t out_data_type,
     int64_t* plan_info_out,     // length 10
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
-    if (data_type == 2) {
-        // FP8 KV cache is not supported by this wrapper yet.
-        return;
-    }
     if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
         return;
     }
+#if !defined(NO_HARDWARE_FP8)
+    if (qo_indptr_host == nullptr || kv_len_arr_host == nullptr) {
+        return;
+    }
+    PrefillPlanSM90Info plan_info;
+    PrefillSM90Plan<int32_t>(
+        workspace_float, workspace_float_size,
+        workspace_int, page_locked_int_buffer, workspace_int_size,
+        plan_info,
+        qo_indptr_host, indptr_host, kv_len_arr_host,
+        batch_size /* total_num_rows for decode */, batch_size,
+        num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+        true /* causal */, enable_cuda_graph,
+        (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+        stream
+    );
+    if (plan_info_out != nullptr) {
+        plan_info_out[0] = plan_info.qo_tile_indices_offset;
+        plan_info_out[1] = plan_info.qo_indptr_offset;
+        plan_info_out[2] = plan_info.kv_indptr_offset;
+        plan_info_out[3] = plan_info.qo_len_offset;
+        plan_info_out[4] = plan_info.kv_len_offset;
+        plan_info_out[5] = plan_info.head_indices_offset;
+        plan_info_out[6] = plan_info.work_indptr_offset;
+        plan_info_out[7] = plan_info.batch_indices_offset;
+        plan_info_out[8] = plan_info.same_schedule_for_all_heads;
+    }
+    return;
+#else
 
     auto run_plan = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
@@ -147,6 +376,7 @@ void flashinfer_decode_plan_wrapper(
         run_plan(half{});
     }
 #endif
+#endif
 }
 
 void flashinfer_decode_run_wrapper(
@@ -162,23 +392,98 @@ void flashinfer_decode_run_wrapper(
     int32_t head_dim,
     int32_t page_size,
     float sm_scale,
+    const float* q_scale_ptr,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
     void* workspace_float,
     size_t workspace_float_size,
     void* workspace_int,
     size_t workspace_int_size,
     const int64_t* plan_info_vec, // length 10
     int32_t data_type,
+    int32_t out_data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
+#if !defined(NO_HARDWARE_FP8)
+    if (plan_info_vec) {
+        using IdType = int32_t;
+        std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 9);
+        PrefillPlanSM90Info plan_info;
+        plan_info.FromVector(vec);
 
-    if (data_type == 2) {
-        // FP8 KV cache is not supported by this wrapper yet.
-        return;
+        auto run_sm90 = [&]() {
+            if (data_type == 2) {
+#if !defined(NO_FP8_KVCACHE)
+                using DTypeQ = __nv_fp8_e4m3;
+                using DTypeKV = __nv_fp8_e4m3;
+                auto run_fp8 = [&](auto out_val) {
+                    using DTypeOut = decltype(out_val);
+                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        batch_size, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        indices, workspace_int, plan_info);
+
+                    using AttentionType = DefaultFP8Attention;
+                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE, AttentionType>(
+                                params, false, stream);
+                        });
+                    });
+                };
+
+                if (out_data_type == 1) {
+                    run_fp8(nv_bfloat16{});
+                } else {
+                    run_fp8(half{});
+                }
+#else
+                fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
+                throw std::runtime_error("Error: FP8 KV-cache disabled.");
+#endif
+            } else {
+                auto run_non_fp8 = [&](auto dtype_val) {
+                    using DTypeKV = decltype(dtype_val);
+                    using DTypeQ = DTypeKV;
+                    using DTypeOut = DTypeKV;
+
+                    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        batch_size, sm_scale, indices, workspace_int, plan_info);
+
+                    using AttentionType = DefaultAttention<false, false, false, false>;
+                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE,
+                                AttentionType>(
+                                params, false, stream);
+                        });
+                    });
+                };
+
+                if (data_type == 1) {
+                    run_non_fp8(nv_bfloat16{});
+                } else {
+                    run_non_fp8(half{});
+                }
+            }
+        };
+
+        run_sm90();
     }
+    return;
+#else
     if (plan_info_vec == nullptr) {
+        fprintf(stderr, "[flashinfer][sm80][decode_run] plan_info_vec is null\n");
         return;
     }
 
@@ -244,6 +549,7 @@ void flashinfer_decode_run_wrapper(
         run_decode(half{});
     }
 #endif
+#endif
 }
 
 void flashinfer_prefill_wrapper(
@@ -251,6 +557,7 @@ void flashinfer_prefill_wrapper(
     void* q_ptr,
     int32_t* q_cu_seqlens,      // Device pointer for kernel params
     int32_t* q_cu_seqlens_host, // Host pointer for planning (avoids D2H copy)
+    int32_t* kv_len_arr_host,   // Host pointer for kv lengths (fp8 sm90 plan)
     int32_t total_num_rows,     // Total tokens (from host to avoid D2H + read)
     void* k_data, void* v_data,
     int32_t* indices,
@@ -263,6 +570,9 @@ void flashinfer_prefill_wrapper(
     int32_t head_dim,
     int32_t page_size,
     float sm_scale,
+    const float* q_scale_ptr,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
     void* workspace_float,
     size_t workspace_float_size,
     void* workspace_int,
@@ -271,14 +581,113 @@ void flashinfer_prefill_wrapper(
     size_t page_locked_int_size,
     bool enable_cuda_graph,
     int32_t data_type,
+    int32_t out_data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
 
-    if (data_type == 2) {
-        // FP8 KV cache is not supported by this wrapper yet.
+#if !defined(NO_HARDWARE_FP8)
+    if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
+        return;
+    }
+    if (q_cu_seqlens_host == nullptr || indptr_host == nullptr || kv_len_arr_host == nullptr) {
+        return;
+    }
+    {
+        using IdType = int32_t;
+
+        PrefillPlanSM90Info plan_info;
+        PrefillSM90Plan<int32_t>(
+            workspace_float, workspace_float_size,
+            workspace_int, page_locked_int_buffer, workspace_int_size,
+            plan_info,
+            q_cu_seqlens_host, indptr_host, kv_len_arr_host,
+            total_num_rows, batch_size,
+            num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+            true /* causal */, enable_cuda_graph,
+            (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+            stream
+        );
+
+        auto run_sm90 = [&]() {
+            if (data_type == 2) {
+#if !defined(NO_FP8_KVCACHE)
+                using DTypeQ = __nv_fp8_e4m3;
+                using DTypeKV = __nv_fp8_e4m3;
+                auto run_fp8 = [&](auto out_val) {
+                    using DTypeOut = decltype(out_val);
+                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        total_num_rows, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        indices, workspace_int, plan_info);
+
+                    using AttentionType = DefaultFP8Attention;
+                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE, AttentionType>(
+                                params, false, stream);
+                        });
+                    });
+                };
+
+                if (out_data_type == 1) {
+                    run_fp8(nv_bfloat16{});
+                } else {
+                    run_fp8(half{});
+                }
+#else
+                fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
+                throw std::runtime_error("Error: FP8 KV-cache disabled.");
+#endif
+            } else {
+                auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
+                    using DTypeKV = decltype(dtype_val);
+                    using DTypeQ = DTypeKV;
+                    using DTypeOut = decltype(out_val);
+
+                    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        total_num_rows, sm_scale, indices, workspace_int, plan_info);
+
+                    using AttentionType = DefaultAttention<false, false, false, false>;
+                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE,
+                                AttentionType>(
+                                params, false, stream);
+                        });
+                    });
+                };
+
+                if (data_type == 1) {
+                    if (out_data_type == 1) {
+                        run_non_fp8(nv_bfloat16{}, nv_bfloat16{});
+                    } else {
+                        run_non_fp8(nv_bfloat16{}, half{});
+                    }
+                } else {
+                    if (out_data_type == 1) {
+                        run_non_fp8(half{}, nv_bfloat16{});
+                    } else {
+                        run_non_fp8(half{}, half{});
+                    }
+                }
+            }
+        };
+
+        run_sm90();
+    }
+    return;
+#else
+    if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
         return;
     }
 
@@ -372,6 +781,7 @@ void flashinfer_prefill_wrapper(
     } else {
         run_prefill(half{});
     }
+#endif
 #endif
 }
 

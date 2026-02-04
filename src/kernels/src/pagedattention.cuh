@@ -262,7 +262,7 @@ __device__ void paged_attention_kernel(
           using Cache_K_vec = typename vllm::Vec<cache_t, VEC_SIZE>::Type;
           Cache_K_vec fp8_k_vec = *reinterpret_cast<const Cache_K_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_vecs[j] = vllm::fp8::scaled_convert<K_vec, Cache_K_vec>(fp8_k_vec, *k_scales);
+          k_vecs[j] = vllm::fp8::scaled_convert<K_vec, Cache_K_vec>(fp8_k_vec, k_scales[kv_head_idx]);
         }
       }
 
@@ -387,7 +387,7 @@ __device__ void paged_attention_kernel(
         } else {
           using Cache_V_vec = typename vllm::Vec<cache_t, V_VEC_SIZE>::Type;
           Cache_V_vec fp8_v_vec = *reinterpret_cast<const Cache_V_vec *>(v_ptr + offset);
-          v_vec = vllm::fp8::scaled_convert<V_vec, Cache_V_vec>(fp8_v_vec, *v_scales);
+          v_vec = vllm::fp8::scaled_convert<V_vec, Cache_V_vec>(fp8_v_vec, v_scales[kv_head_idx]);
         }
         if (block_idx == num_seq_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the

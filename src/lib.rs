@@ -31,6 +31,8 @@ pub struct FlashInferMetadata {
     pub indptr_host: Vec<u32>,
     pub indices: Tensor,
     pub last_len: Tensor,
+    pub last_len_host: Option<Vec<u32>>,
+    pub kv_len_arr_host: Option<Vec<u32>>,
     pub cu_seqlens_q_host: Option<Vec<u32>>,
     pub total_num_rows: Option<u32>,
     pub batch_indices: Option<Tensor>,
@@ -95,12 +97,20 @@ impl PagedAttention {
             num_queries_per_kv,
             alibi_slopes,
             k_scale: if fp8_kvcache {
-                Some(Tensor::new(1f32, &device)?)
+                Some(Tensor::zeros(
+                    (num_key_value_heads,),
+                    candle_core::DType::F32,
+                    &device,
+                )?)
             } else {
                 None
             },
             v_scale: if fp8_kvcache {
-                Some(Tensor::new(1f32, &device)?)
+                Some(Tensor::zeros(
+                    (num_key_value_heads,),
+                    candle_core::DType::F32,
+                    &device,
+                )?)
             } else {
                 None
             },
@@ -330,17 +340,12 @@ impl PagedAttention {
 
         #[cfg(feature = "flashinfer")]
         if input_metadata.flashinfer_metadata.is_some() {
-            let use_flashinfer = match key_cache.as_ref().map(|kc| kc.dtype()) {
-                Some(candle_core::DType::F16) | Some(candle_core::DType::BF16) => true,
-                _ => false,
-            };
-            let use_flashinfer = use_flashinfer
-                && self.sliding_window.is_none()
+            let use_flashinfer = self.sliding_window.is_none()
                 && self.alibi_slopes.is_none()
                 && softcapping.is_none();
             if use_flashinfer {
                 if let Some(kc) = key_cache.as_ref() {
-                    if kc.dtype() != query.dtype() {
+                    if kc.dtype() != query.dtype() && kc.dtype() != candle_core::DType::U8 {
                         candle_core::bail!(
                             "flashinfer requires query dtype {:?} to match kv cache dtype {:?}",
                             query.dtype(),
@@ -351,21 +356,16 @@ impl PagedAttention {
 
                 let (_, attention_heads, _, head_size) = query.shape().dims4()?;
                 let (_, key_value_heads, _, _) = key.shape().dims4()?;
-                let query = query.transpose(1, 2)?.contiguous()?.reshape((
-                    (),
-                    attention_heads,
-                    head_size,
-                ))?;
-                let key =
-                    key.transpose(1, 2)?
-                        .contiguous()?
-                        .reshape(((), key_value_heads, head_size))?;
+                let query = query
+                    .transpose(1, 2)?
+                    .reshape(((), attention_heads, head_size))?;
+                let key = key
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
 
-                let value = value.transpose(1, 2)?.contiguous()?.reshape((
-                    (),
-                    key_value_heads,
-                    head_size,
-                ))?;
+                let value = value
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
 
                 let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
                 if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
@@ -374,6 +374,8 @@ impl PagedAttention {
                         &value,
                         kc,
                         vc,
+                        self.k_scale.as_ref(),
+                        self.v_scale.as_ref(),
                         &fm.indices,
                         &fm.indptr,
                         &fm.last_len,
@@ -393,10 +395,14 @@ impl PagedAttention {
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),
+                        self.k_scale.as_ref(),
+                        self.v_scale.as_ref(),
                         &fm.indices,
                         &fm.indptr,
                         &fm.indptr_host,
                         &fm.last_len,
+                        fm.last_len_host.as_deref(),
+                        fm.kv_len_arr_host.as_deref(),
                         input_metadata.cu_seqlens_q.as_ref().unwrap(),
                         fm.cu_seqlens_q_host.as_ref().unwrap(),
                         fm.total_num_rows.unwrap(),
@@ -416,6 +422,8 @@ impl PagedAttention {
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),
+                        self.k_scale.as_ref(),
+                        self.v_scale.as_ref(),
                         &fm.indices,
                         &fm.indptr,
                         &fm.last_len,
@@ -425,6 +433,7 @@ impl PagedAttention {
                         head_size,
                         self.scale as f32,
                         plan_info,
+                        fm.use_cuda_graph,
                     )
                 };
             }

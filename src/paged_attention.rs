@@ -181,6 +181,13 @@ impl PagedAttention {
                     _ => candle::bail!("k_scales must be a cuda tensor"),
                 };
                 let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+                if k_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        k_scales_layout.shape().elem_count()
+                    );
+                }
 
                 let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
@@ -188,6 +195,13 @@ impl PagedAttention {
                     _ => candle::bail!("v_scales must be a cuda tensor"),
                 };
                 let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+                if v_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        v_scales_layout.shape().elem_count()
+                    );
+                }
                 (
                     *k_scales.device_ptr() as *const core::ffi::c_void,
                     *v_scales.device_ptr() as *const core::ffi::c_void,
@@ -506,17 +520,31 @@ impl PagedAttention {
         }
         let (k_scale, v_scale) =
             if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
-                let (k_scales, _) = k_scales.storage_and_layout();
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
                 let k_scales = match &*k_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
+                if k_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle_core::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        k_scales_layout.shape().elem_count()
+                    )
+                }
 
-                let (v_scales, _) = v_scales.storage_and_layout();
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
+                if v_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle_core::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        v_scales_layout.shape().elem_count()
+                    )
+                }
 
                 (Some(k_scales.clone()), Some(v_scales.clone()))
             } else {
@@ -942,6 +970,13 @@ impl ReshapeCache {
                     _ => candle::bail!("k_scales must be a cuda tensor"),
                 };
                 let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+                if k_scales_layout.shape().elem_count() != num_heads {
+                    candle::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        k_scales_layout.shape().elem_count()
+                    );
+                }
 
                 let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
@@ -949,6 +984,13 @@ impl ReshapeCache {
                     _ => candle::bail!("v_scales must be a cuda tensor"),
                 };
                 let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+                if v_scales_layout.shape().elem_count() != num_heads {
+                    candle::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        v_scales_layout.shape().elem_count()
+                    );
+                }
 
                 (
                     *k_scales.device_ptr() as *const core::ffi::c_void,
@@ -1117,17 +1159,31 @@ impl ReshapeCache {
 
         let (k_scale, v_scale) =
             if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
-                let (k_scales, _) = k_scales.storage_and_layout();
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
                 let k_scales = match &*k_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
+                if k_scales_layout.shape().elem_count() != num_heads {
+                    candle_core::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        k_scales_layout.shape().elem_count()
+                    )
+                }
 
-                let (v_scales, _) = v_scales.storage_and_layout();
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
+                if v_scales_layout.shape().elem_count() != num_heads {
+                    candle_core::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        v_scales_layout.shape().elem_count()
+                    )
+                }
 
                 (Some(k_scales.clone()), Some(v_scales.clone()))
             } else {

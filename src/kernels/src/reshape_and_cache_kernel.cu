@@ -63,8 +63,10 @@ __global__ void reshape_and_cache_kernel(
       value_cache[tgt_value_idx] = value[src_value_idx];
     } else {
       // FP8 (E4M3) Quantization
-      key_cache[tgt_key_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(key[src_key_idx], *k_scales);
-      value_cache[tgt_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(value[src_value_idx], *v_scales);
+      key_cache[tgt_key_idx] =
+          vllm::fp8::scaled_convert<cache_t, scalar_t>(key[src_key_idx], k_scales[head_idx]);
+      value_cache[tgt_value_idx] =
+          vllm::fp8::scaled_convert<cache_t, scalar_t>(value[src_value_idx], v_scales[head_idx]);
     }
   }
 }
@@ -125,8 +127,10 @@ __global__ void reshape_and_cache_flash_kernel(
       value_cache[tgt_key_value_idx] = tgt_value;
     } else {
       // FP8 (E4M3) Quantization
-      key_cache[tgt_key_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_key, *k_scales);
-      value_cache[tgt_key_value_idx] = vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_value, *v_scales);
+      key_cache[tgt_key_value_idx] =
+          vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_key, k_scales[head_idx]);
+      value_cache[tgt_key_value_idx] =
+          vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_value, v_scales[head_idx]);
     }
   }
 }

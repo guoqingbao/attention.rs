@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
     println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -43,6 +44,9 @@ fn main() -> Result<()> {
     if compute_cap.unwrap_or(80) < 80 {
         builder = builder.arg("-DNO_BF16_KERNEL");
         builder = builder.arg("-DNO_MARLIN_KERNEL");
+    }
+
+    if compute_cap.unwrap_or(80) < 90 {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
@@ -69,6 +73,12 @@ fn main() -> Result<()> {
             vec!["include"],
             false,
         );
+
+        // If cutlass feature not enabled but we still needs fp8 kvcache under flashinfer
+        if !std::env::var("CARGO_FEATURE_CUTLASS").is_ok() && !fp8_kvcache_disabled {
+            // Featch cutlass header for flashinfer
+            builder = builder.with_cutlass(None);
+        }
     }
 
     // Target handling

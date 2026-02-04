@@ -994,21 +994,24 @@ pub fn call_causal_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_update_scales(
+#[allow(clippy::too_many_arguments)]
+pub fn call_update_scales_per_head(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     ty: PagedAttentionDType,
     k: &Buffer,
     v: &Buffer,
-    num_elements: i64,
+    num_tokens: i64,
+    num_heads: i32,
+    head_dim: i32,
     k_scales: &Buffer,
     v_scales: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let name = match ty {
-        PagedAttentionDType::F32 => "compute_and_update_scales_float",
-        PagedAttentionDType::BF16 => "compute_and_update_scales_bfloat16_t",
-        PagedAttentionDType::F16 => "compute_and_update_scales_half",
+        PagedAttentionDType::F32 => "compute_and_update_scales_per_head_float",
+        PagedAttentionDType::BF16 => "compute_and_update_scales_per_head_bfloat16_t",
+        PagedAttentionDType::F16 => "compute_and_update_scales_per_head_half",
     };
 
     let pipeline = kernels.load_pipeline(device, name.to_string())?;
@@ -1017,27 +1020,28 @@ pub fn call_update_scales(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Set the parameters
     set_params!(
         encoder,
         (
-            (k, 0),        // k buffer
-            (v, 0),        // v buffer
-            num_elements,  // total number of elements
-            (k_scales, 0), // k scale
-            (v_scales, 0)  // v scale
+            (k, 0),
+            (v, 0),
+            num_tokens,
+            num_heads,
+            head_dim,
+            (k_scales, 0),
+            (v_scales, 0)
         )
     );
 
-    // Dispatch the kernel
-    let thread_groups_count = MTLSize {
-        width: (num_elements as u64 + 511) / 512,
-        height: 1,
-        depth: 1,
-    };
     let threads_per_threadgroup = MTLSize {
         width: 512,
         height: 1,
+        depth: 1,
+    };
+    let blocks = (num_tokens as u64 * head_dim as u64 + 511) / 512;
+    let thread_groups_count = MTLSize {
+        width: blocks.max(1),
+        height: num_heads as u64,
         depth: 1,
     };
 

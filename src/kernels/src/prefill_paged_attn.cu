@@ -273,7 +273,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               } else {
                 Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(
                     &k_cache[k_idx]);
-                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
+                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scales[kv_head_idx]);
               }
             }
 
@@ -335,7 +335,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               v = to_float(*reinterpret_cast<const K_vec*>(src));
             } else {
               Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec *>(src);
-              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, v_scales[kv_head_idx]);
             }
 
             acc_vec[k] += dot(p_vec[b], v);

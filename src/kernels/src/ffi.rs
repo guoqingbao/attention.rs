@@ -171,28 +171,34 @@ extern "C" {
         stream: i64,
     );
 
-    pub fn update_kv_scales_f32(
+    pub fn update_kv_scales_per_head_f32(
         k: *const c_void,
         v: *const c_void,
-        elements: c_long,
+        num_tokens: c_long,
+        num_heads: c_int,
+        head_dim: c_int,
         k_scales: *const f32,
         v_scales: *const f32,
         stream: i64,
     );
 
-    pub fn update_kv_scales_f16(
+    pub fn update_kv_scales_per_head_f16(
         k: *const c_void,
         v: *const c_void,
-        elements: c_long,
+        num_tokens: c_long,
+        num_heads: c_int,
+        head_dim: c_int,
         k_scales: *const f32,
         v_scales: *const f32,
         stream: i64,
     );
 
-    pub fn update_kv_scales_bf16(
+    pub fn update_kv_scales_per_head_bf16(
         k: *const c_void,
         v: *const c_void,
-        elements: c_long,
+        num_tokens: c_long,
+        num_heads: c_int,
+        head_dim: c_int,
         k_scales: *const f32,
         v_scales: *const f32,
         stream: i64,
@@ -915,6 +921,31 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn flashinfer_fp8_quantize_q_per_head(
+        input: *const c_void,
+        output_q: *mut c_void,
+        output_scale: *mut f32,
+        numel: i64,
+        num_heads: c_int,
+        head_dim: c_int,
+        is_input_f16: bool,
+        stream: i64,
+    );
+
+    pub fn flashinfer_fp8_quantize_kv_per_head(
+        k_in: *const c_void,
+        v_in: *const c_void,
+        k_out: *mut c_void,
+        v_out: *mut c_void,
+        numel: i64,
+        num_heads: c_int,
+        head_dim: c_int,
+        k_scales: *const f32,
+        v_scales: *const f32,
+        is_input_f16: bool,
+        stream: i64,
+    );
+
     // FlashInfer wrappers
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_append_kv_cache(
@@ -938,7 +969,9 @@ extern "C" {
 
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_decode_plan_wrapper(
-        indptr_host: *const i32, // Host pointer for planning
+        indptr_host: *const i32,     // Host pointer for planning
+        qo_indptr_host: *const i32,  // Host pointer for fp8 decode plan
+        kv_len_arr_host: *const i32, // Host pointer for fp8 decode plan
         batch_size: i32,
         num_qo_heads: i32,
         num_kv_heads: i32,
@@ -952,6 +985,7 @@ extern "C" {
         page_locked_int_size: usize,
         enable_cuda_graph: bool,
         data_type: i32,
+        out_data_type: i32,
         plan_info_out: *mut i64, // length 10
         stream: i64,
     );
@@ -971,12 +1005,16 @@ extern "C" {
         head_dim: i32,
         page_size: i32,
         sm_scale: f32,
+        q_scale_ptr: *const f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
         workspace_float: *mut c_void,
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
         plan_info_vec: *const i64, // length 10
         data_type: i32,
+        out_data_type: i32,
         stream: i64,
     );
 
@@ -986,6 +1024,7 @@ extern "C" {
         q_ptr: *const c_void,
         q_cu_seqlens: *const i32,      // Device pointer for kernel params
         q_cu_seqlens_host: *const i32, // Host pointer for planning
+        kv_len_arr_host: *const i32,   // Host pointer for kv lengths (fp8 sm90 plan)
         total_num_rows: i32,           // Total tokens (from host)
         k_data: *const c_void,
         v_data: *const c_void,
@@ -999,6 +1038,9 @@ extern "C" {
         head_dim: i32,
         page_size: i32,
         sm_scale: f32,
+        q_scale_ptr: *const f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
         workspace_float: *mut c_void,
         workspace_float_size: usize,
         workspace_int: *mut c_void,
@@ -1007,6 +1049,7 @@ extern "C" {
         page_locked_int_size: usize,
         enable_cuda_graph: bool,
         data_type: i32,
+        out_data_type: i32,
         stream: i64,
     );
 }
