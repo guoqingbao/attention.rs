@@ -329,24 +329,23 @@ impl candle::CustomOp1 for FlashInferAppend {
     }
 }
 
-pub struct FlashInferDecode {
+pub struct FlashInferDecodeWithPlan {
     pub key_cache: Tensor,
     pub value_cache: Tensor,
     pub indices: Tensor,
-    pub indptr: Tensor,        // Device tensor for paged_kv
-    pub indptr_host: Vec<u32>, // Host data for planning
+    pub indptr: Tensor, // Device tensor for paged_kv
     pub last_len: Tensor,
     pub block_size: usize,
     pub num_qo_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub sm_scale: f32,
-    pub enable_cuda_graph: bool,
+    pub plan_info: Vec<i64>, // length 10
 }
 
-impl candle::CustomOp1 for FlashInferDecode {
+impl candle::CustomOp1 for FlashInferDecodeWithPlan {
     fn name(&self) -> &'static str {
-        "flashinfer-decode"
+        "flashinfer-decode-with-plan"
     }
 
     fn cpu_fwd(
@@ -356,6 +355,7 @@ impl candle::CustomOp1 for FlashInferDecode {
     ) -> Result<(candle::CpuStorage, candle::Shape)> {
         candle::bail!("no cpu support")
     }
+
     fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
         match q.dtype() {
             DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
@@ -366,7 +366,7 @@ impl candle::CustomOp1 for FlashInferDecode {
     }
 }
 
-impl FlashInferDecode {
+impl FlashInferDecodeWithPlan {
     fn cuda_fwd_impl<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
     >(
@@ -374,6 +374,13 @@ impl FlashInferDecode {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
+        if self.plan_info.len() != 10 {
+            candle::bail!(
+                "flashinfer decode plan_info must have length 10, got {}",
+                self.plan_info.len()
+            );
+        }
+
         let dev = q.device();
         let (batch_size, _, _) = q_l.shape().dims3()?;
 
@@ -406,20 +413,20 @@ impl FlashInferDecode {
             DType::BF16 => 1,
             _ => 0,
         };
+
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
-        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
-            get_or_init_workspace(dev, self.enable_cuda_graph)?;
+        let (ws_float_ptr, ws_int_ptr, _page_locked_ptr, _page_locked_size) =
+            get_or_init_workspace(dev, true)?;
 
         unsafe {
-            kernels::ffi::flashinfer_decode_wrapper(
+            kernels::ffi::flashinfer_decode_run_wrapper(
                 out_ptr,
                 q_ptr,
                 kc_ptr,
                 vc_ptr,
                 *indices_ptr.device_ptr() as *const i32,
                 *indptr_ptr.device_ptr() as *const i32,
-                self.indptr_host.as_ptr().cast(), // Host pointer for planning
                 *last_len_ptr.device_ptr() as *const i32,
                 batch_size as i32,
                 self.num_qo_heads as i32,
@@ -431,9 +438,7 @@ impl FlashInferDecode {
                 WORKSPACE_FLOAT_SIZE,
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
-                page_locked_ptr,
-                page_locked_size,
-                self.enable_cuda_graph,
+                self.plan_info.as_ptr(),
                 data_type,
                 *dev.cu_stream() as i64,
             );
@@ -444,36 +449,90 @@ impl FlashInferDecode {
     }
 }
 
-pub fn decode(
+pub fn decode_with_plan(
     q: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
     indices: &Tensor,
     indptr: &Tensor,
-    indptr_host: &[u32], // Host slice for planning (no D2H copy)
     last_len: &Tensor,
     block_size: usize,
     num_qo_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     sm_scale: f32,
-    enable_cuda_graph: bool,
+    plan_info: &[i64],
 ) -> Result<Tensor> {
-    let op = FlashInferDecode {
+    let op = FlashInferDecodeWithPlan {
         key_cache: key_cache.clone(),
         value_cache: value_cache.clone(),
         indices: indices.clone(),
         indptr: indptr.clone(),
-        indptr_host: indptr_host.to_vec(),
         last_len: last_len.clone(),
         block_size,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         sm_scale,
-        enable_cuda_graph,
+        plan_info: plan_info.to_vec(),
     };
     q.apply_op1(op)
+}
+
+pub fn decode_plan(
+    dev: &candle_core::Device,
+    kv_dtype: DType,
+    indptr_host: &[u32],
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    enable_cuda_graph: bool,
+) -> Result<Vec<i64>> {
+    let dev = dev.as_cuda_device()?;
+
+    if indptr_host.len() != batch_size + 1 {
+        candle::bail!(
+            "indptr_host length must be batch_size+1 ({}), got {}",
+            batch_size + 1,
+            indptr_host.len()
+        );
+    }
+
+    // 0: F16, 1: BF16, 2: U8 (FP8)
+    let data_type = match kv_dtype {
+        DType::U8 => 2,
+        DType::BF16 => 1,
+        _ => 0,
+    };
+
+    let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+        get_or_init_workspace(dev, enable_cuda_graph)?;
+
+    let mut plan_info = [0i64; 10];
+    unsafe {
+        kernels::ffi::flashinfer_decode_plan_wrapper(
+            indptr_host.as_ptr().cast(),
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            ws_float_ptr,
+            WORKSPACE_FLOAT_SIZE,
+            ws_int_ptr,
+            WORKSPACE_INT_SIZE,
+            page_locked_ptr,
+            page_locked_size,
+            enable_cuda_graph,
+            data_type,
+            plan_info.as_mut_ptr(),
+            *dev.cu_stream() as i64,
+        );
+    }
+
+    Ok(plan_info.to_vec())
 }
 
 pub struct FlashInferPrefill {

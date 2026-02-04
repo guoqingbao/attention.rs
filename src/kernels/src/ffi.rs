@@ -937,14 +937,33 @@ extern "C" {
     );
 
     #[cfg(feature = "flashinfer")]
-    pub fn flashinfer_decode_wrapper(
+    pub fn flashinfer_decode_plan_wrapper(
+        indptr_host: *const i32, // Host pointer for planning
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
+        enable_cuda_graph: bool,
+        data_type: i32,
+        plan_info_out: *mut i64, // length 10
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_decode_run_wrapper(
         out_ptr: *mut c_void,
         q_ptr: *const c_void,
         k_data: *const c_void,
         v_data: *const c_void,
         indices: *const i32,
-        indptr: *const i32,      // Device pointer for paged_kv
-        indptr_host: *const i32, // Host pointer for planning
+        indptr: *const i32, // Device pointer for paged_kv
         last_len: *const i32,
         batch_size: i32,
         num_qo_heads: i32,
@@ -956,9 +975,7 @@ extern "C" {
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
-        page_locked_int_buffer: *mut c_void,
-        page_locked_int_size: usize,
-        enable_cuda_graph: bool,
+        plan_info_vec: *const i64, // length 10
         data_type: i32,
         stream: i64,
     );

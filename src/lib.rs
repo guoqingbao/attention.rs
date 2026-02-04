@@ -36,6 +36,7 @@ pub struct FlashInferMetadata {
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
+    pub decode_plan_info: Option<Vec<i64>>,
 }
 
 pub struct InputMetadata {
@@ -406,20 +407,24 @@ impl PagedAttention {
                         self.scale as f32,
                     )
                 } else {
-                    crate::flashinfer::decode(
+                    let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg(
+                            "flashinfer decode requires decode_plan_info (plan+run path)",
+                        )
+                    })?;
+                    crate::flashinfer::decode_with_plan(
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),
                         &fm.indices,
                         &fm.indptr,
-                        &fm.indptr_host,
                         &fm.last_len,
                         block_size,
                         attention_heads,
                         key_value_heads,
                         head_size,
                         self.scale as f32,
-                        fm.use_cuda_graph,
+                        plan_info,
                     )
                 };
             }
