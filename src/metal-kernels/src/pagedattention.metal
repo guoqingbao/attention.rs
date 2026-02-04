@@ -221,7 +221,7 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
         } else {
           Quant_vec fp8_k_vec = *reinterpret_cast<const device Quant_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_scale = k_scales[kv_head_idx];
+          k_scale = k_scales[0];
           k_vecs[j] = scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scale);
         }
       }
@@ -342,7 +342,7 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
           v_vec = *reinterpret_cast<const device V_vec*>(v_ptr + offset);
         } else {
           Quant_vec fp8_v_vec = *reinterpret_cast<const device Quant_vec *>(v_ptr + offset);
-          v_scale = v_scales[kv_head_idx];
+          v_scale = v_scales[0];
           v_vec = scaled_convert<V_vec, Quant_vec>(fp8_v_vec, v_scale);
         }
 

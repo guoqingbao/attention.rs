@@ -58,7 +58,6 @@ kernel void compute_and_update_scales_per_head_kernel(
     constant int& head_dim [[buffer(4)]],
     device float* k_scales [[buffer(5)]],
     device float* v_scales [[buffer(6)]],
-    uint3 blockIdx [[threadgroup_position_in_grid]],
     uint3 threadIdx [[thread_position_in_threadgroup]]
 ) {
     const uint tid = threadIdx.x;
@@ -66,23 +65,19 @@ kernel void compute_and_update_scales_per_head_kernel(
         return;
     }
 
-    const int head_idx = blockIdx.y;
     threadgroup float s_k[THREADS_PER_TG];
     threadgroup float s_v[THREADS_PER_TG];
 
-    long numel_per_head = num_tokens * (long)head_dim;
+    const long total_elems = num_tokens * (long)num_heads * (long)head_dim;
     long idx = (long)tid;
     long stride = (long)THREADS_PER_TG;
 
     float local_max_k = 0.0f;
     float local_max_v = 0.0f;
 
-    for (long i = idx; i < numel_per_head; i += stride) {
-        long token = i / head_dim;
-        int d = (int)(i % head_dim);
-        long base = token * (long)(num_heads * head_dim) + (long)head_idx * head_dim + d;
-        float avk = to_float_abs<T>(k[base]);
-        float avv = to_float_abs<T>(v[base]);
+    for (long i = idx; i < total_elems; i += stride) {
+        float avk = to_float_abs<T>(k[i]);
+        float avv = to_float_abs<T>(v[i]);
         if (avk > local_max_k) local_max_k = avk;
         if (avv > local_max_v) local_max_v = avv;
     }
@@ -102,10 +97,8 @@ kernel void compute_and_update_scales_per_head_kernel(
     if (tid == 0) {
         float candidate_k_scale = s_k[0] / DIV_CONST;
         float candidate_v_scale = s_v[0] / DIV_CONST;
-        float cur_k_scale = k_scales[head_idx];
-        float cur_v_scale = v_scales[head_idx];
-        k_scales[head_idx] = max(cur_k_scale, candidate_k_scale);
-        v_scales[head_idx] = max(cur_v_scale, candidate_v_scale);
+        k_scales[0] = max(k_scales[0], candidate_k_scale);
+        v_scales[0] = max(v_scales[0], candidate_v_scale);
     }
 }
 
@@ -119,7 +112,6 @@ kernel void compute_and_update_scales_per_head_kernel(
     constant int& head_dim [[buffer(4)]],                  \
     device float* k_scales [[buffer(5)]],                  \
     device float* v_scales [[buffer(6)]],                  \
-    uint3 blockIdx [[threadgroup_position_in_grid]], \
     uint3 threadIdx [[thread_position_in_threadgroup]]);
 
 instantiate_compute_and_update_scales_per_head(float)

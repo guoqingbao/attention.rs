@@ -525,11 +525,12 @@ impl PagedAttention {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
-                if k_scales_layout.shape().elem_count() != num_kv_heads {
+                let k_len = k_scales_layout.shape().elem_count();
+                if k_len != 1 && k_len != num_kv_heads {
                     candle_core::bail!(
-                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        "k_scales length must be 1 or num_kv_heads ({}), got {}",
                         num_kv_heads,
-                        k_scales_layout.shape().elem_count()
+                        k_len
                     )
                 }
 
@@ -538,11 +539,12 @@ impl PagedAttention {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
-                if v_scales_layout.shape().elem_count() != num_kv_heads {
+                let v_len = v_scales_layout.shape().elem_count();
+                if v_len != 1 && v_len != num_kv_heads {
                     candle_core::bail!(
-                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        "v_scales length must be 1 or num_kv_heads ({}), got {}",
                         num_kv_heads,
-                        v_scales_layout.shape().elem_count()
+                        v_len
                     )
                 }
 
@@ -598,6 +600,8 @@ impl PagedAttention {
                 qs.buffer(),
                 qs_l.start_offset() * qs.dtype().size_in_bytes(),
                 alibi_storage_and_offset,
+                k_scale.clone(),
+                v_scale.clone(),
                 None,
                 num_kv_heads as i32,
                 self.softmax_scale,
@@ -1164,11 +1168,12 @@ impl ReshapeCache {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
-                if k_scales_layout.shape().elem_count() != num_heads {
+                let k_len = k_scales_layout.shape().elem_count();
+                if k_len != 1 && k_len != num_heads {
                     candle_core::bail!(
-                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        "k_scales length must be 1 or num_kv_heads ({}), got {}",
                         num_heads,
-                        k_scales_layout.shape().elem_count()
+                        k_len
                     )
                 }
 
@@ -1177,11 +1182,12 @@ impl ReshapeCache {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
-                if v_scales_layout.shape().elem_count() != num_heads {
+                let v_len = v_scales_layout.shape().elem_count();
+                if v_len != 1 && v_len != num_heads {
                     candle_core::bail!(
-                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        "v_scales length must be 1 or num_kv_heads ({}), got {}",
                         num_heads,
-                        v_scales_layout.shape().elem_count()
+                        v_len
                     )
                 }
 

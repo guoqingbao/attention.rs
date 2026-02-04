@@ -677,6 +677,159 @@ struct FloatVec<Half8_> {
   using Type = Float8_;
 };
 
+// FP8 vector data types (packed).
+template<>
+struct Vec<uint8_t, 1> {
+  using Type = uint8_t;
+};
+template<>
+struct Vec<uint8_t, 2> {
+  using Type = uint16_t;
+};
+template<>
+struct Vec<uint8_t, 4> {
+  using Type = uint32_t;
+};
+template<>
+struct Vec<uint8_t, 8> {
+  using Type = uint2;
+};
+
+// FP8 E4M3FN -> float conversion.
+static inline float softmax_fp8_to_float(uint8_t v) {
+  const uint8_t s_mask = 0x80;
+  const uint8_t e_mask = 0x78;
+  const uint8_t m_mask = 0x07;
+
+  uint8_t exp8 = (v & e_mask) >> 3;
+  uint8_t man8 = (v & m_mask);
+
+  if (exp8 > 0) {
+    if (exp8 == 0xF && man8 == 0x7) return NAN;
+    uint32_t sign = (v & s_mask) << 24;
+    uint32_t exp32 = (uint32_t(exp8) + 120) << 23;
+    uint32_t man32 = uint32_t(man8) << 20;
+    return as_type<float>(sign | exp32 | man32);
+  }
+
+  if (man8 == 0) {
+    return (v & s_mask) ? -0.0f : 0.0f;
+  }
+
+  const float m = float(man8) / 8.f;
+  float val = ldexp(m, -6);
+  return (v & s_mask) ? -val : val;
+}
+
+template <typename Tout, typename Tin>
+inline Tout scaled_vec_conversion(Tin x, float scale);
+
+// fp8 -> half
+template <>
+inline half scaled_vec_conversion<half, uint8_t>(uint8_t a, float scale) {
+  float f = softmax_fp8_to_float(a);
+  return static_cast<half>(f * scale);
+}
+// fp8x2 -> half2
+template <>
+inline half2 scaled_vec_conversion<half2, uint16_t>(uint16_t a, float scale) {
+  half2 ret;
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  ret.x = static_cast<half>(softmax_fp8_to_float(b0) * scale);
+  ret.y = static_cast<half>(softmax_fp8_to_float(b1) * scale);
+  return ret;
+}
+// fp8x4 -> half4
+template <>
+inline half4 scaled_vec_conversion<half4, uint32_t>(uint32_t a, float scale) {
+  half4 ret;
+  half2 ar = scaled_vec_conversion<half2, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  half2 br = scaled_vec_conversion<half2, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  ret.x = ar.x;
+  ret.y = ar.y;
+  ret.z = br.x;
+  ret.w = br.y;
+  return ret;
+}
+// fp8x8 -> half8
+template <>
+inline Half8_ scaled_vec_conversion<Half8_, uint2>(uint2 a, float scale) {
+  Half8_ ret;
+  ret.x = scaled_vec_conversion<half4, uint32_t>(a.x, scale);
+  ret.y = scaled_vec_conversion<half4, uint32_t>(a.y, scale);
+  return ret;
+}
+
+// fp8 -> bfloat16
+template <>
+inline bfloat16_t scaled_vec_conversion<bfloat16_t, uint8_t>(uint8_t a, float scale) {
+  float f = softmax_fp8_to_float(a);
+  return static_cast<bfloat16_t>(f * scale);
+}
+// fp8x2 -> bfloat2
+template <>
+inline Bfloat2_ scaled_vec_conversion<Bfloat2_, uint16_t>(uint16_t a, float scale) {
+  Bfloat2_ res;
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  res.x = scaled_vec_conversion<bfloat16_t, uint8_t>(b0, scale);
+  res.y = scaled_vec_conversion<bfloat16_t, uint8_t>(b1, scale);
+  return res;
+}
+// fp8x4 -> bfloat4
+template <>
+inline Bfloat4_ scaled_vec_conversion<Bfloat4_, uint32_t>(uint32_t a, float scale) {
+  Bfloat4_ res;
+  res.x = scaled_vec_conversion<Bfloat2_, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  res.y = scaled_vec_conversion<Bfloat2_, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  return res;
+}
+// fp8x8 -> bfloat8
+template <>
+inline Bfloat8_ scaled_vec_conversion<Bfloat8_, uint2>(uint2 a, float scale) {
+  Bfloat8_ res;
+  res.x = scaled_vec_conversion<Bfloat4_, uint32_t>(a.x, scale);
+  res.y = scaled_vec_conversion<Bfloat4_, uint32_t>(a.y, scale);
+  return res;
+}
+
+// fp8 -> float
+template <>
+inline float scaled_vec_conversion<float, uint8_t>(uint8_t a, float scale) {
+  return softmax_fp8_to_float(a) * scale;
+}
+// fp8x2 -> float2
+template <>
+inline float2 scaled_vec_conversion<float2, uint16_t>(uint16_t a, float scale) {
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  float2 res;
+  res.x = scaled_vec_conversion<float, uint8_t>(b0, scale);
+  res.y = scaled_vec_conversion<float, uint8_t>(b1, scale);
+  return res;
+}
+// fp8x4 -> float4
+template <>
+inline float4 scaled_vec_conversion<float4, uint32_t>(uint32_t a, float scale) {
+  float4 res;
+  float2 ar = scaled_vec_conversion<float2, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  float2 br = scaled_vec_conversion<float2, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  res.x = ar.x;
+  res.y = ar.y;
+  res.z = br.x;
+  res.w = br.y;
+  return res;
+}
+// fp8x8 -> float8
+template <>
+inline Float8_ scaled_vec_conversion<Float8_, uint2>(uint2 a, float scale) {
+  Float8_ res;
+  res.x = scaled_vec_conversion<float4, uint32_t>(a.x, scale);
+  res.y = scaled_vec_conversion<float4, uint32_t>(a.y, scale);
+  return res;
+}
+
 template<>
 inline float mul(half a, half b) {
   return (float)a * (float)b;
@@ -883,21 +1036,21 @@ struct Qk_dot {
  * @param o_stride_tokens The stride of the output tensor's first dimension.
  * @param query_start_len Indicates the start token index for each sequence in the flattened query tensor.
  * @param alibi_slopes Optional buffer with ALiBi slopes for positional bias.
- * @param k_scale Unused parameter, kept for signature compatibility.
- * @param v_scale Unused parameter, kept for signature compatibility.
+ * @param k_scales Per-head K FP8 scales (nullptr if not quantized).
+ * @param v_scales Per-head V FP8 scales (nullptr if not quantized).
  * @param sinks Optional buffer for sink attention.
  * @param sliding_window The sliding window size for attention, if used.
  * @param total_num_blocks The total number of physical blocks allocated in the KV cache.
  * @param kv_block_stride The stride between physical blocks in the KV cache.
  * @param kv_head_stride The stride between KV heads in the KV cache.
  **/
-template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
+template<typename T, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 [[kernel]] void chunked_prefill_paged_attention(
     // Buffer mappings
     device T* out [[buffer(0)]],                    // [num_all_tokens_new, num_query_heads, HEAD_SIZE]
     device const T* q [[buffer(1)]],                // [num_all_tokens_new, num_query_heads, HEAD_SIZE]
-    device const T* k_cache [[buffer(2)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE/x, BLOCK_SIZE, x]
-    device const T* v_cache [[buffer(3)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE, BLOCK_SIZE]
+    device const cache_t* k_cache [[buffer(2)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE/x, BLOCK_SIZE, x]
+    device const cache_t* v_cache [[buffer(3)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE, BLOCK_SIZE]
     const constant int& num_kv_heads [[buffer(4)]],
     const constant float& sm_scale [[buffer(5)]],
     device const uint32_t* block_tables [[buffer(6)]],
@@ -910,9 +1063,8 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     const constant int& o_stride_tokens [[buffer(13)]],
     device const uint32_t* query_start_len [[buffer(14)]],
     device const float* alibi_slopes [[buffer(15)]],
-    // The following parameters are kept for signature compatibility but are marked unused.
-    const constant float& k_scale [[buffer(16)]],   // not used
-    const constant float& v_scale [[buffer(17)]],   // not used
+    device const float* k_scales [[buffer(16)]],
+    device const float* v_scales [[buffer(17)]],
     device const float* sinks [[buffer(18)]],
     const constant int& sliding_window [[buffer(19)]],
     const constant int& total_num_blocks [[buffer(20)]],
@@ -926,6 +1078,7 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     constexpr int THREAD_GROUP_SIZE = 1; // Used for Qk_dot template, as in the source CUDA kernel
     constexpr int VEC_SIZE = 16 / sizeof(T);
     constexpr int NUM_VECS = HEAD_SIZE / VEC_SIZE;
+    constexpr bool is_quantized = !is_same_v<T, cache_t>;
 
     // --- Thread and Grid Mapping ---
     // In CUDA: tid = threadIdx.x
@@ -944,7 +1097,7 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     constexpr int NUM_BLOCK_VECS = BLOCK_SIZE / VEC_SIZE;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
-    constexpr int X = 16 / sizeof(T); // Sub-vector size
+    constexpr int X = 16 / sizeof(cache_t); // Sub-vector size
     const bool use_alibi = (alibi_slopes != nullptr);
     const bool use_sinks = (sinks != nullptr);
 
@@ -974,6 +1127,7 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     using Q_vec = typename Vec<T, VEC_SIZE>::Type;
     using K_vec = typename Vec<T, VEC_SIZE>::Type;
     using Float_vec = typename Vec<float, VEC_SIZE>::Type;
+    using Quant_vec = typename Vec<cache_t, VEC_SIZE>::Type;
 
     // Buffers for q, k, and temporary storage
     Q_vec q_vec[NUM_VECS];
@@ -1035,9 +1189,15 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
             for (int k = 0; k < NUM_VECS; k++) {
               int d = k * VEC_SIZE;
               int gy = d / X;
+              int gx = d % X;
               int64_t k_idx = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride +
-                              (int64_t)gy * (BLOCK_SIZE * X) + (int64_t)b * X;
-              k_vec[k] = *reinterpret_cast<device const K_vec*>(k_cache + k_idx);
+                              (int64_t)gy * (BLOCK_SIZE * X) + (int64_t)b * X + (int64_t)gx;
+              if constexpr (!is_quantized) {
+                k_vec[k] = *reinterpret_cast<device const K_vec*>(k_cache + k_idx);
+              } else {
+                Quant_vec fp8_k_vec = *reinterpret_cast<device const Quant_vec*>(k_cache + k_idx);
+                k_vec[k] = scaled_vec_conversion<K_vec, Quant_vec>(fp8_k_vec, k_scales[0]);
+              }
             }
 
             // Compute dot product q·k
@@ -1085,10 +1245,15 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
         const int64_t v_base_block = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
         Float_vec v;
         for (int k = 0; k < HEAD_SIZE; ++k) {
-          device const T* v_row_ptr = v_cache + v_base_block + (int64_t)k * BLOCK_SIZE;
+          device const cache_t* v_row_ptr = v_cache + v_base_block + (int64_t)k * BLOCK_SIZE;
           for (int b = 0; b < NUM_BLOCK_VECS; b++) {
-            device const T* src = v_row_ptr + b * VEC_SIZE;
-            to_float(v, *reinterpret_cast<device const K_vec*>(src));
+            device const cache_t* src = v_row_ptr + b * VEC_SIZE;
+            if constexpr (!is_quantized) {
+              to_float(v, *reinterpret_cast<device const K_vec*>(src));
+            } else {
+              Quant_vec fp8_v_vec = *reinterpret_cast<device const Quant_vec*>(src);
+              v = scaled_vec_conversion<Float_vec, Quant_vec>(fp8_v_vec, v_scales[0]);
+            }
             acc_vec[k] += dot(p_vec[b], v);
           }
         }
@@ -1113,13 +1278,13 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     }
 }
 
-#define instantiate_prefill_attention_inner(type, head_size, block_size, token_chunk_size) \
-    template [[host_name("chunked_prefill_" #type "_hs" #head_size "_bs" #block_size "_tcs" #token_chunk_size)]] \
-    [[kernel]] void chunked_prefill_paged_attention<type, head_size, block_size, token_chunk_size>( \
+#define instantiate_prefill_attention_inner(type, cache_type, head_size, block_size, token_chunk_size, suffix) \
+    template [[host_name("chunked_prefill_" #type suffix "_hs" #head_size "_bs" #block_size "_tcs" #token_chunk_size)]] \
+    [[kernel]] void chunked_prefill_paged_attention<type, cache_type, head_size, block_size, token_chunk_size>( \
         device type* out [[buffer(0)]], \
         device const type* q [[buffer(1)]], \
-        device const type* k_cache [[buffer(2)]], \
-        device const type* v_cache [[buffer(3)]], \
+        device const cache_type* k_cache [[buffer(2)]], \
+        device const cache_type* v_cache [[buffer(3)]], \
         const constant int& num_kv_heads [[buffer(4)]], \
         const constant float& sm_scale [[buffer(5)]], \
         device const uint32_t* block_tables [[buffer(6)]], \
@@ -1132,8 +1297,8 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
         const constant int& o_stride_tokens [[buffer(13)]], \
         device const uint32_t* query_start_len [[buffer(14)]], \
         device const float* alibi_slopes [[buffer(15)]], \
-        const constant float& k_scale [[buffer(16)]], \
-        const constant float& v_scale [[buffer(17)]], \
+        device const float* k_scales [[buffer(16)]], \
+        device const float* v_scales [[buffer(17)]], \
         device const float* sinks [[buffer(18)]], \
         const constant int& sliding_window [[buffer(19)]], \
         const constant int& total_num_blocks [[buffer(20)]], \
@@ -1143,23 +1308,27 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
         uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]);
 
 // Instantiate for various head sizes
-#define instantiate_prefill_attention_heads(type, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 64,  block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 96,  block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 128, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 192, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 256, block_size, token_chunk_size)
+#define instantiate_prefill_attention_heads(type, cache_type, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 64,  block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 96,  block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 128, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 192, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 256, block_size, token_chunk_size, suffix)
 
 // Instantiate for various block sizes
-#define instantiate_prefill_attention_block_size(type, token_chunk_size) \
-    instantiate_prefill_attention_heads(type, 32, token_chunk_size) \
-    instantiate_prefill_attention_heads(type, 64, token_chunk_size)
+#define instantiate_prefill_attention_block_size(type, cache_type, token_chunk_size, suffix) \
+    instantiate_prefill_attention_heads(type, cache_type, 32, token_chunk_size, suffix) \
+    instantiate_prefill_attention_heads(type, cache_type, 64, token_chunk_size, suffix)
 
 // Main instantiation macro for a given type
-#define instantiate_prefill_attention(type) \
-    instantiate_prefill_attention_block_size(type, 64) // Using a fixed TOKEN_CHUNK_SIZE of 64
+#define instantiate_prefill_attention(type, cache_type, suffix) \
+    instantiate_prefill_attention_block_size(type, cache_type, 64, suffix) // Using a fixed TOKEN_CHUNK_SIZE of 64
 
 // Call the macros to generate kernels for different data types
-instantiate_prefill_attention(float)
-instantiate_prefill_attention(half)
-instantiate_prefill_attention(bfloat16_t)
+instantiate_prefill_attention(float, float, "")
+instantiate_prefill_attention(half, half, "")
+instantiate_prefill_attention(bfloat16_t, bfloat16_t, "")
+
+instantiate_prefill_attention(float, uint8_t, "_uint8_t")
+instantiate_prefill_attention(half, uint8_t, "_uint8_t")
+instantiate_prefill_attention(bfloat16_t, uint8_t, "_uint8_t")

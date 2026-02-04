@@ -56,8 +56,8 @@ template<typename T, typename cache_t, bool is_quantized>
       key_cache[tgt_key_idx] = key[src_key_idx];
       value_cache[tgt_value_idx] = value[src_value_idx];
     } else {
-      k_scale = k_scales[head_idx];
-      v_scale = v_scales[head_idx];
+      k_scale = k_scales[0];
+      v_scale = v_scales[0];
       key_cache[tgt_key_idx] = scaled_convert<cache_t, T>(key[src_key_idx], k_scale);
       value_cache[tgt_value_idx] = scaled_convert<cache_t, T>(value[src_value_idx], v_scale);
     }    
