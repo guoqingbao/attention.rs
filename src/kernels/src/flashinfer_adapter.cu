@@ -471,7 +471,7 @@ void flashinfer_decode_run_wrapper(
                 };
 
                 if (out_data_type == 1) {
-                    run_fp8(nv_bfloat16{});
+                    run_fp8(cutlass::bfloat16_t{});
                 } else {
                     run_fp8(half{});
                 }
@@ -683,7 +683,7 @@ void flashinfer_prefill_wrapper(
             };
 
                 if (out_data_type == 1) {
-                    run_fp8(nv_bfloat16{});
+                    run_fp8(cutlass::bfloat16_t{});
                 } else {
                     run_fp8(half{});
                 }
