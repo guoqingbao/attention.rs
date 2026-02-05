@@ -60,26 +60,8 @@ fn main() -> Result<()> {
 
     if std::env::var("CARGO_FEATURE_CUTLASS").is_ok() {
         builder = builder.arg("-DUSE_CUTLASS").with_cutlass(None);
-        if compute_cap == 90 {
-            builder = builder.arg("-DCUTLASS_ARCH_MMA_SM90_SUPPORTED");
-            builder = builder.arg("-DCUTLASS_ARCH_MMA_SM90_ENABLED");
-            builder = builder.arg("-DCUTLASS_ARCH_TMA_SM90_ENABLED");
-            builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
-        }
-
         if compute_cap >= 90 {
             builder = builder.arg("-DCUTLASS_ENABLE_GDC_FOR_SM90");
-        }
-
-        if compute_cap >= 100 {
-            builder = builder.arg("-DCUTLASS_ARCH_MMA_SM100_SUPPORTED");
-            builder = builder.arg("-DCUTLASS_ARCH_MMA_SM100_ENABLED");
-            builder = builder.arg("-DCUTE_ARCH_TMA_SM100_ENABLED");
-        }
-
-        if compute_cap >= 120 {
-            builder = builder.arg("-DCUTE_ARCH_F8F6F4_MMA_ENABLED");
-            builder = builder.arg("-DCUTE_ARCH_MXF8F6F4_MMA_ENABLED");
         }
     }
 
