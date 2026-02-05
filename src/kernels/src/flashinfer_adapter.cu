@@ -430,13 +430,17 @@ void flashinfer_decode_run_wrapper(
 
                     using AttentionType = DefaultFP8Attention;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE, AttentionType>(
-                                params, false, stream);
-                        });
-                    });
-                };
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchFP8PrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                            params, false, stream);
+                    } else {
+                        BatchFP8PrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                            params, false, stream);
+                    }
+                });
+            };
 
                 if (out_data_type == 1) {
                     run_fp8(nv_bfloat16{});
@@ -461,14 +465,17 @@ void flashinfer_decode_run_wrapper(
 
                     using AttentionType = DefaultAttention<false, false, false, false>;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
-                            BatchPrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE,
-                                AttentionType>(
-                                params, false, stream);
-                        });
-                    });
-                };
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                            params, false, stream);
+                    } else {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                            params, false, stream);
+                    }
+                });
+            };
 
                 if (data_type == 1) {
                     run_non_fp8(nv_bfloat16{});
@@ -627,13 +634,17 @@ void flashinfer_prefill_wrapper(
 
                     using AttentionType = DefaultFP8Attention;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE, AttentionType>(
-                                params, false, stream);
-                        });
-                    });
-                };
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchFP8PrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                            params, false, stream);
+                    } else {
+                        BatchFP8PrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                            params, false, stream);
+                    }
+                });
+            };
 
                 if (out_data_type == 1) {
                     run_fp8(nv_bfloat16{});
@@ -658,14 +669,17 @@ void flashinfer_prefill_wrapper(
 
                     using AttentionType = DefaultAttention<false, false, false, false>;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                        DISPATCH_BOOL(plan_info.same_schedule_for_all_heads, SAME_SCHEDULE, {
-                            BatchPrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, SAME_SCHEDULE,
-                                AttentionType>(
-                                params, false, stream);
-                        });
-                    });
-                };
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                            params, false, stream);
+                    } else {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                            params, false, stream);
+                    }
+                });
+            };
 
                 if (data_type == 1) {
                     if (out_data_type == 1) {
