@@ -435,6 +435,8 @@ void flashinfer_decode_run_wrapper(
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
+    (void)rope_theta;
+    (void)rope_theta;
 #if !defined(NO_HARDWARE_FP8)
     if (plan_info_vec) {
         using IdType = int32_t;
@@ -473,7 +475,7 @@ void flashinfer_decode_run_wrapper(
                 if (out_data_type == 1) {
                     run_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_fp8(half{});
+                    run_fp8(cutlass::half_t{});
                 }
 #else
                 fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
@@ -507,15 +509,15 @@ void flashinfer_decode_run_wrapper(
 
                 if (data_type == 1) {
                     if (out_data_type == 1) {
-                        run_non_fp8(nv_bfloat16{}, nv_bfloat16{});
+                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
                     } else {
-                        run_non_fp8(nv_bfloat16{}, half{});
+                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::half_t{});
                     }
                 } else {
                     if (out_data_type == 1) {
-                        run_non_fp8(half{}, nv_bfloat16{});
+                        run_non_fp8(cutlass::half_t{}, cutlass::bfloat16_t{});
                     } else {
-                        run_non_fp8(half{}, half{});
+                        run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
                     }
                 }
             }
@@ -685,7 +687,7 @@ void flashinfer_prefill_wrapper(
                 if (out_data_type == 1) {
                     run_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_fp8(half{});
+                    run_fp8(cutlass::half_t{});
                 }
 #else
                 fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
@@ -719,15 +721,15 @@ void flashinfer_prefill_wrapper(
 
                 if (data_type == 1) {
                     if (out_data_type == 1) {
-                        run_non_fp8(nv_bfloat16{}, nv_bfloat16{});
+                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
                     } else {
-                        run_non_fp8(nv_bfloat16{}, half{});
+                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::half_t{});
                     }
                 } else {
                     if (out_data_type == 1) {
-                        run_non_fp8(half{}, nv_bfloat16{});
+                        run_non_fp8(cutlass::half_t{}, cutlass::bfloat16_t{});
                     } else {
-                        run_non_fp8(half{}, half{});
+                        run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
                     }
                 }
             }
