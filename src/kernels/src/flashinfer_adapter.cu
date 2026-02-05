@@ -20,7 +20,10 @@
     #endif
 
     #include <flashinfer/attention/default_decode_params.cuh>
-    #include <flashinfer/page.cuh>
+#include <flashinfer/page.cuh>
+#if !defined(NO_HARDWARE_FP8)
+#include <cutlass/numeric_types.h>
+#endif
     #include <flashinfer/pos_enc.cuh>
 
 using namespace flashinfer;
@@ -426,8 +429,8 @@ void flashinfer_decode_run_wrapper(
         auto run_sm90 = [&]() {
             if (data_type == 2) {
 #if !defined(NO_FP8_KVCACHE)
-                using DTypeQ = __nv_fp8_e4m3;
-                using DTypeKV = __nv_fp8_e4m3;
+                using DTypeQ = cutlass::float_e4m3_t;
+                using DTypeKV = cutlass::float_e4m3_t;
                 auto run_fp8 = [&](auto out_val) {
                     using DTypeOut = decltype(out_val);
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
@@ -630,8 +633,8 @@ void flashinfer_prefill_wrapper(
         auto run_sm90 = [&]() {
             if (data_type == 2) {
 #if !defined(NO_FP8_KVCACHE)
-                using DTypeQ = __nv_fp8_e4m3;
-                using DTypeKV = __nv_fp8_e4m3;
+                using DTypeQ = cutlass::float_e4m3_t;
+                using DTypeKV = cutlass::float_e4m3_t;
                 auto run_fp8 = [&](auto out_val) {
                     using DTypeOut = decltype(out_val);
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
