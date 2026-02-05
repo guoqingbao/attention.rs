@@ -446,22 +446,20 @@ void flashinfer_decode_run_wrapper(
 
         auto run_sm90 = [&]() {
             if (data_type == 2) {
-#if !defined(NO_FP8_KVCACHE)
                 if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
                     return;
                 }
                 using DTypeQ = cutlass::float_e4m3_t;
                 using DTypeKV = cutlass::float_e4m3_t;
-                auto run_fp8 = [&](auto out_val) {
-                    using DTypeOut = decltype(out_val);
+                using AttentionType = DefaultFP8Attention;
+                if (out_data_type == 1) {
+                    using DTypeOut = cutlass::bfloat16_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
                         params, q_ptr, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
                         batch_size, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
-
-                    using AttentionType = DefaultFP8Attention;
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
                             BatchFP8PrefillWithPagedKVCacheDispatched<
@@ -473,25 +471,34 @@ void flashinfer_decode_run_wrapper(
                                 params, false, stream);
                         }
                     });
-                };
-
-                if (out_data_type == 1) {
-                    run_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_fp8(cutlass::half_t{});
+                    using DTypeOut = cutlass::half_t;
+                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        batch_size, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        indices, workspace_int, plan_info);
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
                 }
-#else
-                fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
-                throw std::runtime_error("Error: FP8 KV-cache disabled.");
-#endif
             } else {
                 if (out_data_type != data_type) {
                     return;
                 }
-                auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
+                auto run_non_fp8 = [&](auto dtype_val) {
                     using DTypeKV = decltype(dtype_val);
                     using DTypeQ = DTypeKV;
-                    using DTypeOut = decltype(out_val);
+                    using DTypeOut = DTypeKV;
 
                     BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
@@ -514,9 +521,9 @@ void flashinfer_decode_run_wrapper(
                 };
 
                 if (data_type == 1) {
-                    run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
+                    run_non_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
+                    run_non_fp8(cutlass::half_t{});
                 }
             }
         };
@@ -656,22 +663,20 @@ void flashinfer_prefill_wrapper(
 
         auto run_sm90 = [&]() {
             if (data_type == 2) {
-#if !defined(NO_FP8_KVCACHE)
                 if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
                     return;
                 }
                 using DTypeQ = cutlass::float_e4m3_t;
                 using DTypeKV = cutlass::float_e4m3_t;
-                auto run_fp8 = [&](auto out_val) {
-                    using DTypeOut = decltype(out_val);
+                using AttentionType = DefaultFP8Attention;
+                if (out_data_type == 1) {
+                    using DTypeOut = cutlass::bfloat16_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
                         params, q_ptr, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
                         total_num_rows, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
-
-                    using AttentionType = DefaultFP8Attention;
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
                             BatchFP8PrefillWithPagedKVCacheDispatched<
@@ -683,25 +688,34 @@ void flashinfer_prefill_wrapper(
                                 params, false, stream);
                         }
                     });
-            };
-
-                if (out_data_type == 1) {
-                    run_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_fp8(cutlass::half_t{});
+                    using DTypeOut = cutlass::half_t;
+                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                        params, q_ptr, k_data, v_data, out_ptr,
+                        num_qo_heads, num_kv_heads, head_dim, page_size,
+                        total_num_rows, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        indices, workspace_int, plan_info);
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
                 }
-#else
-                fprintf(stderr, "FP8 KV-cache is disabled at build time.\n");
-                throw std::runtime_error("Error: FP8 KV-cache disabled.");
-#endif
             } else {
                 if (out_data_type != data_type) {
                     return;
                 }
-                auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
+                auto run_non_fp8 = [&](auto dtype_val) {
                     using DTypeKV = decltype(dtype_val);
                     using DTypeQ = DTypeKV;
-                    using DTypeOut = decltype(out_val);
+                    using DTypeOut = DTypeKV;
 
                     BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
@@ -721,12 +735,12 @@ void flashinfer_prefill_wrapper(
                                 params, false, stream);
                         }
                     });
-            };
+                };
 
                 if (data_type == 1) {
-                    run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
+                    run_non_fp8(cutlass::bfloat16_t{});
                 } else {
-                    run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
+                    run_non_fp8(cutlass::half_t{});
                 }
             }
         };

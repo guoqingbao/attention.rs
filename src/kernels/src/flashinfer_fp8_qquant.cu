@@ -107,6 +107,8 @@ extern "C" void flashinfer_fp8_quantize_q_per_head(const void* input, void* outp
   if (numel <= 0) {
     return;
   }
+  // Ensure scales start from 0 for atomicMax-based reduction.
+  cudaMemsetAsync(output_scale, 0, (size_t)num_heads * sizeof(float), stream);
   const int threads = 256;
   int blocks = static_cast<int>((numel + threads - 1) / threads);
   if (blocks > 65535) {
