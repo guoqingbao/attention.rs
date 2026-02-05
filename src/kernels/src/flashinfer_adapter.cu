@@ -234,16 +234,16 @@ static inline void FillSM90PagedParams(
 #endif // Flashinfer
 
 #if !defined(NO_HARDWARE_FP8)
-#define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, BODY) \
+#define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, ...) \
     if ((HEAD_DIM_VALUE) == 64) {                              \
         constexpr uint32_t HEAD_DIM = 64;                      \
-        BODY;                                                  \
+        __VA_ARGS__;                                           \
     } else if ((HEAD_DIM_VALUE) == 128) {                      \
         constexpr uint32_t HEAD_DIM = 128;                     \
-        BODY;                                                  \
+        __VA_ARGS__;                                           \
     } else if ((HEAD_DIM_VALUE) == 256) {                      \
         constexpr uint32_t HEAD_DIM = 256;                     \
-        BODY;                                                  \
+        __VA_ARGS__;                                           \
     } else {                                                   \
         return;                                                \
     }
