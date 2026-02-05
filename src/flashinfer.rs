@@ -541,6 +541,12 @@ impl FlashInferDecodeWithPlan {
             if sm < 90 {
                 candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
             }
+            if !(self.head_dim == 64 || self.head_dim == 128 || self.head_dim == 256) {
+                candle::bail!(
+                    "flashinfer fp8 decode supports head_dim 64/128/256, got {}",
+                    self.head_dim
+                );
+            }
             if self.plan_info.len() != 9 {
                 candle::bail!(
                     "flashinfer fp8 decode plan_info must have length 9, got {}",
@@ -576,18 +582,30 @@ impl FlashInferDecodeWithPlan {
 
         let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
         let (q_scale_ptr, k_scale_ptr, v_scale_ptr) = if data_type == 2 {
+            let k_scales = self
+                .k_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 decode requires k_scale"))?;
+            let v_scales = self
+                .v_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 decode requires v_scale"))?;
+            if k_scales.elem_count() != self.num_kv_heads
+                || v_scales.elem_count() != self.num_kv_heads
+            {
+                candle::bail!(
+                    "fp8 decode requires k_scale/v_scale length == num_kv_heads ({}), got {}/{}",
+                    self.num_kv_heads,
+                    k_scales.elem_count(),
+                    v_scales.elem_count()
+                );
+            }
             let q_scale_ptr = q_scale
                 .as_ref()
                 .map(|s| *s.device_ptr() as *const f32)
                 .unwrap_or(std::ptr::null());
-            let k_scale_ptr = match &self.k_scale {
-                Some(t) => get_cuda_f32_ptr(t)?,
-                None => std::ptr::null(),
-            };
-            let v_scale_ptr = match &self.v_scale {
-                Some(t) => get_cuda_f32_ptr(t)?,
-                None => std::ptr::null(),
-            };
+            let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
+            let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
             (q_scale_ptr, k_scale_ptr, v_scale_ptr)
         } else {
             (std::ptr::null(), std::ptr::null(), std::ptr::null())
@@ -859,6 +877,12 @@ impl FlashInferPrefill {
             if q.dtype() != DType::F16 && q.dtype() != DType::BF16 {
                 candle::bail!("flashinfer fp8 prefill requires f16/bf16 q");
             }
+            if !(self.head_dim == 64 || self.head_dim == 128 || self.head_dim == 256) {
+                candle::bail!(
+                    "flashinfer fp8 prefill supports head_dim 64/128/256, got {}",
+                    self.head_dim
+                );
+            }
         }
 
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
@@ -884,18 +908,30 @@ impl FlashInferPrefill {
 
         let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
         let (q_scale_ptr, k_scale_ptr, v_scale_ptr) = if data_type == 2 {
+            let k_scales = self
+                .k_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 prefill requires k_scale"))?;
+            let v_scales = self
+                .v_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 prefill requires v_scale"))?;
+            if k_scales.elem_count() != self.num_kv_heads
+                || v_scales.elem_count() != self.num_kv_heads
+            {
+                candle::bail!(
+                    "fp8 prefill requires k_scale/v_scale length == num_kv_heads ({}), got {}/{}",
+                    self.num_kv_heads,
+                    k_scales.elem_count(),
+                    v_scales.elem_count()
+                );
+            }
             let q_scale_ptr = q_scale
                 .as_ref()
                 .map(|s| *s.device_ptr() as *const f32)
                 .unwrap_or(std::ptr::null());
-            let k_scale_ptr = match &self.k_scale {
-                Some(t) => get_cuda_f32_ptr(t)?,
-                None => std::ptr::null(),
-            };
-            let v_scale_ptr = match &self.v_scale {
-                Some(t) => get_cuda_f32_ptr(t)?,
-                None => std::ptr::null(),
-            };
+            let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
+            let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
             (q_scale_ptr, k_scale_ptr, v_scale_ptr)
         } else {
             (std::ptr::null(), std::ptr::null(), std::ptr::null())

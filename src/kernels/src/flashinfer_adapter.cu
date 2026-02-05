@@ -447,6 +447,9 @@ void flashinfer_decode_run_wrapper(
         auto run_sm90 = [&]() {
             if (data_type == 2) {
 #if !defined(NO_FP8_KVCACHE)
+                if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
+                    return;
+                }
                 using DTypeQ = cutlass::float_e4m3_t;
                 using DTypeKV = cutlass::float_e4m3_t;
                 auto run_fp8 = [&](auto out_val) {
@@ -482,6 +485,9 @@ void flashinfer_decode_run_wrapper(
                 throw std::runtime_error("Error: FP8 KV-cache disabled.");
 #endif
             } else {
+                if (out_data_type != data_type) {
+                    return;
+                }
                 auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
                     using DTypeKV = decltype(dtype_val);
                     using DTypeQ = DTypeKV;
@@ -508,17 +514,9 @@ void flashinfer_decode_run_wrapper(
                 };
 
                 if (data_type == 1) {
-                    if (out_data_type == 1) {
-                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
-                    } else {
-                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::half_t{});
-                    }
+                    run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
                 } else {
-                    if (out_data_type == 1) {
-                        run_non_fp8(cutlass::half_t{}, cutlass::bfloat16_t{});
-                    } else {
-                        run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
-                    }
+                    run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
                 }
             }
         };
@@ -659,6 +657,9 @@ void flashinfer_prefill_wrapper(
         auto run_sm90 = [&]() {
             if (data_type == 2) {
 #if !defined(NO_FP8_KVCACHE)
+                if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
+                    return;
+                }
                 using DTypeQ = cutlass::float_e4m3_t;
                 using DTypeKV = cutlass::float_e4m3_t;
                 auto run_fp8 = [&](auto out_val) {
@@ -694,6 +695,9 @@ void flashinfer_prefill_wrapper(
                 throw std::runtime_error("Error: FP8 KV-cache disabled.");
 #endif
             } else {
+                if (out_data_type != data_type) {
+                    return;
+                }
                 auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
                     using DTypeKV = decltype(dtype_val);
                     using DTypeQ = DTypeKV;
@@ -720,17 +724,9 @@ void flashinfer_prefill_wrapper(
             };
 
                 if (data_type == 1) {
-                    if (out_data_type == 1) {
-                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
-                    } else {
-                        run_non_fp8(cutlass::bfloat16_t{}, cutlass::half_t{});
-                    }
+                    run_non_fp8(cutlass::bfloat16_t{}, cutlass::bfloat16_t{});
                 } else {
-                    if (out_data_type == 1) {
-                        run_non_fp8(cutlass::half_t{}, cutlass::bfloat16_t{});
-                    } else {
-                        run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
-                    }
+                    run_non_fp8(cutlass::half_t{}, cutlass::half_t{});
                 }
             }
         };
