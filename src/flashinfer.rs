@@ -145,51 +145,6 @@ fn get_cuda_f32_ptr(t: &Tensor) -> Result<*const f32> {
     }
 }
 
-fn quantize_q_fp8(
-    q: &CudaStorage,
-    q_l: &Layout,
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<(CudaSlice<u8>, CudaSlice<f32>)> {
-    let dev = q.device();
-    let dtype = q.dtype();
-    if dtype != DType::F16 && dtype != DType::BF16 {
-        candle::bail!("fp8 quantization requires f16/bf16 input");
-    }
-    let numel = q_l.shape().elem_count();
-    let q_fp8 = unsafe { dev.alloc::<u8>(numel) }.w()?;
-    let q_scale = unsafe { dev.alloc::<f32>(num_heads) }.w()?;
-
-    let q_ptr = match &q.slice {
-        candle_core::cuda_backend::CudaStorageSlice::F16(inp) => {
-            *inp.slice(q_l.start_offset()..).device_ptr() as *const core::ffi::c_void
-        }
-        candle_core::cuda_backend::CudaStorageSlice::BF16(inp) => {
-            *inp.slice(q_l.start_offset()..).device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle::bail!("q must be f16/bf16 cuda tensor"),
-    };
-
-    let q_fp8_ptr = *q_fp8.device_ptr() as *mut std::ffi::c_void;
-    let q_scale_ptr = *q_scale.device_ptr() as *mut f32;
-    let stream = *dev.cu_stream() as i64;
-
-    unsafe {
-        kernels::ffi::flashinfer_fp8_quantize_q_per_head(
-            q_ptr,
-            q_fp8_ptr,
-            q_scale_ptr,
-            numel as i64,
-            num_heads as i32,
-            head_dim as i32,
-            dtype == DType::F16,
-            stream,
-        );
-    }
-
-    Ok((q_fp8, q_scale))
-}
-
 fn get_or_init_workspace(
     dev: &candle_core::cuda_backend::CudaDevice,
     for_cuda_graph: bool,
@@ -350,9 +305,28 @@ impl candle::CustomOp1 for FlashInferAppend {
         let k_data_ptr = get_cuda_ptr(k_ptr)?;
         let v_data_ptr = get_cuda_ptr(v_ptr)?;
 
-        let mut _k_fp8: Option<CudaSlice<u8>> = None;
-        let mut _v_fp8: Option<CudaSlice<u8>> = None;
-        let (k_append_ptr, v_append_ptr) = if data_type == 2 {
+        let (k_append_ptr, v_append_ptr) = (k_data_ptr, v_data_ptr);
+
+        let (indices_s, indices_l) = indices_ptr.storage_and_layout();
+        let indices = match &*indices_s {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indices_l.start_offset()..),
+            _ => candle::bail!("indices must be cuda"),
+        };
+
+        let (indptr_s, indptr_l) = indptr_ptr.storage_and_layout();
+        let indptr = match &*indptr_s {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indptr_l.start_offset()..),
+            _ => candle::bail!("indptr must be cuda"),
+        };
+
+        let (last_len_s, last_len_l) = last_len_ptr.storage_and_layout();
+        let last_len = match &*last_len_s {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(last_len_l.start_offset()..),
+            _ => candle::bail!("last_len must be cuda"),
+        };
+        let is_input_f16 = k_ptr.dtype() == DType::F16;
+
+        let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
             let sm = cuda_utils::sm_version(dev).unwrap_or(0);
             if sm < 90 {
                 candle::bail!("flashinfer fp8 append requires sm90+, got sm{}", sm);
@@ -375,51 +349,9 @@ impl candle::CustomOp1 for FlashInferAppend {
             }
             let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
             let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
-            let numel = nnz as usize * num_heads * head_dim;
-            let k_q = unsafe { dev.alloc::<u8>(numel) }.w()?;
-            let v_q = unsafe { dev.alloc::<u8>(numel) }.w()?;
-            let is_input_f16 = k_ptr.dtype() == DType::F16;
-            unsafe {
-                kernels::ffi::flashinfer_fp8_quantize_kv_per_head(
-                    k_data_ptr,
-                    v_data_ptr,
-                    *k_q.device_ptr() as *mut std::ffi::c_void,
-                    *v_q.device_ptr() as *mut std::ffi::c_void,
-                    numel as i64,
-                    num_heads as i32,
-                    head_dim as i32,
-                    k_scale_ptr,
-                    v_scale_ptr,
-                    is_input_f16,
-                    *dev.cu_stream() as i64,
-                );
-            }
-            _k_fp8 = Some(k_q);
-            _v_fp8 = Some(v_q);
-            (
-                *_k_fp8.as_ref().unwrap().device_ptr() as *const std::ffi::c_void,
-                *_v_fp8.as_ref().unwrap().device_ptr() as *const std::ffi::c_void,
-            )
+            (k_scale_ptr, v_scale_ptr)
         } else {
-            (k_data_ptr, v_data_ptr)
-        };
-
-        let (indices_s, indices_l) = indices_ptr.storage_and_layout();
-        let indices = match &*indices_s {
-            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indices_l.start_offset()..),
-            _ => candle::bail!("indices must be cuda"),
-        };
-
-        let (indptr_s, indptr_l) = indptr_ptr.storage_and_layout();
-        let indptr = match &*indptr_s {
-            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indptr_l.start_offset()..),
-            _ => candle::bail!("indptr must be cuda"),
-        };
-
-        let (last_len_s, last_len_l) = last_len_ptr.storage_and_layout();
-        let last_len = match &*last_len_s {
-            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(last_len_l.start_offset()..),
-            _ => candle::bail!("last_len must be cuda"),
+            (std::ptr::null(), std::ptr::null())
         };
 
         unsafe {
@@ -438,6 +370,9 @@ impl candle::CustomOp1 for FlashInferAppend {
                 num_heads as i32,
                 head_dim as i32,
                 page_size as i32,
+                k_scale_ptr,
+                v_scale_ptr,
+                is_input_f16,
                 data_type,
                 *dev.cu_stream() as i64,
             );
@@ -560,20 +495,7 @@ impl FlashInferDecodeWithPlan {
             );
         }
 
-        let mut _q_fp8: Option<CudaSlice<u8>> = None;
-        let mut q_scale: Option<CudaSlice<f32>> = None;
-        let q_ptr = if data_type == 2 {
-            if q.dtype() != DType::F16 && q.dtype() != DType::BF16 {
-                candle::bail!("flashinfer fp8 decode requires f16/bf16 q");
-            }
-            let (q8, qs) = quantize_q_fp8(q, q_l, self.num_qo_heads, self.head_dim)?;
-            q_scale = Some(qs);
-            let q_ptr = *q8.device_ptr() as *const core::ffi::c_void;
-            _q_fp8 = Some(q8);
-            q_ptr
-        } else {
-            get_cuda_ptr_storage(q, q_l, q.dtype())?
-        };
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
@@ -581,7 +503,7 @@ impl FlashInferDecodeWithPlan {
             get_or_init_workspace(dev, self.enable_cuda_graph)?;
 
         let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
-        let (q_scale_ptr, k_scale_ptr, v_scale_ptr) = if data_type == 2 {
+        let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
             let k_scales = self
                 .k_scale
                 .as_ref()
@@ -600,15 +522,11 @@ impl FlashInferDecodeWithPlan {
                     v_scales.elem_count()
                 );
             }
-            let q_scale_ptr = q_scale
-                .as_ref()
-                .map(|s| *s.device_ptr() as *const f32)
-                .unwrap_or(std::ptr::null());
             let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
             let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
-            (q_scale_ptr, k_scale_ptr, v_scale_ptr)
+            (k_scale_ptr, v_scale_ptr)
         } else {
-            (std::ptr::null(), std::ptr::null(), std::ptr::null())
+            (std::ptr::null(), std::ptr::null())
         };
 
         unsafe {
@@ -626,7 +544,6 @@ impl FlashInferDecodeWithPlan {
                 self.head_dim as i32,
                 self.block_size as i32,
                 self.sm_scale,
-                q_scale_ptr,
                 k_scale_ptr,
                 v_scale_ptr,
                 ws_float_ptr,
@@ -894,20 +811,10 @@ impl FlashInferPrefill {
         let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
             get_or_init_workspace(dev, false)?;
 
-        let mut q_fp8: Option<CudaSlice<u8>> = None;
-        let mut q_scale: Option<CudaSlice<f32>> = None;
-        let q_ptr = if data_type == 2 {
-            let (q8, qs) = quantize_q_fp8(q, q_l, self.num_qo_heads, self.head_dim)?;
-            q_scale = Some(qs);
-            let q_ptr = *q8.device_ptr() as *const core::ffi::c_void;
-            q_fp8 = Some(q8);
-            q_ptr
-        } else {
-            get_cuda_ptr_storage(q, q_l, q.dtype())?
-        };
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
         let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
-        let (q_scale_ptr, k_scale_ptr, v_scale_ptr) = if data_type == 2 {
+        let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
             let k_scales = self
                 .k_scale
                 .as_ref()
@@ -926,15 +833,11 @@ impl FlashInferPrefill {
                     v_scales.elem_count()
                 );
             }
-            let q_scale_ptr = q_scale
-                .as_ref()
-                .map(|s| *s.device_ptr() as *const f32)
-                .unwrap_or(std::ptr::null());
             let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
             let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
-            (q_scale_ptr, k_scale_ptr, v_scale_ptr)
+            (k_scale_ptr, v_scale_ptr)
         } else {
-            (std::ptr::null(), std::ptr::null(), std::ptr::null())
+            (std::ptr::null(), std::ptr::null())
         };
 
         let last_len_host = if let Some(v) = &self.last_len_host {
@@ -982,7 +885,6 @@ impl FlashInferPrefill {
                 self.head_dim as i32,
                 self.block_size as i32,
                 self.sm_scale,
-                q_scale_ptr,
                 k_scale_ptr,
                 v_scale_ptr,
                 ws_float_ptr,

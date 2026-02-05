@@ -28,6 +28,17 @@
 
 using namespace flashinfer;
 
+extern "C" void flashinfer_fp8_quantize_q_per_head(const void* input, void* output_q,
+                                                   float* output_scale, int64_t numel,
+                                                   int num_heads, int head_dim,
+                                                   bool is_input_f16, int64_t stream_);
+extern "C" void flashinfer_fp8_quantize_kv_per_head(const void* k_in, const void* v_in,
+                                                    void* k_out, void* v_out, int64_t numel,
+                                                    int num_heads, int head_dim,
+                                                    const float* k_scales,
+                                                    const float* v_scales, bool is_input_f16,
+                                                    int64_t stream_);
+
 #if defined(NO_HARDWARE_FP8)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias =
@@ -266,10 +277,40 @@ void flashinfer_append_kv_cache(
     int32_t num_heads,
     int32_t head_dim,
     int32_t page_size,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    bool is_input_f16,
     int32_t data_type,
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
+    void* k_ptr_local = new_k_ptr;
+    void* v_ptr_local = new_v_ptr;
+    void* k_fp8_ptr = nullptr;
+    void* v_fp8_ptr = nullptr;
+    if (data_type == 2) {
+        if (!k_scale_ptr || !v_scale_ptr) {
+            return;
+        }
+        int64_t numel = static_cast<int64_t>(nnz) * num_heads * head_dim;
+        cudaMallocAsync(&k_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+        cudaMallocAsync(&v_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+        flashinfer_fp8_quantize_kv_per_head(
+            new_k_ptr,
+            new_v_ptr,
+            k_fp8_ptr,
+            v_fp8_ptr,
+            numel,
+            num_heads,
+            head_dim,
+            k_scale_ptr,
+            v_scale_ptr,
+            is_input_f16,
+            (int64_t)stream);
+        k_ptr_local = k_fp8_ptr;
+        v_ptr_local = v_fp8_ptr;
+    }
+
     auto run = [&](auto dtype_val) {
         using DType = decltype(dtype_val);
         paged_kv_t<DType, int32_t> paged_kv(
@@ -283,13 +324,13 @@ void flashinfer_append_kv_cache(
              size_t stride_n = num_heads * head_dim;
              size_t stride_h = head_dim;
              
-             AppendPagedKVCache(paged_kv, (DType*)new_k_ptr, (DType*)new_v_ptr, 
+             AppendPagedKVCache(paged_kv, (DType*)k_ptr_local, (DType*)v_ptr_local, 
                                 batch_indices, positions, nnz,
                                 stride_n, stride_h, stride_n, stride_h, 
                                 stream);
         } else {
              // Decode append (Batch)
-             AppendPagedKVCacheDecode(paged_kv, (DType*)new_k_ptr, (DType*)new_v_ptr, stream);
+             AppendPagedKVCacheDecode(paged_kv, (DType*)k_ptr_local, (DType*)v_ptr_local, stream);
         }
     };
 
@@ -299,6 +340,13 @@ void flashinfer_append_kv_cache(
         run(uint8_t(0));
     } else {
         run(half(0));
+    }
+
+    if (k_fp8_ptr) {
+        cudaFreeAsync(k_fp8_ptr, stream);
+    }
+    if (v_fp8_ptr) {
+        cudaFreeAsync(v_fp8_ptr, stream);
     }
 #endif
 }
@@ -420,7 +468,6 @@ void flashinfer_decode_run_wrapper(
     int32_t head_dim,
     int32_t page_size,
     float sm_scale,
-    const float* q_scale_ptr,
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     void* workspace_float,
@@ -444,9 +491,30 @@ void flashinfer_decode_run_wrapper(
         PrefillPlanSM90Info plan_info;
         plan_info.FromVector(vec);
 
+        void* q_ptr_local = const_cast<void*>(q_ptr);
+        void* q_scale_ptr = nullptr;
+        void* q_fp8_ptr = nullptr;
+        if (data_type == 2) {
+            int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
+            cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+            cudaMallocAsync(&q_scale_ptr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
+            
+            bool is_input_f16 = (out_data_type == 0);
+            flashinfer_fp8_quantize_q_per_head(
+                q_ptr,
+                q_fp8_ptr,
+                static_cast<float*>(q_scale_ptr),
+                numel,
+                num_qo_heads,
+                head_dim,
+                is_input_f16,
+                (int64_t)stream);
+            q_ptr_local = q_fp8_ptr;
+        }
+
         auto run_sm90 = [&]() {
             if (data_type == 2) {
-                if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
+                if (!k_scale_ptr || !v_scale_ptr || q_scale_ptr == nullptr) {
                     return;
                 }
                 using DTypeQ = cutlass::float_e4m3_t;
@@ -456,9 +524,9 @@ void flashinfer_decode_run_wrapper(
                     using DTypeOut = cutlass::bfloat16_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr, k_data, v_data, out_ptr,
+                        params, q_ptr_local, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
-                        batch_size, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
@@ -475,9 +543,9 @@ void flashinfer_decode_run_wrapper(
                     using DTypeOut = cutlass::half_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr, k_data, v_data, out_ptr,
+                        params, q_ptr_local, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
-                        batch_size, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
@@ -529,6 +597,12 @@ void flashinfer_decode_run_wrapper(
         };
 
         run_sm90();
+        if (q_fp8_ptr) {
+            cudaFreeAsync(q_fp8_ptr, stream);
+        }
+        if (q_scale_ptr) {
+            cudaFreeAsync(q_scale_ptr, stream);
+        }
     }
     return;
 #else
@@ -620,7 +694,6 @@ void flashinfer_prefill_wrapper(
     int32_t head_dim,
     int32_t page_size,
     float sm_scale,
-    const float* q_scale_ptr,
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     void* workspace_float,
@@ -661,9 +734,29 @@ void flashinfer_prefill_wrapper(
             stream
         );
 
+        void* q_ptr_local = const_cast<void*>(q_ptr);
+        void* q_scale_ptr = nullptr;
+        void* q_fp8_ptr = nullptr;
+        if (data_type == 2) {
+            int64_t numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
+            cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+            cudaMallocAsync(&q_scale_ptr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
+            bool is_input_f16 = (out_data_type == 0);
+            flashinfer_fp8_quantize_q_per_head(
+                q_ptr,
+                q_fp8_ptr,
+                static_cast<float*>(q_scale_ptr),
+                numel,
+                num_qo_heads,
+                head_dim,
+                is_input_f16,
+                (int64_t)stream);
+            q_ptr_local = q_fp8_ptr;
+        }
+
         auto run_sm90 = [&]() {
             if (data_type == 2) {
-                if (!q_scale_ptr || !k_scale_ptr || !v_scale_ptr) {
+                if (!k_scale_ptr || !v_scale_ptr || q_scale_ptr == nullptr) {
                     return;
                 }
                 using DTypeQ = cutlass::float_e4m3_t;
@@ -673,9 +766,9 @@ void flashinfer_prefill_wrapper(
                     using DTypeOut = cutlass::bfloat16_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr, k_data, v_data, out_ptr,
+                        params, q_ptr_local, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
-                        total_num_rows, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        total_num_rows, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
@@ -692,9 +785,9 @@ void flashinfer_prefill_wrapper(
                     using DTypeOut = cutlass::half_t;
                     FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr, k_data, v_data, out_ptr,
+                        params, q_ptr_local, k_data, v_data, out_ptr,
                         num_qo_heads, num_kv_heads, head_dim, page_size,
-                        total_num_rows, sm_scale, q_scale_ptr, k_scale_ptr, v_scale_ptr,
+                        total_num_rows, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
                         indices, workspace_int, plan_info);
                     DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
                         if (plan_info.same_schedule_for_all_heads) {
@@ -746,6 +839,12 @@ void flashinfer_prefill_wrapper(
         };
 
         run_sm90();
+        if (q_fp8_ptr) {
+            cudaFreeAsync(q_fp8_ptr, stream);
+        }
+        if (q_scale_ptr) {
+            cudaFreeAsync(q_scale_ptr, stream);
+        }
     }
     return;
 #else
