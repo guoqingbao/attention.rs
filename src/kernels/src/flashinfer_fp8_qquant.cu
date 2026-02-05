@@ -67,7 +67,7 @@ __global__ void q_fp8_compute_scale_per_head_kernel(const T* __restrict__ input,
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    float candidate = s[0] / 448.0f;
+    float candidate = fmaxf(s[0] / 448.0f, 1e-6f);
     if (candidate > 0.0f) {
       atomicMaxFloat(&scale_out[head_idx], candidate);
     }

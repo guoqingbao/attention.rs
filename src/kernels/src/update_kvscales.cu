@@ -23,7 +23,8 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#define DIV_CONST 240.0f
+// Scale = max_abs / 448.0f (clamped to >= 1e-6).
+#define DIV_CONST 448.0f
 
 template<typename T>
 __device__ __forceinline__ float to_float_abs(T x);
@@ -110,8 +111,8 @@ __global__ void compute_and_update_scales_per_head_kernel(
     }
 
     if (threadIdx.x == 0) {
-        float candidate_k_scale = s_k[0] / DIV_CONST;
-        float candidate_v_scale = s_v[0] / DIV_CONST;
+        float candidate_k_scale = fmaxf(s_k[0] / DIV_CONST, 1e-6f);
+        float candidate_v_scale = fmaxf(s_v[0] / DIV_CONST, 1e-6f);
         if (candidate_k_scale > 0.0f) atomicMaxFloat(&k_scales[head_idx], candidate_k_scale);
         if (candidate_v_scale > 0.0f) atomicMaxFloat(&v_scales[head_idx], candidate_v_scale);
     }
