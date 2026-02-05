@@ -72,14 +72,13 @@ struct FP8BatchPrefillPagedParams {
     IdType* batch_indices;
 
     struct AdditionalParams {
-        float logits_soft_cap;
-        float sm_scale;
         float* maybe_scale_q;
         float* maybe_scale_k;
         float* maybe_scale_v;
-        float scale_q_scalar;
-        float scale_k_scalar;
-        float scale_v_scalar;
+        double sm_scale;
+        double scale_q_scalar;
+        double scale_k_scalar;
+        double scale_v_scalar;
     } additional_params;
 
     int64_t q_stride_n;
@@ -94,6 +93,7 @@ struct FP8BatchPrefillPagedParams {
     int64_t k_page_stride;
     int64_t v_page_stride;
 
+    int head_dim;
     int num_qo_heads;
     int num_kv_heads;
     int group_size;
@@ -140,20 +140,20 @@ static inline void FillFP8PagedParams(
     params.k_page_stride = static_cast<int64_t>(page_size) * num_kv_heads * head_dim;
     params.v_page_stride = params.k_page_stride;
     params.nnz_qo = nnz_qo;
+    params.head_dim = head_dim;
     params.num_qo_heads = num_qo_heads;
     params.num_kv_heads = num_kv_heads;
     params.group_size = num_qo_heads / num_kv_heads;
     params.page_size = page_size;
     params.window_left = -1;
     params.causal = true;
-    params.additional_params.logits_soft_cap = 0.0f;
-    params.additional_params.sm_scale = sm_scale;
+    params.additional_params.sm_scale = static_cast<double>(sm_scale);
     params.additional_params.maybe_scale_q = const_cast<float*>(q_scale_ptr);
     params.additional_params.maybe_scale_k = const_cast<float*>(k_scale_ptr);
     params.additional_params.maybe_scale_v = const_cast<float*>(v_scale_ptr);
-    params.additional_params.scale_q_scalar = 1.0f;
-    params.additional_params.scale_k_scalar = 1.0f;
-    params.additional_params.scale_v_scalar = 1.0f;
+    params.additional_params.scale_q_scalar = 1.0;
+    params.additional_params.scale_k_scalar = 1.0;
+    params.additional_params.scale_v_scalar = 1.0;
 
     params.qo_tile_indices =
         GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
