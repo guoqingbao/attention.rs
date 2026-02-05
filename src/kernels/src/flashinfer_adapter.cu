@@ -25,6 +25,15 @@
 
 using namespace flashinfer;
 
+#if defined(NO_HARDWARE_FP8)
+template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+using DefaultAttentionAlias =
+    DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap, use_alibi>;
+#else
+template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+using DefaultAttentionAlias = DefaultAttention<use_logits_soft_cap>;
+#endif
+
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_ = int32_t>
 struct FP8BatchPrefillPagedParams {
     using DTypeQ = DTypeQ_;
@@ -340,7 +349,7 @@ void flashinfer_decode_plan_wrapper(
 
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
-                using AttentionType = DefaultAttention<false, false, false, false>;
+                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 DecodePlanInfo plan_info;
@@ -463,7 +472,7 @@ void flashinfer_decode_run_wrapper(
                         num_qo_heads, num_kv_heads, head_dim, page_size,
                         batch_size, sm_scale, indices, workspace_int, plan_info);
 
-                    using AttentionType = DefaultAttention<false, false, false, false>;
+                    using AttentionType = DefaultAttentionAlias<false, false, false, false>;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     if (plan_info.same_schedule_for_all_heads) {
                         BatchPrefillWithPagedKVCacheDispatched<
@@ -514,7 +523,7 @@ void flashinfer_decode_run_wrapper(
                 std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
                 plan_info.FromVector(vec);
 
-                using AttentionType = DefaultAttention<false, false, false, false>;
+                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 ParamsType params(
@@ -667,7 +676,7 @@ void flashinfer_prefill_wrapper(
                         num_qo_heads, num_kv_heads, head_dim, page_size,
                         total_num_rows, sm_scale, indices, workspace_int, plan_info);
 
-                    using AttentionType = DefaultAttention<false, false, false, false>;
+                    using AttentionType = DefaultAttentionAlias<false, false, false, false>;
                     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     if (plan_info.same_schedule_for_all_heads) {
                         BatchPrefillWithPagedKVCacheDispatched<
@@ -773,7 +782,7 @@ void flashinfer_prefill_wrapper(
                 tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
             }
             
-            using AttentionType = DefaultAttention<false, false, false, false>;
+            using AttentionType = DefaultAttentionAlias<false, false, false, false>;
 
             DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                 BatchPrefillWithPagedKVCacheDispatched<
