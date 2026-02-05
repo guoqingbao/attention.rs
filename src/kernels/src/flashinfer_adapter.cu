@@ -233,6 +233,22 @@ static inline void FillSM90PagedParams(
 
 #endif // Flashinfer
 
+#if !defined(NO_HARDWARE_FP8)
+#define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, BODY) \
+    if ((HEAD_DIM_VALUE) == 64) {                              \
+        constexpr uint32_t HEAD_DIM = 64;                      \
+        BODY;                                                  \
+    } else if ((HEAD_DIM_VALUE) == 128) {                      \
+        constexpr uint32_t HEAD_DIM = 128;                     \
+        BODY;                                                  \
+    } else if ((HEAD_DIM_VALUE) == 256) {                      \
+        constexpr uint32_t HEAD_DIM = 256;                     \
+        BODY;                                                  \
+    } else {                                                   \
+        return;                                                \
+    }
+#endif
+
 extern "C" {
 
 void flashinfer_append_kv_cache(
@@ -441,18 +457,18 @@ void flashinfer_decode_run_wrapper(
                         indices, workspace_int, plan_info);
 
                     using AttentionType = DefaultFP8Attention;
-                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                    if (plan_info.same_schedule_for_all_heads) {
-                        BatchFP8PrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                            params, false, stream);
-                    } else {
-                        BatchFP8PrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                            params, false, stream);
-                    }
-                });
-            };
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
+                };
 
                 if (out_data_type == 1) {
                     run_fp8(nv_bfloat16{});
@@ -464,10 +480,10 @@ void flashinfer_decode_run_wrapper(
                 throw std::runtime_error("Error: FP8 KV-cache disabled.");
 #endif
             } else {
-                auto run_non_fp8 = [&](auto dtype_val) {
+                auto run_non_fp8 = [&](auto dtype_val, auto out_val) {
                     using DTypeKV = decltype(dtype_val);
                     using DTypeQ = DTypeKV;
-                    using DTypeOut = DTypeKV;
+                    using DTypeOut = decltype(out_val);
 
                     BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
                     FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
@@ -476,23 +492,31 @@ void flashinfer_decode_run_wrapper(
                         batch_size, sm_scale, indices, workspace_int, plan_info);
 
                     using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                    if (plan_info.same_schedule_for_all_heads) {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                            params, false, stream);
-                    } else {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                            params, false, stream);
-                    }
-                });
-            };
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
+                };
 
                 if (data_type == 1) {
-                    run_non_fp8(nv_bfloat16{});
+                    if (out_data_type == 1) {
+                        run_non_fp8(nv_bfloat16{}, nv_bfloat16{});
+                    } else {
+                        run_non_fp8(nv_bfloat16{}, half{});
+                    }
                 } else {
-                    run_non_fp8(half{});
+                    if (out_data_type == 1) {
+                        run_non_fp8(half{}, nv_bfloat16{});
+                    } else {
+                        run_non_fp8(half{}, half{});
+                    }
                 }
             }
         };
@@ -645,17 +669,17 @@ void flashinfer_prefill_wrapper(
                         indices, workspace_int, plan_info);
 
                     using AttentionType = DefaultFP8Attention;
-                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                    if (plan_info.same_schedule_for_all_heads) {
-                        BatchFP8PrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                            params, false, stream);
-                    } else {
-                        BatchFP8PrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                            params, false, stream);
-                    }
-                });
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchFP8PrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
             };
 
                 if (out_data_type == 1) {
@@ -680,17 +704,17 @@ void flashinfer_prefill_wrapper(
                         total_num_rows, sm_scale, indices, workspace_int, plan_info);
 
                     using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                    if (plan_info.same_schedule_for_all_heads) {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                            params, false, stream);
-                    } else {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                            params, false, stream);
-                    }
-                });
+                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                        if (plan_info.same_schedule_for_all_heads) {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                                params, false, stream);
+                        } else {
+                            BatchPrefillWithPagedKVCacheDispatched<
+                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                                params, false, stream);
+                        }
+                    });
             };
 
                 if (data_type == 1) {
