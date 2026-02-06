@@ -79,24 +79,24 @@ __global__ void q_fp8_quantize_per_head_kernel(const T* __restrict__ input,
                                                uint8_t* __restrict__ output, int64_t numel,
                                                int num_heads, int head_dim,
                                                const float* __restrict__ scale_ptr) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= numel) {
-    return;
+  const int64_t start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t idx = start; idx < numel; idx += stride) {
+    const int64_t head_idx = (idx / head_dim) % num_heads;
+    float scale = scale_ptr[head_idx];
+    if (scale == 0.0f) {
+      output[idx] = 0;
+      continue;
+    }
+    float f = 0.0f;
+    if constexpr (std::is_same_v<T, __half>) {
+      f = __half2float(input[idx]);
+    } else {
+      f = __bfloat162float(input[idx]);
+    }
+    f = f / scale;
+    output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
   }
-  const int64_t head_idx = (idx / head_dim) % num_heads;
-  float scale = scale_ptr[head_idx];
-  if (scale == 0.0f) {
-    output[idx] = 0;
-    return;
-  }
-  float f = 0.0f;
-  if constexpr (std::is_same_v<T, __half>) {
-    f = __half2float(input[idx]);
-  } else {
-    f = __bfloat162float(input[idx]);
-  }
-  f = f / scale;
-  output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
 }
 
 extern "C" void flashinfer_fp8_quantize_q_per_head(const void* input, void* output_q,
@@ -140,24 +140,24 @@ __global__ void kv_fp8_quantize_per_head_kernel(const T* __restrict__ input,
                                                 uint8_t* __restrict__ output, int64_t numel,
                                                 int num_heads, int head_dim,
                                                 const float* __restrict__ scale_ptr) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= numel) {
-    return;
+  const int64_t start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t idx = start; idx < numel; idx += stride) {
+    const int64_t head_idx = (idx / head_dim) % num_heads;
+    float scale = scale_ptr[head_idx];
+    if (scale == 0.0f) {
+      output[idx] = 0;
+      continue;
+    }
+    float f = 0.0f;
+    if constexpr (std::is_same_v<T, __half>) {
+      f = __half2float(input[idx]);
+    } else {
+      f = __bfloat162float(input[idx]);
+    }
+    f = f / scale;
+    output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
   }
-  const int64_t head_idx = (idx / head_dim) % num_heads;
-  float scale = scale_ptr[head_idx];
-  if (scale == 0.0f) {
-    output[idx] = 0;
-    return;
-  }
-  float f = 0.0f;
-  if constexpr (std::is_same_v<T, __half>) {
-    f = __half2float(input[idx]);
-  } else {
-    f = __bfloat162float(input[idx]);
-  }
-  f = f / scale;
-  output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
 }
 
 extern "C" void flashinfer_fp8_quantize_kv_per_head(const void* k_in, const void* v_in,

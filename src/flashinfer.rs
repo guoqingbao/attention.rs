@@ -660,7 +660,7 @@ pub fn decode_plan(
         }
         v
     } else {
-        return candle::bail!("decode_plan requires kv_len_arr_host in metadata");
+        candle::bail!("decode_plan requires kv_len_arr_host in metadata");
     };
     let qo_indptr_host = Some(qo_indptr);
     unsafe {
@@ -843,7 +843,7 @@ impl FlashInferPrefill {
         let last_len_host = if let Some(v) = &self.last_len_host {
             v.as_slice()
         } else {
-            return candle::bail!("flashinfer prefill requires last_len_host in metadata");
+            candle::bail!("flashinfer prefill requires last_len_host in metadata");
         };
         if last_len_host.len() != batch_size {
             candle::bail!(
@@ -862,7 +862,7 @@ impl FlashInferPrefill {
             }
             v.as_slice()
         } else {
-            return candle::bail!("flashinfer prefill requires kv_len_arr_host in metadata");
+            candle::bail!("flashinfer prefill requires kv_len_arr_host in metadata");
         };
 
         unsafe {

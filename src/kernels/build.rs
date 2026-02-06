@@ -58,10 +58,22 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_FP8_KVCACHE");
     }
 
-    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok() {
+    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok()
+        || std::env::var("CARGO_FEATURE_FLASHINFER").is_ok()
+    {
         builder = builder.arg("-DUSE_CUTLASS").with_cutlass(None);
-        if compute_cap >= 90 {
-            builder = builder.arg("-DCUTLASS_ENABLE_GDC_FOR_SM90");
+
+        if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+            if compute_cap >= 89 {
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
+            }
+            if compute_cap == 90 {
+                builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
+            }
+            if compute_cap >= 90 {
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
+            }
         }
     }
 
@@ -76,12 +88,6 @@ fn main() -> Result<()> {
             vec!["include"],
             false,
         );
-
-        // If cutlass feature not enabled but we still needs fp8 kvcache under flashinfer
-        if !std::env::var("CARGO_FEATURE_CUTLASS").is_ok() && !fp8_kvcache_disabled {
-            // Featch cutlass header for flashinfer
-            builder = builder.with_cutlass(None);
-        }
     }
 
     // Target handling
