@@ -8,8 +8,8 @@
     #include <flashinfer/attention/scheduler.cuh>
     #if defined(NO_HARDWARE_FP8)
         #include <flashinfer/attention/prefill.cuh>
-        #include <flashinfer/attention/variants.cuh>
         #include <flashinfer/attention/default_prefill_params.cuh>
+        #include <flashinfer/attention/variants.cuh>
     #else
         #include <flashinfer/attention/hopper/prefill_sm90.cuh>
         #include <flashinfer/attention/hopper/variants.cuh>
@@ -43,9 +43,67 @@ extern "C" void flashinfer_fp8_quantize_kv_per_head(const void* k_in, const void
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias =
     DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap, use_alibi>;
+using DefaultDecodeAttention = DefaultAttentionAlias<false, false, false, false>;
 #else
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias = DefaultAttention<use_logits_soft_cap>;
+
+// Decode kernels require the non-hopper attention variant interface, but the
+// standard and hopper variant headers conflict if included together in one TU.
+// Keep a local decode-only variant so SM90 builds can use FlashInfer decode
+// planning/run (including split-kv metadata) without pulling standard variants.
+struct DefaultDecodeAttention {
+    static constexpr bool use_softmax = true;
+    uint32_t kv_len;
+    float sm_scale_log2;
+
+    template <typename Params>
+    __device__ __host__ DefaultDecodeAttention(const Params& params, uint32_t batch_idx,
+                                               uint8_t* smem_ptr) {
+        (void)smem_ptr;
+        kv_len = params.get_kv_len(batch_idx);
+        sm_scale_log2 = params.sm_scale * math::log2e;
+    }
+
+    template <typename Params, typename T>
+    __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
+                                                 uint32_t qo_idx, uint32_t kv_idx,
+                                                 uint32_t qo_head_idx, uint32_t kv_head_idx) {
+        (void)params;
+        (void)batch_idx;
+        (void)qo_idx;
+        (void)kv_idx;
+        (void)qo_head_idx;
+        (void)kv_head_idx;
+        return logits;
+    }
+
+    template <typename Params>
+    __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+        (void)params;
+        (void)batch_idx;
+        (void)qo_idx;
+        (void)kv_idx;
+        (void)qo_head_idx;
+        (void)kv_head_idx;
+        return true;
+    }
+
+    template <typename Params, typename T, typename T_M>
+    __device__ __forceinline__ T OutputTransform(const Params& params, T output, uint32_t batch_idx,
+                                                 uint32_t qo_idx, uint32_t qo_head_idx, T_M& m,
+                                                 float& d, float scale) {
+        (void)params;
+        (void)batch_idx;
+        (void)qo_idx;
+        (void)qo_head_idx;
+        (void)scale;
+        float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+        return output * d_rcp;
+    }
+};
 #endif
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_ = int32_t>
@@ -377,34 +435,38 @@ void flashinfer_decode_plan_wrapper(
         return;
     }
 #if !defined(NO_HARDWARE_FP8)
-    if (qo_indptr_host == nullptr || kv_len_arr_host == nullptr) {
+    // Keep the SM90 FP8 decode path on prefill-style scheduling because it uses
+    // per-head q/k/v scales that are not part of default decode params.
+    if (data_type == 2) {
+        if (qo_indptr_host == nullptr || kv_len_arr_host == nullptr) {
+            return;
+        }
+        PrefillPlanSM90Info plan_info;
+        PrefillSM90Plan<int32_t>(
+            workspace_float, workspace_float_size,
+            workspace_int, page_locked_int_buffer, workspace_int_size,
+            plan_info,
+            qo_indptr_host, indptr_host, kv_len_arr_host,
+            batch_size /* total_num_rows for decode */, batch_size,
+            num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+            true /* causal */, enable_cuda_graph,
+            (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+            stream
+        );
+        if (plan_info_out != nullptr) {
+            plan_info_out[0] = plan_info.qo_tile_indices_offset;
+            plan_info_out[1] = plan_info.qo_indptr_offset;
+            plan_info_out[2] = plan_info.kv_indptr_offset;
+            plan_info_out[3] = plan_info.qo_len_offset;
+            plan_info_out[4] = plan_info.kv_len_offset;
+            plan_info_out[5] = plan_info.head_indices_offset;
+            plan_info_out[6] = plan_info.work_indptr_offset;
+            plan_info_out[7] = plan_info.batch_indices_offset;
+            plan_info_out[8] = plan_info.same_schedule_for_all_heads;
+        }
         return;
     }
-    PrefillPlanSM90Info plan_info;
-    PrefillSM90Plan<int32_t>(
-        workspace_float, workspace_float_size,
-        workspace_int, page_locked_int_buffer, workspace_int_size,
-        plan_info,
-        qo_indptr_host, indptr_host, kv_len_arr_host,
-        batch_size /* total_num_rows for decode */, batch_size,
-        num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-        true /* causal */, enable_cuda_graph,
-        (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
-        stream
-    );
-    if (plan_info_out != nullptr) {
-        plan_info_out[0] = plan_info.qo_tile_indices_offset;
-        plan_info_out[1] = plan_info.qo_indptr_offset;
-        plan_info_out[2] = plan_info.kv_indptr_offset;
-        plan_info_out[3] = plan_info.qo_len_offset;
-        plan_info_out[4] = plan_info.kv_len_offset;
-        plan_info_out[5] = plan_info.head_indices_offset;
-        plan_info_out[6] = plan_info.work_indptr_offset;
-        plan_info_out[7] = plan_info.batch_indices_offset;
-        plan_info_out[8] = plan_info.same_schedule_for_all_heads;
-    }
-    return;
-#else
+#endif
 
     auto run_plan = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
@@ -416,7 +478,7 @@ void flashinfer_decode_plan_wrapper(
 
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
-                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 DecodePlanInfo plan_info;
@@ -452,7 +514,6 @@ void flashinfer_decode_plan_wrapper(
         run_plan(half{});
     }
 #endif
-#endif
 }
 
 void flashinfer_decode_run_wrapper(
@@ -482,11 +543,14 @@ void flashinfer_decode_run_wrapper(
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
-    (void)rope_theta;
-    (void)rope_theta;
+    if (plan_info_vec == nullptr) {
+        fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
+        return;
+    }
 #if !defined(NO_HARDWARE_FP8)
-    if (plan_info_vec) {
-        using IdType = int32_t;
+    using IdType = int32_t;
+    // Keep FP8 decode on the SM90 prefill-style path.
+    if (data_type == 2) {
         std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 9);
         PrefillPlanSM90Info plan_info;
         plan_info.FromVector(vec);
@@ -494,122 +558,84 @@ void flashinfer_decode_run_wrapper(
         void* q_ptr_local = const_cast<void*>(q_ptr);
         void* q_scale_ptr = nullptr;
         void* q_fp8_ptr = nullptr;
-        if (data_type == 2) {
-            int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
-            cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
-            cudaMallocAsync(&q_scale_ptr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
-            
-            bool is_input_f16 = (out_data_type == 0);
-            flashinfer_fp8_quantize_q_per_head(
-                q_ptr,
-                q_fp8_ptr,
-                static_cast<float*>(q_scale_ptr),
-                numel,
-                num_qo_heads,
-                head_dim,
-                is_input_f16,
-                (int64_t)stream);
-            q_ptr_local = q_fp8_ptr;
+        int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
+        cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+        cudaMallocAsync(&q_scale_ptr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
+
+        bool is_input_f16 = (out_data_type == 0);
+        flashinfer_fp8_quantize_q_per_head(
+            q_ptr,
+            q_fp8_ptr,
+            static_cast<float*>(q_scale_ptr),
+            numel,
+            num_qo_heads,
+            head_dim,
+            is_input_f16,
+            (int64_t)stream);
+        q_ptr_local = q_fp8_ptr;
+
+        if (!k_scale_ptr || !v_scale_ptr || q_scale_ptr == nullptr) {
+            if (q_fp8_ptr) {
+                cudaFreeAsync(q_fp8_ptr, stream);
+            }
+            if (q_scale_ptr) {
+                cudaFreeAsync(q_scale_ptr, stream);
+            }
+            return;
         }
 
-        auto run_sm90 = [&]() {
-            if (data_type == 2) {
-                if (!k_scale_ptr || !v_scale_ptr || q_scale_ptr == nullptr) {
-                    return;
-                }
-                using DTypeQ = cutlass::float_e4m3_t;
-                using DTypeKV = cutlass::float_e4m3_t;
-                using AttentionType = DefaultFP8Attention;
-                if (out_data_type == 1) {
-                    using DTypeOut = cutlass::bfloat16_t;
-                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr_local, k_data, v_data, out_ptr,
-                        num_qo_heads, num_kv_heads, head_dim, page_size,
-                        batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
-                        indices, workspace_int, plan_info);
-                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-                        if (plan_info.same_schedule_for_all_heads) {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                                params, false, stream);
-                        } else {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                                params, false, stream);
-                        }
-                    });
+        using DTypeQ = cutlass::float_e4m3_t;
+        using DTypeKV = cutlass::float_e4m3_t;
+        using AttentionType = DefaultFP8Attention;
+        if (out_data_type == 1) {
+            using DTypeOut = cutlass::bfloat16_t;
+            FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+            FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                params, q_ptr_local, k_data, v_data, out_ptr,
+                num_qo_heads, num_kv_heads, head_dim, page_size,
+                batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
+                indices, workspace_int, plan_info);
+            DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                if (plan_info.same_schedule_for_all_heads) {
+                    BatchFP8PrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                        params, false, stream);
                 } else {
-                    using DTypeOut = cutlass::half_t;
-                    FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-                    FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr_local, k_data, v_data, out_ptr,
-                        num_qo_heads, num_kv_heads, head_dim, page_size,
-                        batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
-                        indices, workspace_int, plan_info);
-                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-                        if (plan_info.same_schedule_for_all_heads) {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                                params, false, stream);
-                        } else {
-                            BatchFP8PrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                                params, false, stream);
-                        }
-                    });
+                    BatchFP8PrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                        params, false, stream);
                 }
-            } else {
-                if (out_data_type != data_type) {
-                    return;
-                }
-                auto run_non_fp8 = [&](auto dtype_val) {
-                    using DTypeKV = decltype(dtype_val);
-                    using DTypeQ = DTypeKV;
-                    using DTypeOut = DTypeKV;
-
-                    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-                    FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                        params, q_ptr, k_data, v_data, out_ptr,
-                        num_qo_heads, num_kv_heads, head_dim, page_size,
-                        batch_size, sm_scale, indices, workspace_int, plan_info);
-
-                    using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                    DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-                        if (plan_info.same_schedule_for_all_heads) {
-                            BatchPrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                                params, false, stream);
-                        } else {
-                            BatchPrefillWithPagedKVCacheDispatched<
-                                HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                                params, false, stream);
-                        }
-                    });
-                };
-
-                if (data_type == 1) {
-                    run_non_fp8(cutlass::bfloat16_t{});
+            });
+        } else {
+            using DTypeOut = cutlass::half_t;
+            FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+            FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                params, q_ptr_local, k_data, v_data, out_ptr,
+                num_qo_heads, num_kv_heads, head_dim, page_size,
+                batch_size, sm_scale, static_cast<float*>(q_scale_ptr), k_scale_ptr, v_scale_ptr,
+                indices, workspace_int, plan_info);
+            DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                if (plan_info.same_schedule_for_all_heads) {
+                    BatchFP8PrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                        params, false, stream);
                 } else {
-                    run_non_fp8(cutlass::half_t{});
+                    BatchFP8PrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                        params, false, stream);
                 }
-            }
-        };
+            });
+        }
 
-        run_sm90();
         if (q_fp8_ptr) {
             cudaFreeAsync(q_fp8_ptr, stream);
         }
         if (q_scale_ptr) {
             cudaFreeAsync(q_scale_ptr, stream);
         }
-    }
-    return;
-#else
-    if (plan_info_vec == nullptr) {
-        fprintf(stderr, "[flashinfer][sm80][decode_run] plan_info_vec is null\n");
         return;
     }
+#endif
 
     auto run_decode = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
@@ -631,7 +657,7 @@ void flashinfer_decode_run_wrapper(
                 std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
                 plan_info.FromVector(vec);
 
-                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 ParamsType params(
@@ -672,7 +698,6 @@ void flashinfer_decode_run_wrapper(
     } else {
         run_decode(half{});
     }
-#endif
 #endif
 }
 
