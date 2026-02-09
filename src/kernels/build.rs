@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");
+    // println!("cargo:rerun-if-changed=src/flashinfer_adapter_fp8.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -69,9 +70,10 @@ fn main() -> Result<()> {
             }
             if compute_cap == 90 {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
+                builder = builder.arg("-DSM_90_PASS");
             }
             if compute_cap >= 90 {
-                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
+                // builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
             }
         }
