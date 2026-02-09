@@ -8,7 +8,7 @@ use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
 use std::cell::RefCell;
 
 /// Workspace buffer sizes for FlashInfer operations
-const WORKSPACE_FLOAT_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+pub(crate) const WORKSPACE_FLOAT_SIZE: usize = 256 * 1024 * 1024; // 256 MB
 const WORKSPACE_INT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Static workspace buffers for FlashInfer to avoid per-call allocation
@@ -72,7 +72,7 @@ thread_local! {
     static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
 }
 
-fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
+pub(crate) fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
     let (s, l) = t.storage_and_layout();
     match (&*s, t.dtype()) {
         (Storage::Cuda(c), DType::U8) => {
@@ -100,7 +100,7 @@ fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
     }
 }
 
-fn get_cuda_ptr_storage(
+pub(crate) fn get_cuda_ptr_storage(
     s: &CudaStorage,
     l: &Layout,
     dtype: DType,
@@ -145,7 +145,7 @@ fn get_cuda_f32_ptr(t: &Tensor) -> Result<*const f32> {
     }
 }
 
-fn get_or_init_workspace(
+pub(crate) fn get_or_init_workspace(
     dev: &candle_core::cuda_backend::CudaDevice,
     for_cuda_graph: bool,
 ) -> Result<(

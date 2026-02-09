@@ -23,6 +23,8 @@ pub mod ops;
 
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
+#[cfg(feature = "flashinfer")]
+pub mod trtllm;
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -71,6 +73,28 @@ pub struct PagedAttention {
 }
 
 impl PagedAttention {
+    fn trtllm_scalar_kv_scales(&self) -> Result<(f32, f32)> {
+        let mut k = 1.0f32;
+        let mut v = 1.0f32;
+        if let Some(k_scale) = &self.k_scale {
+            let ks = k_scale.to_vec1::<f32>()?;
+            if let Some(m) = ks.iter().copied().reduce(f32::max) {
+                if m.is_finite() && m > 0.0 {
+                    k = m;
+                }
+            }
+        }
+        if let Some(v_scale) = &self.v_scale {
+            let vs = v_scale.to_vec1::<f32>()?;
+            if let Some(m) = vs.iter().copied().reduce(f32::max) {
+                if m.is_finite() && m > 0.0 {
+                    v = m;
+                }
+            }
+        }
+        Ok((k, v))
+    }
+
     fn maybe_update_kv_scales(&self, key: &Tensor, value: &Tensor) -> Result<()> {
         if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
             if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
@@ -348,6 +372,23 @@ impl PagedAttention {
             let use_flashinfer = self.sliding_window.is_none()
                 && self.alibi_slopes.is_none()
                 && softcapping.is_none();
+            let mut use_trtllm_backend = std::env::var("FLASHINFER_BACKEND")
+                .ok()
+                .map(|v| v.eq_ignore_ascii_case("trtllm"))
+                .unwrap_or(false);
+            if use_trtllm_backend {
+                let dev = query
+                    .device()
+                    .as_cuda_device()
+                    .map_err(candle_core::Error::wrap)?;
+                let sm = crate::cuda_utils::sm_version(dev).unwrap_or(0);
+                if sm < 100 {
+                    candle_core::bail!(
+                        "FLASHINFER_BACKEND=trtllm requires sm100+, got sm{}",
+                        sm
+                    );
+                }
+            }
             if use_flashinfer {
                 if let Some(kc) = key_cache.as_ref() {
                     if kc.dtype() != query.dtype() && kc.dtype() != candle_core::DType::U8 {
@@ -373,6 +414,7 @@ impl PagedAttention {
                     .reshape(((), key_value_heads, head_size))?;
 
                 self.maybe_update_kv_scales(&key, &value)?;
+                let (trtllm_k_scale, trtllm_v_scale) = self.trtllm_scalar_kv_scales()?;
 
                 let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
                 if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
@@ -397,7 +439,51 @@ impl PagedAttention {
                     16
                 };
 
-                return if input_metadata.is_prefill {
+                return if input_metadata.is_prefill && use_trtllm_backend {
+                    let block_tables = input_metadata.block_tables.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg("trtllm prefill requires block_tables")
+                    })?;
+                    let context_lens = input_metadata.context_lens.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg("trtllm prefill requires context_lens")
+                    })?;
+                    let cu_q = input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg("trtllm prefill requires cu_seqlens_q")
+                    })?;
+                    crate::trtllm::context(
+                        &query,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        block_tables,
+                        context_lens,
+                        cu_q,
+                        &fm.indptr,
+                        input_metadata.max_seqlen_q,
+                        input_metadata.max_seqlen_k,
+                        (self.scale as f32) * trtllm_k_scale,
+                        trtllm_v_scale,
+                        true,
+                    )
+                } else if !input_metadata.is_prefill && use_trtllm_backend {
+                    let block_tables = input_metadata.block_tables.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg("trtllm decode requires block_tables")
+                    })?;
+                    let context_lens = input_metadata.context_lens.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg("trtllm decode requires context_lens")
+                    })?;
+                    crate::trtllm::decode(
+                        &query,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        block_tables,
+                        context_lens,
+                        None,
+                        input_metadata.max_seqlen_q.max(1),
+                        input_metadata.max_seqlen_k,
+                        (self.scale as f32) * trtllm_k_scale,
+                        trtllm_v_scale,
+                        true,
+                    )
+                } else if input_metadata.is_prefill {
                     crate::flashinfer::prefill(
                         &query,
                         key_cache.as_ref().unwrap(),
