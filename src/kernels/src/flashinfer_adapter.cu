@@ -602,7 +602,7 @@ void flashinfer_prefill_wrapper(
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
     if (data_type == 2) {
-        #if defined(DFLASHINFER_ENABLE_FP8_E4M3)
+        #if defined(FLASHINFER_ENABLE_FP8_E4M3)
         flashinfer_prefill_wrapper_fp8(
             out_ptr,
             q_ptr,
