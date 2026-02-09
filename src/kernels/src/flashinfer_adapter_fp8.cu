@@ -266,8 +266,8 @@ void flashinfer_decode_plan_wrapper_fp8(
         qo_indptr_host, indptr_host, kv_len_arr_host,
         batch_size, batch_size,
         num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-        true, enable_cuda_graph,
-        (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+        false, enable_cuda_graph,
+        2,
         stream
     );
     if (plan_info_out != nullptr) {

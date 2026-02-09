@@ -9,7 +9,7 @@ use std::cell::RefCell;
 
 /// Workspace buffer sizes for FlashInfer operations
 const WORKSPACE_FLOAT_SIZE: usize = 256 * 1024 * 1024; // 256 MB
-const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024; // 128 MB
+const WORKSPACE_INT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Static workspace buffers for FlashInfer to avoid per-call allocation
 struct PinnedHostBuffer {

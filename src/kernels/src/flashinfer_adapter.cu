@@ -14,9 +14,6 @@
         #include <flashinfer/attention/prefill.cuh>
         #include <flashinfer/attention/default_prefill_params.cuh>
         #include <flashinfer/attention/variants.cuh>
-        // #if !defined(NO_FP8_KVCACHE)
-        //     #include <flashinfer/attention/hopper/quantization/prefill_sm90.cuh>
-        // #endif
     #endif
 
 #include <flashinfer/attention/default_decode_params.cuh>
@@ -163,6 +160,111 @@ static inline void FillSM90PagedParams(
     }
 #endif
 
+#if defined(FLASHINFER_ENABLE_FP8_E4M3)
+extern "C" {
+
+void flashinfer_append_kv_cache_fp8(
+    void* k_data_ptr,
+    void* v_data_ptr,
+    void* new_k_ptr,
+    void* new_v_ptr,
+    int32_t* paged_kv_indices,
+    int32_t* paged_kv_indptr,
+    int32_t* paged_kv_last_len,
+    int32_t* batch_indices,
+    int32_t* positions,
+    int32_t nnz,
+    int32_t batch_size,
+    int32_t num_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    bool is_input_f16,
+    int32_t data_type,
+    cudaStream_t stream
+);
+
+void flashinfer_decode_plan_wrapper_fp8(
+    int32_t* indptr_host,
+    int32_t* qo_indptr_host,
+    int32_t* kv_len_arr_host,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    void* workspace_float,
+    size_t workspace_float_size,
+    void* workspace_int,
+    size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
+    bool enable_cuda_graph,
+    int32_t data_type,
+    int32_t out_data_type,
+    int64_t* plan_info_out,
+    cudaStream_t stream
+);
+void flashinfer_decode_run_wrapper_fp8(
+    void* out_ptr,
+    void* q_ptr,
+    void* k_data, void* v_data,
+    int32_t* indices,
+    int32_t* indptr,
+    int32_t* last_len,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_float,
+    size_t workspace_float_size,
+    void* workspace_int,
+    size_t workspace_int_size,
+    const int64_t* plan_info_vec,
+    int32_t data_type,
+    int32_t out_data_type,
+    cudaStream_t stream
+);
+
+void flashinfer_prefill_wrapper_fp8(
+    void* out_ptr,
+    void* q_ptr,
+    int32_t* q_cu_seqlens,
+    int32_t* q_cu_seqlens_host,
+    int32_t* kv_len_arr_host,
+    int32_t total_num_rows,
+    void* k_data, void* v_data,
+    int32_t* indices,
+    int32_t* indptr,
+    int32_t* indptr_host,
+    int32_t* last_len,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_float,
+    size_t workspace_float_size,
+    void* workspace_int,
+    size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
+    bool enable_cuda_graph,
+    int32_t data_type,
+    int32_t out_data_type,
+    cudaStream_t stream
+);
+}
+#endif
+
 extern "C" {
 
 void flashinfer_append_kv_cache(
@@ -187,29 +289,31 @@ void flashinfer_append_kv_cache(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
-    // if (data_type == 2) {
-    //     flashinfer_append_kv_cache_fp8(
-    //         k_data_ptr,
-    //         v_data_ptr,
-    //         new_k_ptr,
-    //         new_v_ptr,
-    //         paged_kv_indices,
-    //         paged_kv_indptr,
-    //         paged_kv_last_len,
-    //         batch_indices,
-    //         positions,
-    //         nnz,
-    //         batch_size,
-    //         num_heads,
-    //         head_dim,
-    //         page_size,
-    //         k_scale_ptr,
-    //         v_scale_ptr,
-    //         is_input_f16,
-    //         data_type,
-    //         stream);
-    //     return;
-    // }
+    if (data_type == 2) {
+        #if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_append_kv_cache_fp8(
+            k_data_ptr,
+            v_data_ptr,
+            new_k_ptr,
+            new_v_ptr,
+            paged_kv_indices,
+            paged_kv_indptr,
+            paged_kv_last_len,
+            batch_indices,
+            positions,
+            nnz,
+            batch_size,
+            num_heads,
+            head_dim,
+            page_size,
+            k_scale_ptr,
+            v_scale_ptr,
+            is_input_f16,
+            data_type,
+            stream);
+        #endif
+        return;
+    }
 
     auto run = [&](auto dtype_val) {
         using DType = decltype(dtype_val);
@@ -267,29 +371,31 @@ void flashinfer_decode_plan_wrapper(
     if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
         return;
     }
-    // if (data_type == 2) {
-    //     flashinfer_decode_plan_wrapper_fp8(
-    //         indptr_host,
-    //         qo_indptr_host,
-    //         kv_len_arr_host,
-    //         batch_size,
-    //         num_qo_heads,
-    //         num_kv_heads,
-    //         head_dim,
-    //         page_size,
-    //         workspace_float,
-    //         workspace_float_size,
-    //         workspace_int,
-    //         workspace_int_size,
-    //         page_locked_int_buffer,
-    //         page_locked_int_size,
-    //         enable_cuda_graph,
-    //         data_type,
-    //         out_data_type,
-    //         plan_info_out,
-    //         stream);
-    //     return;
-    // }
+    if (data_type == 2) {
+        #if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_decode_plan_wrapper_fp8(
+            indptr_host,
+            qo_indptr_host,
+            kv_len_arr_host,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            workspace_float,
+            workspace_float_size,
+            workspace_int,
+            workspace_int_size,
+            page_locked_int_buffer,
+            page_locked_int_size,
+            enable_cuda_graph,
+            data_type,
+            out_data_type,
+            plan_info_out,
+            stream);
+        #endif
+        return;
+    }
     auto run_plan = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
         using DTypeQ = DTypeKV;
@@ -365,32 +471,34 @@ void flashinfer_decode_run_wrapper(
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
-    // if (data_type == 2) {
-    //     flashinfer_decode_run_wrapper_fp8(
-    //         out_ptr,
-    //         q_ptr,
-    //         k_data, v_data,
-    //         indices,
-    //         indptr,
-    //         last_len,
-    //         batch_size,
-    //         num_qo_heads,
-    //         num_kv_heads,
-    //         head_dim,
-    //         page_size,
-    //         sm_scale,
-    //         k_scale_ptr,
-    //         v_scale_ptr,
-    //         workspace_float,
-    //         workspace_float_size,
-    //         workspace_int,
-    //         workspace_int_size,
-    //         plan_info_vec,
-    //         data_type,
-    //         out_data_type,
-    //         stream);
-    //     return;
-    // }
+    if (data_type == 2) {
+        #if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_decode_run_wrapper_fp8(
+            out_ptr,
+            q_ptr,
+            k_data, v_data,
+            indices,
+            indptr,
+            last_len,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            sm_scale,
+            k_scale_ptr,
+            v_scale_ptr,
+            workspace_float,
+            workspace_float_size,
+            workspace_int,
+            workspace_int_size,
+            plan_info_vec,
+            data_type,
+            out_data_type,
+            stream);
+        #endif
+        return;
+    }
     if (plan_info_vec == nullptr) {
         fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
         return;
@@ -493,39 +601,41 @@ void flashinfer_prefill_wrapper(
 #ifdef USE_FLASHINFER
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
-    // if (data_type == 2) {
-    //     flashinfer_prefill_wrapper_fp8(
-    //         out_ptr,
-    //         q_ptr,
-    //         q_cu_seqlens,
-    //         q_cu_seqlens_host,
-    //         kv_len_arr_host,
-    //         total_num_rows,
-    //         k_data, v_data,
-    //         indices,
-    //         indptr,
-    //         indptr_host,
-    //         last_len,
-    //         batch_size,
-    //         num_qo_heads,
-    //         num_kv_heads,
-    //         head_dim,
-    //         page_size,
-    //         sm_scale,
-    //         k_scale_ptr,
-    //         v_scale_ptr,
-    //         workspace_float,
-    //         workspace_float_size,
-    //         workspace_int,
-    //         workspace_int_size,
-    //         page_locked_int_buffer,
-    //         page_locked_int_size,
-    //         enable_cuda_graph,
-    //         data_type,
-    //         out_data_type,
-    //         stream);
-    //     return;
-    // }
+    if (data_type == 2) {
+        #if defined(DFLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_prefill_wrapper_fp8(
+            out_ptr,
+            q_ptr,
+            q_cu_seqlens,
+            q_cu_seqlens_host,
+            kv_len_arr_host,
+            total_num_rows,
+            k_data, v_data,
+            indices,
+            indptr,
+            indptr_host,
+            last_len,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            sm_scale,
+            k_scale_ptr,
+            v_scale_ptr,
+            workspace_float,
+            workspace_float_size,
+            workspace_int,
+            workspace_int_size,
+            page_locked_int_buffer,
+            page_locked_int_size,
+            enable_cuda_graph,
+            data_type,
+            out_data_type,
+            stream);
+        #endif
+        return;
+    }
 
 #if defined(SM_90_PASS)
     if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
