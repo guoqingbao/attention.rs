@@ -38,6 +38,7 @@ fn main() -> Result<()> {
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
+        .nvcc_thread_patterns(&["flash_api", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
@@ -85,12 +86,12 @@ fn main() -> Result<()> {
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
-        // DO not change this, this featch flashinfer v0.6.2 headers
-        // which is compatible with our code
+        // DO not change this, this featch custom flashinfer v0.6.3 headers
+        // which is compatible with our code (added more gqa group_size)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
-            "https://github.com/flashinfer-ai/flashinfer.git",
-            "a49b45336e56e4615eae102cf29d5110293d9130", // v0.6.2
+            "https://github.com/guoqingbao/flashinfer.git",
+            "05d49ada05a8ef90c24b8e680228f57b198b3ef8", // v0.6.3
             vec!["include"],
             false,
         );

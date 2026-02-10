@@ -614,60 +614,55 @@ void flashinfer_decode_run_wrapper(
             fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
             return;
         }
-
         auto run_decode_fp8 = [&](auto dtype_q_val) {
             using DTypeQ = decltype(dtype_q_val);
             using DTypeKV = uint8_t;
             using DTypeOut = DTypeQ;
             using IdType = int32_t;
 
-            uint32_t group_size = num_qo_heads / num_kv_heads;
-
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
-                    paged_kv_t<DTypeKV, IdType> paged_kv(
-                        num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
-                        (DTypeKV*)k_data, (DTypeKV*)v_data,
-                        indices, indptr, last_len
-                    );
+                paged_kv_t<DTypeKV, IdType> paged_kv(
+                    num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
+                    (DTypeKV*)k_data, (DTypeKV*)v_data,
+                    indices, indptr, last_len
+                );
 
-                    DecodePlanInfo plan_info;
-                    std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
-                    plan_info.FromVector(vec);
+                DecodePlanInfo plan_info;
+                std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
+                plan_info.FromVector(vec);
 
-                    using AttentionType = DefaultDecodeAttention;
-                    using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+                using AttentionType = DefaultDecodeAttention;
+                using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
-                    ParamsType params(
-                        (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
-                        nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
-                        num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                        -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
-                    );
+                ParamsType params(
+                    (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
+                    nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
+                    num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
+                    -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+                );
 
-                    params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
-                    params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
-                    params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
-                    params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-                    params.partition_kv = plan_info.split_kv;
-                    params.padded_batch_size = plan_info.padded_batch_size;
-                    params.block_valid_mask = nullptr;
-                    if (plan_info.split_kv && plan_info.enable_cuda_graph) {
-                        params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
-                    }
+                params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
+                params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
+                params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
+                params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
+                params.partition_kv = plan_info.split_kv;
+                params.padded_batch_size = plan_info.padded_batch_size;
+                params.block_valid_mask = nullptr;
+                if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+                    params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+                }
 
-                    DTypeOut* tmp_v = nullptr;
-                    float* tmp_s = nullptr;
-                    if (plan_info.split_kv) {
-                        tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-                        tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
-                    }
+                DTypeOut* tmp_v = nullptr;
+                float* tmp_s = nullptr;
+                if (plan_info.split_kv) {
+                    tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                    tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+                }
 
-                    BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
-                         AttentionType, ParamsType>(
-                         params, tmp_v, tmp_s, false /* pdl */, stream
-                    );
-                });
+                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                        AttentionType, ParamsType>(
+                        params, tmp_v, tmp_s, false /* pdl */, stream
+                );
             });
         };
 
@@ -689,53 +684,49 @@ void flashinfer_decode_run_wrapper(
         using DTypeOut = DTypeKV;
         using IdType = int32_t;
         
-        uint32_t group_size = num_qo_heads / num_kv_heads;
-
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
-                paged_kv_t<DTypeKV, IdType> paged_kv(
-                    num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
-                    (DTypeKV*)k_data, (DTypeKV*)v_data,
-                    indices, indptr, last_len
-                );
+            paged_kv_t<DTypeKV, IdType> paged_kv(
+                num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
+                (DTypeKV*)k_data, (DTypeKV*)v_data,
+                indices, indptr, last_len
+            );
 
-                DecodePlanInfo plan_info;
-                std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
-                plan_info.FromVector(vec);
+            DecodePlanInfo plan_info;
+            std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
+            plan_info.FromVector(vec);
 
-                using AttentionType = DefaultDecodeAttention;
-                using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+            using AttentionType = DefaultDecodeAttention;
+            using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
-                ParamsType params(
-                    (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
-                    nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
-                    num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                    -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
-                );
-                
-                params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
-                params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
-                params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
-                params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-                params.partition_kv = plan_info.split_kv;
-                params.padded_batch_size = plan_info.padded_batch_size;
-                params.block_valid_mask = nullptr;
-                if (plan_info.split_kv && plan_info.enable_cuda_graph) {
-                    params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
-                }
-                
-                DTypeOut* tmp_v = nullptr;
-                float* tmp_s = nullptr;
-                if (plan_info.split_kv) {
-                    tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-                    tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
-                }
+            ParamsType params(
+                (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
+                nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
+                num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
+                -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+            );
+            
+            params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
+            params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
+            params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
+            params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
+            params.partition_kv = plan_info.split_kv;
+            params.padded_batch_size = plan_info.padded_batch_size;
+            params.block_valid_mask = nullptr;
+            if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+                params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+            }
+            
+            DTypeOut* tmp_v = nullptr;
+            float* tmp_s = nullptr;
+            if (plan_info.split_kv) {
+                tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+            }
 
-                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
-                     AttentionType, ParamsType>(
-                     params, tmp_v, tmp_s, false /* pdl */, stream
-                );
-            });
+            BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                    AttentionType, ParamsType>(
+                    params, tmp_v, tmp_s, false /* pdl */, stream
+            );
         });
     };
 

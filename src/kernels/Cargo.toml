@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 
 [build-dependencies]
-cudaforge = "0.1.2"
+cudaforge = "0.1.4"
 anyhow = { version = "1", features = ["backtrace"] }
 sha2 = "0.10"
 ureq = { version = "2.10", default-features = true }

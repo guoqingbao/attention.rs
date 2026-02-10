@@ -4,9 +4,9 @@ version = "0.4.0"
 edition = "2021"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "af2ee3d" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "af2ee3d" }
-candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "af2ee3d", optional = true }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "a686ea4" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "a686ea4" }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "a686ea4", optional = true }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
