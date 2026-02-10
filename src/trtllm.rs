@@ -141,7 +141,10 @@ impl TrtllmDecode {
             );
         }
 
-        Ok((CudaStorage::wrap_cuda_slice(out, dev.clone()), q_l.shape().clone()))
+        Ok((
+            CudaStorage::wrap_cuda_slice(out, dev.clone()),
+            q_l.shape().clone(),
+        ))
     }
 }
 
@@ -176,10 +179,10 @@ pub fn decode(
 pub struct TrtllmContext {
     pub key_cache: Tensor,
     pub value_cache: Tensor,
-    pub block_tables: Tensor,
+    pub block_tables: Option<Tensor>,
     pub seq_lens: Tensor,
     pub cum_seq_lens_q: Tensor,
-    pub cum_seq_lens_kv: Tensor,
+    pub cum_seq_lens_kv: Option<Tensor>,
     pub max_q_len: usize,
     pub max_kv_len: usize,
     pub bmm1_scale: f32,
@@ -224,8 +227,24 @@ impl TrtllmContext {
             candle::bail!("trtllm backend requires sm100+, got sm{}", sm);
         }
         let (sum_seq_q, num_qo_heads, head_dim) = q_l.shape().dims3()?;
-        let (num_pages, page_size, num_kv_heads, _) = self.key_cache.shape().dims4()?;
-        let (batch_size, max_num_blocks_per_seq) = self.block_tables.shape().dims2()?;
+        let use_paged = self.block_tables.is_some();
+        let (num_pages, page_size, num_kv_heads, max_num_blocks_per_seq, batch_size) = if use_paged
+        {
+            let (num_pages, page_size, num_kv_heads, _) = self.key_cache.shape().dims4()?;
+            let (batch_size, max_num_blocks_per_seq) =
+                self.block_tables.as_ref().unwrap().shape().dims2()?;
+            (
+                num_pages,
+                page_size,
+                num_kv_heads,
+                max_num_blocks_per_seq,
+                batch_size,
+            )
+        } else {
+            let (_sum_seq_kv, num_kv_heads, _) = self.key_cache.shape().dims3()?;
+            let batch_size = self.seq_lens.dim(0)?;
+            (0usize, 0usize, num_kv_heads, 0usize, batch_size)
+        };
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
@@ -233,13 +252,17 @@ impl TrtllmContext {
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
 
-        let (bt_s, bt_l) = self.block_tables.storage_and_layout();
-        let bt_ptr = match &*bt_s {
-            Storage::Cuda(c) => {
-                let t = c.as_cuda_slice::<u32>()?.slice(bt_l.start_offset()..);
-                *t.device_ptr() as *const i32
+        let bt_ptr = if let Some(block_tables) = &self.block_tables {
+            let (bt_s, bt_l) = block_tables.storage_and_layout();
+            match &*bt_s {
+                Storage::Cuda(c) => {
+                    let t = c.as_cuda_slice::<u32>()?.slice(bt_l.start_offset()..);
+                    *t.device_ptr() as *const i32
+                }
+                _ => candle::bail!("block_tables must be cuda"),
             }
-            _ => candle::bail!("block_tables must be cuda"),
+        } else {
+            std::ptr::null()
         };
         let (sl_s, sl_l) = self.seq_lens.storage_and_layout();
         let sl_ptr = match &*sl_s {
@@ -257,13 +280,17 @@ impl TrtllmContext {
             }
             _ => candle::bail!("cum_seq_lens_q must be cuda"),
         };
-        let (cum_kv_s, cum_kv_l) = self.cum_seq_lens_kv.storage_and_layout();
-        let cum_kv_ptr = match &*cum_kv_s {
-            Storage::Cuda(c) => {
-                let t = c.as_cuda_slice::<u32>()?.slice(cum_kv_l.start_offset()..);
-                *t.device_ptr() as *const i32
+        let cum_kv_ptr = if let Some(cum_seq_lens_kv) = &self.cum_seq_lens_kv {
+            let (cum_kv_s, cum_kv_l) = cum_seq_lens_kv.storage_and_layout();
+            match &*cum_kv_s {
+                Storage::Cuda(c) => {
+                    let t = c.as_cuda_slice::<u32>()?.slice(cum_kv_l.start_offset()..);
+                    *t.device_ptr() as *const i32
+                }
+                _ => candle::bail!("cum_seq_lens_kv must be cuda"),
             }
-            _ => candle::bail!("cum_seq_lens_kv must be cuda"),
+        } else {
+            cum_q_ptr
         };
 
         let (ws_float_ptr, _ws_int_ptr, _page_locked_ptr, _page_locked_size) =
@@ -302,7 +329,10 @@ impl TrtllmContext {
             );
         }
 
-        Ok((CudaStorage::wrap_cuda_slice(out, dev.clone()), q_l.shape().clone()))
+        Ok((
+            CudaStorage::wrap_cuda_slice(out, dev.clone()),
+            q_l.shape().clone(),
+        ))
     }
 }
 
@@ -310,10 +340,10 @@ pub fn context(
     q: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
-    block_tables: &Tensor,
+    block_tables: Option<&Tensor>,
     seq_lens: &Tensor,
     cum_seq_lens_q: &Tensor,
-    cum_seq_lens_kv: &Tensor,
+    cum_seq_lens_kv: Option<&Tensor>,
     max_q_len: usize,
     max_kv_len: usize,
     bmm1_scale: f32,
@@ -323,10 +353,10 @@ pub fn context(
     let op = TrtllmContext {
         key_cache: key_cache.clone(),
         value_cache: value_cache.clone(),
-        block_tables: block_tables.clone(),
+        block_tables: block_tables.cloned(),
         seq_lens: seq_lens.clone(),
         cum_seq_lens_q: cum_seq_lens_q.clone(),
-        cum_seq_lens_kv: cum_seq_lens_kv.clone(),
+        cum_seq_lens_kv: cum_seq_lens_kv.cloned(),
         max_q_len,
         max_kv_len,
         bmm1_scale,

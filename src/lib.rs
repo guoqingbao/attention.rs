@@ -383,10 +383,7 @@ impl PagedAttention {
                     .map_err(candle_core::Error::wrap)?;
                 let sm = crate::cuda_utils::sm_version(dev).unwrap_or(0);
                 if sm < 100 {
-                    candle_core::bail!(
-                        "FLASHINFER_BACKEND=trtllm requires sm100+, got sm{}",
-                        sm
-                    );
+                    candle_core::bail!("FLASHINFER_BACKEND=trtllm requires sm100+, got sm{}", sm);
                 }
             }
             if use_flashinfer {
@@ -440,23 +437,37 @@ impl PagedAttention {
                 };
 
                 return if input_metadata.is_prefill && use_trtllm_backend {
-                    let block_tables = input_metadata.block_tables.as_ref().ok_or_else(|| {
-                        candle_core::Error::msg("trtllm prefill requires block_tables")
-                    })?;
                     let context_lens = input_metadata.context_lens.as_ref().ok_or_else(|| {
                         candle_core::Error::msg("trtllm prefill requires context_lens")
                     })?;
                     let cu_q = input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
                         candle_core::Error::msg("trtllm prefill requires cu_seqlens_q")
                     })?;
+                    let (k_in, v_in) = if input_metadata.block_tables.is_some() {
+                        (
+                            key_cache.as_ref().ok_or_else(|| {
+                                candle_core::Error::msg("trtllm paged prefill requires key_cache")
+                            })?,
+                            value_cache.as_ref().ok_or_else(|| {
+                                candle_core::Error::msg("trtllm paged prefill requires value_cache")
+                            })?,
+                        )
+                    } else {
+                        (&key, &value)
+                    };
+                    let cum_kv = if input_metadata.block_tables.is_some() {
+                        Some(&fm.indptr)
+                    } else {
+                        None
+                    };
                     crate::trtllm::context(
                         &query,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
-                        block_tables,
+                        k_in,
+                        v_in,
+                        input_metadata.block_tables.as_ref(),
                         context_lens,
                         cu_q,
-                        &fm.indptr,
+                        cum_kv,
                         input_metadata.max_seqlen_q,
                         input_metadata.max_seqlen_k,
                         (self.scale as f32) * trtllm_k_scale,

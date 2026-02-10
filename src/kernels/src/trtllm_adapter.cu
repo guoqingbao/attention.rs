@@ -105,20 +105,36 @@ static void trtllm_paged_attention_launcher(
   params.mNumHeadsQPerKv = static_cast<int>(num_qo_heads / num_kv_heads);
   params.mBatchSize = static_cast<int>(batch_size);
   params.mMaxSeqLenKv = static_cast<int>(max_kv_len);
-  params.mMaxNumPagesPerSeqKv = static_cast<int>(max_num_blocks_per_seq);
-  params.mNumTokensPerPage = static_cast<int>(page_size);
-  params.mQkvLayout = QkvLayout::PagedKv;
+  const bool use_paged_kv = block_tables != nullptr;
+  if (use_paged_kv) {
+    params.mMaxNumPagesPerSeqKv = static_cast<int>(max_num_blocks_per_seq);
+    params.mNumTokensPerPage = static_cast<int>(page_size);
+    params.mQkvLayout = QkvLayout::PagedKv;
+  } else {
+    // Non-paged prefill path: use separate contiguous Q/K/V buffers.
+    params.mMaxNumPagesPerSeqKv = 0;
+    params.mNumTokensPerPage = 0;
+    params.mQkvLayout = QkvLayout::SeparateQkv;
+    params.mSumOfSeqLensKv = static_cast<int>(sum_seq_q);
+  }
   params.mMultiProcessorCount = getMultiProcessorCount();
-  // NHD page layout: [page, token, head, dim]
   params.qStrideTokens = static_cast<int>(num_qo_heads * head_dim_qk);
   params.qStrideHeads = static_cast<int>(head_dim_qk);
   params.kStrideKeysValues = static_cast<int>(num_kv_heads * head_dim_qk);
   params.kStrideHeads = static_cast<int>(head_dim_qk);
-  params.kStrideBatch = static_cast<int>(page_size * num_kv_heads * head_dim_qk);
   params.vStrideKeysValues = static_cast<int>(num_kv_heads * head_dim_vo);
   params.vStrideHeads = static_cast<int>(head_dim_vo);
-  params.vStrideBatch = static_cast<int>(page_size * num_kv_heads * head_dim_vo);
-  params.mNumPagesInMemPool = static_cast<int>(num_pages * 2);
+  if (use_paged_kv) {
+    // NHD page layout: [page, token, head, dim]
+    params.kStrideBatch = static_cast<int>(page_size * num_kv_heads * head_dim_qk);
+    params.vStrideBatch = static_cast<int>(page_size * num_kv_heads * head_dim_vo);
+    params.mNumPagesInMemPool = static_cast<int>(num_pages * 2);
+  } else {
+    // Ragged contiguous K/V in [sum_seq, head, dim].
+    params.kStrideBatch = -1;
+    params.vStrideBatch = -1;
+    params.mNumPagesInMemPool = 0;
+  }
   params.stream = stream;
   params.outputScale = static_cast<float>(bmm2_scale);
   params.outputScalePtr = nullptr;

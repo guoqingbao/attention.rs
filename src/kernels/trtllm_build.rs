@@ -196,11 +196,13 @@ pub fn configure(builder: KernelBuilder, compute_cap: usize) -> Result<KernelBui
         );
     }
 
-    let user_dir = std::env::var("ATTENTION_RS_TRTLLM_FMHA_DIR").ok().map(PathBuf::from);
-    let default_dir = std::env::var("HOME")
+    let user_dir = std::env::var("ATTENTION_RS_TRTLLM_FMHA_DIR")
         .ok()
-        .map(PathBuf::from)
-        .map(|p| p.join(".cache/flashinfer/cubins").join(TRTLLM_GEN_FMHA_REL_PATH));
+        .map(PathBuf::from);
+    let default_dir = std::env::var("HOME").ok().map(PathBuf::from).map(|p| {
+        p.join(".cache/flashinfer/cubins")
+            .join(TRTLLM_GEN_FMHA_REL_PATH)
+    });
     let trtllm_dir = user_dir.or(default_dir);
     let Some(trtllm_dir) = trtllm_dir else {
         anyhow::bail!("TRTLLM support requested but no artifact dir could be resolved");
@@ -212,12 +214,7 @@ pub fn configure(builder: KernelBuilder, compute_cap: usize) -> Result<KernelBui
     let no_download = env_true("ATTENTION_RS_TRTLLM_NO_DOWNLOAD");
     let download_cubins = env_true("ATTENTION_RS_TRTLLM_DOWNLOAD_CUBINS");
 
-    let meta_hash = ensure_trtllm_artifacts(
-        &trtllm_dir,
-        repository,
-        no_download,
-        download_cubins,
-    )?;
+    let meta_hash = ensure_trtllm_artifacts(&trtllm_dir, repository, no_download, download_cubins)?;
 
     let include_dir = trtllm_dir.join("include");
     if !include_dir.join("flashInferMetaInfo.h").exists() {
