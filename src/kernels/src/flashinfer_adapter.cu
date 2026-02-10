@@ -26,6 +26,37 @@
 #include <flashinfer/pos_enc.cuh>
 using namespace flashinfer;
 
+#define DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, ...) \
+  if (group_size == 1) {                                     \
+    constexpr size_t GROUP_SIZE = 1;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 2) {                              \
+    constexpr size_t GROUP_SIZE = 2;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 3) {                              \
+    constexpr size_t GROUP_SIZE = 3;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 4) {                              \
+    constexpr size_t GROUP_SIZE = 4;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 8) {                              \
+    constexpr size_t GROUP_SIZE = 8;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 16) {                              \
+    constexpr size_t GROUP_SIZE = 16;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 32) {                              \
+    constexpr size_t GROUP_SIZE = 32;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 64) {                              \
+    constexpr size_t GROUP_SIZE = 64;                         \
+    __VA_ARGS__                                              \
+  } else {                                                   \
+    std::ostringstream err_msg;                              \
+    err_msg << "Unsupported group_size: " << group_size;     \
+    FLASHINFER_ERROR(err_msg.str());                         \
+  }
+
 #if !defined(SM_90_PASS)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias =
@@ -463,7 +494,7 @@ void flashinfer_decode_plan_wrapper(
             uint32_t group_size = num_qo_heads / num_kv_heads;
 
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+                DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
                     using AttentionType = DefaultDecodeAttention;
                     using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -511,7 +542,7 @@ void flashinfer_decode_plan_wrapper(
         uint32_t group_size = num_qo_heads / num_kv_heads;
 
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+            DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
                 using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -593,7 +624,7 @@ void flashinfer_decode_run_wrapper(
             uint32_t group_size = num_qo_heads / num_kv_heads;
 
             DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+                DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
                     paged_kv_t<DTypeKV, IdType> paged_kv(
                         num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                         (DTypeKV*)k_data, (DTypeKV*)v_data,
@@ -661,7 +692,7 @@ void flashinfer_decode_run_wrapper(
         uint32_t group_size = num_qo_heads / num_kv_heads;
 
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+            DISPATCH_GQA_GROUP_SIZE_X(group_size, GROUP_SIZE, {
                 paged_kv_t<DTypeKV, IdType> paged_kv(
                     num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                     (DTypeKV*)k_data, (DTypeKV*)v_data,
