@@ -28,6 +28,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_adapter_fp8.cu");
     println!("cargo:rerun-if-changed=src/trtllm_adapter.cu");
+    println!("cargo:rerun-if-changed=trtllm/fmhaReduction.cu");
     trtllm_build::emit_rerun_if_env_changed();
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();

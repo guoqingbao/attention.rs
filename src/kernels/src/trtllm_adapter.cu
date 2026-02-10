@@ -205,6 +205,9 @@ std::string getCubin(const std::string& kernel_path, const std::string& /*sha256
 }
 }  // namespace flashinfer::trtllm_cubin_loader
 
+// Needed by fmhaKernels.cuh for generation kernels with multi-CTA reduction.
+#include "../trtllm/fmhaReduction.cu"
+
 #endif  // USE_FLASHINFER && ENABLE_TRTLLM
 
 extern "C" {
