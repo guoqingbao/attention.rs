@@ -136,6 +136,50 @@ extern "C" void flashinfer_fp8_quantize_q_per_head(const void* input, void* outp
 }
 
 template <typename T>
+__global__ void q_fp8_quantize_scalar_kernel(const T* __restrict__ input,
+                                             uint8_t* __restrict__ output, int64_t numel,
+                                             const float* __restrict__ scale_ptr) {
+  const int64_t start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  float scale = scale_ptr[0];
+  for (int64_t idx = start; idx < numel; idx += stride) {
+    if (scale == 0.0f) {
+      output[idx] = 0;
+      continue;
+    }
+    float f = 0.0f;
+    if constexpr (std::is_same_v<T, __half>) {
+      f = __half2float(input[idx]);
+    } else {
+      f = __bfloat162float(input[idx]);
+    }
+    f = f / scale;
+    output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
+  }
+}
+
+extern "C" void flashinfer_fp8_quantize_q_scalar(const void* input, void* output_q, int64_t numel,
+                                                  const float* q_scale, bool is_input_f16,
+                                                  int64_t stream_) {
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  if (numel <= 0) {
+    return;
+  }
+  const int threads = 256;
+  int blocks = static_cast<int>((numel + threads - 1) / threads);
+  if (blocks > 65535) {
+    blocks = 65535;
+  }
+  if (is_input_f16) {
+    q_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(input), static_cast<uint8_t*>(output_q), numel, q_scale);
+  } else {
+    q_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input), static_cast<uint8_t*>(output_q), numel, q_scale);
+  }
+}
+
+template <typename T>
 __global__ void kv_fp8_quantize_per_head_kernel(const T* __restrict__ input,
                                                 uint8_t* __restrict__ output, int64_t numel,
                                                 int num_heads, int head_dim,
@@ -160,12 +204,33 @@ __global__ void kv_fp8_quantize_per_head_kernel(const T* __restrict__ input,
   }
 }
 
-extern "C" void flashinfer_fp8_quantize_kv_per_head(const void* k_in, const void* v_in,
-                                                    void* k_out, void* v_out, int64_t numel,
-                                                    int num_heads, int head_dim,
-                                                    const float* k_scales,
-                                                    const float* v_scales, bool is_input_f16,
-                                                    int64_t stream_) {
+template <typename T>
+__global__ void kv_fp8_quantize_scalar_kernel(const T* __restrict__ input,
+                                              uint8_t* __restrict__ output, int64_t numel,
+                                              const float* __restrict__ scale_ptr) {
+  const int64_t start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  float scale = scale_ptr[0];
+  for (int64_t idx = start; idx < numel; idx += stride) {
+    if (scale == 0.0f) {
+      output[idx] = 0;
+      continue;
+    }
+    float f = 0.0f;
+    if constexpr (std::is_same_v<T, __half>) {
+      f = __half2float(input[idx]);
+    } else {
+      f = __bfloat162float(input[idx]);
+    }
+    f = f / scale;
+    output[idx] = vllm::fp8::dispatch_float_to_fp8(f);
+  }
+}
+
+extern "C" void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* v_in,
+                                                  void* k_out, void* v_out, int64_t numel,
+                                                  const float* k_scale, const float* v_scale,
+                                                  bool is_input_f16, int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
   if (numel <= 0) {
     return;
@@ -176,18 +241,14 @@ extern "C" void flashinfer_fp8_quantize_kv_per_head(const void* k_in, const void
     blocks = 65535;
   }
   if (is_input_f16) {
-    kv_fp8_quantize_per_head_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const __half*>(k_in), static_cast<uint8_t*>(k_out), numel, num_heads,
-        head_dim, k_scales);
-    kv_fp8_quantize_per_head_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const __half*>(v_in), static_cast<uint8_t*>(v_out), numel, num_heads,
-        head_dim, v_scales);
+    kv_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(k_in), static_cast<uint8_t*>(k_out), numel, k_scale);
+    kv_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(v_in), static_cast<uint8_t*>(v_out), numel, v_scale);
   } else {
-    kv_fp8_quantize_per_head_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(k_in), static_cast<uint8_t*>(k_out), numel, num_heads,
-        head_dim, k_scales);
-    kv_fp8_quantize_per_head_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(v_in), static_cast<uint8_t*>(v_out), numel, num_heads,
-        head_dim, v_scales);
+    kv_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(k_in), static_cast<uint8_t*>(k_out), numel, k_scale);
+    kv_fp8_quantize_scalar_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(v_in), static_cast<uint8_t*>(v_out), numel, v_scale);
   }
 }

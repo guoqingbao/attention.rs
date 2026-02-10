@@ -189,9 +189,9 @@ pub fn trtllm_backend_requested() -> bool {
 }
 
 pub fn configure(builder: KernelBuilder, compute_cap: usize) -> Result<KernelBuilder> {
-    if compute_cap < 100 {
+    if compute_cap != 100 && compute_cap != 103 {
         anyhow::bail!(
-            "TRTLLM requires compute capability >= 100, got {}",
+            "TRTLLM backend currently supports only SM100/SM103 cubins, got SM{}",
             compute_cap
         );
     }

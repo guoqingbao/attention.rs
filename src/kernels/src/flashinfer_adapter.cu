@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <vector>
 #include <algorithm>
 
@@ -140,6 +141,67 @@ static inline void FillSM90PagedParams(
         GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.batch_indices_offset);
     params.kv_indices = indices;
 }
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+static inline void FillSM90RaggedParams(
+    BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>& params,
+    void* q_ptr,
+    void* k_ptr,
+    void* v_ptr,
+    void* out_ptr,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int64_t nnz_qo,
+    int64_t nnz_kv,
+    float sm_scale,
+    void* workspace_int,
+    const PrefillPlanSM90Info& plan_info
+) {
+    params.q_ptr = static_cast<DTypeQ*>(q_ptr);
+    params.k_ptr = static_cast<DTypeKV*>(k_ptr);
+    params.v_ptr = static_cast<DTypeKV*>(v_ptr);
+    params.o_ptr = static_cast<DTypeO*>(out_ptr);
+    params.lse_ptr = nullptr;
+    params.q_stride_n = static_cast<int64_t>(num_qo_heads) * head_dim;
+    params.q_stride_h = head_dim;
+    params.o_stride_n = params.q_stride_n;
+    params.o_stride_h = params.q_stride_h;
+    params.k_stride_n = static_cast<int64_t>(num_kv_heads) * head_dim;
+    params.k_stride_h = head_dim;
+    params.v_stride_n = params.k_stride_n;
+    params.v_stride_h = params.k_stride_h;
+    params.nnz_qo = nnz_qo;
+    params.nnz_kv = nnz_kv;
+    params.num_qo_heads = num_qo_heads;
+    params.num_kv_heads = num_kv_heads;
+    params.group_size = num_qo_heads / num_kv_heads;
+    params.window_left = -1;
+    params.causal = true;
+    params.additional_params.logits_soft_cap = 0.0f;
+    params.additional_params.sm_scale = sm_scale;
+    params.additional_params.maybe_prefix_len_ptr = nullptr;
+    params.additional_params.maybe_token_pos_in_items_ptr = nullptr;
+    params.additional_params.token_pos_in_items_len = 0;
+    params.additional_params.maybe_max_item_len_ptr = nullptr;
+
+    params.qo_tile_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
+    params.qo_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_indptr_offset);
+    params.kv_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_indptr_offset);
+    params.qo_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_len_offset);
+    params.kv_lens =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_len_offset);
+    params.head_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.head_indices_offset);
+    params.work_indptr =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.work_indptr_offset);
+    params.batch_indices =
+        GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.batch_indices_offset);
+}
 #endif
 
 #endif // Flashinfer
@@ -162,75 +224,6 @@ static inline void FillSM90PagedParams(
 
 #if defined(FLASHINFER_ENABLE_FP8_E4M3)
 extern "C" {
-
-void flashinfer_append_kv_cache_fp8(
-    void* k_data_ptr,
-    void* v_data_ptr,
-    void* new_k_ptr,
-    void* new_v_ptr,
-    int32_t* paged_kv_indices,
-    int32_t* paged_kv_indptr,
-    int32_t* paged_kv_last_len,
-    int32_t* batch_indices,
-    int32_t* positions,
-    int32_t nnz,
-    int32_t batch_size,
-    int32_t num_heads,
-    int32_t head_dim,
-    int32_t page_size,
-    const float* k_scale_ptr,
-    const float* v_scale_ptr,
-    bool is_input_f16,
-    int32_t data_type,
-    cudaStream_t stream
-);
-
-void flashinfer_decode_plan_wrapper_fp8(
-    int32_t* indptr_host,
-    int32_t* qo_indptr_host,
-    int32_t* kv_len_arr_host,
-    int32_t batch_size,
-    int32_t num_qo_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t page_size,
-    void* workspace_float,
-    size_t workspace_float_size,
-    void* workspace_int,
-    size_t workspace_int_size,
-    void* page_locked_int_buffer,
-    size_t page_locked_int_size,
-    bool enable_cuda_graph,
-    int32_t data_type,
-    int32_t out_data_type,
-    int64_t* plan_info_out,
-    cudaStream_t stream
-);
-void flashinfer_decode_run_wrapper_fp8(
-    void* out_ptr,
-    void* q_ptr,
-    void* k_data, void* v_data,
-    int32_t* indices,
-    int32_t* indptr,
-    int32_t* last_len,
-    int32_t batch_size,
-    int32_t num_qo_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t page_size,
-    float sm_scale,
-    const float* k_scale_ptr,
-    const float* v_scale_ptr,
-    void* workspace_float,
-    size_t workspace_float_size,
-    void* workspace_int,
-    size_t workspace_int_size,
-    const int64_t* plan_info_vec,
-    int32_t data_type,
-    int32_t out_data_type,
-    cudaStream_t stream
-);
-
 void flashinfer_prefill_wrapper_fp8(
     void* out_ptr,
     void* q_ptr,
@@ -262,10 +255,86 @@ void flashinfer_prefill_wrapper_fp8(
     int32_t out_data_type,
     cudaStream_t stream
 );
+void flashinfer_prefill_ragged_wrapper_fp8(
+    void* out_ptr,
+    void* q_ptr,
+    int32_t* q_cu_seqlens,
+    int32_t* kv_cu_seqlens,
+    int32_t* q_cu_seqlens_host,
+    int32_t* kv_cu_seqlens_host,
+    int32_t total_num_rows,
+    int32_t total_kv_rows,
+    void* k_ptr,
+    void* v_ptr,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_float,
+    size_t workspace_float_size,
+    void* workspace_int,
+    size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
+    bool enable_cuda_graph,
+    int32_t data_type,
+    int32_t out_data_type,
+    cudaStream_t stream
+);
+void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* v_in,
+                                       void* k_out, void* v_out, int64_t numel,
+                                       const float* k_scale, const float* v_scale,
+                                       bool is_input_f16, int64_t stream_);
 }
 #endif
 
+template <typename T>
+__global__ void scale_output_inplace_kernel(T* out, int64_t numel, float scale) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; idx < numel; idx += stride) {
+        float x = static_cast<float>(out[idx]);
+        out[idx] = static_cast<T>(x * scale);
+    }
+}
+
 extern "C" {
+
+void flashinfer_scale_output_inplace(
+    void* out_ptr,
+    int64_t numel,
+    float scale,
+    int32_t out_data_type,
+    int64_t stream
+) {
+#ifdef USE_FLASHINFER
+    if (out_ptr == nullptr || numel <= 0 || scale == 1.0f) {
+        return;
+    }
+    cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr int threads = 256;
+    int64_t blocks_64 = (numel + threads - 1) / threads;
+    int blocks = static_cast<int>(blocks_64 > 65535 ? 65535 : blocks_64);
+    if (out_data_type == 1) {
+        scale_output_inplace_kernel<nv_bfloat16><<<blocks, threads, 0, cu_stream>>>(
+            static_cast<nv_bfloat16*>(out_ptr), numel, scale
+        );
+    } else {
+        scale_output_inplace_kernel<half><<<blocks, threads, 0, cu_stream>>>(
+            static_cast<half*>(out_ptr), numel, scale
+        );
+    }
+#else
+    (void)out_ptr;
+    (void)numel;
+    (void)scale;
+    (void)out_data_type;
+    (void)stream;
+#endif
+}
 
 void flashinfer_append_kv_cache(
     void* k_data_ptr,
@@ -291,26 +360,38 @@ void flashinfer_append_kv_cache(
 #ifdef USE_FLASHINFER
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
-        flashinfer_append_kv_cache_fp8(
-            k_data_ptr,
-            v_data_ptr,
-            new_k_ptr,
-            new_v_ptr,
-            paged_kv_indices,
-            paged_kv_indptr,
-            paged_kv_last_len,
-            batch_indices,
-            positions,
-            nnz,
-            batch_size,
-            num_heads,
-            head_dim,
-            page_size,
-            k_scale_ptr,
-            v_scale_ptr,
-            is_input_f16,
-            data_type,
-            stream);
+        if (!k_scale_ptr || !v_scale_ptr) {
+            return;
+        }
+        void* k_fp8_ptr = nullptr;
+        void* v_fp8_ptr = nullptr;
+        int64_t numel = static_cast<int64_t>(nnz) * num_heads * head_dim;
+        cudaMallocAsync(&k_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+        cudaMallocAsync(&v_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+        flashinfer_fp8_quantize_kv_scalar(
+            new_k_ptr, new_v_ptr, k_fp8_ptr, v_fp8_ptr, numel,
+            k_scale_ptr, v_scale_ptr, is_input_f16, (int64_t)stream
+        );
+
+        paged_kv_t<uint8_t, int32_t> paged_kv(
+            num_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
+            (uint8_t*)k_data_ptr, (uint8_t*)v_data_ptr,
+            paged_kv_indices, paged_kv_indptr, paged_kv_last_len
+        );
+        if (batch_size > 0 && batch_indices && positions) {
+            size_t stride_n = num_heads * head_dim;
+            size_t stride_h = head_dim;
+            AppendPagedKVCache(
+                paged_kv, (uint8_t*)k_fp8_ptr, (uint8_t*)v_fp8_ptr,
+                batch_indices, positions, nnz,
+                stride_n, stride_h, stride_n, stride_h, stream
+            );
+        } else {
+            AppendPagedKVCacheDecode(paged_kv, (uint8_t*)k_fp8_ptr, (uint8_t*)v_fp8_ptr, stream);
+        }
+
+        if (k_fp8_ptr) cudaFreeAsync(k_fp8_ptr, stream);
+        if (v_fp8_ptr) cudaFreeAsync(v_fp8_ptr, stream);
         #endif
         return;
     }
@@ -373,26 +454,51 @@ void flashinfer_decode_plan_wrapper(
     }
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
-        flashinfer_decode_plan_wrapper_fp8(
-            indptr_host,
-            qo_indptr_host,
-            kv_len_arr_host,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            workspace_float,
-            workspace_float_size,
-            workspace_int,
-            workspace_int_size,
-            page_locked_int_buffer,
-            page_locked_int_size,
-            enable_cuda_graph,
-            data_type,
-            out_data_type,
-            plan_info_out,
-            stream);
+        auto run_plan_fp8 = [&](auto dtype_q_val) {
+            using DTypeQ = decltype(dtype_q_val);
+            using DTypeKV = uint8_t;
+            using DTypeOut = DTypeQ;
+            using IdType = int32_t;
+
+            uint32_t group_size = num_qo_heads / num_kv_heads;
+
+            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+                    using AttentionType = DefaultDecodeAttention;
+                    using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+
+                    DecodePlanInfo plan_info;
+                    DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
+                        workspace_float, workspace_float_size,
+                        workspace_int, page_locked_int_buffer, workspace_int_size,
+                        plan_info,
+                        indptr_host, batch_size, num_qo_heads, page_size, enable_cuda_graph, stream,
+                        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+                            GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
+                            AttentionType, ParamsType>
+                    );
+
+                    if (plan_info_out != nullptr) {
+                        plan_info_out[0] = plan_info.padded_batch_size;
+                        plan_info_out[1] = plan_info.v_offset;
+                        plan_info_out[2] = plan_info.s_offset;
+                        plan_info_out[3] = plan_info.request_indices_offset;
+                        plan_info_out[4] = plan_info.kv_tile_indices_offset;
+                        plan_info_out[5] = plan_info.o_indptr_offset;
+                        plan_info_out[6] = plan_info.block_valid_mask_offset;
+                        plan_info_out[7] = plan_info.kv_chunk_size_ptr_offset;
+                        plan_info_out[8] = plan_info.enable_cuda_graph;
+                        plan_info_out[9] = plan_info.split_kv;
+                    }
+                });
+            });
+        };
+
+        if (out_data_type == 1) {
+            run_plan_fp8(nv_bfloat16{});
+        } else {
+            run_plan_fp8(half{});
+        }
         #endif
         return;
     }
@@ -473,29 +579,72 @@ void flashinfer_decode_run_wrapper(
     const float rope_theta = 10000.0f;
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
-        flashinfer_decode_run_wrapper_fp8(
-            out_ptr,
-            q_ptr,
-            k_data, v_data,
-            indices,
-            indptr,
-            last_len,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            sm_scale,
-            k_scale_ptr,
-            v_scale_ptr,
-            workspace_float,
-            workspace_float_size,
-            workspace_int,
-            workspace_int_size,
-            plan_info_vec,
-            data_type,
-            out_data_type,
-            stream);
+        if (plan_info_vec == nullptr) {
+            fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
+            return;
+        }
+
+        auto run_decode_fp8 = [&](auto dtype_q_val) {
+            using DTypeQ = decltype(dtype_q_val);
+            using DTypeKV = uint8_t;
+            using DTypeOut = DTypeQ;
+            using IdType = int32_t;
+
+            uint32_t group_size = num_qo_heads / num_kv_heads;
+
+            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+                    paged_kv_t<DTypeKV, IdType> paged_kv(
+                        num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
+                        (DTypeKV*)k_data, (DTypeKV*)v_data,
+                        indices, indptr, last_len
+                    );
+
+                    DecodePlanInfo plan_info;
+                    std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
+                    plan_info.FromVector(vec);
+
+                    using AttentionType = DefaultDecodeAttention;
+                    using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+
+                    ParamsType params(
+                        (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
+                        nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
+                        num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
+                        -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+                    );
+
+                    params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
+                    params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
+                    params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
+                    params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
+                    params.partition_kv = plan_info.split_kv;
+                    params.padded_batch_size = plan_info.padded_batch_size;
+                    params.block_valid_mask = nullptr;
+                    if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+                        params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+                    }
+
+                    DTypeOut* tmp_v = nullptr;
+                    float* tmp_s = nullptr;
+                    if (plan_info.split_kv) {
+                        tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                        tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+                    }
+
+                    BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                         AttentionType, ParamsType>(
+                         params, tmp_v, tmp_s, false /* pdl */, stream
+                    );
+                });
+            });
+        };
+
+        if (out_data_type == 1) {
+            run_decode_fp8(nv_bfloat16{});
+        } else {
+            run_decode_fp8(half{});
+        }
         #endif
         return;
     }
@@ -604,35 +753,13 @@ void flashinfer_prefill_wrapper(
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
         flashinfer_prefill_wrapper_fp8(
-            out_ptr,
-            q_ptr,
-            q_cu_seqlens,
-            q_cu_seqlens_host,
-            kv_len_arr_host,
-            total_num_rows,
-            k_data, v_data,
-            indices,
-            indptr,
-            indptr_host,
-            last_len,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            sm_scale,
-            k_scale_ptr,
-            v_scale_ptr,
-            workspace_float,
-            workspace_float_size,
-            workspace_int,
-            workspace_int_size,
-            page_locked_int_buffer,
-            page_locked_int_size,
-            enable_cuda_graph,
-            data_type,
-            out_data_type,
-            stream);
+            out_ptr, q_ptr, q_cu_seqlens, q_cu_seqlens_host, kv_len_arr_host, total_num_rows,
+            k_data, v_data, indices, indptr, indptr_host, last_len,
+            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
+            k_scale_ptr, v_scale_ptr, workspace_float, workspace_float_size, workspace_int,
+            workspace_int_size, page_locked_int_buffer, page_locked_int_size, enable_cuda_graph,
+            data_type, out_data_type, stream
+        );
         #endif
         return;
     }
@@ -783,9 +910,6 @@ void flashinfer_prefill_wrapper(
                     params, tmp_v, tmp_s, false /* pdl */, stream
                 );
             });
-
-            // Should not free static buffer
-           // cudaFreeHost(page_locked_buffer);
         });
     };
 
@@ -793,6 +917,175 @@ void flashinfer_prefill_wrapper(
         run_prefill(nv_bfloat16{});
     } else {
         run_prefill(half{});
+    }
+#endif
+#endif
+}
+
+void flashinfer_prefill_ragged_wrapper(
+    void* out_ptr,
+    void* q_ptr,
+    int32_t* q_cu_seqlens,
+    int32_t* kv_cu_seqlens,
+    int32_t* q_cu_seqlens_host,
+    int32_t* kv_cu_seqlens_host,
+    int32_t total_num_rows,
+    int32_t total_kv_rows,
+    void* k_ptr,
+    void* v_ptr,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_float,
+    size_t workspace_float_size,
+    void* workspace_int,
+    size_t workspace_int_size,
+    void* page_locked_int_buffer,
+    size_t page_locked_int_size,
+    bool enable_cuda_graph,
+    int32_t data_type,
+    int32_t out_data_type,
+    cudaStream_t stream
+) {
+#ifdef USE_FLASHINFER
+    if (data_type == 2) {
+#if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_prefill_ragged_wrapper_fp8(
+            out_ptr, q_ptr, q_cu_seqlens, kv_cu_seqlens, q_cu_seqlens_host, kv_cu_seqlens_host,
+            total_num_rows, total_kv_rows, k_ptr, v_ptr, batch_size, num_qo_heads, num_kv_heads,
+            head_dim, sm_scale, k_scale_ptr, v_scale_ptr, workspace_float, workspace_float_size,
+            workspace_int, workspace_int_size, page_locked_int_buffer, page_locked_int_size,
+            enable_cuda_graph, data_type, out_data_type, stream
+        );
+#endif
+        return;
+    }
+    if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
+        return;
+    }
+    if (q_cu_seqlens_host == nullptr || kv_cu_seqlens_host == nullptr ||
+        q_cu_seqlens == nullptr || kv_cu_seqlens == nullptr) {
+        return;
+    }
+    const float rope_scale = 1.0f;
+    const float rope_theta = 10000.0f;
+#if defined(SM_90_PASS)
+    std::vector<int32_t> kv_len_host(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        kv_len_host[i] = kv_cu_seqlens_host[i + 1] - kv_cu_seqlens_host[i];
+    }
+    PrefillPlanSM90Info plan_info;
+    PrefillSM90Plan<int32_t>(
+        workspace_float, workspace_float_size,
+        workspace_int, page_locked_int_buffer, workspace_int_size,
+        plan_info,
+        q_cu_seqlens_host, kv_cu_seqlens_host, kv_len_host.data(),
+        total_num_rows, batch_size,
+        num_qo_heads, num_kv_heads, head_dim, head_dim, 1,
+        true, enable_cuda_graph,
+        (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+        stream
+    );
+    using IdType = int32_t;
+    auto run_ragged_sm90 = [&](auto dtype_val) {
+        using DTypeKV = decltype(dtype_val);
+        using DTypeQ = DTypeKV;
+        using DTypeOut = DTypeKV;
+        BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+        FillSM90RaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+            params, q_ptr, k_ptr, v_ptr, out_ptr,
+            num_qo_heads, num_kv_heads, head_dim, total_num_rows, total_kv_rows, sm_scale,
+            workspace_int, plan_info);
+        using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            if (plan_info.same_schedule_for_all_heads) {
+                BatchPrefillWithRaggedKVCacheDispatched<
+                    HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                    params, false, stream);
+            } else {
+                BatchPrefillWithRaggedKVCacheDispatched<
+                    HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                    params, false, stream);
+            }
+        });
+    };
+    if (data_type == 1) {
+        run_ragged_sm90(cutlass::bfloat16_t{});
+    } else {
+        run_ragged_sm90(cutlass::half_t{});
+    }
+#else
+    auto run_ragged = [&](auto dtype_val) {
+        using DTypeKV = decltype(dtype_val);
+        using DTypeQ = DTypeKV;
+        using DTypeOut = DTypeKV;
+        using IdType = int32_t;
+        PrefillPlanInfo plan_info;
+        PrefillPlan<int32_t>(
+            workspace_float, workspace_float_size,
+            workspace_int, page_locked_int_buffer, workspace_int_size,
+            plan_info,
+            q_cu_seqlens_host, kv_cu_seqlens_host, total_num_rows,
+            batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, 1,
+            enable_cuda_graph, sizeof(DTypeOut),
+            -1, 0, false, 0, stream
+        );
+        using ParamsType = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+        ParamsType params(
+            (DTypeQ*)q_ptr, (DTypeKV*)k_ptr, (DTypeKV*)v_ptr, nullptr,
+            q_cu_seqlens, kv_cu_seqlens, nullptr, nullptr, nullptr,
+            (DTypeOut*)out_ptr, nullptr, nullptr,
+            num_qo_heads, num_kv_heads,
+            num_qo_heads * head_dim, head_dim,
+            num_kv_heads * head_dim, head_dim,
+            -1, 0.0f, sm_scale, rope_scale, rope_theta
+        );
+        params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
+        params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
+        params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
+        params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
+        params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
+        params.max_total_num_rows = plan_info.total_num_rows;
+        params.padded_batch_size = plan_info.padded_batch_size;
+        params.partition_kv = plan_info.split_kv;
+        params.merge_indptr = nullptr;
+        params.block_valid_mask = nullptr;
+        if (plan_info.split_kv) {
+            params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
+            if (plan_info.enable_cuda_graph) {
+                params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+            }
+        }
+        params.total_num_rows = nullptr;
+        if (plan_info.enable_cuda_graph) {
+            params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
+        }
+        DTypeOut* tmp_v = nullptr;
+        float* tmp_s = nullptr;
+        if (plan_info.split_kv) {
+            tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+            tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+        }
+        using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                BatchPrefillWithRaggedKVCacheDispatched<
+                    CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                    PosEncodingMode::kNone, false, MaskMode::kCausal,
+                    AttentionType, ParamsType>(
+                    params, tmp_v, tmp_s, false, stream
+                );
+            });
+        });
+    };
+    if (data_type == 1) {
+        run_ragged(nv_bfloat16{});
+    } else {
+        run_ragged(half{});
     }
 #endif
 #endif

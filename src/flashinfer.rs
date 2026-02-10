@@ -339,16 +339,8 @@ impl candle::CustomOp1 for FlashInferAppend {
                 .v_scale
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("fp8 append requires v_scale"))?;
-            if k_scales.elem_count() != num_heads || v_scales.elem_count() != num_heads {
-                candle::bail!(
-                    "fp8 append requires k_scale/v_scale length == num_kv_heads ({}), got {}/{}",
-                    num_heads,
-                    k_scales.elem_count(),
-                    v_scales.elem_count()
-                );
-            }
-            let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
-            let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
+            let k_scale_ptr = get_cuda_f32_ptr(&k_scales)?;
+            let v_scale_ptr = get_cuda_f32_ptr(&v_scales)?;
             (k_scale_ptr, v_scale_ptr)
         } else {
             (std::ptr::null(), std::ptr::null())
@@ -476,15 +468,17 @@ impl FlashInferDecodeWithPlan {
             if sm < 90 {
                 candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
             }
-            if !(self.head_dim == 64 || self.head_dim == 128 || self.head_dim == 256) {
+            if sm == 90 {
+                if self.plan_info.len() != 9 {
+                    candle::bail!(
+                        "flashinfer fp8 decode plan_info must have length 9 on sm90, got {}",
+                        self.plan_info.len()
+                    );
+                }
+            } else if self.plan_info.len() != 10 {
                 candle::bail!(
-                    "flashinfer fp8 decode supports head_dim 64/128/256, got {}",
-                    self.head_dim
-                );
-            }
-            if self.plan_info.len() != 9 {
-                candle::bail!(
-                    "flashinfer fp8 decode plan_info must have length 9, got {}",
+                    "flashinfer fp8 decode plan_info must have length 10 on sm{}, got {}",
+                    sm,
                     self.plan_info.len()
                 );
             }
@@ -512,16 +506,6 @@ impl FlashInferDecodeWithPlan {
                 .v_scale
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("fp8 decode requires v_scale"))?;
-            if k_scales.elem_count() != self.num_kv_heads
-                || v_scales.elem_count() != self.num_kv_heads
-            {
-                candle::bail!(
-                    "fp8 decode requires k_scale/v_scale length == num_kv_heads ({}), got {}/{}",
-                    self.num_kv_heads,
-                    k_scales.elem_count(),
-                    v_scales.elem_count()
-                );
-            }
             let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
             let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
             (k_scale_ptr, v_scale_ptr)
@@ -690,7 +674,8 @@ pub fn decode_plan(
         );
     }
 
-    if data_type == 2 {
+    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+    if data_type == 2 && sm == 90 {
         Ok(plan_info[..9].to_vec())
     } else {
         Ok(plan_info.to_vec())
@@ -794,12 +779,6 @@ impl FlashInferPrefill {
             if q.dtype() != DType::F16 && q.dtype() != DType::BF16 {
                 candle::bail!("flashinfer fp8 prefill requires f16/bf16 q");
             }
-            if !(self.head_dim == 64 || self.head_dim == 128 || self.head_dim == 256) {
-                candle::bail!(
-                    "flashinfer fp8 prefill supports head_dim 64/128/256, got {}",
-                    self.head_dim
-                );
-            }
         }
 
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
@@ -823,16 +802,6 @@ impl FlashInferPrefill {
                 .v_scale
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("fp8 prefill requires v_scale"))?;
-            if k_scales.elem_count() != self.num_kv_heads
-                || v_scales.elem_count() != self.num_kv_heads
-            {
-                candle::bail!(
-                    "fp8 prefill requires k_scale/v_scale length == num_kv_heads ({}), got {}/{}",
-                    self.num_kv_heads,
-                    k_scales.elem_count(),
-                    v_scales.elem_count()
-                );
-            }
             let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
             let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
             (k_scale_ptr, v_scale_ptr)
@@ -905,6 +874,148 @@ impl FlashInferPrefill {
     }
 }
 
+pub struct FlashInferRaggedPrefill {
+    pub key: Tensor,
+    pub value: Tensor,
+    pub k_scale: Option<Tensor>,
+    pub v_scale: Option<Tensor>,
+    pub kv_data_type: i32, // 0:f16, 1:bf16, 2:fp8 kv-cache mode
+    pub q_cu_seqlens: Tensor,
+    pub kv_cu_seqlens: Tensor,
+    pub q_cu_seqlens_host: Vec<u32>,
+    pub kv_cu_seqlens_host: Vec<u32>,
+    pub total_num_rows: u32,
+    pub total_kv_rows: u32,
+    pub num_qo_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub sm_scale: f32,
+}
+
+impl candle::CustomOp1 for FlashInferRaggedPrefill {
+    fn name(&self) -> &'static str {
+        "flashinfer-ragged-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &candle::CpuStorage,
+        _: &Layout,
+    ) -> Result<(candle::CpuStorage, candle::Shape)> {
+        candle::bail!("no cpu support")
+    }
+
+    fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            _ => candle::bail!("unsupported q dtype for ragged prefill"),
+        }
+    }
+}
+
+impl FlashInferRaggedPrefill {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
+        let dev = q.device();
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
+        let k_ptr = get_cuda_ptr(&self.key)?;
+        let v_ptr = get_cuda_ptr(&self.value)?;
+
+        let (q_lens, q_lens_l) = self.q_cu_seqlens.storage_and_layout();
+        let q_lens_ptr = match &*q_lens {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(q_lens_l.start_offset()..),
+            _ => candle::bail!("q_cu_seqlens must be cuda"),
+        };
+        let (kv_lens, kv_lens_l) = self.kv_cu_seqlens.storage_and_layout();
+        let kv_lens_ptr = match &*kv_lens {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(kv_lens_l.start_offset()..),
+            _ => candle::bail!("kv_cu_seqlens must be cuda"),
+        };
+
+        let data_type = if self.kv_data_type == 2 {
+            2
+        } else {
+            match self.key.dtype() {
+                DType::BF16 => 1,
+                DType::F16 => 0,
+                DType::U8 => 2,
+                _ => candle::bail!("unsupported key dtype for ragged prefill"),
+            }
+        };
+        let mut k_scale_ptr = std::ptr::null();
+        let mut v_scale_ptr = std::ptr::null();
+        if data_type == 2 {
+            let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+            if sm < 90 {
+                candle::bail!("flashinfer fp8 ragged prefill requires sm90+, got sm{}", sm);
+            }
+            let k_scales = self
+                .k_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 ragged prefill requires k_scale"))?;
+            let v_scales = self
+                .v_scale
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("fp8 ragged prefill requires v_scale"))?;
+            k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
+            v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
+        }
+        let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
+        let batch_size = self.q_cu_seqlens_host.len().saturating_sub(1);
+        if self.kv_cu_seqlens_host.len() != batch_size + 1 {
+            candle::bail!(
+                "kv_cu_seqlens_host length must be batch_size+1 ({}), got {}",
+                batch_size + 1,
+                self.kv_cu_seqlens_host.len()
+            );
+        }
+
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
+        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+            get_or_init_workspace(dev, false)?;
+        unsafe {
+            kernels::ffi::flashinfer_prefill_ragged_wrapper(
+                out_ptr,
+                q_ptr,
+                *q_lens_ptr.device_ptr() as *const i32,
+                *kv_lens_ptr.device_ptr() as *const i32,
+                self.q_cu_seqlens_host.as_ptr().cast(),
+                self.kv_cu_seqlens_host.as_ptr().cast(),
+                self.total_num_rows as i32,
+                self.total_kv_rows as i32,
+                k_ptr,
+                v_ptr,
+                batch_size as i32,
+                self.num_qo_heads as i32,
+                self.num_kv_heads as i32,
+                self.head_dim as i32,
+                self.sm_scale,
+                k_scale_ptr,
+                v_scale_ptr,
+                ws_float_ptr,
+                WORKSPACE_FLOAT_SIZE,
+                ws_int_ptr,
+                WORKSPACE_INT_SIZE,
+                page_locked_ptr,
+                page_locked_size,
+                false,
+                data_type,
+                out_data_type,
+                *dev.cu_stream() as i64,
+            );
+        }
+        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        Ok((out, q_l.shape().clone()))
+    }
+}
+
 pub fn prefill(
     q: &Tensor,
     key_cache: &Tensor,
@@ -941,6 +1052,45 @@ pub fn prefill(
         q_cu_seqlens_host: q_cu_seqlens_host.to_vec(),
         total_num_rows,
         block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+    };
+    q.apply_op1(op)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_ragged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    kv_data_type: i32,
+    q_cu_seqlens: &Tensor,
+    kv_cu_seqlens: &Tensor,
+    q_cu_seqlens_host: &[u32],
+    kv_cu_seqlens_host: &[u32],
+    total_num_rows: u32,
+    total_kv_rows: u32,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+) -> Result<Tensor> {
+    let op = FlashInferRaggedPrefill {
+        key: k.clone(),
+        value: v.clone(),
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
+        kv_data_type,
+        q_cu_seqlens: q_cu_seqlens.clone(),
+        kv_cu_seqlens: kv_cu_seqlens.clone(),
+        q_cu_seqlens_host: q_cu_seqlens_host.to_vec(),
+        kv_cu_seqlens_host: kv_cu_seqlens_host.to_vec(),
+        total_num_rows,
+        total_kv_rows,
         num_qo_heads,
         num_kv_heads,
         head_dim,

@@ -63,8 +63,11 @@ impl TrtllmDecode {
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
         let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-        if sm < 100 {
-            candle::bail!("trtllm backend requires sm100+, got sm{}", sm);
+        if sm != 100 && sm != 103 {
+            candle::bail!(
+                "trtllm backend currently supports only sm100/sm103, got sm{}",
+                sm
+            );
         }
         let (sum_seq_q, num_qo_heads, head_dim) = q_l.shape().dims3()?;
         let (num_pages, page_size, num_kv_heads, _) = self.key_cache.shape().dims4()?;
@@ -223,8 +226,11 @@ impl TrtllmContext {
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
         let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-        if sm < 100 {
-            candle::bail!("trtllm backend requires sm100+, got sm{}", sm);
+        if sm != 100 && sm != 103 {
+            candle::bail!(
+                "trtllm backend currently supports only sm100/sm103, got sm{}",
+                sm
+            );
         }
         let (sum_seq_q, num_qo_heads, head_dim) = q_l.shape().dims3()?;
         let use_paged = self.block_tables.is_some();

@@ -932,20 +932,6 @@ extern "C" {
         stream: i64,
     );
 
-    pub fn flashinfer_fp8_quantize_kv_per_head(
-        k_in: *const c_void,
-        v_in: *const c_void,
-        k_out: *mut c_void,
-        v_out: *mut c_void,
-        numel: i64,
-        num_heads: c_int,
-        head_dim: c_int,
-        k_scales: *const f32,
-        v_scales: *const f32,
-        is_input_f16: bool,
-        stream: i64,
-    );
-
     // FlashInfer wrappers
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_append_kv_cache(
@@ -1050,6 +1036,46 @@ extern "C" {
         page_locked_int_size: usize,
         enable_cuda_graph: bool,
         data_type: i32,
+        out_data_type: i32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_prefill_ragged_wrapper(
+        out_ptr: *mut c_void,
+        q_ptr: *const c_void,
+        q_cu_seqlens: *const i32,       // Device pointer
+        kv_cu_seqlens: *const i32,      // Device pointer
+        q_cu_seqlens_host: *const i32,  // Host pointer
+        kv_cu_seqlens_host: *const i32, // Host pointer
+        total_num_rows: i32,            // Total query rows
+        total_kv_rows: i32,             // Total kv rows
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        sm_scale: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
+        enable_cuda_graph: bool,
+        data_type: i32,
+        out_data_type: i32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_scale_output_inplace(
+        out_ptr: *mut c_void,
+        numel: i64,
+        scale: f32,
         out_data_type: i32,
         stream: i64,
     );

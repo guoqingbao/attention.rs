@@ -369,10 +369,10 @@ impl PagedAttention {
     ) -> Result<Tensor> {
         #[cfg(feature = "flashinfer")]
         if input_metadata.flashinfer_metadata.is_some() {
-            let use_flashinfer = self.sliding_window.is_none()
+            let mut use_flashinfer = self.sliding_window.is_none()
                 && self.alibi_slopes.is_none()
                 && softcapping.is_none();
-            let mut use_trtllm_backend = std::env::var("FLASHINFER_BACKEND")
+            let use_trtllm_backend = std::env::var("FLASHINFER_BACKEND")
                 .ok()
                 .map(|v| v.eq_ignore_ascii_case("trtllm"))
                 .unwrap_or(false);
@@ -382,8 +382,11 @@ impl PagedAttention {
                     .as_cuda_device()
                     .map_err(candle_core::Error::wrap)?;
                 let sm = crate::cuda_utils::sm_version(dev).unwrap_or(0);
-                if sm < 100 {
-                    candle_core::bail!("FLASHINFER_BACKEND=trtllm requires sm100+, got sm{}", sm);
+                if sm != 100 && sm != 103 {
+                    candle_core::bail!(
+                        "FLASHINFER_BACKEND=trtllm currently supports only sm100/sm103, got sm{}",
+                        sm
+                    );
                 }
             }
             if use_flashinfer {
@@ -495,27 +498,79 @@ impl PagedAttention {
                         true,
                     )
                 } else if input_metadata.is_prefill {
-                    crate::flashinfer::prefill(
-                        &query,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
-                        self.k_scale.as_ref(),
-                        self.v_scale.as_ref(),
-                        &fm.indices,
-                        &fm.indptr,
-                        &fm.indptr_host,
-                        &fm.last_len,
-                        fm.last_len_host.as_deref(),
-                        fm.kv_len_arr_host.as_deref(),
-                        input_metadata.cu_seqlens_q.as_ref().unwrap(),
-                        fm.cu_seqlens_q_host.as_ref().unwrap(),
-                        fm.total_num_rows.unwrap(),
-                        block_size,
-                        attention_heads,
-                        key_value_heads,
-                        head_size,
-                        self.scale as f32,
-                    )
+                    if input_metadata.block_tables.is_none() {
+                        let q_cu = input_metadata.cu_seqlens_q.as_ref().ok_or_else(|| {
+                            candle_core::Error::msg(
+                                "flashinfer ragged prefill requires cu_seqlens_q",
+                            )
+                        })?;
+                        let kv_cu = input_metadata.cu_seqlens_k.as_ref().unwrap_or(q_cu);
+                        let q_host = fm.cu_seqlens_q_host.as_ref().ok_or_else(|| {
+                            candle_core::Error::msg(
+                                "flashinfer ragged prefill requires cu_seqlens_q_host",
+                            )
+                        })?;
+                        let total_q = fm
+                            .total_num_rows
+                            .unwrap_or_else(|| q_host.last().copied().unwrap_or(0));
+                        let kv_host =
+                            if let Some(kv_cu_host_t) = input_metadata.cu_seqlens_k.as_ref() {
+                                kv_cu_host_t.to_vec1::<u32>()?
+                            } else {
+                                q_host.clone()
+                            };
+                        let total_kv = kv_host.last().copied().unwrap_or(total_q);
+                        let kv_data_type = if key_cache
+                            .as_ref()
+                            .is_some_and(|kc| kc.dtype() == candle_core::DType::U8)
+                        {
+                            2
+                        } else if key.dtype() == candle_core::DType::BF16 {
+                            1
+                        } else {
+                            0
+                        };
+                        crate::flashinfer::prefill_ragged(
+                            &query,
+                            &key,
+                            &value,
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            kv_data_type,
+                            q_cu,
+                            kv_cu,
+                            q_host,
+                            &kv_host,
+                            total_q,
+                            total_kv,
+                            attention_heads,
+                            key_value_heads,
+                            head_size,
+                            self.scale as f32,
+                        )
+                    } else {
+                        crate::flashinfer::prefill(
+                            &query,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &fm.indices,
+                            &fm.indptr,
+                            &fm.indptr_host,
+                            &fm.last_len,
+                            fm.last_len_host.as_deref(),
+                            fm.kv_len_arr_host.as_deref(),
+                            input_metadata.cu_seqlens_q.as_ref().unwrap(),
+                            fm.cu_seqlens_q_host.as_ref().unwrap(),
+                            fm.total_num_rows.unwrap(),
+                            block_size,
+                            attention_heads,
+                            key_value_heads,
+                            head_size,
+                            self.scale as f32,
+                        )
+                    }
                 } else {
                     let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
                         candle_core::Error::msg(
