@@ -1074,4 +1074,118 @@ extern "C" {
         out_data_type: i32,
         stream: i64,
     );
+
+    pub fn causal_conv1d_update_f32(
+        x: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        conv_state: *mut f32,
+        out: *mut f32,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        silu: bool,
+        stream: i64,
+    );
+    pub fn causal_conv1d_update_f16(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        conv_state: *mut c_void,
+        out: *mut c_void,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        silu: bool,
+        stream: i64,
+    );
+    pub fn causal_conv1d_update_bf16(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        conv_state: *mut c_void,
+        out: *mut c_void,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        silu: bool,
+        stream: i64,
+    );
+
+    pub fn chunk_gated_delta_rule_decode_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        batch: c_int,
+        heads: c_int,
+        dim: c_int,
+        stream: i64,
+    );
+    pub fn chunk_gated_delta_rule_decode_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut c_void,
+        out: *mut c_void,
+        batch: c_int,
+        heads: c_int,
+        dim: c_int,
+        stream: i64,
+    );
+    pub fn chunk_gated_delta_rule_decode_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut c_void,
+        out: *mut c_void,
+        batch: c_int,
+        heads: c_int,
+        dim: c_int,
+        stream: i64,
+    );
+
+    pub fn fused_gdn_gating_f32(
+        al: *const f32,
+        a: *mut f32,
+        b: *mut f32,
+        dt: *const f32,
+        g: *mut f32,
+        beta: *mut f32,
+        bat: c_int,
+        seq: c_int,
+        h: c_int,
+        s: i64,
+    );
+    pub fn fused_gdn_gating_f16(
+        al: *const c_void,
+        a: *mut c_void,
+        b: *mut c_void,
+        dt: *const c_void,
+        g: *mut c_void,
+        beta: *mut c_void,
+        bat: c_int,
+        seq: c_int,
+        h: c_int,
+        s: i64,
+    );
+    pub fn fused_gdn_gating_bf16(
+        al: *const c_void,
+        a: *mut c_void,
+        b: *mut c_void,
+        dt: *const c_void,
+        g: *mut c_void,
+        beta: *mut c_void,
+        bat: c_int,
+        seq: c_int,
+        h: c_int,
+        s: i64,
+    );
 }

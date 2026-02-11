@@ -19,6 +19,8 @@ pub mod cache;
 #[cfg(feature = "cuda")]
 pub mod cuda_utils;
 pub mod fp8_linear;
+pub mod gdn;
+pub mod mamba_cache;
 pub mod ops;
 
 #[cfg(feature = "flashinfer")]
