@@ -45,6 +45,7 @@ pub struct FlashInferMetadata {
 
 pub struct InputMetadata {
     pub is_prefill: bool,
+    pub sequence_ids: Option<Vec<usize>>,
     pub slot_mapping: Tensor,
     pub block_tables: Option<Tensor>,
     pub context_lens: Option<Tensor>,

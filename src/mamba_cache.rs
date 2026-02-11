@@ -7,8 +7,8 @@
 // The cache uses slot-based indexing: each sequence is assigned a slot index,
 // and states are updated in-place during forward passes.
 
-use candle_core::{DType, Device, Result, Tensor, IndexOp};
-use std::collections::HashMap;
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use std::collections::{HashMap, HashSet};
 
 pub struct MambaCache {
     /// Per-layer conv states: [max_batch, d_conv, conv_kernel_size - 1]
@@ -34,7 +34,8 @@ impl MambaCache {
     /// - d_conv: convolution dimension (typically intermediate_size)
     /// - conv_kernel_size: convolution kernel size (typically 4)
     /// - num_heads: number of GDN attention heads
-    /// - head_dim: head dimension for GDN
+    /// - head_k_dim: key head dimension for GDN recurrence state
+    /// - head_v_dim: value head dimension for GDN recurrence state
     /// - dtype: data type for state tensors
     /// - device: computation device
     pub fn new(
@@ -43,7 +44,8 @@ impl MambaCache {
         d_conv: usize,
         conv_kernel_size: usize,
         num_heads: usize,
-        head_dim: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
@@ -57,7 +59,7 @@ impl MambaCache {
                 device,
             )?);
             recurrent_states.push(Tensor::zeros(
-                (max_batch_size, num_heads, head_dim, head_dim),
+                (max_batch_size, num_heads, head_k_dim, head_v_dim),
                 dtype,
                 device,
             )?);
@@ -81,6 +83,10 @@ impl MambaCache {
         if let Some(&existing) = self.seq_to_slot.get(&seq_id) {
             return Ok(existing);
         }
+        if self.free_slots.is_empty() {
+            let new_capacity = (self.max_batch_size * 2).max(1);
+            self.expand_capacity(new_capacity)?;
+        }
         let slot = self.free_slots.pop().ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "MambaCache: no free slots (max_batch_size={})",
@@ -89,6 +95,80 @@ impl MambaCache {
         })?;
         self.seq_to_slot.insert(seq_id, slot);
         Ok(slot)
+    }
+
+    fn expand_capacity(&mut self, new_max_batch_size: usize) -> Result<()> {
+        if new_max_batch_size <= self.max_batch_size {
+            return Ok(());
+        }
+        let old_max_batch_size = self.max_batch_size;
+        for layer_idx in 0..self.num_gdn_layers {
+            let conv = &self.conv_states[layer_idx];
+            let conv_dim = conv.dim(1)?;
+            let conv_window = conv.dim(2)?;
+            let mut expanded_conv = Tensor::zeros(
+                (new_max_batch_size, conv_dim, conv_window),
+                conv.dtype(),
+                &conv.device(),
+            )?;
+            expanded_conv = expanded_conv
+                .slice_assign(&[0..old_max_batch_size, 0..conv_dim, 0..conv_window], conv)?;
+            self.conv_states[layer_idx] = expanded_conv;
+
+            let rec = &self.recurrent_states[layer_idx];
+            let rec_heads = rec.dim(1)?;
+            let rec_h = rec.dim(2)?;
+            let rec_w = rec.dim(3)?;
+            let mut expanded_rec = Tensor::zeros(
+                (new_max_batch_size, rec_heads, rec_h, rec_w),
+                rec.dtype(),
+                &rec.device(),
+            )?;
+            expanded_rec = expanded_rec.slice_assign(
+                &[0..old_max_batch_size, 0..rec_heads, 0..rec_h, 0..rec_w],
+                rec,
+            )?;
+            self.recurrent_states[layer_idx] = expanded_rec;
+        }
+        self.free_slots
+            .extend((old_max_batch_size..new_max_batch_size).rev());
+        self.max_batch_size = new_max_batch_size;
+        Ok(())
+    }
+
+    pub fn ensure_slots_for_sequences(&mut self, seq_ids: &[usize]) -> Result<Vec<usize>> {
+        let active: HashSet<usize> = seq_ids.iter().copied().collect();
+        for &seq_id in seq_ids {
+            if self.seq_to_slot.contains_key(&seq_id) {
+                continue;
+            }
+            if self.allocate_slot(seq_id).is_ok() {
+                continue;
+            }
+
+            // Best effort reclamation for stale sequences if slot pressure appears.
+            let stale_ids = self
+                .seq_to_slot
+                .keys()
+                .copied()
+                .filter(|id| !active.contains(id))
+                .collect::<Vec<_>>();
+            for stale_id in stale_ids {
+                self.free_slot(stale_id);
+            }
+            self.allocate_slot(seq_id)?;
+        }
+        seq_ids
+            .iter()
+            .map(|id| {
+                self.seq_to_slot.get(id).copied().ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "MambaCache: sequence {} not found in cache",
+                        id
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Free a cache slot when a sequence is done
@@ -104,22 +184,23 @@ impl MambaCache {
     fn reset_slot_states(&mut self, slot: usize) -> Result<()> {
         for layer_idx in 0..self.num_gdn_layers {
             let conv = &self.conv_states[layer_idx];
-            let zeros_conv = Tensor::zeros(
-                &conv.dims()[1..],
-                conv.dtype(),
-                &conv.device(),
+            let zeros_conv = Tensor::zeros(&conv.dims()[1..], conv.dtype(), &conv.device())?;
+            self.conv_states[layer_idx] = self.conv_states[layer_idx].slice_assign(
+                &[slot..slot + 1, 0..conv.dim(1)?, 0..conv.dim(2)?],
+                &zeros_conv.unsqueeze(0)?,
             )?;
-            self.conv_states[layer_idx] = self.conv_states[layer_idx]
-                .slice_assign(&[slot..slot + 1, 0..conv.dim(1)?, 0..conv.dim(2)?], &zeros_conv.unsqueeze(0)?)?;
 
             let rec = &self.recurrent_states[layer_idx];
-            let zeros_rec = Tensor::zeros(
-                &rec.dims()[1..],
-                rec.dtype(),
-                &rec.device(),
+            let zeros_rec = Tensor::zeros(&rec.dims()[1..], rec.dtype(), &rec.device())?;
+            self.recurrent_states[layer_idx] = self.recurrent_states[layer_idx].slice_assign(
+                &[
+                    slot..slot + 1,
+                    0..rec.dim(1)?,
+                    0..rec.dim(2)?,
+                    0..rec.dim(3)?,
+                ],
+                &zeros_rec.unsqueeze(0)?,
             )?;
-            self.recurrent_states[layer_idx] = self.recurrent_states[layer_idx]
-                .slice_assign(&[slot..slot + 1, 0..rec.dim(1)?, 0..rec.dim(2)?, 0..rec.dim(3)?], &zeros_rec.unsqueeze(0)?)?;
         }
         Ok(())
     }
@@ -156,6 +237,73 @@ impl MambaCache {
     /// Get reference to the full recurrent state tensor for a layer
     pub fn recurrent_state(&self, gdn_layer_idx: usize) -> &Tensor {
         &self.recurrent_states[gdn_layer_idx]
+    }
+
+    pub fn get_batch_conv_state(&self, gdn_layer_idx: usize, slots: &[usize]) -> Result<Tensor> {
+        if slots.is_empty() {
+            candle_core::bail!("MambaCache: empty slot list for conv state");
+        }
+        let slot_ids = slots.iter().map(|&s| s as u32).collect::<Vec<_>>();
+        let index = Tensor::from_vec(
+            slot_ids,
+            (slots.len(),),
+            self.conv_states[gdn_layer_idx].device(),
+        )?;
+        self.conv_states[gdn_layer_idx].index_select(&index, 0)
+    }
+
+    pub fn set_batch_conv_state(
+        &mut self,
+        gdn_layer_idx: usize,
+        slots: &[usize],
+        batch_state: &Tensor,
+    ) -> Result<()> {
+        let mut full_state = self.conv_states[gdn_layer_idx].clone();
+        let conv_dim = full_state.dim(1)?;
+        let conv_window = full_state.dim(2)?;
+        for (batch_idx, &slot) in slots.iter().enumerate() {
+            let state = batch_state.i(batch_idx)?.unsqueeze(0)?;
+            full_state =
+                full_state.slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &state)?;
+        }
+        self.conv_states[gdn_layer_idx] = full_state;
+        Ok(())
+    }
+
+    pub fn get_batch_recurrent_state(
+        &self,
+        gdn_layer_idx: usize,
+        slots: &[usize],
+    ) -> Result<Tensor> {
+        if slots.is_empty() {
+            candle_core::bail!("MambaCache: empty slot list for recurrent state");
+        }
+        let slot_ids = slots.iter().map(|&s| s as u32).collect::<Vec<_>>();
+        let index = Tensor::from_vec(
+            slot_ids,
+            (slots.len(),),
+            self.recurrent_states[gdn_layer_idx].device(),
+        )?;
+        self.recurrent_states[gdn_layer_idx].index_select(&index, 0)
+    }
+
+    pub fn set_batch_recurrent_state(
+        &mut self,
+        gdn_layer_idx: usize,
+        slots: &[usize],
+        batch_state: &Tensor,
+    ) -> Result<()> {
+        let mut full_state = self.recurrent_states[gdn_layer_idx].clone();
+        let n_heads = full_state.dim(1)?;
+        let dim_h = full_state.dim(2)?;
+        let dim_w = full_state.dim(3)?;
+        for (batch_idx, &slot) in slots.iter().enumerate() {
+            let state = batch_state.i(batch_idx)?.unsqueeze(0)?;
+            full_state = full_state
+                .slice_assign(&[slot..slot + 1, 0..n_heads, 0..dim_h, 0..dim_w], &state)?;
+        }
+        self.recurrent_states[gdn_layer_idx] = full_state;
+        Ok(())
     }
 
     /// Get the slot index for a sequence

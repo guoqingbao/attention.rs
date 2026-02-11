@@ -1,6 +1,6 @@
 [package]
 name = "attention-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,7 @@ half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_di
 tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
-kernels = { path = "./src/kernels", version="0.4.0", optional = true}
+kernels = { path = "./src/kernels", version="0.4.1", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true}
 
