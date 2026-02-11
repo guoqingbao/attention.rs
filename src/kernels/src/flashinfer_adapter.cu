@@ -123,6 +123,8 @@ static inline void FillSM90PagedParams(
     float sm_scale,
     IdType* indices,
     void* workspace_int,
+    int window_left,
+    float logits_soft_cap,
     const PrefillPlanSM90Info& plan_info
 ) {
     params.q_ptr = static_cast<DTypeQ*>(q_ptr);
@@ -145,9 +147,9 @@ static inline void FillSM90PagedParams(
     params.num_kv_heads = num_kv_heads;
     params.group_size = num_qo_heads / num_kv_heads;
     params.page_size = page_size;
-    params.window_left = -1;
+    params.window_left = window_left > 0 ? window_left : -1;
     params.causal = true;
-    params.additional_params.logits_soft_cap = 0.0f;
+    params.additional_params.logits_soft_cap = logits_soft_cap;
     params.additional_params.sm_scale = sm_scale;
     params.additional_params.maybe_prefix_len_ptr = nullptr;
     params.additional_params.maybe_token_pos_in_items_ptr = nullptr;
@@ -333,39 +335,6 @@ __global__ void scale_output_inplace_kernel(T* out, int64_t numel, float scale) 
 }
 
 extern "C" {
-
-void flashinfer_scale_output_inplace(
-    void* out_ptr,
-    int64_t numel,
-    float scale,
-    int32_t out_data_type,
-    int64_t stream
-) {
-#ifdef USE_FLASHINFER
-    if (out_ptr == nullptr || numel <= 0 || scale == 1.0f) {
-        return;
-    }
-    cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
-    constexpr int threads = 256;
-    int64_t blocks_64 = (numel + threads - 1) / threads;
-    int blocks = static_cast<int>(blocks_64 > 65535 ? 65535 : blocks_64);
-    if (out_data_type == 1) {
-        scale_output_inplace_kernel<nv_bfloat16><<<blocks, threads, 0, cu_stream>>>(
-            static_cast<nv_bfloat16*>(out_ptr), numel, scale
-        );
-    } else {
-        scale_output_inplace_kernel<half><<<blocks, threads, 0, cu_stream>>>(
-            static_cast<half*>(out_ptr), numel, scale
-        );
-    }
-#else
-    (void)out_ptr;
-    (void)numel;
-    (void)scale;
-    (void)out_data_type;
-    (void)stream;
-#endif
-}
 
 void flashinfer_append_kv_cache(
     void* k_data_ptr,
@@ -601,6 +570,8 @@ void flashinfer_decode_run_wrapper(
     void* workspace_int,
     size_t workspace_int_size,
     const int64_t* plan_info_vec, // length 10
+    int32_t window_left,
+    float logits_soft_cap,
     int32_t data_type,
     int32_t out_data_type,
     cudaStream_t stream
@@ -638,7 +609,7 @@ void flashinfer_decode_run_wrapper(
                     (DTypeQ*)q_ptr, nullptr /* q_rope_offset */, paged_kv, (DTypeOut*)out_ptr,
                     nullptr /* lse */, nullptr /* alibi */, num_qo_heads,
                     num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                    -1 /* window_left */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+                    window_left > 0 ? window_left : -1 /* window_left */, logits_soft_cap /* logits_cap */, sm_scale, rope_scale, rope_theta
                 );
 
                 params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
@@ -765,6 +736,8 @@ void flashinfer_prefill_wrapper(
     void* page_locked_int_buffer,
     size_t page_locked_int_size,
     bool enable_cuda_graph,
+    int32_t window_left,
+    float logits_soft_cap,
     int32_t data_type,
     int32_t out_data_type,
     cudaStream_t stream
@@ -822,7 +795,7 @@ void flashinfer_prefill_wrapper(
                 FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
                     params, q_ptr, k_data, v_data, out_ptr,
                     num_qo_heads, num_kv_heads, head_dim, page_size,
-                    total_num_rows, sm_scale, indices, workspace_int, plan_info);
+                    total_num_rows, sm_scale, indices, workspace_int, window_left, logits_soft_cap, plan_info);
 
                 using AttentionType = DefaultAttentionAlias<false, false, false, false>;
                 DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
@@ -872,7 +845,6 @@ void flashinfer_prefill_wrapper(
             }
             void* page_locked_buffer = page_locked_int_buffer;
 
-            // Use host pointers directly - no D2H copy needed
             PrefillPlan<int32_t>(
                 workspace_float, workspace_float_size,
                 workspace_int, page_locked_buffer, workspace_int_size,
@@ -880,7 +852,7 @@ void flashinfer_prefill_wrapper(
                 q_cu_seqlens_host, indptr_host, total_num_rows,
                 batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
                 enable_cuda_graph, sizeof(DTypeOut),
-                -1 /* window_left */, 0 /* fixed_split_size */, false /* disable_split_kv */, 0,
+                window_left > 0 ? window_left : -1 /* window_left */, 0 /* fixed_split_size */, false /* disable_split_kv */, 0,
                 stream
             );
 
@@ -890,7 +862,7 @@ void flashinfer_prefill_wrapper(
                 nullptr /* mask indptr */, nullptr /* q rope offset */,
                 (DTypeOut*)out_ptr, nullptr /* lse */, nullptr /* alibi */,
                 num_qo_heads, num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                -1 /* window */, 0.0f /* logits_cap */, sm_scale, rope_scale, rope_theta
+                window_left > 0 ? window_left : -1 /* window */, logits_soft_cap, /* logits_cap */, sm_scale, rope_scale, rope_theta
             );
 
             params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
