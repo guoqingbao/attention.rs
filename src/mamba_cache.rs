@@ -258,15 +258,11 @@ impl MambaCache {
         slots: &[usize],
         batch_state: &Tensor,
     ) -> Result<()> {
-        let mut full_state = self.conv_states[gdn_layer_idx].clone();
-        let conv_dim = full_state.dim(1)?;
-        let conv_window = full_state.dim(2)?;
         for (batch_idx, &slot) in slots.iter().enumerate() {
-            let state = batch_state.i(batch_idx)?.unsqueeze(0)?;
-            full_state =
-                full_state.slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &state)?;
+            let state = batch_state.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+            let dst = self.conv_states[gdn_layer_idx].narrow(0, slot, 1)?;
+            dst.copy_(&state, 0)?;
         }
-        self.conv_states[gdn_layer_idx] = full_state;
         Ok(())
     }
 
@@ -293,16 +289,11 @@ impl MambaCache {
         slots: &[usize],
         batch_state: &Tensor,
     ) -> Result<()> {
-        let mut full_state = self.recurrent_states[gdn_layer_idx].clone();
-        let n_heads = full_state.dim(1)?;
-        let dim_h = full_state.dim(2)?;
-        let dim_w = full_state.dim(3)?;
         for (batch_idx, &slot) in slots.iter().enumerate() {
-            let state = batch_state.i(batch_idx)?.unsqueeze(0)?;
-            full_state = full_state
-                .slice_assign(&[slot..slot + 1, 0..n_heads, 0..dim_h, 0..dim_w], &state)?;
+            let state = batch_state.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+            let dst = self.recurrent_states[gdn_layer_idx].narrow(0, slot, 1)?;
+            dst.copy_(&state, 0)?;
         }
-        self.recurrent_states[gdn_layer_idx] = full_state;
         Ok(())
     }
 
