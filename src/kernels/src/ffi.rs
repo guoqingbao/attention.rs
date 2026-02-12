@@ -334,6 +334,37 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn mamba_scatter_rows_f16(
+        src: *const c_void,
+        dst: *mut c_void,
+        slots: *const c_long,
+        num_rows: i32,
+        row_elems: i32,
+        src_row_stride: i64,
+        dst_row_stride: i64,
+        stream: i64,
+    );
+    pub fn mamba_scatter_rows_bf16(
+        src: *const c_void,
+        dst: *mut c_void,
+        slots: *const c_long,
+        num_rows: i32,
+        row_elems: i32,
+        src_row_stride: i64,
+        dst_row_stride: i64,
+        stream: i64,
+    );
+    pub fn mamba_scatter_rows_f32(
+        src: *const c_void,
+        dst: *mut c_void,
+        slots: *const c_long,
+        num_rows: i32,
+        row_elems: i32,
+        src_row_stride: i64,
+        dst_row_stride: i64,
+        stream: i64,
+    );
+
     pub fn asort_asc_f32(
         x: *const c_void,
         dst: *mut c_void,
@@ -1164,89 +1195,6 @@ extern "C" {
         seq_len: c_int,
         k_dim: c_int,
         v_dim: c_int,
-        stream: i64,
-    );
-
-    pub fn chunk_gated_delta_rule_decode_f32(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        g: *const f32,
-        beta: *const f32,
-        state: *mut f32,
-        out: *mut f32,
-        batch: c_int,
-        heads: c_int,
-        dim: c_int,
-        stream: i64,
-    );
-    pub fn chunk_gated_delta_rule_decode_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        g: *const c_void,
-        beta: *const c_void,
-        state: *mut c_void,
-        out: *mut c_void,
-        batch: c_int,
-        heads: c_int,
-        dim: c_int,
-        stream: i64,
-    );
-    pub fn chunk_gated_delta_rule_decode_bf16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        g: *const c_void,
-        beta: *const c_void,
-        state: *mut c_void,
-        out: *mut c_void,
-        batch: c_int,
-        heads: c_int,
-        dim: c_int,
-        stream: i64,
-    );
-
-    pub fn chunk_gated_delta_rule_prefill_f32(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        g: *const f32,
-        beta: *const f32,
-        state: *mut f32,
-        out: *mut f32,
-        batch: c_int,
-        seq_len: c_int,
-        heads: c_int,
-        dim: c_int,
-        stream: i64,
-    );
-    pub fn chunk_gated_delta_rule_prefill_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        g: *const c_void,
-        beta: *const c_void,
-        state: *mut c_void,
-        out: *mut c_void,
-        batch: c_int,
-        seq_len: c_int,
-        heads: c_int,
-        dim: c_int,
-        stream: i64,
-    );
-    pub fn chunk_gated_delta_rule_prefill_bf16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        g: *const c_void,
-        beta: *const c_void,
-        state: *mut c_void,
-        out: *mut c_void,
-        batch: c_int,
-        seq_len: c_int,
-        heads: c_int,
-        dim: c_int,
         stream: i64,
     );
 

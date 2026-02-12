@@ -8,7 +8,198 @@
 // and states are updated in-place during forward passes.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct ScatterRowsUpdate {
+    slots: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::InplaceOp2 for ScatterRowsUpdate {
+    fn name(&self) -> &'static str {
+        "mamba-scatter-rows-update"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &mut candle_core::CpuStorage,
+        _: &candle_core::Layout,
+        _: &candle_core::CpuStorage,
+        _: &candle_core::Layout,
+    ) -> Result<()> {
+        candle_core::bail!("mamba-scatter-rows-update is CUDA only")
+    }
+
+    fn cuda_fwd(
+        &self,
+        dst: &mut candle_core::CudaStorage,
+        dst_layout: &candle_core::Layout,
+        src: &candle_core::CudaStorage,
+        src_layout: &candle_core::Layout,
+    ) -> Result<()> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::DType;
+        use kernels::ffi;
+
+        let num_rows = src_layout.shape().dims()[0];
+        if num_rows == 0 {
+            return Ok(());
+        }
+        if src.dtype() != dst.dtype() {
+            candle_core::bail!(
+                "mamba scatter dtype mismatch: src={:?} dst={:?}",
+                src.dtype(),
+                dst.dtype()
+            );
+        }
+
+        let row_elems = src_layout.shape().elem_count() / num_rows;
+
+        let src_row_stride = src_layout.stride()[0] as i64;
+        let dst_row_stride = dst_layout.stride()[0] as i64;
+
+        let src_off = src_layout.start_offset();
+        let dst_off = dst_layout.start_offset();
+
+        let elem_size = src.dtype().size_in_bytes();
+        let src_ptr = match &src.slice {
+            CudaStorageSlice::BF16(s) => {
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+            }
+            CudaStorageSlice::F16(s) => {
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+            }
+            CudaStorageSlice::F32(s) => {
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+            }
+            _ => candle_core::bail!("Unsupported src dtype for mamba scatter"),
+        };
+        let dst_ptr = match &dst.slice {
+            CudaStorageSlice::BF16(s) => {
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+            }
+            CudaStorageSlice::F16(s) => {
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+            }
+            CudaStorageSlice::F32(s) => {
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+            }
+            _ => candle_core::bail!("Unsupported dst dtype for mamba scatter"),
+        };
+
+        let (slots_storage, slots_layout) = self.slots.storage_and_layout();
+        let slots = match &*slots_storage {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<i64>()?,
+            _ => candle_core::bail!("slots tensor must be a CUDA tensor"),
+        };
+        let slots = slots.slice(slots_layout.start_offset()..);
+        if slots_layout.shape().elem_count() != num_rows {
+            candle_core::bail!(
+                "slots length mismatch in mamba scatter: slots={} rows={}",
+                slots_layout.shape().elem_count(),
+                num_rows
+            );
+        }
+        let slots_ptr = *slots.device_ptr() as *const core::ffi::c_long;
+        let stream = *dst.device().cu_stream() as i64;
+
+        unsafe {
+            match dst.dtype() {
+                DType::F16 => ffi::mamba_scatter_rows_f16(
+                    src_ptr,
+                    dst_ptr,
+                    slots_ptr,
+                    num_rows as i32,
+                    row_elems as i32,
+                    src_row_stride,
+                    dst_row_stride,
+                    stream,
+                ),
+                DType::BF16 => ffi::mamba_scatter_rows_bf16(
+                    src_ptr,
+                    dst_ptr,
+                    slots_ptr,
+                    num_rows as i32,
+                    row_elems as i32,
+                    src_row_stride,
+                    dst_row_stride,
+                    stream,
+                ),
+                DType::F32 => ffi::mamba_scatter_rows_f32(
+                    src_ptr,
+                    dst_ptr,
+                    slots_ptr,
+                    num_rows as i32,
+                    row_elems as i32,
+                    src_row_stride,
+                    dst_row_stride,
+                    stream,
+                ),
+                dtype => candle_core::bail!("Unsupported dtype for mamba scatter: {dtype:?}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn scatter_rows_cuda(dst: &Tensor, slots: &[usize], src: &Tensor) -> Result<()> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    if !matches!(dst.device(), Device::Cuda(_)) || !matches!(src.device(), Device::Cuda(_)) {
+        candle_core::bail!("Mamba cache updates require CUDA tensors");
+    }
+    if src.dim(0)? != slots.len() {
+        candle_core::bail!(
+            "mamba scatter source rows mismatch: rows={} slots={}",
+            src.dim(0)?,
+            slots.len()
+        );
+    }
+    if src.dtype() != dst.dtype() {
+        candle_core::bail!(
+            "mamba scatter dtype mismatch: src={:?} dst={:?}",
+            src.dtype(),
+            dst.dtype()
+        );
+    }
+
+    let src_rows = src.dim(0)?;
+    let dst_rows = dst.dim(0)?;
+    if slots.iter().any(|&slot| slot >= dst_rows) {
+        candle_core::bail!(
+            "mamba scatter slot out of range: max_slot={} dst_rows={}",
+            slots.iter().copied().max().unwrap_or(0),
+            dst_rows
+        );
+    }
+    let src_row_elems = src.elem_count() / src_rows;
+    let dst_row_elems = dst.elem_count() / dst_rows;
+    if src_row_elems != dst_row_elems {
+        candle_core::bail!(
+            "mamba scatter row width mismatch: src={} dst={}",
+            src_row_elems,
+            dst_row_elems
+        );
+    }
+
+    let src_2d = src.contiguous()?.reshape((src_rows, src_row_elems))?;
+    let dst_2d = dst.reshape((dst_rows, dst_row_elems))?;
+    let slot_ids = slots.iter().map(|&s| s as i64).collect::<Vec<_>>();
+    let slots_tensor = Tensor::from_vec(slot_ids, (slots.len(),), dst.device())?;
+    dst_2d.inplace_op2(
+        &src_2d,
+        &ScatterRowsUpdate {
+            slots: slots_tensor,
+        },
+    )?;
+    Ok(())
+}
 
 pub struct MambaCache {
     /// Per-layer conv states: [max_batch, d_conv, conv_kernel_size - 1]
@@ -137,24 +328,9 @@ impl MambaCache {
     }
 
     pub fn ensure_slots_for_sequences(&mut self, seq_ids: &[usize]) -> Result<Vec<usize>> {
-        let active: HashSet<usize> = seq_ids.iter().copied().collect();
         for &seq_id in seq_ids {
             if self.seq_to_slot.contains_key(&seq_id) {
                 continue;
-            }
-            if self.allocate_slot(seq_id).is_ok() {
-                continue;
-            }
-
-            // Best effort reclamation for stale sequences if slot pressure appears.
-            let stale_ids = self
-                .seq_to_slot
-                .keys()
-                .copied()
-                .filter(|id| !active.contains(id))
-                .collect::<Vec<_>>();
-            for stale_id in stale_ids {
-                self.free_slot(stale_id);
             }
             self.allocate_slot(seq_id)?;
         }
@@ -258,12 +434,16 @@ impl MambaCache {
         slots: &[usize],
         batch_state: &Tensor,
     ) -> Result<()> {
-        for (batch_idx, &slot) in slots.iter().enumerate() {
-            let state = batch_state.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
-            let dst = self.conv_states[gdn_layer_idx].narrow(0, slot, 1)?;
-            dst.copy_(&state, 0)?;
+        #[cfg(feature = "cuda")]
+        {
+            return scatter_rows_cuda(&self.conv_states[gdn_layer_idx], slots, batch_state);
         }
-        Ok(())
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (gdn_layer_idx, slots, batch_state);
+            candle_core::bail!("Mamba cache updates require building attention-rs with CUDA");
+        }
     }
 
     pub fn get_batch_recurrent_state(
@@ -289,12 +469,16 @@ impl MambaCache {
         slots: &[usize],
         batch_state: &Tensor,
     ) -> Result<()> {
-        for (batch_idx, &slot) in slots.iter().enumerate() {
-            let state = batch_state.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
-            let dst = self.recurrent_states[gdn_layer_idx].narrow(0, slot, 1)?;
-            dst.copy_(&state, 0)?;
+        #[cfg(feature = "cuda")]
+        {
+            return scatter_rows_cuda(&self.recurrent_states[gdn_layer_idx], slots, batch_state);
         }
-        Ok(())
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (gdn_layer_idx, slots, batch_state);
+            candle_core::bail!("Mamba cache updates require building attention-rs with CUDA");
+        }
     }
 
     /// Get the slot index for a sequence
