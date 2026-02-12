@@ -228,7 +228,8 @@ impl MambaCache {
     /// - num_heads: number of GDN attention heads
     /// - head_k_dim: key head dimension for GDN recurrence state
     /// - head_v_dim: value head dimension for GDN recurrence state
-    /// - dtype: data type for state tensors
+    /// - conv_dtype: data type for conv state tensors
+    /// - recurrent_dtype: data type for recurrent state tensors
     /// - device: computation device
     pub fn new(
         num_gdn_layers: usize,
@@ -238,7 +239,8 @@ impl MambaCache {
         num_heads: usize,
         head_k_dim: usize,
         head_v_dim: usize,
-        dtype: DType,
+        conv_dtype: DType,
+        recurrent_dtype: DType,
         device: &Device,
     ) -> Result<Self> {
         let mut conv_states = Vec::with_capacity(num_gdn_layers);
@@ -247,12 +249,12 @@ impl MambaCache {
         for _ in 0..num_gdn_layers {
             conv_states.push(Tensor::zeros(
                 (max_batch_size, d_conv, conv_kernel_size - 1),
-                dtype,
+                conv_dtype,
                 device,
             )?);
             recurrent_states.push(Tensor::zeros(
                 (max_batch_size, num_heads, head_k_dim, head_v_dim),
-                dtype,
+                recurrent_dtype,
                 device,
             )?);
         }
@@ -384,10 +386,30 @@ impl MambaCache {
     /// Reset (zero out) all states for a given slot
     fn reset_slot_states(&mut self, slot: usize) -> Result<()> {
         for layer_idx in 0..self.num_gdn_layers {
-            self.conv_states[layer_idx].narrow(0, slot, 1)?.zero_()?;
-            self.recurrent_states[layer_idx]
-                .narrow(0, slot, 1)?
-                .zero_()?;
+            let conv_dim = self.conv_states[layer_idx].dim(1)?;
+            let conv_window = self.conv_states[layer_idx].dim(2)?;
+            let conv_zeros = Tensor::zeros(
+                (1, conv_dim, conv_window),
+                self.conv_states[layer_idx].dtype(),
+                self.conv_states[layer_idx].device(),
+            )?;
+            let conv_updated = self.conv_states[layer_idx]
+                .slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &conv_zeros)?;
+            self.conv_states[layer_idx] = conv_updated;
+
+            let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
+            let rec_h = self.recurrent_states[layer_idx].dim(2)?;
+            let rec_w = self.recurrent_states[layer_idx].dim(3)?;
+            let rec_zeros = Tensor::zeros(
+                (1, rec_heads, rec_h, rec_w),
+                self.recurrent_states[layer_idx].dtype(),
+                self.recurrent_states[layer_idx].device(),
+            )?;
+            let rec_updated = self.recurrent_states[layer_idx].slice_assign(
+                &[slot..slot + 1, 0..rec_heads, 0..rec_h, 0..rec_w],
+                &rec_zeros,
+            )?;
+            self.recurrent_states[layer_idx] = rec_updated;
         }
         Ok(())
     }

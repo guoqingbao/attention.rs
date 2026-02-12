@@ -42,8 +42,27 @@ fn get_cuda_const_ptr_u32(t: &Tensor) -> Result<*const u32> {
 }
 
 #[cfg(feature = "cuda")]
+fn get_cuda_const_ptr_i64(t: &Tensor) -> Result<*const i64> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    let (storage, _) = t.storage_and_layout();
+    match &*storage {
+        Storage::Cuda(s) => Ok(*s.as_cuda_slice::<i64>()?.device_ptr() as *const i64),
+        _ => candle_core::bail!("Expected CUDA i64 tensor"),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn get_cuda_mut_ptr(t: &Tensor) -> Result<*mut c_void> {
     Ok(get_cuda_const_ptr(t)? as *mut c_void)
+}
+
+#[cfg(feature = "cuda")]
+fn ensure_contiguous(t: &Tensor) -> Result<Tensor> {
+    if t.is_contiguous() {
+        Ok(t.clone())
+    } else {
+        t.contiguous()
+    }
 }
 
 /// Causal conv1d forward pass for variable-length sequences (prefill mode).
@@ -221,6 +240,128 @@ pub fn causal_conv1d_update(
     }
 }
 
+/// Causal conv1d single-step update with slot-indexed global state.
+#[cfg(feature = "cuda")]
+pub fn causal_conv1d_update_slots(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    conv_state: &mut Tensor,
+    slots: &Tensor,
+    activation_silu: bool,
+) -> Result<Tensor> {
+    match (x.device(), x.dtype()) {
+        (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
+            let x_c = x.contiguous()?;
+            let weight_c = weight.contiguous()?;
+            let bias_c = if let Some(b) = bias {
+                Some(b.contiguous()?)
+            } else {
+                None
+            };
+
+            let (batch, d_conv) = x_c.dims2()?;
+            let kernel_size = weight_c.dim(2)?;
+            if slots.dtype() != DType::I64 || slots.dim(0)? != batch {
+                candle_core::bail!(
+                    "causal_conv1d_update_slots expects slots [batch] I64, got {:?} {:?}",
+                    slots.shape(),
+                    slots.dtype()
+                );
+            }
+            let out = Tensor::zeros((batch, d_conv), x.dtype(), x.device())?;
+
+            let x_ptr = get_cuda_const_ptr(&x_c)?;
+            let weight_ptr = get_cuda_const_ptr(&weight_c)?;
+            let bias_ptr = if let Some(ref b) = bias_c {
+                get_cuda_const_ptr(b)?
+            } else {
+                std::ptr::null()
+            };
+            let state_ptr = get_cuda_mut_ptr(conv_state)?;
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+
+            unsafe {
+                match x.dtype() {
+                    DType::F16 => ffi::causal_conv1d_update_slots_f16(
+                        x_ptr,
+                        weight_ptr,
+                        bias_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        d_conv as c_int,
+                        kernel_size as c_int,
+                        activation_silu,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::causal_conv1d_update_slots_bf16(
+                        x_ptr,
+                        weight_ptr,
+                        bias_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        d_conv as c_int,
+                        kernel_size as c_int,
+                        activation_silu,
+                        stream,
+                    ),
+                    DType::F32 => ffi::causal_conv1d_update_slots_f32(
+                        x_ptr as *const f32,
+                        weight_ptr as *const f32,
+                        bias_ptr as *const f32,
+                        state_ptr as *mut f32,
+                        slots_ptr,
+                        out_ptr as *mut f32,
+                        batch as c_int,
+                        d_conv as c_int,
+                        kernel_size as c_int,
+                        activation_silu,
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(out)
+        }
+        _ => {
+            // Non-CUDA fallback: keep behavior correct for tests.
+            let slots_vec = if slots.dtype() == DType::I64 {
+                slots.to_vec1::<i64>()?
+            } else {
+                candle_core::bail!("causal_conv1d_update_slots fallback expects I64 slots");
+            };
+            if slots_vec.is_empty() {
+                candle_core::bail!("causal_conv1d_update_slots got empty slots");
+            }
+            let mut gathered = Vec::with_capacity(slots_vec.len());
+            for &s in &slots_vec {
+                gathered.push(conv_state.i(s as usize)?);
+            }
+            let gathered_refs = gathered.iter().collect::<Vec<_>>();
+            let mut batch_state = Tensor::stack(&gathered_refs, 0)?;
+            let out =
+                causal_conv1d_update_naive(x, weight, bias, &mut batch_state, activation_silu)?;
+            for (i, &s) in slots_vec.iter().enumerate() {
+                *conv_state = conv_state.slice_assign(
+                    &[
+                        s as usize..s as usize + 1,
+                        0..conv_state.dim(1)?,
+                        0..conv_state.dim(2)?,
+                    ],
+                    &batch_state.narrow(0, i, 1)?,
+                )?;
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// Fused GDN gating computation.
 /// g = -exp(A_log) * softplus(a + dt_bias)
 /// beta = sigmoid(b)
@@ -289,6 +430,152 @@ pub fn fused_gdn_gating(
             Ok((g, beta))
         }
         _ => fused_gdn_gating_naive(a_log, a, b, dt_bias),
+    }
+}
+
+/// Fused gated RMSNorm:
+/// out = RMSNorm(x; gamma, bias, eps) * SiLU(z)
+/// - `x`: [rows, value_dim]
+/// - `z`: [rows, value_dim]
+/// - `norm_weight`: [value_dim] (full) or [group_size] (per-group/head)
+/// - `norm_bias`: same rule as `norm_weight`
+#[cfg(feature = "cuda")]
+pub fn gated_rmsnorm_silu_mul(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+) -> Result<Tensor> {
+    match (x.device(), x.dtype()) {
+        (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
+            let x_c = x.contiguous()?;
+            let (rows, value_dim) = x_c.dims2()?;
+            let z_c = if z.dtype() == x.dtype() {
+                z.contiguous()?
+            } else {
+                z.to_dtype(x.dtype())?.contiguous()?
+            };
+            let (z_rows, z_dim) = z_c.dims2()?;
+            if z_rows != rows || z_dim != value_dim {
+                candle_core::bail!(
+                    "gated_rmsnorm_silu_mul shape mismatch: x={:?}, z={:?}",
+                    x.shape(),
+                    z.shape()
+                );
+            }
+            if group_size == 0 || value_dim % group_size != 0 {
+                candle_core::bail!(
+                    "gated_rmsnorm_silu_mul invalid group_size={} for value_dim={}",
+                    group_size,
+                    value_dim
+                );
+            }
+
+            let weight = if norm_weight.dtype() == x.dtype() {
+                norm_weight.contiguous()?
+            } else {
+                norm_weight.to_dtype(x.dtype())?.contiguous()?
+            };
+            let weight_len = weight.dim(0)?;
+            let per_group_weights = if weight_len == group_size {
+                true
+            } else if weight_len == value_dim {
+                false
+            } else {
+                candle_core::bail!(
+                    "gated_rmsnorm_silu_mul invalid weight shape {:?}, expected [{group_size}] or [{value_dim}]",
+                    norm_weight.shape()
+                );
+            };
+
+            let bias = if let Some(b) = norm_bias {
+                let b = if b.dtype() == x.dtype() {
+                    b.contiguous()?
+                } else {
+                    b.to_dtype(x.dtype())?.contiguous()?
+                };
+                let b_len = b.dim(0)?;
+                let expected = if per_group_weights {
+                    group_size
+                } else {
+                    value_dim
+                };
+                if b_len != expected {
+                    candle_core::bail!(
+                        "gated_rmsnorm_silu_mul invalid bias shape {:?}, expected [{expected}]",
+                        b.shape()
+                    );
+                }
+                Some(b)
+            } else {
+                None
+            };
+            let out = Tensor::zeros((rows, value_dim), x.dtype(), x.device())?;
+
+            let x_ptr = get_cuda_const_ptr(&x_c)?;
+            let z_ptr = get_cuda_const_ptr(&z_c)?;
+            let w_ptr = get_cuda_const_ptr(&weight)?;
+            let b_ptr = if let Some(ref b) = bias {
+                get_cuda_const_ptr(b)?
+            } else {
+                std::ptr::null()
+            };
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+            let eps = eps as f32;
+
+            unsafe {
+                match x.dtype() {
+                    DType::F16 => ffi::gdn_gated_rmsnorm_silu_mul_f16(
+                        x_ptr,
+                        z_ptr,
+                        w_ptr,
+                        b_ptr,
+                        out_ptr,
+                        rows as c_int,
+                        value_dim as c_int,
+                        group_size as c_int,
+                        eps,
+                        per_group_weights,
+                        bias.is_some(),
+                        stream,
+                    ),
+                    DType::BF16 => ffi::gdn_gated_rmsnorm_silu_mul_bf16(
+                        x_ptr,
+                        z_ptr,
+                        w_ptr,
+                        b_ptr,
+                        out_ptr,
+                        rows as c_int,
+                        value_dim as c_int,
+                        group_size as c_int,
+                        eps,
+                        per_group_weights,
+                        bias.is_some(),
+                        stream,
+                    ),
+                    DType::F32 => ffi::gdn_gated_rmsnorm_silu_mul_f32(
+                        x_ptr as *const f32,
+                        z_ptr as *const f32,
+                        w_ptr as *const f32,
+                        b_ptr as *const f32,
+                        out_ptr as *mut f32,
+                        rows as c_int,
+                        value_dim as c_int,
+                        group_size as c_int,
+                        eps,
+                        per_group_weights,
+                        bias.is_some(),
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(out)
+        }
+        _ => gated_rmsnorm_silu_mul_naive(x, z, norm_weight, norm_bias, eps, group_size),
     }
 }
 
@@ -386,6 +673,194 @@ pub fn gated_delta_rule_recurrence(
             out.to_dtype(out_dtype)
         }
         _ => gated_delta_rule_recurrence_naive(q, k, v, g, beta, state),
+    }
+}
+
+/// One-step decode recurrence with slot-indexed global state.
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_decode_slots(
+    q: &Tensor,         // [batch, heads, k_dim]
+    k: &Tensor,         // [batch, heads, k_dim]
+    v: &Tensor,         // [batch, heads, v_dim]
+    g: &Tensor,         // [batch, heads]
+    beta: &Tensor,      // [batch, heads]
+    state: &mut Tensor, // [max_batch, heads, k_dim, v_dim]
+    slots: &Tensor,     // [batch] i64
+) -> Result<Tensor> {
+    match q.device() {
+        Device::Cuda(dev) => {
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
+            let g_c = ensure_contiguous(g)?;
+            let beta_c = ensure_contiguous(beta)?;
+
+            let (batch, heads, k_dim) = q_c.dims3()?;
+            let (bk, hk, kk) = k_c.dims3()?;
+            let (bv, hv, v_dim) = v_c.dims3()?;
+            let (bg, hg) = g_c.dims2()?;
+            let (bb, hb) = beta_c.dims2()?;
+            if batch != bk
+                || batch != bv
+                || batch != bg
+                || batch != bb
+                || heads != hk
+                || heads != hv
+                || heads != hg
+                || heads != hb
+                || k_dim != kk
+            {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots shape mismatch: q={:?}, k={:?}, v={:?}, g={:?}, beta={:?}",
+                    q.shape(),
+                    k.shape(),
+                    v.shape(),
+                    g.shape(),
+                    beta.shape()
+                );
+            }
+            if slots.dtype() != DType::I64 || slots.dim(0)? != batch {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots expects slots [batch] I64, got {:?} {:?}",
+                    slots.shape(),
+                    slots.dtype()
+                );
+            }
+
+            if q.dtype() != k.dtype()
+                || q.dtype() != v.dtype()
+                || q.dtype() != g.dtype()
+                || q.dtype() != beta.dtype()
+            {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots dtype mismatch: q={:?} k={:?} v={:?} g={:?} beta={:?}",
+                    q.dtype(),
+                    k.dtype(),
+                    v.dtype(),
+                    g.dtype(),
+                    beta.dtype()
+                );
+            }
+
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let stream = *dev.cu_stream() as i64;
+            if q.dtype() == DType::F32 {
+                if state.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "gated_delta_rule_decode_slots expects F32 state for F32 inputs, got {:?}",
+                        state.dtype()
+                    );
+                }
+                let out = Tensor::zeros((batch, heads, v_dim), DType::F32, q.device())?;
+                let q_ptr = get_cuda_const_ptr(&q_c)? as *const f32;
+                let k_ptr = get_cuda_const_ptr(&k_c)? as *const f32;
+                let v_ptr = get_cuda_const_ptr(&v_c)? as *const f32;
+                let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+                let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
+                let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+                let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
+
+                unsafe {
+                    ffi::gated_delta_rule_decode_slots_f32(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    )
+                }
+                Ok(out)
+            } else {
+                if state.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "gated_delta_rule_decode_slots expects F32 recurrent state for {:?} inputs, got {:?}",
+                        q.dtype(),
+                        state.dtype()
+                    );
+                }
+                if !state.is_contiguous() {
+                    candle_core::bail!(
+                        "gated_delta_rule_decode_slots expects contiguous recurrent state during CUDA execution"
+                    );
+                }
+                // Stable path: use proven FP32 decode kernel while keeping global recurrent
+                // state in FP32 (no full-state cast per step).
+                let q_f32 = q_c.to_dtype(DType::F32)?;
+                let k_f32 = k_c.to_dtype(DType::F32)?;
+                let v_f32 = v_c.to_dtype(DType::F32)?;
+                let g_f32 = g_c.to_dtype(DType::F32)?;
+                let beta_f32 = beta_c.to_dtype(DType::F32)?;
+                let out_f32 = Tensor::zeros((batch, heads, v_dim), DType::F32, q.device())?;
+
+                let q_ptr = get_cuda_const_ptr(&q_f32)? as *const f32;
+                let k_ptr = get_cuda_const_ptr(&k_f32)? as *const f32;
+                let v_ptr = get_cuda_const_ptr(&v_f32)? as *const f32;
+                let g_ptr = get_cuda_const_ptr(&g_f32)? as *const f32;
+                let beta_ptr = get_cuda_const_ptr(&beta_f32)? as *const f32;
+                let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+                let out_ptr = get_cuda_mut_ptr(&out_f32)? as *mut f32;
+
+                unsafe {
+                    ffi::gated_delta_rule_decode_slots_f32(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    )
+                }
+                out_f32.to_dtype(q.dtype())
+            }
+        }
+        _ => {
+            let slots_vec = slots.to_vec1::<i64>()?;
+            let mut outs = Vec::with_capacity(slots_vec.len());
+            for (b, &slot) in slots_vec.iter().enumerate() {
+                let mut state_b = state.i(slot as usize)?;
+                let q_b = q.i(b)?;
+                let k_b = k.i(b)?;
+                let v_b = v.i(b)?;
+                let g_b = g.i(b)?;
+                let beta_b = beta.i(b)?;
+                let out_b = gated_delta_rule_recurrence_naive(
+                    &q_b.unsqueeze(0)?,
+                    &k_b.unsqueeze(0)?,
+                    &v_b.unsqueeze(0)?,
+                    &g_b.unsqueeze(0)?,
+                    &beta_b.unsqueeze(0)?,
+                    &mut state_b,
+                )?
+                .squeeze(0)?;
+                *state = state.slice_assign(
+                    &[
+                        slot as usize..slot as usize + 1,
+                        0..state.dim(1)?,
+                        0..state.dim(2)?,
+                        0..state.dim(3)?,
+                    ],
+                    &state_b.unsqueeze(0)?,
+                )?;
+                outs.push(out_b);
+            }
+            let refs = outs.iter().collect::<Vec<_>>();
+            Tensor::stack(&refs, 0)
+        }
     }
 }
 
@@ -588,6 +1063,69 @@ pub fn fused_gdn_gating_naive(
     Ok((g, beta))
 }
 
+pub fn gated_rmsnorm_silu_mul_naive(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+) -> Result<Tensor> {
+    let (rows, value_dim) = x.dims2()?;
+    let (z_rows, z_dim) = z.dims2()?;
+    if z_rows != rows || z_dim != value_dim {
+        candle_core::bail!(
+            "gated_rmsnorm_silu_mul_naive shape mismatch: x={:?}, z={:?}",
+            x.shape(),
+            z.shape()
+        );
+    }
+    if group_size == 0 || value_dim % group_size != 0 {
+        candle_core::bail!(
+            "gated_rmsnorm_silu_mul_naive invalid group_size={} for value_dim={}",
+            group_size,
+            value_dim
+        );
+    }
+
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let z_gate = candle_nn::ops::silu(&z.to_dtype(DType::F32)?)?;
+    let groups = value_dim / group_size;
+    let per_group_weights = norm_weight.dim(0)? == group_size;
+    let full_weights = norm_weight.dim(0)? == value_dim;
+    if !per_group_weights && !full_weights {
+        candle_core::bail!(
+            "gated_rmsnorm_silu_mul_naive invalid weight shape {:?}, expected [{group_size}] or [{value_dim}]",
+            norm_weight.shape()
+        );
+    }
+
+    let x_grouped = x_f32.reshape((rows, groups, group_size))?;
+    let variance = (&x_grouped * &x_grouped)?.mean_keepdim(2)?;
+    let mut y = x_grouped.broadcast_div(&(variance + eps)?.sqrt()?)?;
+
+    if per_group_weights {
+        let w = norm_weight.to_dtype(DType::F32)?;
+        y = y.broadcast_mul(&w.reshape((1, 1, group_size))?)?;
+        if let Some(b) = norm_bias {
+            let b = b.to_dtype(DType::F32)?;
+            y = y.broadcast_add(&b.reshape((1, 1, group_size))?)?;
+        }
+    } else {
+        let w = norm_weight
+            .to_dtype(DType::F32)?
+            .reshape((1, groups, group_size))?;
+        y = y.broadcast_mul(&w)?;
+        if let Some(b) = norm_bias {
+            let b = b.to_dtype(DType::F32)?.reshape((1, groups, group_size))?;
+            y = y.broadcast_add(&b)?;
+        }
+    }
+
+    let y = y.reshape((rows, value_dim))?;
+    (y * z_gate)?.to_dtype(x.dtype())
+}
+
 /// Softplus: log(1 + exp(x)).
 fn softplus(x: &Tensor) -> Result<Tensor> {
     let exp_x = x.exp()?;
@@ -628,6 +1166,48 @@ pub fn fused_gdn_gating(
 }
 
 #[cfg(not(feature = "cuda"))]
+pub fn gated_rmsnorm_silu_mul(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+) -> Result<Tensor> {
+    gated_rmsnorm_silu_mul_naive(x, z, norm_weight, norm_bias, eps, group_size)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn causal_conv1d_update_slots(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    conv_state: &mut Tensor,
+    slots: &Tensor,
+    activation_silu: bool,
+) -> Result<Tensor> {
+    let slots_vec = slots.to_vec1::<i64>()?;
+    let mut gathered = Vec::with_capacity(slots_vec.len());
+    for &s in &slots_vec {
+        gathered.push(conv_state.i(s as usize)?);
+    }
+    let gathered_refs = gathered.iter().collect::<Vec<_>>();
+    let mut batch_state = Tensor::stack(&gathered_refs, 0)?;
+    let out = causal_conv1d_update_naive(x, weight, bias, &mut batch_state, activation_silu)?;
+    for (i, &s) in slots_vec.iter().enumerate() {
+        *conv_state = conv_state.slice_assign(
+            &[
+                s as usize..s as usize + 1,
+                0..conv_state.dim(1)?,
+                0..conv_state.dim(2)?,
+            ],
+            &batch_state.narrow(0, i, 1)?,
+        )?;
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
 pub fn gated_delta_rule_recurrence(
     q: &Tensor,
     k: &Tensor,
@@ -637,4 +1217,47 @@ pub fn gated_delta_rule_recurrence(
     state: &mut Tensor,
 ) -> Result<Tensor> {
     gated_delta_rule_recurrence_naive(q, k, v, g, beta, state)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gated_delta_rule_decode_slots(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+) -> Result<Tensor> {
+    let slots_vec = slots.to_vec1::<i64>()?;
+    let mut outs = Vec::with_capacity(slots_vec.len());
+    for (b, &slot) in slots_vec.iter().enumerate() {
+        let mut state_b = state.i(slot as usize)?;
+        let q_b = q.i(b)?;
+        let k_b = k.i(b)?;
+        let v_b = v.i(b)?;
+        let g_b = g.i(b)?;
+        let beta_b = beta.i(b)?;
+        let out_b = gated_delta_rule_recurrence_naive(
+            &q_b.unsqueeze(0)?,
+            &k_b.unsqueeze(0)?,
+            &v_b.unsqueeze(0)?,
+            &g_b.unsqueeze(0)?,
+            &beta_b.unsqueeze(0)?,
+            &mut state_b,
+        )?
+        .squeeze(0)?;
+        *state = state.slice_assign(
+            &[
+                slot as usize..slot as usize + 1,
+                0..state.dim(1)?,
+                0..state.dim(2)?,
+                0..state.dim(3)?,
+            ],
+            &state_b.unsqueeze(0)?,
+        )?;
+        outs.push(out_b);
+    }
+    let refs = outs.iter().collect::<Vec<_>>();
+    Tensor::stack(&refs, 0)
 }

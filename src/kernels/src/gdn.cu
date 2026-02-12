@@ -262,6 +262,234 @@ extern "C" void gated_delta_rule_recurrence(
     CHECK_CUDA(cudaGetLastError());
 }
 
+template <typename T, int BV, int MAX_K>
+__global__ void gated_delta_rule_decode_slots_kernel(
+    const T* __restrict__ q,      // [batch, heads, k_dim]
+    const T* __restrict__ k,      // [batch, heads, k_dim]
+    const T* __restrict__ v,      // [batch, heads, v_dim]
+    const T* __restrict__ g,      // [batch, heads]
+    const T* __restrict__ beta,   // [batch, heads]
+    T* __restrict__ state,        // [max_batch, heads, k_dim, v_dim]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,          // [batch, heads, v_dim]
+    int batch,
+    int heads,
+    int k_dim,
+    int v_dim) {
+    const int v_tile = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int v_idx = v_tile * BV + tid;
+    if (v_idx >= v_dim || bh >= batch * heads) return;
+
+    const int b = bh / heads;
+    const int h = bh % heads;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    const T* q_bh = q + (bh * k_dim);
+    const T* k_bh = k + (bh * k_dim);
+    const T* v_bh = v + (bh * v_dim);
+    const float g_t = to_float(g[bh]);
+    const float beta_t = to_float(beta[bh]);
+
+    T* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
+    T* out_bh = out + (bh * v_dim + v_idx);
+
+    if (k_dim > MAX_K) return;
+
+    const float decay = expf(g_t);
+    const float scale = rsqrtf(static_cast<float>(k_dim));
+
+    float s_buf[MAX_K];
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] = to_float(state_bh[j * v_dim]);
+    }
+
+    float kv_mem = 0.0f;
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] *= decay;
+        kv_mem = __fmaf_rn(s_buf[j], to_float(k_bh[j]), kv_mem);
+    }
+
+    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+
+    float y = 0.0f;
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] = __fmaf_rn(to_float(k_bh[j]), delta, s_buf[j]);
+        y = __fmaf_rn(s_buf[j], to_float(q_bh[j]) * scale, y);
+    }
+
+    for (int j = 0; j < k_dim; ++j) {
+        state_bh[j * v_dim] = from_float<T>(s_buf[j]);
+    }
+
+    *out_bh = from_float<T>(y);
+}
+
+template <typename T, int BV, int MAX_K>
+__global__ void gated_delta_rule_decode_slots_kernel_state_f32(
+    const T* __restrict__ q,      // [batch, heads, k_dim]
+    const T* __restrict__ k,      // [batch, heads, k_dim]
+    const T* __restrict__ v,      // [batch, heads, v_dim]
+    const T* __restrict__ g,      // [batch, heads]
+    const T* __restrict__ beta,   // [batch, heads]
+    float* __restrict__ state,    // [max_batch, heads, k_dim, v_dim]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,          // [batch, heads, v_dim]
+    int batch,
+    int heads,
+    int k_dim,
+    int v_dim) {
+    const int v_tile = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int v_idx = v_tile * BV + tid;
+    if (v_idx >= v_dim || bh >= batch * heads) return;
+
+    const int b = bh / heads;
+    const int h = bh % heads;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    const T* q_bh = q + (bh * k_dim);
+    const T* k_bh = k + (bh * k_dim);
+    const T* v_bh = v + (bh * v_dim);
+    const float g_t = to_float(g[bh]);
+    const float beta_t = to_float(beta[bh]);
+
+    float* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
+    T* out_bh = out + (bh * v_dim + v_idx);
+
+    if (k_dim > MAX_K) return;
+
+    const float decay = expf(g_t);
+    const float scale = rsqrtf(static_cast<float>(k_dim));
+
+    float s_buf[MAX_K];
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] = state_bh[j * v_dim];
+    }
+
+    float kv_mem = 0.0f;
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] *= decay;
+        kv_mem = __fmaf_rn(s_buf[j], to_float(k_bh[j]), kv_mem);
+    }
+
+    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+
+    float y = 0.0f;
+    for (int j = 0; j < k_dim; ++j) {
+        s_buf[j] = __fmaf_rn(to_float(k_bh[j]), delta, s_buf[j]);
+        y = __fmaf_rn(s_buf[j], to_float(q_bh[j]) * scale, y);
+    }
+
+    for (int j = 0; j < k_dim; ++j) {
+        state_bh[j * v_dim] = s_buf[j];
+    }
+
+    *out_bh = from_float<T>(y);
+}
+
+template <typename T>
+void launch_gated_delta_rule_decode_slots(
+    const T* q,
+    const T* k,
+    const T* v,
+    const T* g,
+    const T* beta,
+    T* state,
+    const int64_t* slots,
+    T* out,
+    int batch,
+    int heads,
+    int k_dim,
+    int v_dim,
+    cudaStream_t stream) {
+    constexpr int BV = 64;
+    constexpr int MAX_K = 256;
+    if (k_dim > MAX_K) {
+        printf("gated_delta_rule_decode_slots: k_dim=%d exceeds MAX_K=%d\\n", k_dim, MAX_K);
+        return;
+    }
+    dim3 grid((v_dim + BV - 1) / BV, batch * heads);
+    dim3 block(BV);
+    gated_delta_rule_decode_slots_kernel<T, BV, MAX_K><<<grid, block, 0, stream>>>(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+template <typename T>
+void launch_gated_delta_rule_decode_slots_state_f32(
+    const T* q,
+    const T* k,
+    const T* v,
+    const T* g,
+    const T* beta,
+    float* state,
+    const int64_t* slots,
+    T* out,
+    int batch,
+    int heads,
+    int k_dim,
+    int v_dim,
+    cudaStream_t stream) {
+    constexpr int BV = 64;
+    constexpr int MAX_K = 256;
+    if (k_dim > MAX_K) {
+        printf("gated_delta_rule_decode_slots_state_f32: k_dim=%d exceeds MAX_K=%d\\n", k_dim, MAX_K);
+        return;
+    }
+    dim3 grid((v_dim + BV - 1) / BV, batch * heads);
+    dim3 block(BV);
+    gated_delta_rule_decode_slots_kernel_state_f32<T, BV, MAX_K><<<grid, block, 0, stream>>>(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void gated_delta_rule_decode_slots_f32(
+    const float* q, const float* k, const float* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, float* out, int batch, int heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_f16(
+    const half* q, const half* k, const half* v, const half* g, const half* beta,
+    half* state, const int64_t* slots, half* out, int batch, int heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* g, const __nv_bfloat16* beta, __nv_bfloat16* state,
+    const int64_t* slots, __nv_bfloat16* out, int batch, int heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_f16_state_f32(
+    const half* q, const half* k, const half* v, const half* g, const half* beta,
+    float* state, const int64_t* slots, half* out, int batch, int heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots_state_f32(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_bf16_state_f32(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* g, const __nv_bfloat16* beta, float* state,
+    const int64_t* slots, __nv_bfloat16* out, int batch, int heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots_state_f32(
+        q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
 // =============================================================================
 // Causal Conv1d Forward (Prefill, varlen)
 // =============================================================================
@@ -477,6 +705,106 @@ extern "C" void causal_conv1d_update_bf16(
                                 kernel_size, silu, stream);
 }
 
+template <typename T>
+__global__ void causal_conv1d_update_slots_kernel(
+    const T* __restrict__ x,      // [batch, d_conv]
+    const T* __restrict__ weight, // [d_conv, kernel_size]
+    const T* __restrict__ bias,   // [d_conv] or nullptr
+    T* __restrict__ conv_state,   // [max_batch, d_conv, kernel_size - 1]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,          // [batch, d_conv]
+    int batch_size,
+    int d_conv,
+    int kernel_size,
+    bool activation_silu) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * d_conv) {
+        return;
+    }
+
+    int batch_idx = idx / d_conv;
+    int channel_idx = idx % d_conv;
+    int64_t slot = slots[batch_idx];
+    if (slot < 0) return;
+
+    const T* w_ptr = weight + channel_idx * kernel_size;
+    T* state_ptr = conv_state +
+                   (slot * d_conv + channel_idx) * (kernel_size - 1);
+
+    float history[GDN_MAX_KERNEL_SIZE];
+#pragma unroll
+    for (int i = 0; i < GDN_MAX_KERNEL_SIZE; ++i) {
+        history[i] = 0.0f;
+    }
+    for (int i = 0; i < kernel_size - 1; ++i) {
+        history[i] = to_float(state_ptr[i]);
+    }
+
+    float x_t = to_float(x[idx]);
+    float sum = x_t * to_float(w_ptr[kernel_size - 1]);
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += history[k] * to_float(w_ptr[k]);
+    }
+
+    if (bias != nullptr) {
+        sum += to_float(bias[channel_idx]);
+    }
+    if (activation_silu) {
+        sum = silu_float(sum);
+    }
+
+    if (kernel_size > 1) {
+        for (int k = 0; k < kernel_size - 2; ++k) {
+            state_ptr[k] = from_float<T>(history[k + 1]);
+        }
+        state_ptr[kernel_size - 2] = from_float<T>(x_t);
+    }
+
+    out[idx] = from_float<T>(sum);
+}
+
+template <typename T>
+void launch_causal_conv1d_update_slots(const T* x, const T* weight, const T* bias,
+                                       T* conv_state, const int64_t* slots, T* out,
+                                       int batch, int d_conv, int kernel_size, bool silu,
+                                       cudaStream_t stream) {
+    if (kernel_size < 1 || kernel_size > GDN_MAX_KERNEL_SIZE) {
+        printf("causal_conv1d_update_slots kernel_size=%d not supported (max=%d)\\n",
+               kernel_size, GDN_MAX_KERNEL_SIZE);
+        return;
+    }
+    int total = batch * d_conv;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    causal_conv1d_update_slots_kernel<<<blocks, threads, 0, stream>>>(
+        x, weight, bias, conv_state, slots, out, batch, d_conv, kernel_size, silu);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void causal_conv1d_update_slots_f32(
+    const float* x, const float* weight, const float* bias, float* conv_state,
+    const int64_t* slots, float* out, int batch, int d_conv, int kernel_size, bool silu,
+    cudaStream_t stream) {
+    launch_causal_conv1d_update_slots(
+        x, weight, bias, conv_state, slots, out, batch, d_conv, kernel_size, silu, stream);
+}
+
+extern "C" void causal_conv1d_update_slots_f16(
+    const half* x, const half* weight, const half* bias, half* conv_state,
+    const int64_t* slots, half* out, int batch, int d_conv, int kernel_size, bool silu,
+    cudaStream_t stream) {
+    launch_causal_conv1d_update_slots(
+        x, weight, bias, conv_state, slots, out, batch, d_conv, kernel_size, silu, stream);
+}
+
+extern "C" void causal_conv1d_update_slots_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* conv_state, const int64_t* slots, __nv_bfloat16* out,
+    int batch, int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
+    launch_causal_conv1d_update_slots(
+        x, weight, bias, conv_state, slots, out, batch, d_conv, kernel_size, silu, stream);
+}
+
 // =============================================================================
 // Fused GDN Gating
 // =============================================================================
@@ -546,4 +874,138 @@ extern "C" void fused_gdn_gating_bf16(const __nv_bfloat16* al,
                                          int seq, int h,
                                          cudaStream_t stream) {
     launch_fused_gdn_gating(al, a, b, dt, g, beta, bat, seq, h, stream);
+}
+
+// =============================================================================
+// Fused Gated RMSNorm + SiLU(z) + Mul
+// =============================================================================
+
+template <typename T, int THREADS>
+__global__ void gated_rmsnorm_silu_mul_kernel(
+    const T* __restrict__ x,       // [rows, value_dim]
+    const T* __restrict__ z,       // [rows, value_dim]
+    const T* __restrict__ gamma,   // [group_size] (per-head) or [value_dim] (full)
+    const T* __restrict__ bias,    // optional, same shape rule as gamma
+    T* __restrict__ out,           // [rows, value_dim]
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias) {
+    const int row_group = blockIdx.x;
+    const int num_groups = value_dim / group_size;
+    const int row = row_group / num_groups;
+    const int group = row_group % num_groups;
+    const int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const int group_offset = row * value_dim + group * group_size;
+    const T* x_group = x + group_offset;
+    const T* z_group = z + group_offset;
+    T* out_group = out + group_offset;
+
+    __shared__ float sumsq_buf[THREADS];
+    float sumsq = 0.0f;
+    for (int i = tid; i < group_size; i += THREADS) {
+        float xv = to_float(x_group[i]);
+        sumsq = __fmaf_rn(xv, xv, sumsq);
+    }
+    sumsq_buf[tid] = sumsq;
+    __syncthreads();
+
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sumsq_buf[tid] += sumsq_buf[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inv_rms = rsqrtf(sumsq_buf[0] / static_cast<float>(group_size) + eps);
+
+    for (int i = tid; i < group_size; i += THREADS) {
+        const int wb_idx = per_group_weights ? i : (group * group_size + i);
+        float normed = to_float(x_group[i]) * inv_rms;
+        float y = normed * to_float(gamma[wb_idx]);
+        if (has_bias) {
+            y += to_float(bias[wb_idx]);
+        }
+        float gate = silu_float(to_float(z_group[i]));
+        out_group[i] = from_float<T>(y * gate);
+    }
+}
+
+template <typename T>
+void launch_gated_rmsnorm_silu_mul(
+    const T* x,
+    const T* z,
+    const T* gamma,
+    const T* bias,
+    T* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    if (rows <= 0 || value_dim <= 0 || group_size <= 0 || value_dim % group_size != 0) return;
+    constexpr int THREADS = 256;
+    const int num_groups = value_dim / group_size;
+    dim3 grid(rows * num_groups);
+    dim3 block(THREADS);
+    gated_rmsnorm_silu_mul_kernel<T, THREADS><<<grid, block, 0, stream>>>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void gdn_gated_rmsnorm_silu_mul_f32(
+    const float* x,
+    const float* z,
+    const float* gamma,
+    const float* bias,
+    float* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
+}
+
+extern "C" void gdn_gated_rmsnorm_silu_mul_f16(
+    const half* x,
+    const half* z,
+    const half* gamma,
+    const half* bias,
+    half* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
+}
+
+extern "C" void gdn_gated_rmsnorm_silu_mul_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* z,
+    const __nv_bfloat16* gamma,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
 }
