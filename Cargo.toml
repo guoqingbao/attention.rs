@@ -2,6 +2,14 @@
 name = "attention-rs"
 version = "0.4.1"
 edition = "2021"
+description = "High-performance LLM attention kernels and operations (PagedAttention, MoE, RoPE) for Candle, optimized for CUDA and Metal."
+repository = "https://github.com/guoqingbao/attention.rs"
+homepage = "https://github.com/guoqingbao/attention.rs"
+documentation = "https://docs.rs/attention-rs"
+readme = "ReadMe.md"
+keywords = ["llm", "attention", "paged-attention", "cuda", "metal", "candle", "inference", "moe"]
+categories = ["algorithms", "hardware-support", "science"]
+license = "MIT"
 
 [dependencies]
 candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "a686ea4" }
