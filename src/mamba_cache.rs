@@ -385,33 +385,69 @@ impl MambaCache {
 
     /// Reset (zero out) all states for a given slot
     fn reset_slot_states(&mut self, slot: usize) -> Result<()> {
-        for layer_idx in 0..self.num_gdn_layers {
-            let conv_dim = self.conv_states[layer_idx].dim(1)?;
-            let conv_window = self.conv_states[layer_idx].dim(2)?;
-            let conv_zeros = Tensor::zeros(
-                (1, conv_dim, conv_window),
-                self.conv_states[layer_idx].dtype(),
-                self.conv_states[layer_idx].device(),
-            )?;
-            let conv_updated = self.conv_states[layer_idx]
-                .slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &conv_zeros)?;
-            self.conv_states[layer_idx] = conv_updated;
+        #[cfg(feature = "cuda")]
+        {
+            let device = self
+                .conv_states
+                .first()
+                .map(|t| t.device().clone())
+                .or_else(|| self.recurrent_states.first().map(|t| t.device().clone()))
+                .ok_or_else(|| candle_core::Error::Msg("MambaCache has no layers".to_string()))?;
+            let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), &device)?;
 
-            let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
-            let rec_h = self.recurrent_states[layer_idx].dim(2)?;
-            let rec_w = self.recurrent_states[layer_idx].dim(3)?;
-            let rec_zeros = Tensor::zeros(
-                (1, rec_heads, rec_h, rec_w),
-                self.recurrent_states[layer_idx].dtype(),
-                self.recurrent_states[layer_idx].device(),
-            )?;
-            let rec_updated = self.recurrent_states[layer_idx].slice_assign(
-                &[slot..slot + 1, 0..rec_heads, 0..rec_h, 0..rec_w],
-                &rec_zeros,
-            )?;
-            self.recurrent_states[layer_idx] = rec_updated;
+            for layer_idx in 0..self.num_gdn_layers {
+                let conv_dim = self.conv_states[layer_idx].dim(1)?;
+                let conv_window = self.conv_states[layer_idx].dim(2)?;
+                let conv_zeros = Tensor::zeros(
+                    (1, conv_dim, conv_window),
+                    self.conv_states[layer_idx].dtype(),
+                    self.conv_states[layer_idx].device(),
+                )?;
+                scatter_rows_cuda(&self.conv_states[layer_idx], &slot_tensor, &conv_zeros)?;
+
+                let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
+                let rec_h = self.recurrent_states[layer_idx].dim(2)?;
+                let rec_w = self.recurrent_states[layer_idx].dim(3)?;
+                let rec_zeros = Tensor::zeros(
+                    (1, rec_heads, rec_h, rec_w),
+                    self.recurrent_states[layer_idx].dtype(),
+                    self.recurrent_states[layer_idx].device(),
+                )?;
+                scatter_rows_cuda(&self.recurrent_states[layer_idx], &slot_tensor, &rec_zeros)?;
+            }
+            return Ok(());
         }
-        Ok(())
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            for layer_idx in 0..self.num_gdn_layers {
+                let conv_dim = self.conv_states[layer_idx].dim(1)?;
+                let conv_window = self.conv_states[layer_idx].dim(2)?;
+                let conv_zeros = Tensor::zeros(
+                    (1, conv_dim, conv_window),
+                    self.conv_states[layer_idx].dtype(),
+                    self.conv_states[layer_idx].device(),
+                )?;
+                let conv_updated = self.conv_states[layer_idx]
+                    .slice_assign(&[slot..slot + 1, 0..conv_dim, 0..conv_window], &conv_zeros)?;
+                self.conv_states[layer_idx] = conv_updated;
+
+                let rec_heads = self.recurrent_states[layer_idx].dim(1)?;
+                let rec_h = self.recurrent_states[layer_idx].dim(2)?;
+                let rec_w = self.recurrent_states[layer_idx].dim(3)?;
+                let rec_zeros = Tensor::zeros(
+                    (1, rec_heads, rec_h, rec_w),
+                    self.recurrent_states[layer_idx].dtype(),
+                    self.recurrent_states[layer_idx].device(),
+                )?;
+                let rec_updated = self.recurrent_states[layer_idx].slice_assign(
+                    &[slot..slot + 1, 0..rec_heads, 0..rec_h, 0..rec_w],
+                    &rec_zeros,
+                )?;
+                self.recurrent_states[layer_idx] = rec_updated;
+            }
+            Ok(())
+        }
     }
 
     /// Get the conv state tensor for a given GDN layer and slot
