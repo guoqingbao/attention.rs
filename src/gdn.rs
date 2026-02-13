@@ -695,19 +695,24 @@ pub fn gated_delta_rule_decode_slots(
             let g_c = ensure_contiguous(g)?;
             let beta_c = ensure_contiguous(beta)?;
 
-            let (batch, heads, k_dim) = q_c.dims3()?;
-            let (bk, hk, kk) = k_c.dims3()?;
-            let (bv, hv, v_dim) = v_c.dims3()?;
-            let (bg, hg) = g_c.dims2()?;
-            let (bb, hb) = beta_c.dims2()?;
+            let (bq, hq, kq) = q.dims3()?;
+            let (bk, hk, kk) = k.dims3()?;
+            let (bv, hv, v_dim) = v.dims3()?;
+            let (bg, hg) = g.dims2()?; // g is [batch, heads]
+            let (bb, hb) = beta.dims2()?;
+
+            let batch = bq;
+            let heads = hv;
+            let k_dim = kq;
+
             if batch != bk
                 || batch != bv
                 || batch != bg
                 || batch != bb
-                || heads != hk
-                || heads != hv
                 || heads != hg
                 || heads != hb
+                || heads != hk
+                || heads != hq
                 || k_dim != kk
             {
                 candle_core::bail!(
@@ -791,41 +796,57 @@ pub fn gated_delta_rule_decode_slots(
                         "gated_delta_rule_decode_slots expects contiguous recurrent state during CUDA execution"
                     );
                 }
-                // Stable path: use proven FP32 decode kernel while keeping global recurrent
-                // state in FP32 (no full-state cast per step).
-                let q_f32 = q_c.to_dtype(DType::F32)?;
-                let k_f32 = k_c.to_dtype(DType::F32)?;
-                let v_f32 = v_c.to_dtype(DType::F32)?;
-                let g_f32 = g_c.to_dtype(DType::F32)?;
-                let beta_f32 = beta_c.to_dtype(DType::F32)?;
-                let out_f32 = Tensor::zeros((batch, heads, v_dim), DType::F32, q.device())?;
-
-                let q_ptr = get_cuda_const_ptr(&q_f32)? as *const f32;
-                let k_ptr = get_cuda_const_ptr(&k_f32)? as *const f32;
-                let v_ptr = get_cuda_const_ptr(&v_f32)? as *const f32;
-                let g_ptr = get_cuda_const_ptr(&g_f32)? as *const f32;
-                let beta_ptr = get_cuda_const_ptr(&beta_f32)? as *const f32;
+                // S3: use native-dtype kernel with FP32 state — no input casts needed
+                let out = Tensor::zeros((batch, heads, v_dim), q.dtype(), q.device())?;
+                let q_ptr = get_cuda_const_ptr(&q_c)?;
+                let k_ptr = get_cuda_const_ptr(&k_c)?;
+                let v_ptr = get_cuda_const_ptr(&v_c)?;
+                let g_ptr = get_cuda_const_ptr(&g_c)?;
+                let beta_ptr = get_cuda_const_ptr(&beta_c)?;
                 let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
-                let out_ptr = get_cuda_mut_ptr(&out_f32)? as *mut f32;
+                let out_ptr = get_cuda_mut_ptr(&out)?;
 
-                unsafe {
-                    ffi::gated_delta_rule_decode_slots_f32(
-                        q_ptr,
-                        k_ptr,
-                        v_ptr,
-                        g_ptr,
-                        beta_ptr,
-                        state_ptr,
-                        slots_ptr,
-                        out_ptr,
-                        batch as c_int,
-                        heads as c_int,
-                        k_dim as c_int,
-                        v_dim as c_int,
-                        stream,
-                    )
+                match q.dtype() {
+                    DType::F16 => unsafe {
+                        ffi::gated_delta_rule_decode_slots_f16_state_f32(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            g_ptr,
+                            beta_ptr,
+                            state_ptr,
+                            slots_ptr,
+                            out_ptr as *mut c_void,
+                            batch as c_int,
+                            heads as c_int,
+                            k_dim as c_int,
+                            v_dim as c_int,
+                            stream,
+                        )
+                    },
+                    DType::BF16 => unsafe {
+                        ffi::gated_delta_rule_decode_slots_bf16_state_f32(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            g_ptr,
+                            beta_ptr,
+                            state_ptr,
+                            slots_ptr,
+                            out_ptr as *mut c_void,
+                            batch as c_int,
+                            heads as c_int,
+                            k_dim as c_int,
+                            v_dim as c_int,
+                            stream,
+                        )
+                    },
+                    dt => candle_core::bail!(
+                        "gated_delta_rule_decode_slots unsupported dtype: {:?}",
+                        dt
+                    ),
                 }
-                out_f32.to_dtype(q.dtype())
+                Ok(out)
             }
         }
         _ => {
@@ -860,6 +881,209 @@ pub fn gated_delta_rule_decode_slots(
             }
             let refs = outs.iter().collect::<Vec<_>>();
             Tensor::stack(&refs, 0)
+        }
+    }
+}
+
+/// Fused L2 normalization over the last dimension.
+/// Replaces the multi-op sequence: sumsq → sqrt → clamp → div.
+/// input: [rows, dim] → output: [rows, dim] (each row normalized to unit L2 norm)
+pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
+    match input.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(dev) => {
+            let input_c = ensure_contiguous(input)?;
+            let shape = input_c.shape();
+            if shape.rank() < 2 {
+                candle_core::bail!(
+                    "l2_norm_last_dim expects at least 2D input, got {:?}",
+                    shape
+                );
+            }
+            let dim = shape.dims()[shape.rank() - 1];
+            let rows = shape.elem_count() / dim;
+            let output = Tensor::zeros(shape, input.dtype(), input.device())?;
+            let in_ptr = get_cuda_const_ptr(&input_c)?;
+            let out_ptr = get_cuda_mut_ptr(&output)?;
+            let stream = *dev.cu_stream() as i64;
+
+            match input.dtype() {
+                DType::F32 => unsafe {
+                    ffi::l2_norm_last_dim_f32(
+                        in_ptr as *const f32,
+                        out_ptr as *mut f32,
+                        rows as c_int,
+                        dim as c_int,
+                        eps as f32,
+                        stream,
+                    )
+                },
+                DType::F16 => unsafe {
+                    ffi::l2_norm_last_dim_f16(
+                        in_ptr,
+                        out_ptr as *mut c_void,
+                        rows as c_int,
+                        dim as c_int,
+                        eps as f32,
+                        stream,
+                    )
+                },
+                DType::BF16 => unsafe {
+                    ffi::l2_norm_last_dim_bf16(
+                        in_ptr,
+                        out_ptr as *mut c_void,
+                        rows as c_int,
+                        dim as c_int,
+                        eps as f32,
+                        stream,
+                    )
+                },
+                dt => candle_core::bail!("l2_norm_last_dim: unsupported dtype {:?}", dt),
+            }
+            Ok(output)
+        }
+        _ => {
+            // Fallback using candle ops
+            let sumsq = input.sqr()?.sum_keepdim(input.rank() - 1)?;
+            let norm = (sumsq + eps)?.sqrt()?;
+            input.broadcast_div(&norm)
+        }
+    }
+}
+
+/// Batched variable-length recurrence: processes multiple sequences in one CUDA launch.
+/// Accepts native dtype inputs (bf16/f16/f32) with FP32 state.
+///
+/// Shapes:
+/// - `q`, `k`: `[total_tokens, num_heads, k_dim]`
+/// - `v`: `[total_tokens, num_heads, v_dim]`
+/// - `g`, `beta`: `[total_tokens, num_heads]`
+/// - `state`: `[max_batch, num_heads, k_dim, v_dim]` (FP32, updated in place)
+/// - `slots`: `[batch]` i64
+/// - `cu_seqlens`: `[batch + 1]` u32
+pub fn gated_delta_rule_recurrence_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    cu_seqlens: &Tensor,
+) -> Result<Tensor> {
+    match q.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(dev) => {
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
+            let g_c = ensure_contiguous(g)?;
+            let beta_c = ensure_contiguous(beta)?;
+
+            let (total_tokens, num_heads, k_dim) = q_c.dims3()?;
+            let num_heads_v = v_c.dim(1)?;
+            let v_dim = v_c.dim(2)?;
+            let batch = slots.dim(0)?;
+
+            if num_heads != num_heads_v {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen: q heads {} != v heads {}",
+                    num_heads,
+                    num_heads_v
+                );
+            }
+
+            if state.dtype() != DType::F32 {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen expects FP32 state, got {:?}",
+                    state.dtype()
+                );
+            }
+            if cu_seqlens.dtype() != DType::U32 || cu_seqlens.dim(0)? != batch + 1 {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen expects cu_seqlens [batch+1] U32, got {:?} {:?}",
+                    cu_seqlens.shape(),
+                    cu_seqlens.dtype()
+                );
+            }
+
+            let out = Tensor::zeros((total_tokens, num_heads, v_dim), q.dtype(), q.device())?;
+
+            let q_ptr = get_cuda_const_ptr(&q_c)?;
+            let k_ptr = get_cuda_const_ptr(&k_c)?;
+            let v_ptr = get_cuda_const_ptr(&v_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)?;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+
+            match q.dtype() {
+                DType::F32 => unsafe {
+                    ffi::gated_delta_rule_recurrence_varlen_f32(
+                        q_ptr as *const f32,
+                        k_ptr as *const f32,
+                        v_ptr as *const f32,
+                        g_ptr as *const f32,
+                        beta_ptr as *const f32,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr as *mut f32,
+                        cu_ptr,
+                        batch as c_int,
+                        num_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    )
+                },
+                DType::F16 => unsafe {
+                    ffi::gated_delta_rule_recurrence_varlen_f16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr as *mut c_void,
+                        cu_ptr,
+                        batch as c_int,
+                        num_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    )
+                },
+                DType::BF16 => unsafe {
+                    ffi::gated_delta_rule_recurrence_varlen_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr as *mut c_void,
+                        cu_ptr,
+                        batch as c_int,
+                        num_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    )
+                },
+                dt => candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen unsupported dtype: {:?}",
+                    dt
+                ),
+            }
+            Ok(out)
+        }
+        _ => {
+            candle_core::bail!("gated_delta_rule_recurrence_varlen requires CUDA device")
         }
     }
 }
