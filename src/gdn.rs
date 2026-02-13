@@ -16,16 +16,17 @@ use std::ffi::{c_int, c_void};
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr(t: &Tensor) -> Result<*const c_void> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    let (storage, _) = t.storage_and_layout();
+    let (storage, layout) = t.storage_and_layout();
+    let offset = layout.start_offset();
     match (&*storage, t.dtype()) {
         (Storage::Cuda(s), DType::F16) => {
-            Ok(*s.as_cuda_slice::<f16>()?.device_ptr() as *const c_void)
+            Ok(*s.as_cuda_slice::<f16>()?.slice(offset..).device_ptr() as *const c_void)
         }
         (Storage::Cuda(s), DType::BF16) => {
-            Ok(*s.as_cuda_slice::<bf16>()?.device_ptr() as *const c_void)
+            Ok(*s.as_cuda_slice::<bf16>()?.slice(offset..).device_ptr() as *const c_void)
         }
         (Storage::Cuda(s), DType::F32) => {
-            Ok(*s.as_cuda_slice::<f32>()?.device_ptr() as *const c_void)
+            Ok(*s.as_cuda_slice::<f32>()?.slice(offset..).device_ptr() as *const c_void)
         }
         _ => candle_core::bail!("Expected CUDA tensor with f16/bf16/f32 dtype"),
     }
@@ -34,9 +35,12 @@ fn get_cuda_const_ptr(t: &Tensor) -> Result<*const c_void> {
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr_u32(t: &Tensor) -> Result<*const u32> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    let (storage, _) = t.storage_and_layout();
+    let (storage, layout) = t.storage_and_layout();
+    let offset = layout.start_offset();
     match &*storage {
-        Storage::Cuda(s) => Ok(*s.as_cuda_slice::<u32>()?.device_ptr() as *const u32),
+        Storage::Cuda(s) => {
+            Ok(*s.as_cuda_slice::<u32>()?.slice(offset..).device_ptr() as *const u32)
+        }
         _ => candle_core::bail!("Expected CUDA u32 tensor"),
     }
 }
@@ -44,9 +48,12 @@ fn get_cuda_const_ptr_u32(t: &Tensor) -> Result<*const u32> {
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr_i64(t: &Tensor) -> Result<*const i64> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    let (storage, _) = t.storage_and_layout();
+    let (storage, layout) = t.storage_and_layout();
+    let offset = layout.start_offset();
     match &*storage {
-        Storage::Cuda(s) => Ok(*s.as_cuda_slice::<i64>()?.device_ptr() as *const i64),
+        Storage::Cuda(s) => {
+            Ok(*s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr() as *const i64)
+        }
         _ => candle_core::bail!("Expected CUDA i64 tensor"),
     }
 }
@@ -604,7 +611,14 @@ pub fn gated_delta_rule_recurrence(
             let (bh_v, seq_len_v, v_dim) = v.dims3()?;
             let (bh_g, seq_len_g) = g.dims2()?;
             let (bh_b, seq_len_b) = beta.dims2()?;
-            let (bh_s, k_dim_s, v_dim_s) = state.dims3()?;
+
+            let original_shape = state.shape().clone();
+            let (bh_s, k_dim_s, v_dim_s) = if original_shape.rank() == 4 {
+                let (b, h, k, v) = state.dims4()?;
+                (b * h, k, v)
+            } else {
+                state.dims3()?
+            };
 
             if bh != bh_k
                 || bh != bh_v
@@ -631,45 +645,103 @@ pub fn gated_delta_rule_recurrence(
                 );
             }
 
-            let out_dtype = q.dtype();
-            let state_dtype = state.dtype();
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
 
-            let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
-            let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
-            let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
-            let g_f32 = g.to_dtype(DType::F32)?.contiguous()?;
-            let beta_f32 = beta.to_dtype(DType::F32)?.contiguous()?;
-            let state_f32 = state.to_dtype(DType::F32)?.contiguous()?;
+            if q_c.dtype() != k_c.dtype() || q_c.dtype() != v_c.dtype() {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence dtype mismatch: q={:?} k={:?} v={:?}",
+                    q_c.dtype(),
+                    k_c.dtype(),
+                    v_c.dtype()
+                );
+            }
 
-            let out = Tensor::zeros((bh, seq_len, v_dim), DType::F32, q.device())?;
+            let out_dtype = q_c.dtype();
+            let g_f32 = if g.dtype() == DType::F32 {
+                ensure_contiguous(g)?
+            } else {
+                g.to_dtype(DType::F32)?.contiguous()?
+            };
+            let beta_f32 = if beta.dtype() == DType::F32 {
+                ensure_contiguous(beta)?
+            } else {
+                beta.to_dtype(DType::F32)?.contiguous()?
+            };
 
-            let q_ptr = get_cuda_const_ptr(&q_f32)? as *const f32;
-            let k_ptr = get_cuda_const_ptr(&k_f32)? as *const f32;
-            let v_ptr = get_cuda_const_ptr(&v_f32)? as *const f32;
+            if state.dtype() != DType::F32 {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence expects F32 state, got {:?}",
+                    state.dtype()
+                );
+            }
+            if !state.is_contiguous() {
+                candle_core::bail!("gated_delta_rule_recurrence expects contiguous state");
+            }
+            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+
+            let out = Tensor::zeros((bh, seq_len, v_dim), DType::F32, q_c.device())?;
+
+            let q_ptr = get_cuda_const_ptr(&q_c)?;
+            let k_ptr = get_cuda_const_ptr(&k_c)?;
+            let v_ptr = get_cuda_const_ptr(&v_c)?;
             let g_ptr = get_cuda_const_ptr(&g_f32)? as *const f32;
             let beta_ptr = get_cuda_const_ptr(&beta_f32)? as *const f32;
-            let state_ptr = get_cuda_mut_ptr(&state_f32)? as *mut f32;
             let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
             let stream = *dev.cu_stream() as i64;
 
             unsafe {
-                ffi::gated_delta_rule_recurrence(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    g_ptr,
-                    beta_ptr,
-                    state_ptr,
-                    out_ptr,
-                    bh as c_int,
-                    seq_len as c_int,
-                    k_dim as c_int,
-                    v_dim as c_int,
-                    stream,
-                )
+                match out_dtype {
+                    DType::F32 => ffi::gated_delta_rule_recurrence(
+                        q_ptr as *const f32,
+                        k_ptr as *const f32,
+                        v_ptr as *const f32,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        out_ptr,
+                        bh as c_int,
+                        seq_len as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    ),
+                    DType::F16 => ffi::gated_delta_rule_recurrence_f16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        out_ptr,
+                        bh as c_int,
+                        seq_len as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::gated_delta_rule_recurrence_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        out_ptr,
+                        bh as c_int,
+                        seq_len as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        stream,
+                    ),
+                    dt => candle_core::bail!(
+                        "gated_delta_rule_recurrence unsupported dtype: {:?}",
+                        dt
+                    ),
+                }
             }
 
-            *state = state_f32.to_dtype(state_dtype)?;
             out.to_dtype(out_dtype)
         }
         _ => gated_delta_rule_recurrence_naive(q, k, v, g, beta, state),

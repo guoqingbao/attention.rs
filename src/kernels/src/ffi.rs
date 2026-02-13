@@ -1237,6 +1237,34 @@ extern "C" {
         v_dim: c_int,
         stream: i64,
     );
+    pub fn gated_delta_rule_recurrence_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        bh: c_int,
+        seq_len: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        stream: i64,
+    );
+    pub fn gated_delta_rule_recurrence_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        bh: c_int,
+        seq_len: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        stream: i64,
+    );
 
     pub fn gated_delta_rule_decode_slots_f32(
         q: *const f32,

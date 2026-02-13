@@ -59,11 +59,11 @@ __device__ __forceinline__ float silu_float(float x) {
 // Gated Delta Rule Recurrence (DeltaNet core)
 // =============================================================================
 
-template <int BK, int BV>
+template <typename T, int BK, int BV>
 __global__ void gated_delta_rule_recurrence_kernel_tiled(
-    const float* __restrict__ q,      // [BH, S, K]
-    const float* __restrict__ k,      // [BH, S, K]
-    const float* __restrict__ v,      // [BH, S, V]
+    const T* __restrict__ q,          // [BH, S, K]
+    const T* __restrict__ k,          // [BH, S, K]
+    const T* __restrict__ v,          // [BH, S, V]
     const float* __restrict__ g,      // [BH, S]
     const float* __restrict__ beta,   // [BH, S]
     float* __restrict__ state,        // [BH, K, V] (in/out)
@@ -79,9 +79,9 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
         return;
     }
 
-    const float* q_bh = q + bh * seq_len * BK;
-    const float* k_bh = k + bh * seq_len * BK;
-    const float* v_bh = v + bh * seq_len * v_dim;
+    const T* q_bh = q + bh * seq_len * BK;
+    const T* k_bh = k + bh * seq_len * BK;
+    const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
     float* state_bh = state + bh * BK * v_dim;
@@ -104,7 +104,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
         // Cooperative load k into shared memory
 #pragma unroll
         for (int j = tid; j < BK; j += BV) {
-            k_buf[j] = k_bh[t * BK + j];
+            k_buf[j] = to_float(k_bh[t * BK + j]);
         }
         // Broadcast scalars via shared memory (K3 for prefill)
         if (tid == 0) {
@@ -115,7 +115,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 
         const float decay = scalars[0];
         const float beta_t = scalars[1];
-        const float v_t = v_bh[t * v_dim + v_idx];
+        const float v_t = to_float(v_bh[t * v_dim + v_idx]);
 
         float kv_mem = 0.0f;
 #pragma unroll
@@ -130,7 +130,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
         __syncthreads();
 #pragma unroll
         for (int j = tid; j < BK; j += BV) {
-            q_buf[j] = q_bh[t * BK + j];
+            q_buf[j] = to_float(q_bh[t * BK + j]);
         }
         __syncthreads();
 
@@ -151,11 +151,11 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     }
 }
 
-template <int BV, int MAX_K>
+template <typename T, int BV, int MAX_K>
 __global__ void gated_delta_rule_recurrence_kernel_fallback(
-    const float* __restrict__ q,      // [BH, S, K]
-    const float* __restrict__ k,      // [BH, S, K]
-    const float* __restrict__ v,      // [BH, S, V]
+    const T* __restrict__ q,          // [BH, S, K]
+    const T* __restrict__ k,          // [BH, S, K]
+    const T* __restrict__ v,          // [BH, S, V]
     const float* __restrict__ g,      // [BH, S]
     const float* __restrict__ beta,   // [BH, S]
     float* __restrict__ state,        // [BH, K, V] (in/out)
@@ -172,9 +172,9 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
         return;
     }
 
-    const float* q_bh = q + bh * seq_len * k_dim;
-    const float* k_bh = k + bh * seq_len * k_dim;
-    const float* v_bh = v + bh * seq_len * v_dim;
+    const T* q_bh = q + bh * seq_len * k_dim;
+    const T* k_bh = k + bh * seq_len * k_dim;
+    const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
     float* state_bh = state + bh * k_dim * v_dim;
@@ -193,7 +193,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
     for (int t = 0; t < seq_len; ++t) {
         for (int j = tid; j < k_dim; j += BV) {
-            k_buf[j] = k_bh[t * k_dim + j];
+            k_buf[j] = to_float(k_bh[t * k_dim + j]);
         }
         if (tid == 0) {
             scalars_buf[0] = expf(g_bh[t]);
@@ -203,7 +203,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
         const float decay = scalars_buf[0];
         const float beta_t = scalars_buf[1];
-        const float v_t = v_bh[t * v_dim + v_idx];
+        const float v_t = to_float(v_bh[t * v_dim + v_idx]);
 
         float kv_mem = 0.0f;
         for (int j = 0; j < k_dim; ++j) {
@@ -215,7 +215,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
         __syncthreads();
         for (int j = tid; j < k_dim; j += BV) {
-            q_buf[j] = q_bh[t * k_dim + j];
+            q_buf[j] = to_float(q_bh[t * k_dim + j]);
         }
         __syncthreads();
 
@@ -233,10 +233,11 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     }
 }
 
-extern "C" void gated_delta_rule_recurrence(
-    const float* q,
-    const float* k,
-    const float* v,
+template <typename T>
+void launch_gated_delta_rule_recurrence(
+    const T* q,
+    const T* k,
+    const T* v,
     const float* g,
     const float* beta,
     float* state,
@@ -255,14 +256,14 @@ extern "C" void gated_delta_rule_recurrence(
         constexpr int BV = 64;
         dim3 grid((v_dim + BV - 1) / BV, bh);
         dim3 block(BV);
-        gated_delta_rule_recurrence_kernel_tiled<BK, BV><<<grid, block, 0, stream>>>(
+        gated_delta_rule_recurrence_kernel_tiled<T, BK, BV><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, out, seq_len, v_dim);
     } else if (k_dim == 64) {
         constexpr int BK = 64;
         constexpr int BV = 64;
         dim3 grid((v_dim + BV - 1) / BV, bh);
         dim3 block(BV);
-        gated_delta_rule_recurrence_kernel_tiled<BK, BV><<<grid, block, 0, stream>>>(
+        gated_delta_rule_recurrence_kernel_tiled<T, BK, BV><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, out, seq_len, v_dim);
     } else {
         constexpr int BV = 64;
@@ -274,10 +275,61 @@ extern "C" void gated_delta_rule_recurrence(
         dim3 grid((v_dim + BV - 1) / BV, bh);
         dim3 block(BV);
         size_t smem = (2 * static_cast<size_t>(k_dim) + 2) * sizeof(float);
-        gated_delta_rule_recurrence_kernel_fallback<BV, MAX_K><<<grid, block, smem, stream>>>(
+        gated_delta_rule_recurrence_kernel_fallback<T, BV, MAX_K><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, out, seq_len, k_dim, v_dim);
     }
     CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void gated_delta_rule_recurrence(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* g,
+    const float* beta,
+    float* state,
+    float* out,
+    int bh,
+    int seq_len,
+    int k_dim,
+    int v_dim,
+    cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence(
+        q, k, v, g, beta, state, out, bh, seq_len, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_recurrence_f16(
+    const half* q,
+    const half* k,
+    const half* v,
+    const float* g,
+    const float* beta,
+    float* state,
+    float* out,
+    int bh,
+    int seq_len,
+    int k_dim,
+    int v_dim,
+    cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence(
+        q, k, v, g, beta, state, out, bh, seq_len, k_dim, v_dim, stream);
+}
+
+extern "C" void gated_delta_rule_recurrence_bf16(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const float* g,
+    const float* beta,
+    float* state,
+    float* out,
+    int bh,
+    int seq_len,
+    int k_dim,
+    int v_dim,
+    cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence(
+        q, k, v, g, beta, state, out, bh, seq_len, k_dim, v_dim, stream);
 }
 
 // =============================================================================
@@ -1261,9 +1313,40 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_bf16(
 // Fused L2 Norm (last dim) — replaces ~8 Candle kernel launches (S5)
 // =============================================================================
 
+template <typename T, int WARPS_PER_BLOCK>
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__global__ void l2_norm_last_dim_warp_kernel(
+    const T* __restrict__ input,   // [rows, dim]
+    T* __restrict__ output,        // [rows, dim]
+    int rows,
+    int dim,
+    float eps) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (row >= rows) return;
+
+    const T* in_row = input + row * dim;
+    T* out_row = output + row * dim;
+
+    float sumsq = 0.0f;
+    for (int i = lane_id; i < dim; i += 32) {
+        const float v = to_float(in_row[i]);
+        sumsq = __fmaf_rn(v, v, sumsq);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sumsq += __shfl_down_sync(0xffffffff, sumsq, offset);
+    }
+    const float inv_norm = rsqrtf(fmaxf(sumsq, 0.0f) + eps);
+
+    for (int i = lane_id; i < dim; i += 32) {
+        out_row[i] = from_float<T>(to_float(in_row[i]) * inv_norm);
+    }
+}
+
 template <typename T, int THREADS>
 __launch_bounds__(THREADS)
-__global__ void l2_norm_last_dim_kernel(
+__global__ void l2_norm_last_dim_block_kernel(
     const T* __restrict__ input,   // [rows, dim]
     T* __restrict__ output,        // [rows, dim]
     int rows,
@@ -1276,33 +1359,26 @@ __global__ void l2_norm_last_dim_kernel(
     const T* in_row = input + row * dim;
     T* out_row = output + row * dim;
 
-    // Compute sum of squares using warp shuffle reduction
     float sumsq = 0.0f;
     for (int i = tid; i < dim; i += THREADS) {
-        float val = to_float(in_row[i]);
-        sumsq = __fmaf_rn(val, val, sumsq);
+        const float v = to_float(in_row[i]);
+        sumsq = __fmaf_rn(v, v, sumsq);
     }
 
-    // Warp-level reduction
     for (int offset = 16; offset > 0; offset >>= 1) {
         sumsq += __shfl_down_sync(0xffffffff, sumsq, offset);
     }
 
-    // Inter-warp reduction
     constexpr int NUM_WARPS = THREADS / 32;
     __shared__ float warp_sums[NUM_WARPS];
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
-
     if (lane_id == 0) {
         warp_sums[warp_id] = sumsq;
     }
     __syncthreads();
 
-    float total = 0.0f;
-    if (tid < NUM_WARPS) {
-        total = warp_sums[tid];
-    }
+    float total = (tid < NUM_WARPS) ? warp_sums[tid] : 0.0f;
     if (warp_id == 0) {
         for (int offset = NUM_WARPS / 2; offset > 0; offset >>= 1) {
             total += __shfl_down_sync(0xffffffff, total, offset);
@@ -1313,27 +1389,24 @@ __global__ void l2_norm_last_dim_kernel(
     }
     __syncthreads();
 
-    const float inv_norm = rsqrtf(warp_sums[0] + eps);
-
-    // Normalize
+    const float inv_norm = rsqrtf(fmaxf(warp_sums[0], 0.0f) + eps);
     for (int i = tid; i < dim; i += THREADS) {
-        float val = to_float(in_row[i]);
-        out_row[i] = from_float<T>(val * inv_norm);
+        out_row[i] = from_float<T>(to_float(in_row[i]) * inv_norm);
     }
 }
 
 template <typename T>
 void launch_l2_norm_last_dim(const T* input, T* output, int rows, int dim,
-                              float eps, cudaStream_t stream) {
-    // Optimize block size for the dimension
-    if (dim <= 128) {
-        constexpr int THREADS = 128;
-        l2_norm_last_dim_kernel<T, THREADS><<<rows, THREADS, 0, stream>>>(
-            input, output, rows, dim, eps);
+                             float eps, cudaStream_t stream) {
+    if (dim <= 256) {
+        constexpr int WARPS_PER_BLOCK = 8;
+        const int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        l2_norm_last_dim_warp_kernel<T, WARPS_PER_BLOCK>
+            <<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(input, output, rows, dim, eps);
     } else {
         constexpr int THREADS = 256;
-        l2_norm_last_dim_kernel<T, THREADS><<<rows, THREADS, 0, stream>>>(
-            input, output, rows, dim, eps);
+        l2_norm_last_dim_block_kernel<T, THREADS>
+            <<<rows, THREADS, 0, stream>>>(input, output, rows, dim, eps);
     }
     CHECK_CUDA(cudaGetLastError());
 }
