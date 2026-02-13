@@ -335,7 +335,7 @@ extern "C" void gated_delta_rule_recurrence_bf16(
 // =============================================================================
 // Optimized decode kernel: K3 (scalar broadcast), K4 (exact BK template),
 // K5 (cooperative state load), K6 (shared q/k)
-// Dynamic shared memory layout: [q_smem: BK] [k_smem: BK] [scalars: 3]
+// Dynamic shared memory layout: [q_smem: BK] [k_smem: BK] [scalars: 2]
 // =============================================================================
 
 template <typename T, int BV, int BK>
@@ -367,12 +367,11 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     extern __shared__ float smem[];
     float* q_smem = smem;                  // [BK]
     float* k_smem = smem + BK;             // [BK]
-    float* scalars = smem + 2 * BK;        // [3]: decay, beta_t, scale
+    float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
 
     if (tid == 0) {
         scalars[0] = expf(to_float(g[bh]));
         scalars[1] = to_float(beta[bh]);
-        scalars[2] = rsqrtf(static_cast<float>(k_dim));
     }
 
     // K6: cooperative load of q/k into shared memory
@@ -384,7 +383,6 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     __syncthreads();
     const float decay = scalars[0];
     const float beta_t = scalars[1];
-    const float scale = scalars[2];
 
     // K5: state pointer — stride v_dim between k elements (non-coalesced)
     // We load into registers; cooperative smem load not beneficial for decode
@@ -412,7 +410,7 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     // Load q into shared memory (reuse k_smem space — k no longer needed)
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
-        q_smem[j] = to_float(q_bh[j]) * scale;
+        q_smem[j] = to_float(q_bh[j]);
     }
     __syncthreads();
 
@@ -464,12 +462,11 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     extern __shared__ float smem[];
     float* q_smem = smem;
     float* k_smem = smem + BK;
-    float* scalars = smem + 2 * BK;
+    float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
 
     if (tid == 0) {
         scalars[0] = expf(to_float(g[bh]));
         scalars[1] = to_float(beta[bh]);
-        scalars[2] = rsqrtf(static_cast<float>(k_dim));
     }
 
     // K6: cooperative load of k into shared memory
@@ -481,7 +478,6 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     __syncthreads();
     const float decay = scalars[0];
     const float beta_t = scalars[1];
-    const float scale = scalars[2];
 
     float* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
 
@@ -506,7 +502,7 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     // Load q into shared memory
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
-        q_smem[j] = to_float(q_bh[j]) * scale;
+        q_smem[j] = to_float(q_bh[j]);
     }
     __syncthreads();
 
@@ -539,15 +535,15 @@ void launch_gated_delta_rule_decode_slots(
     constexpr int BV = 64;
     dim3 grid((v_dim + BV - 1) / BV, batch * heads);
     dim3 block(BV);
-    // smem: q[BK] + k[BK] + scalars[3]
+    // smem: q[BK] + k[BK] + scalars[2]
     if (k_dim <= 64) {
         constexpr int BK = 64;
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     } else if (k_dim <= 128) {
         constexpr int BK = 128;
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     } else {
@@ -556,7 +552,7 @@ void launch_gated_delta_rule_decode_slots(
             printf("gated_delta_rule_decode_slots: k_dim=%d exceeds MAX_K=%d\n", k_dim, BK);
             return;
         }
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     }
@@ -574,12 +570,12 @@ void launch_gated_delta_rule_decode_slots_state_f32(
     dim3 block(BV);
     if (k_dim <= 64) {
         constexpr int BK = 64;
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel_state_f32<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     } else if (k_dim <= 128) {
         constexpr int BK = 128;
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel_state_f32<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     } else {
@@ -588,7 +584,7 @@ void launch_gated_delta_rule_decode_slots_state_f32(
             printf("gated_delta_rule_decode_slots_state_f32: k_dim=%d exceeds MAX_K=%d\n", k_dim, BK);
             return;
         }
-        size_t smem = (2 * BK + 3) * sizeof(float);
+        size_t smem = (2 * BK + 2) * sizeof(float);
         gated_delta_rule_decode_slots_kernel_state_f32<T, BV, BK><<<grid, block, smem, stream>>>(
             q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim);
     }

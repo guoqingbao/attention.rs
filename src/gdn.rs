@@ -751,13 +751,13 @@ pub fn gated_delta_rule_recurrence(
 /// One-step decode recurrence with slot-indexed global state.
 #[cfg(feature = "cuda")]
 pub fn gated_delta_rule_decode_slots(
-    q: &Tensor,         // [batch, heads, k_dim]
-    k: &Tensor,         // [batch, heads, k_dim]
-    v: &Tensor,         // [batch, heads, v_dim]
-    g: &Tensor,         // [batch, heads]
-    beta: &Tensor,      // [batch, heads]
+    q: &Tensor,    // [batch, heads, k_dim], caller-scaled if needed (e.g. * 1/sqrt(k_dim))
+    k: &Tensor,    // [batch, heads, k_dim]
+    v: &Tensor,    // [batch, heads, v_dim]
+    g: &Tensor,    // [batch, heads]
+    beta: &Tensor, // [batch, heads]
     state: &mut Tensor, // [max_batch, heads, k_dim, v_dim]
-    slots: &Tensor,     // [batch] i64
+    slots: &Tensor, // [batch] i64
 ) -> Result<Tensor> {
     match q.device() {
         Device::Cuda(dev) => {
