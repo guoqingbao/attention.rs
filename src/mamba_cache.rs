@@ -8,7 +8,7 @@
 // and states are updated in-place during forward passes.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -215,6 +215,18 @@ pub struct MambaCache {
     max_batch_size: usize,
     /// Number of GDN layers
     num_gdn_layers: usize,
+    /// Max number of cached prefix-state snapshots.
+    prefix_cache_capacity: usize,
+    /// Prefix hash -> captured slot states.
+    prefix_states: HashMap<u64, PrefixStateSnapshot>,
+    /// LRU queue for prefix-state eviction.
+    prefix_lru: VecDeque<u64>,
+}
+
+#[derive(Clone)]
+struct PrefixStateSnapshot {
+    conv_states: Vec<Tensor>,
+    recurrent_states: Vec<Tensor>,
 }
 
 impl MambaCache {
@@ -268,6 +280,9 @@ impl MambaCache {
             seq_to_slot: HashMap::new(),
             max_batch_size,
             num_gdn_layers,
+            prefix_cache_capacity: 0,
+            prefix_states: HashMap::new(),
+            prefix_lru: VecDeque::new(),
         })
     }
 
@@ -583,6 +598,106 @@ impl MambaCache {
         self.seq_to_slot.len()
     }
 
+    pub fn set_prefix_cache_capacity(&mut self, capacity: usize) {
+        self.prefix_cache_capacity = capacity;
+        if capacity == 0 {
+            self.prefix_states.clear();
+            self.prefix_lru.clear();
+            return;
+        }
+        self.evict_prefix_states_if_needed();
+    }
+
+    pub fn has_prefix_state(&self, hash: u64) -> bool {
+        self.prefix_cache_capacity > 0 && self.prefix_states.contains_key(&hash)
+    }
+
+    fn touch_prefix_state(&mut self, hash: u64) {
+        self.prefix_lru.retain(|&h| h != hash);
+        self.prefix_lru.push_back(hash);
+    }
+
+    fn evict_prefix_states_if_needed(&mut self) {
+        while self.prefix_states.len() > self.prefix_cache_capacity {
+            let Some(hash) = self.prefix_lru.pop_front() else {
+                break;
+            };
+            if self.prefix_states.remove(&hash).is_some() {
+                break;
+            }
+        }
+    }
+
+    pub fn capture_prefix_state(&mut self, seq_id: usize, hash: u64) -> Result<bool> {
+        if self.prefix_cache_capacity == 0 {
+            return Ok(false);
+        }
+        let Some(slot) = self.get_slot(seq_id) else {
+            return Ok(false);
+        };
+        if self.num_gdn_layers == 0 {
+            return Ok(false);
+        }
+
+        let device = self.conv_states[0].device();
+        let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), device)?;
+        let mut conv_states = Vec::with_capacity(self.num_gdn_layers);
+        let mut recurrent_states = Vec::with_capacity(self.num_gdn_layers);
+        for layer_idx in 0..self.num_gdn_layers {
+            conv_states.push(self.get_batch_conv_state(layer_idx, &slot_tensor)?);
+            recurrent_states.push(self.get_batch_recurrent_state(layer_idx, &slot_tensor)?);
+        }
+
+        self.prefix_states.insert(
+            hash,
+            PrefixStateSnapshot {
+                conv_states,
+                recurrent_states,
+            },
+        );
+        self.touch_prefix_state(hash);
+        self.evict_prefix_states_if_needed();
+        Ok(true)
+    }
+
+    pub fn restore_prefix_state(&mut self, seq_id: usize, hash: u64) -> Result<bool> {
+        if self.prefix_cache_capacity == 0 {
+            return Ok(false);
+        }
+        let Some(snapshot) = self.prefix_states.get(&hash).cloned() else {
+            return Ok(false);
+        };
+        let Some(slot) = self.get_slot(seq_id) else {
+            return Ok(false);
+        };
+        if self.num_gdn_layers == 0 {
+            return Ok(false);
+        }
+        if snapshot.conv_states.len() != self.num_gdn_layers
+            || snapshot.recurrent_states.len() != self.num_gdn_layers
+        {
+            candle_core::bail!(
+                "MambaCache prefix snapshot layers mismatch: got conv={} rec={} expected={}",
+                snapshot.conv_states.len(),
+                snapshot.recurrent_states.len(),
+                self.num_gdn_layers
+            );
+        }
+
+        let device = self.conv_states[0].device();
+        let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), device)?;
+        for layer_idx in 0..self.num_gdn_layers {
+            self.set_batch_conv_state(layer_idx, &slot_tensor, &snapshot.conv_states[layer_idx])?;
+            self.set_batch_recurrent_state(
+                layer_idx,
+                &slot_tensor,
+                &snapshot.recurrent_states[layer_idx],
+            )?;
+        }
+        self.touch_prefix_state(hash);
+        Ok(true)
+    }
+
     pub fn reset_all(&mut self) -> Result<()> {
         for layer_idx in 0..self.num_gdn_layers {
             self.conv_states[layer_idx].zero_()?;
@@ -590,6 +705,8 @@ impl MambaCache {
         }
         self.seq_to_slot.clear();
         self.free_slots = (0..self.max_batch_size).rev().collect();
+        self.prefix_states.clear();
+        self.prefix_lru.clear();
         Ok(())
     }
 }
