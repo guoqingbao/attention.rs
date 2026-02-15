@@ -177,10 +177,19 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
         // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
         // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support
+        println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
+        // DO not change this, this featch custom flashinfer v0.6.2 headers
+        // which is compatible with our code (added more gqa group_size)
+        let fi_repo = std::env::var("CARGO_FEATURE_FLASHINFER_REPO").unwrap_or(
+            "https://github.com/guoqingbao/flashinfer.git".to_string()
+        );
+        let fi_commit = std::env::var("CARGO_FEATURE_FLASHINFER_COMMIT").unwrap_or(
+            "377611ceeb404b31768b17983ac00a2415b26942".to_string(), // v0.6.7
+        );
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
-            "https://github.com/guoqingbao/flashinfer.git",
-            "377611ceeb404b31768b17983ac00a2415b26942", // v0.6.7
+            fi_repo.as_str(),
+            fi_commit.as_str(),
             vec![
                 "include",
                 "include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export",
