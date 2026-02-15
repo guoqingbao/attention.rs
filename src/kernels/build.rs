@@ -87,6 +87,10 @@ fn main() -> Result<()> {
         .source_dir("src")
         .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
+        .arg("-fmad=false")       // Disable FMA rounding non-determinism
+        .arg("-ftz=false")        // Preserve subnormals (critical for attention)
+        .arg("-prec-div=true")         // Enable precise division
+        .arg("-prec-sqrt=true")        // Enable precise square-root
         .arg("-O3");
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
