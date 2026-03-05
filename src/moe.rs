@@ -1,7 +1,248 @@
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::quantized::QTensor;
 use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_dtype_code(dtype: candle_core::DType) -> Result<i32> {
+    match dtype {
+        candle_core::DType::F16 => Ok(0),
+        candle_core::DType::BF16 => Ok(1),
+        _ => candle_core::bail!("only f16/bf16 are supported for flashinfer fused moe"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_ptr_f16bf16(t: &Tensor) -> Result<*const core::ffi::c_void> {
+    use candle_core as candle;
+    let (storage, _) = t.storage_and_layout();
+    match (&*storage, t.dtype()) {
+        (candle::Storage::Cuda(c), candle_core::DType::F16) => {
+            Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr() as *const core::ffi::c_void)
+        }
+        (candle::Storage::Cuda(c), candle_core::DType::BF16) => {
+            Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr() as *const core::ffi::c_void)
+        }
+        _ => candle_core::bail!("expected CUDA f16/bf16 tensor"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_ptr_u8(t: &Tensor) -> Result<*const u8> {
+    use candle_core as candle;
+    let (storage, _) = t.storage_and_layout();
+    match (&*storage, t.dtype()) {
+        (candle::Storage::Cuda(c), candle_core::DType::U8) => {
+            Ok(*c.as_cuda_slice::<u8>()?.device_ptr() as *const u8)
+        }
+        _ => candle_core::bail!("expected CUDA u8 tensor"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_ptr_f32(t: &Tensor) -> Result<*const f32> {
+    use candle_core as candle;
+    let (storage, _) = t.storage_and_layout();
+    match (&*storage, t.dtype()) {
+        (candle::Storage::Cuda(c), candle_core::DType::F32) => {
+            Ok(*c.as_cuda_slice::<f32>()?.device_ptr() as *const f32)
+        }
+        _ => candle_core::bail!("expected CUDA f32 tensor"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_ptr_topk_ids_i32(t: &Tensor) -> Result<*const i32> {
+    use candle_core as candle;
+    let (storage, _) = t.storage_and_layout();
+    match (&*storage, t.dtype()) {
+        (candle::Storage::Cuda(c), candle_core::DType::U32) => {
+            Ok(*c.as_cuda_slice::<u32>()?.device_ptr() as *const i32)
+        }
+        _ => candle_core::bail!("expected CUDA u32 tensor for topk ids"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn cuda_mut_ptr_f16bf16(t: &Tensor) -> Result<*mut core::ffi::c_void> {
+    use candle_core as candle;
+    let (storage, _) = t.storage_and_layout();
+    match (&*storage, t.dtype()) {
+        (candle::Storage::Cuda(c), candle_core::DType::F16) => {
+            Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut core::ffi::c_void)
+        }
+        (candle::Storage::Cuda(c), candle_core::DType::BF16) => {
+            Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr() as *mut core::ffi::c_void)
+        }
+        _ => candle_core::bail!("expected CUDA f16/bf16 tensor"),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+pub fn flashinfer_fused_moe(
+    input: &Tensor,
+    topk_ids: &Tensor,
+    topk_weights: &Tensor,
+    gate_up_weights: &Tensor,
+    down_weights: &Tensor,
+) -> Result<Tensor> {
+    let (num_tokens, hidden_size) = input.dims2()?;
+    let (num_experts, gate_up_n, gate_up_k) = gate_up_weights.dims3()?;
+    let (down_experts, down_n, down_k) = down_weights.dims3()?;
+    let (topk_tokens, top_k) = topk_ids.dims2()?;
+    let (topk_w_tokens, topk_w_k) = topk_weights.dims2()?;
+    if !input.is_contiguous()
+        || !topk_ids.is_contiguous()
+        || !topk_weights.is_contiguous()
+        || !gate_up_weights.is_contiguous()
+        || !down_weights.is_contiguous()
+    {
+        candle_core::bail!("flashinfer fused moe expects contiguous tensors");
+    }
+    if topk_tokens != num_tokens || topk_w_tokens != num_tokens || topk_w_k != top_k {
+        candle_core::bail!("flashinfer fused moe: invalid topk tensors");
+    }
+    if gate_up_k != hidden_size || down_experts != num_experts || down_n != hidden_size {
+        candle_core::bail!("flashinfer fused moe: invalid tensor shapes for moe weights");
+    }
+    if gate_up_n % 2 != 0 {
+        candle_core::bail!("flashinfer fused moe: gate_up second dim must be even");
+    }
+    if down_k * 2 != gate_up_n {
+        candle_core::bail!("flashinfer fused moe: gate_up/down intermediate dims mismatch");
+    }
+    let input_dtype = cuda_dtype_code(input.dtype())?;
+    let weight_dtype = cuda_dtype_code(gate_up_weights.dtype())?;
+    if input_dtype != weight_dtype {
+        candle_core::bail!("flashinfer fused moe: input and weight dtype must match");
+    }
+    let dev = input.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    let output = Tensor::zeros((num_tokens, hidden_size), input.dtype(), input.device())?;
+    let status = unsafe {
+        ffi::flashinfer_fused_moe_bf16(
+            cuda_ptr_f16bf16(input)?,
+            cuda_ptr_topk_ids_i32(topk_ids)?,
+            cuda_ptr_f32(topk_weights)?,
+            cuda_ptr_f16bf16(gate_up_weights)?,
+            cuda_ptr_f16bf16(down_weights)?,
+            cuda_mut_ptr_f16bf16(&output)?,
+            num_tokens as i32,
+            hidden_size as i32,
+            down_k as i32,
+            num_experts as i32,
+            top_k as i32,
+            input_dtype,
+            weight_dtype,
+            stream,
+        )
+    };
+    if status != 0 {
+        candle_core::bail!("flashinfer fused moe bf16 kernel failed with status {status}");
+    }
+    Ok(output)
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+pub fn flashinfer_fused_moe_fp8(
+    input: &Tensor,
+    topk_ids: &Tensor,
+    topk_weights: &Tensor,
+    gate_up_weights: &Tensor,
+    gate_up_scales: &Tensor,
+    down_weights: &Tensor,
+    down_scales: &Tensor,
+) -> Result<Tensor> {
+    let (num_tokens, hidden_size) = input.dims2()?;
+    let (num_experts, gate_up_n, gate_up_k) = gate_up_weights.dims3()?;
+    let (down_experts, down_n, down_k) = down_weights.dims3()?;
+    let (gate_up_scale_experts, gate_up_scale_n, gate_up_scale_k) = gate_up_scales.dims3()?;
+    let (down_scale_experts, down_scale_n, down_scale_k) = down_scales.dims3()?;
+    let (topk_tokens, top_k) = topk_ids.dims2()?;
+    let (topk_w_tokens, topk_w_k) = topk_weights.dims2()?;
+    if !input.is_contiguous()
+        || !topk_ids.is_contiguous()
+        || !topk_weights.is_contiguous()
+        || !gate_up_weights.is_contiguous()
+        || !gate_up_scales.is_contiguous()
+        || !down_weights.is_contiguous()
+        || !down_scales.is_contiguous()
+    {
+        candle_core::bail!("flashinfer fused moe fp8 expects contiguous tensors");
+    }
+    if gate_up_weights.dtype() != candle_core::DType::U8
+        || down_weights.dtype() != candle_core::DType::U8
+        || gate_up_scales.dtype() != candle_core::DType::F32
+        || down_scales.dtype() != candle_core::DType::F32
+    {
+        candle_core::bail!("flashinfer fused moe fp8 expects u8 weights and f32 scales");
+    }
+    if topk_tokens != num_tokens || topk_w_tokens != num_tokens || topk_w_k != top_k {
+        candle_core::bail!("flashinfer fused moe fp8: invalid topk tensors");
+    }
+    if gate_up_k != hidden_size || down_experts != num_experts || down_n != hidden_size {
+        candle_core::bail!("flashinfer fused moe fp8: invalid tensor shapes for moe weights");
+    }
+    if gate_up_n % 2 != 0 || down_k * 2 != gate_up_n {
+        candle_core::bail!("flashinfer fused moe fp8: gate_up/down intermediate dims mismatch");
+    }
+    if gate_up_scale_experts != num_experts || down_scale_experts != num_experts {
+        candle_core::bail!("flashinfer fused moe fp8: scale tensor expert dim mismatch");
+    }
+    if hidden_size % 128 != 0 || down_k % 128 != 0 {
+        candle_core::bail!(
+            "flashinfer fused moe fp8: hidden/intermediate dims must be divisible by 128"
+        );
+    }
+    let expected_gate_up_scale_n = gate_up_n / 128;
+    let expected_gate_up_scale_k = hidden_size / 128;
+    let expected_down_scale_n = hidden_size / 128;
+    let expected_down_scale_k = down_k / 128;
+    if gate_up_scale_n != expected_gate_up_scale_n
+        || gate_up_scale_k != expected_gate_up_scale_k
+        || down_scale_n != expected_down_scale_n
+        || down_scale_k != expected_down_scale_k
+    {
+        candle_core::bail!(
+            "flashinfer fused moe fp8: invalid scale tensor shapes, expected gate_up=[{num_experts}, {expected_gate_up_scale_n}, {expected_gate_up_scale_k}], down=[{num_experts}, {expected_down_scale_n}, {expected_down_scale_k}]"
+        );
+    }
+    let input_dtype = cuda_dtype_code(input.dtype())?;
+    let dev = input.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    let output = Tensor::zeros(
+        (num_tokens, hidden_size),
+        candle_core::DType::BF16,
+        input.device(),
+    )?;
+    let status = unsafe {
+        ffi::flashinfer_fused_moe_fp8(
+            cuda_ptr_f16bf16(input)?,
+            cuda_ptr_topk_ids_i32(topk_ids)?,
+            cuda_ptr_f32(topk_weights)?,
+            cuda_ptr_u8(gate_up_weights)?,
+            cuda_ptr_f32(gate_up_scales)?,
+            cuda_ptr_u8(down_weights)?,
+            cuda_ptr_f32(down_scales)?,
+            cuda_mut_ptr_f16bf16(&output)?,
+            num_tokens as i32,
+            hidden_size as i32,
+            down_k as i32,
+            num_experts as i32,
+            top_k as i32,
+            input_dtype,
+            stream,
+        )
+    };
+    if status != 0 {
+        candle_core::bail!("flashinfer fused moe fp8 kernel failed with status {status}");
+    }
+    Ok(output)
+}
 
 #[cfg(feature = "cuda")]
 pub fn moe_gemm(

@@ -73,11 +73,11 @@ thread_local! {
 }
 
 fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64)
+    matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64)
 }
 
 fn is_supported_flashinfer_decode_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64)
+    matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64)
 }
 
 fn is_supported_flashinfer_decode_shape(group_size: usize, head_dim: usize) -> bool {
@@ -811,7 +811,7 @@ impl FlashInferPrefill {
         let group_size = self.num_qo_heads / self.num_kv_heads;
         if !is_supported_flashinfer_gqa_group_size(group_size) {
             candle::bail!(
-                "flashinfer prefill only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                "flashinfer prefill only supports gqa group_size in [1,2,3,4,6,8,16,32,64], got {}",
                 group_size
             );
         }

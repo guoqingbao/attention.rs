@@ -356,7 +356,7 @@ impl PagedAttention {
             let (_, key_value_heads, _, _) = key.shape().dims4()?;
             let group_size = attention_heads / key_value_heads;
             let flashinfer_prefill_group_supported =
-                matches!(group_size, 1 | 2 | 3 | 4 | 8 | 16 | 32 | 64);
+                matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64);
             let flashinfer_decode_group_supported =
                 flashinfer_prefill_group_supported && !(group_size == 64 && head_size > 128);
             let flashinfer_group_supported = if input_metadata.is_prefill {

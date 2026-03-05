@@ -226,7 +226,7 @@ static inline void FillSM90RaggedParams(
 #ifdef USE_FLASHINFER
 static inline bool IsSupportedDecodeGroupSize(uint32_t group_size) {
     return group_size == 1 || group_size == 2 || group_size == 3 || group_size == 4 ||
-           group_size == 8 || group_size == 16 || group_size == 32 || group_size == 64;
+           group_size == 6 || group_size == 8 || group_size == 16 || group_size == 32 || group_size == 64;
 }
 
 static inline bool IsSupportedDecodeHeadDimForGroupSize(uint32_t group_size, uint32_t head_dim) {
@@ -457,7 +457,7 @@ void flashinfer_decode_plan_wrapper(
     uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
     if (!IsSupportedDecodeGroupSize(group_size)) {
         fprintf(stderr,
-                "[flashinfer][decode_plan] unsupported group_size=%u (supported: 1,2,3,4,8,16,32,64)\n",
+                "[flashinfer][decode_plan] unsupported group_size=%u (supported: 1,2,3,4,6,8,16,32,64)\n",
                 group_size);
         return;
     }
@@ -600,7 +600,7 @@ void flashinfer_decode_run_wrapper(
     uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
     if (!IsSupportedDecodeGroupSize(group_size)) {
         fprintf(stderr,
-                "[flashinfer][decode_run] unsupported group_size=%u (supported: 1,2,3,4,8,16,32,64)\n",
+                "[flashinfer][decode_run] unsupported group_size=%u (supported: 1,2,3,4,6,8,16,32,64)\n",
                 group_size);
         return;
     }
