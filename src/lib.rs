@@ -232,7 +232,7 @@ impl PagedAttention {
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
         if self.sliding_window.is_some() {
-            candle_flash_attn::flash_attn_varlen_windowed_softcap(
+            flashattn_rs::flash_attn_varlen_windowed_softcap(
                 query,
                 key,
                 value,
@@ -247,7 +247,7 @@ impl PagedAttention {
                 Some(0),
             )
         } else {
-            candle_flash_attn::flash_attn_varlen_softcap(
+            flashattn_rs::flash_attn_varlen_softcap(
                 query,
                 key,
                 value,
@@ -303,8 +303,20 @@ impl PagedAttention {
             return if input_metadata.block_tables.is_none() {
                 // prefill without kvcache
                 self.flash_var_len(&query, &key, &value, input_metadata, softcapping)
+            } else if self.sliding_window.is_none() {
+                flashattn_rs::flash_attn_with_kvcache_full(
+                    &query,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    input_metadata.context_lens.as_ref().unwrap(),
+                    input_metadata.block_tables.as_ref().unwrap(),
+                    input_metadata.cu_seqlens_q.as_ref(),
+                    Some(input_metadata.max_seqlen_q),
+                    self.scale as f32,
+                    true,
+                )
             } else {
-                // prefill with kvcache
+                // Sliding-window prefill still needs the windowed varlen path.
                 self.flash_var_len(
                     &query,
                     key_cache.as_ref().unwrap(),
@@ -319,17 +331,27 @@ impl PagedAttention {
         {
             let block_tables = input_metadata.block_tables.as_ref().unwrap();
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
-            candle_flash_attn::flash_attn_with_kvcache_windowed_softcap(
+
+            flashattn_rs::flash_attn_with_kvcache(
                 &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
                 context_lens,
                 block_tables,
                 self.scale as f32,
-                Some(softcapping.unwrap_or(0.0f64) as f32),
-                self.sliding_window,
-                Some(0),
             )
+
+            // flashattn_rs::flash_attn_with_kvcache_windowed_softcap(
+            //     &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
+            //     key_cache.as_ref().unwrap(),
+            //     value_cache.as_ref().unwrap(),
+            //     context_lens,
+            //     block_tables,
+            //     self.scale as f32,
+            //     Some(softcapping.unwrap_or(0.0f64) as f32),
+            //     self.sliding_window,
+            //     Some(0),
+            // )
         }
         #[cfg(not(feature = "flash-decoding"))]
         candle_core::bail!("Invalid pattern for flash_forward")
