@@ -545,8 +545,17 @@ impl MambaCache {
 
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (gdn_layer_idx, slots, batch_state);
-            candle_core::bail!("Mamba cache updates require building attention-rs with CUDA");
+            let slots_vec = slots.to_vec1::<i64>()?;
+            let conv_dim = self.conv_states[gdn_layer_idx].dim(1)?;
+            let conv_window = self.conv_states[gdn_layer_idx].dim(2)?;
+            for (i, &slot) in slots_vec.iter().enumerate() {
+                let s = slot as usize;
+                let b_slice = batch_state.narrow(0, i, 1)?;
+                let updated = self.conv_states[gdn_layer_idx]
+                    .slice_assign(&[s..s + 1, 0..conv_dim, 0..conv_window], &b_slice)?;
+                self.conv_states[gdn_layer_idx] = updated;
+            }
+            Ok(())
         }
     }
 
@@ -580,8 +589,18 @@ impl MambaCache {
 
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (gdn_layer_idx, slots, batch_state);
-            candle_core::bail!("Mamba cache updates require building attention-rs with CUDA");
+            let slots_vec = slots.to_vec1::<i64>()?;
+            let rec_heads = self.recurrent_states[gdn_layer_idx].dim(1)?;
+            let rec_h = self.recurrent_states[gdn_layer_idx].dim(2)?;
+            let rec_w = self.recurrent_states[gdn_layer_idx].dim(3)?;
+            for (i, &slot) in slots_vec.iter().enumerate() {
+                let s = slot as usize;
+                let b_slice = batch_state.narrow(0, i, 1)?;
+                let updated = self.recurrent_states[gdn_layer_idx]
+                    .slice_assign(&[s..s + 1, 0..rec_heads, 0..rec_h, 0..rec_w], &b_slice)?;
+                self.recurrent_states[gdn_layer_idx] = updated;
+            }
+            Ok(())
         }
     }
 

@@ -987,21 +987,28 @@ pub fn gated_delta_rule_decode_slots(
             let slots_vec = slots.to_vec1::<i64>()?;
             let mut outs = Vec::with_capacity(slots_vec.len());
             for (b, &slot) in slots_vec.iter().enumerate() {
-                let mut state_b = state.i(slot as usize)?;
-                let q_b = q.i(b)?;
-                let k_b = k.i(b)?;
-                let v_b = v.i(b)?;
-                let g_b = g.i(b)?;
-                let beta_b = beta.i(b)?;
+                let q_b = q.i(b)?; // [heads, k_dim]
+                let k_b = k.i(b)?; // [heads, k_dim]
+                let v_b = v.i(b)?; // [heads, v_dim]
+                let g_b = g.i(b)?; // [heads]
+                let beta_b = beta.i(b)?; // [heads]
+                let mut state_b = state.i(slot as usize)?; // [heads, k_dim, v_dim]
+
+                // gated_delta_rule_recurrence_naive expects [bh, seq, dim] for q,k,v
+                // and [bh, seq] for g,beta
+                // and [bh, k_dim, v_dim] for state
+                // Here, bh is heads, seq is 1.
                 let out_b = gated_delta_rule_recurrence_naive(
-                    &q_b.unsqueeze(0)?,
-                    &k_b.unsqueeze(0)?,
-                    &v_b.unsqueeze(0)?,
-                    &g_b.unsqueeze(0)?,
-                    &beta_b.unsqueeze(0)?,
-                    &mut state_b,
-                )?
-                .squeeze(0)?;
+                    &q_b.unsqueeze(1)?,    // [heads, 1, k_dim]
+                    &k_b.unsqueeze(1)?,    // [heads, 1, k_dim]
+                    &v_b.unsqueeze(1)?,    // [heads, 1, v_dim]
+                    &g_b.unsqueeze(1)?,    // [heads, 1]
+                    &beta_b.unsqueeze(1)?, // [heads, 1]
+                    &mut state_b,          // [heads, k_dim, v_dim]
+                )? // returns [heads, 1, v_dim]
+                .squeeze(1)?; // [heads, v_dim]
+
+                // Update the state for the specific slot
                 *state = state.slice_assign(
                     &[
                         slot as usize..slot as usize + 1,
@@ -1009,7 +1016,7 @@ pub fn gated_delta_rule_decode_slots(
                         0..state.dim(2)?,
                         0..state.dim(3)?,
                     ],
-                    &state_b.unsqueeze(0)?,
+                    &state_b.unsqueeze(0)?, // state_b is [heads, k_dim, v_dim], unsqueeze to [1, heads, k_dim, v_dim]
                 )?;
                 outs.push(out_b);
             }
@@ -1216,10 +1223,75 @@ pub fn gated_delta_rule_recurrence_varlen(
             }
             Ok(out)
         }
-        _ => {
-            candle_core::bail!("gated_delta_rule_recurrence_varlen requires CUDA device")
-        }
+        _ => gated_delta_rule_recurrence_varlen_naive(q, k, v, g, beta, state, slots, cu_seqlens),
     }
+}
+
+fn gated_delta_rule_recurrence_varlen_naive(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    cu_seqlens: &Tensor,
+) -> Result<Tensor> {
+    let cu = cu_seqlens.to_vec1::<u32>()?;
+    let slots_vec = slots.to_vec1::<i64>()?;
+    let batch = slots_vec.len();
+    if cu.len() != batch + 1 {
+        candle_core::bail!(
+            "gated_delta_rule_recurrence_varlen_naive: cu_seqlens length {} does not match batch size {}",
+            cu.len(),
+            batch
+        );
+    }
+
+    let total_tokens = q.dim(0)?;
+    let num_heads_q = q.dim(1)?;
+    let v_dim = v.dim(2)?;
+    let mut outputs = Vec::with_capacity(batch);
+
+    for b in 0..batch {
+        let start = cu[b] as usize;
+        let end = cu[b + 1] as usize;
+        if start >= end {
+            continue;
+        }
+        let seq_len = end - start;
+
+        let q_b = q.narrow(0, start, seq_len)?.transpose(0, 1)?; // [num_heads, seq_len, k_dim]
+        let k_b = k.narrow(0, start, seq_len)?.transpose(0, 1)?;
+        let v_b = v.narrow(0, start, seq_len)?.transpose(0, 1)?;
+        let g_b = g.narrow(0, start, seq_len)?.transpose(0, 1)?;
+        let beta_b = beta.narrow(0, start, seq_len)?.transpose(0, 1)?;
+
+        let slot = slots_vec[b] as usize;
+        let mut state_b = state.i(slot)?; // [num_heads, k_dim, v_dim]
+
+        let out_b =
+            gated_delta_rule_recurrence_naive(&q_b, &k_b, &v_b, &g_b, &beta_b, &mut state_b)?; // [num_heads, seq_len, v_dim]
+
+        *state = state.slice_assign(
+            &[
+                slot..slot + 1,
+                0..state.dim(1)?,
+                0..state.dim(2)?,
+                0..state.dim(3)?,
+            ],
+            &state_b.unsqueeze(0)?,
+        )?;
+
+        outputs.push(out_b.transpose(0, 1)?);
+    }
+
+    if outputs.is_empty() {
+        return Tensor::zeros((total_tokens, num_heads_q, v_dim), q.dtype(), q.device());
+    }
+
+    let refs = outputs.iter().collect::<Vec<_>>();
+    Tensor::cat(&refs, 0)
 }
 
 fn gated_delta_rule_recurrence_naive(
@@ -1233,7 +1305,36 @@ fn gated_delta_rule_recurrence_naive(
     let out_dtype = q.dtype();
     let state_dtype = state.dtype();
 
-    let (_bh, seq_len, _k_dim) = q.dims3()?;
+    let (bh, seq_len, k_dim) = q.dims3()?;
+    let (bh_k, seq_len_k, k_dim_k) = k.dims3()?;
+    let (bh_v, seq_len_v, v_dim) = v.dims3()?;
+    let (bh_g, seq_len_g) = g.dims2()?;
+    let (bh_b, seq_len_b) = beta.dims2()?;
+    let (bh_s, k_dim_s, v_dim_s) = state.dims3()?;
+    if bh != bh_k
+        || bh != bh_v
+        || bh != bh_g
+        || bh != bh_b
+        || bh != bh_s
+        || seq_len != seq_len_k
+        || seq_len != seq_len_v
+        || seq_len != seq_len_g
+        || seq_len != seq_len_b
+        || k_dim != k_dim_k
+        || k_dim != k_dim_s
+        || v_dim != v_dim_s
+    {
+        candle_core::bail!(
+            "gated_delta_rule_recurrence_naive shape mismatch: q={:?}, k={:?}, v={:?}, g={:?}, beta={:?}, state={:?}",
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            g.shape(),
+            beta.shape(),
+            state.shape(),
+        );
+    }
+
     let q = q.to_dtype(DType::F32)?;
     let k = k.to_dtype(DType::F32)?;
     let v = v.to_dtype(DType::F32)?;
@@ -1254,7 +1355,9 @@ fn gated_delta_rule_recurrence_naive(
 
         let k_exp = k_t.unsqueeze(2)?; // [bh, k_dim, 1]
         let kv_mem = s.broadcast_mul(&k_exp)?.sum(1)?; // [bh, v_dim]
-        let delta = (v_t - kv_mem)?.broadcast_mul(&beta_t.unsqueeze(1)?)?; // [bh, v_dim]
+        let delta = v_t
+            .broadcast_sub(&kv_mem)?
+            .broadcast_mul(&beta_t.unsqueeze(1)?)?; // [bh, v_dim]
 
         let outer = k_exp.broadcast_mul(&delta.unsqueeze(1)?)?; // [bh, k_dim, v_dim]
         s = (s + outer)?;
@@ -1266,6 +1369,99 @@ fn gated_delta_rule_recurrence_naive(
     *state = s.to_dtype(state_dtype)?;
     let output_refs = outputs.iter().collect::<Vec<_>>();
     Tensor::cat(&output_refs, 1)?.to_dtype(out_dtype)
+}
+
+fn gated_delta_rule_decode_slots_naive(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+) -> Result<Tensor> {
+    let (batch, heads, k_dim) = q.dims3()?;
+    let (batch_k, heads_k, k_dim_k) = k.dims3()?;
+    let (batch_v, heads_v, v_dim) = v.dims3()?;
+    let (batch_g, heads_g) = g.dims2()?;
+    let (batch_b, heads_b) = beta.dims2()?;
+    let (state_batch, state_heads, state_k_dim, state_v_dim) = state.dims4()?;
+    if batch != batch_k
+        || batch != batch_v
+        || batch != batch_g
+        || batch != batch_b
+        || heads != heads_k
+        || heads != heads_v
+        || heads != heads_g
+        || heads != heads_b
+        || k_dim != k_dim_k
+        || heads != state_heads
+        || k_dim != state_k_dim
+        || v_dim != state_v_dim
+    {
+        candle_core::bail!(
+            "gated_delta_rule_decode_slots_naive shape mismatch: q={:?}, k={:?}, v={:?}, g={:?}, beta={:?}, state={:?}",
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            g.shape(),
+            beta.shape(),
+            state.shape(),
+        );
+    }
+    if slots.dtype() != DType::I64 || slots.dim(0)? != batch {
+        candle_core::bail!(
+            "gated_delta_rule_decode_slots_naive expects slots [batch] I64, got {:?} {:?}",
+            slots.shape(),
+            slots.dtype()
+        );
+    }
+    if batch > state_batch {
+        candle_core::bail!(
+            "gated_delta_rule_decode_slots_naive batch {} exceeds state capacity {}",
+            batch,
+            state_batch
+        );
+    }
+
+    let out_dtype = q.dtype();
+    let state_dtype = state.dtype();
+    let slots_vec = slots.to_vec1::<i64>()?;
+    let batch_state = state.index_select(slots, 0)?.to_dtype(DType::F32)?;
+    let q = q.to_dtype(DType::F32)?;
+    let k = k.to_dtype(DType::F32)?;
+    let v = v.to_dtype(DType::F32)?;
+    let g = g.to_dtype(DType::F32)?;
+    let beta = beta.to_dtype(DType::F32)?;
+
+    let decay = g.exp()?.unsqueeze(2)?.unsqueeze(3)?;
+    let mut updated_state = batch_state.broadcast_mul(&decay)?;
+    let k_exp = k.unsqueeze(3)?;
+    let kv_mem = updated_state.broadcast_mul(&k_exp)?.sum(2)?;
+    let delta = v
+        .broadcast_sub(&kv_mem)?
+        .broadcast_mul(&beta.unsqueeze(2)?)?;
+    let outer = k_exp.broadcast_mul(&delta.unsqueeze(2)?)?;
+    updated_state = (updated_state + outer)?;
+    let output = updated_state
+        .broadcast_mul(&q.unsqueeze(3)?)?
+        .sum(2)?
+        .to_dtype(out_dtype)?;
+
+    let updated_state = updated_state.to_dtype(state_dtype)?;
+    for (i, &slot) in slots_vec.iter().enumerate() {
+        *state = state.slice_assign(
+            &[
+                slot as usize..slot as usize + 1,
+                0..heads,
+                0..k_dim,
+                0..v_dim,
+            ],
+            &updated_state.narrow(0, i, 1)?,
+        )?;
+    }
+
+    Ok(output)
 }
 
 fn causal_conv1d_fwd_naive_with_state(
@@ -1341,13 +1537,21 @@ pub fn causal_conv1d_naive(
     bias: Option<&Tensor>,
     activation_silu: bool,
 ) -> Result<Tensor> {
+    let out_dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let weight = weight.to_dtype(DType::F32)?;
+    let bias = match bias {
+        Some(b) => Some(b.to_dtype(DType::F32)?),
+        None => None,
+    };
+
     let weight_2d = weight.squeeze(1)?; // [d_conv, kernel_size]
     let kernel_size = weight_2d.dim(1)?;
     let d_conv = weight_2d.dim(0)?;
     let seq_len = x.dim(0)?;
 
     let padding = Tensor::zeros((kernel_size - 1, d_conv), x.dtype(), x.device())?;
-    let x_padded = Tensor::cat(&[&padding, x], 0)?;
+    let x_padded = Tensor::cat(&[&padding, &x], 0)?;
 
     let mut slices = Vec::with_capacity(kernel_size);
     for k in 0..kernel_size {
@@ -1362,14 +1566,14 @@ pub fn causal_conv1d_naive(
     }
 
     if let Some(bias) = bias {
-        output = output.broadcast_add(bias)?;
+        output = output.broadcast_add(&bias)?;
     }
 
     if activation_silu {
         output = candle_nn::ops::silu(&output)?;
     }
 
-    Ok(output)
+    output.to_dtype(out_dtype)
 }
 
 /// Naive causal conv1d update for decode (single step).
@@ -1380,29 +1584,40 @@ pub fn causal_conv1d_update_naive(
     conv_state: &mut Tensor,
     activation_silu: bool,
 ) -> Result<Tensor> {
+    let out_dtype = x.dtype();
+    let state_dtype = conv_state.dtype();
+
+    let x = x.to_dtype(DType::F32)?;
+    let weight = weight.to_dtype(DType::F32)?;
+    let bias = match bias {
+        Some(b) => Some(b.to_dtype(DType::F32)?),
+        None => None,
+    };
+    let state_f32 = conv_state.to_dtype(DType::F32)?;
+
     // x: [batch, d_conv], conv_state: [batch, d_conv, kernel_size - 1]
     let weight_2d = weight.squeeze(1)?; // [d_conv, kernel_size]
     let kernel_size = weight_2d.dim(1)?;
 
     let x_expanded = x.unsqueeze(2)?; // [batch, d_conv, 1]
-    let prev_state = conv_state.clone();
+    let prev_state = state_f32;
     let full_window = Tensor::cat(&[&prev_state, &x_expanded], 2)?; // [batch, d_conv, kernel_size]
     let next_state = full_window.narrow(2, 1, kernel_size - 1)?;
-    *conv_state = next_state;
+    *conv_state = next_state.to_dtype(state_dtype)?;
 
     let mut output = full_window
         .broadcast_mul(&weight_2d.unsqueeze(0)?)?
         .sum(2)?; // [batch, d_conv]
 
     if let Some(bias) = bias {
-        output = output.broadcast_add(bias)?;
+        output = output.broadcast_add(&bias)?;
     }
 
     if activation_silu {
-        candle_nn::ops::silu(&output)
-    } else {
-        Ok(output)
+        output = candle_nn::ops::silu(&output)?;
     }
+
+    output.to_dtype(out_dtype)
 }
 
 /// Naive fused GDN gating.
@@ -1412,13 +1627,19 @@ pub fn fused_gdn_gating_naive(
     b: &Tensor,
     dt_bias: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
+    let out_dtype = a.dtype();
+    let a_f32 = a.to_dtype(DType::F32)?;
+    let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
+    let a_log_f32 = a_log.to_dtype(DType::F32)?;
+    let b_f32 = b.to_dtype(DType::F32)?;
+
     // g = -exp(A_log) * softplus(a + dt_bias)
-    let a_dt = a.broadcast_add(dt_bias)?;
-    let g = softplus(&a_dt)?.broadcast_mul(&a_log.exp()?.neg()?)?;
+    let a_dt = a_f32.broadcast_add(&dt_bias_f32)?;
+    let g = softplus(&a_dt)?.broadcast_mul(&a_log_f32.exp()?.neg()?)?;
 
     // beta = sigmoid(b)
-    let beta = candle_nn::ops::sigmoid(b)?;
-    Ok((g, beta))
+    let beta = candle_nn::ops::sigmoid(&b_f32)?;
+    Ok((g.to_dtype(out_dtype)?, beta.to_dtype(out_dtype)?))
 }
 
 pub fn gated_rmsnorm_silu_mul_naive(
@@ -1587,35 +1808,5 @@ pub fn gated_delta_rule_decode_slots(
     state: &mut Tensor,
     slots: &Tensor,
 ) -> Result<Tensor> {
-    let slots_vec = slots.to_vec1::<i64>()?;
-    let mut outs = Vec::with_capacity(slots_vec.len());
-    for (b, &slot) in slots_vec.iter().enumerate() {
-        let mut state_b = state.i(slot as usize)?;
-        let q_b = q.i(b)?;
-        let k_b = k.i(b)?;
-        let v_b = v.i(b)?;
-        let g_b = g.i(b)?;
-        let beta_b = beta.i(b)?;
-        let out_b = gated_delta_rule_recurrence_naive(
-            &q_b.unsqueeze(0)?,
-            &k_b.unsqueeze(0)?,
-            &v_b.unsqueeze(0)?,
-            &g_b.unsqueeze(0)?,
-            &beta_b.unsqueeze(0)?,
-            &mut state_b,
-        )?
-        .squeeze(0)?;
-        *state = state.slice_assign(
-            &[
-                slot as usize..slot as usize + 1,
-                0..state.dim(1)?,
-                0..state.dim(2)?,
-                0..state.dim(3)?,
-            ],
-            &state_b.unsqueeze(0)?,
-        )?;
-        outs.push(out_b);
-    }
-    let refs = outs.iter().collect::<Vec<_>>();
-    Tensor::stack(&refs, 0)
+    gated_delta_rule_decode_slots_naive(q, k, v, g, beta, state, slots)
 }
