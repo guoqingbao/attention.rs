@@ -1371,6 +1371,7 @@ fn gated_delta_rule_recurrence_naive(
     Tensor::cat(&output_refs, 1)?.to_dtype(out_dtype)
 }
 
+#[cfg(not(feature = "cuda"))]
 fn gated_delta_rule_decode_slots_naive(
     q: &Tensor,
     k: &Tensor,
