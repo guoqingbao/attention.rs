@@ -1069,7 +1069,9 @@ pub fn call_update_scales_per_head(
 /// * `k_bh` - batch * num_kv_heads
 /// * `seq_len` - sequence length
 /// * `d` - head_dim
+/// * `rotary_dim` - number of channels to rotate
 /// * `is_interleaved` - if true, use interleaved RoPE layout
+/// * `is_token_major` - if true, Q/K layout is [tokens, heads, dim]
 #[allow(clippy::too_many_arguments)]
 pub fn call_fused_rope(
     device: &Device,
@@ -1090,7 +1092,9 @@ pub fn call_fused_rope(
     k_bh: u32,
     seq_len: u32,
     d: u32,
+    rotary_dim: u32,
     is_interleaved: bool,
+    is_token_major: bool,
 ) -> Result<(), MetalKernelError> {
     let type_name = match ty {
         DType::F32 => "f32",
@@ -1126,13 +1130,15 @@ pub fn call_fused_rope(
             q_bh,
             k_bh,
             seq_len,
-            d
+            d,
+            rotary_dim,
+            if is_token_major { 1u32 } else { 0u32 }
         )
     );
 
     // Calculate total number of pairs
-    let half_d = d / 2;
-    let total_pairs = ((q_bh + k_bh) * seq_len * half_d) as u64;
+    let rotary_pairs = rotary_dim / 2;
+    let total_pairs = ((q_bh + k_bh) * seq_len * rotary_pairs) as u64;
 
     // Dispatch with 256 threads per threadgroup
     let threads_per_threadgroup = MTLSize {

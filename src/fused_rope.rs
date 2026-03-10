@@ -12,7 +12,6 @@ use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
-#[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 enum RopeLayout {
     BatchMajor {
@@ -29,7 +28,6 @@ enum RopeLayout {
     },
 }
 
-#[cfg(feature = "cuda")]
 impl RopeLayout {
     fn positions_len(self) -> usize {
         match self {
@@ -37,9 +35,40 @@ impl RopeLayout {
             Self::TokenMajor { num_tokens, .. } => num_tokens as usize,
         }
     }
+
+    fn q_bh(self) -> u32 {
+        match self {
+            Self::BatchMajor { q_bh, .. } => q_bh,
+            Self::TokenMajor { q_heads, .. } => q_heads,
+        }
+    }
+
+    fn k_bh(self) -> u32 {
+        match self {
+            Self::BatchMajor { k_bh, .. } => k_bh,
+            Self::TokenMajor { k_heads, .. } => k_heads,
+        }
+    }
+
+    fn seq_len(self) -> u32 {
+        match self {
+            Self::BatchMajor { seq_len, .. } => seq_len,
+            Self::TokenMajor { num_tokens, .. } => num_tokens,
+        }
+    }
+
+    fn d(self) -> u32 {
+        match self {
+            Self::BatchMajor { d, .. } => d,
+            Self::TokenMajor { d, .. } => d,
+        }
+    }
+
+    fn is_token_major(self) -> bool {
+        matches!(self, Self::TokenMajor { .. })
+    }
 }
 
-#[cfg(feature = "cuda")]
 fn resolve_rope_layout(q: &Tensor, k: &Tensor) -> Result<RopeLayout> {
     match (q.dims().len(), k.dims().len()) {
         (4, 4) => {
@@ -82,6 +111,129 @@ fn resolve_rope_layout(q: &Tensor, k: &Tensor) -> Result<RopeLayout> {
             k.shape()
         ),
     }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn launch_fused_rope_metal(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &Tensor,
+    is_interleaved: bool,
+    rotary_dim: usize,
+) -> Result<()> {
+    use candle_core::backend::BackendStorage;
+
+    let layout = resolve_rope_layout(q, k)?;
+    let expected_positions_len = layout.positions_len();
+    let pos_shape = positions.dims();
+    if pos_shape.len() != 1 || pos_shape[0] != expected_positions_len {
+        candle_core::bail!(
+            "positions should be [{}], got {:?}",
+            expected_positions_len,
+            pos_shape
+        );
+    }
+    if rotary_dim == 0 || rotary_dim % 2 != 0 {
+        candle_core::bail!(
+            "rotary_dim must be an even positive integer, got {}",
+            rotary_dim
+        );
+    }
+    if rotary_dim > layout.d() as usize {
+        candle_core::bail!(
+            "rotary_dim {} exceeds head_dim {} for Q {:?}, K {:?}",
+            rotary_dim,
+            layout.d(),
+            q.shape(),
+            k.shape()
+        );
+    }
+
+    let positions = if positions.dtype() != DType::I64 {
+        positions.to_dtype(DType::I64)?
+    } else {
+        positions.clone()
+    };
+
+    if !q.is_contiguous()
+        || !k.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+        || !positions.is_contiguous()
+    {
+        candle_core::bail!("All tensors (q, k, cos, sin, positions) must be contiguous");
+    }
+
+    let dtype = q.dtype();
+    if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
+        candle_core::bail!(
+            "Q, K, cos, sin must have same dtype, got Q: {:?}, K: {:?}, cos: {:?}, sin: {:?}",
+            q.dtype(),
+            k.dtype(),
+            cos.dtype(),
+            sin.dtype()
+        );
+    }
+
+    let (q_storage, q_layout) = q.storage_and_layout();
+    let (k_storage, k_layout) = k.storage_and_layout();
+    let (cos_storage, cos_layout) = cos.storage_and_layout();
+    let (sin_storage, sin_layout) = sin.storage_and_layout();
+    let (pos_storage, pos_layout) = positions.storage_and_layout();
+
+    let q_metal = match &*q_storage {
+        candle_core::Storage::Metal(s) => s,
+        _ => candle_core::bail!("Q must be on Metal device"),
+    };
+    let k_metal = match &*k_storage {
+        candle_core::Storage::Metal(s) => s,
+        _ => candle_core::bail!("K must be on Metal device"),
+    };
+    let cos_metal = match &*cos_storage {
+        candle_core::Storage::Metal(s) => s,
+        _ => candle_core::bail!("cos must be on Metal device"),
+    };
+    let sin_metal = match &*sin_storage {
+        candle_core::Storage::Metal(s) => s,
+        _ => candle_core::bail!("sin must be on Metal device"),
+    };
+    let pos_metal = match &*pos_storage {
+        candle_core::Storage::Metal(s) => s,
+        _ => candle_core::bail!("positions must be on Metal device"),
+    };
+
+    let device = q_metal.device();
+    let command_buffer = device.command_buffer()?;
+    let kernels = metal_kernels::Kernels::default();
+
+    metal_kernels::call_fused_rope(
+        device.device(),
+        &*command_buffer,
+        kernels,
+        dtype,
+        q_metal.buffer(),
+        q_layout.start_offset() * dtype.size_in_bytes(),
+        k_metal.buffer(),
+        k_layout.start_offset() * dtype.size_in_bytes(),
+        cos_metal.buffer(),
+        cos_layout.start_offset() * dtype.size_in_bytes(),
+        sin_metal.buffer(),
+        sin_layout.start_offset() * dtype.size_in_bytes(),
+        pos_metal.buffer(),
+        pos_layout.start_offset() * std::mem::size_of::<i64>(),
+        layout.q_bh(),
+        layout.k_bh(),
+        layout.seq_len(),
+        layout.d(),
+        rotary_dim as u32,
+        is_interleaved,
+        layout.is_token_major(),
+    )
+    .map_err(|e| candle_core::Error::Msg(format!("Metal fused_rope error: {:?}", e)))?;
+
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -741,107 +893,31 @@ impl FusedRope {
         positions: &Tensor,
         is_interleaved: bool,
     ) -> Result<()> {
-        use candle_core::backend::BackendStorage;
-
-        let (b, q_h, seq_len, d) = q.dims4()?;
-        let (kb, k_h, k_seq_len, kd) = k.dims4()?;
-
-        if b != kb || seq_len != k_seq_len || d != kd {
-            candle_core::bail!(
-                "Q and K batch/seq_len/head_dim must match, got Q: {:?}, K: {:?}",
-                q.shape(),
-                k.shape()
-            );
-        }
-
-        // Check contiguity - bail if not contiguous (avoid hidden allocations)
-        if !q.is_contiguous() || !k.is_contiguous() || !cos.is_contiguous() || !sin.is_contiguous()
-        {
-            candle_core::bail!("All tensors (q, k, cos, sin) must be contiguous");
-        }
-
-        let positions = if positions.dtype() != DType::I64 {
-            positions.to_dtype(DType::I64)?
-        } else {
-            positions.clone()
-        };
-        if !positions.is_contiguous() {
-            candle_core::bail!("positions must be contiguous");
-        }
-
-        let dtype = q.dtype();
-        if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
-            candle_core::bail!("Q, K, cos, sin must have same dtype");
-        }
-
-        let q_bh = (b * q_h) as u32;
-        let k_bh = (b * k_h) as u32;
-        let seq_len_u32 = seq_len as u32;
-        let d_u32 = d as u32;
-
-        // Get Metal storage, layout, and device
-        let (q_storage, q_layout) = q.storage_and_layout();
-        let (k_storage, k_layout) = k.storage_and_layout();
-        let (cos_storage, cos_layout) = cos.storage_and_layout();
-        let (sin_storage, sin_layout) = sin.storage_and_layout();
-        let (pos_storage, pos_layout) = positions.storage_and_layout();
-
-        let q_metal = match &*q_storage {
-            candle_core::Storage::Metal(s) => s,
-            _ => candle_core::bail!("Q must be on Metal device"),
-        };
-        let k_metal = match &*k_storage {
-            candle_core::Storage::Metal(s) => s,
-            _ => candle_core::bail!("K must be on Metal device"),
-        };
-        let cos_metal = match &*cos_storage {
-            candle_core::Storage::Metal(s) => s,
-            _ => candle_core::bail!("cos must be on Metal device"),
-        };
-        let sin_metal = match &*sin_storage {
-            candle_core::Storage::Metal(s) => s,
-            _ => candle_core::bail!("sin must be on Metal device"),
-        };
-        let pos_metal = match &*pos_storage {
-            candle_core::Storage::Metal(s) => s,
-            _ => candle_core::bail!("positions must be on Metal device"),
-        };
-
-        #[cfg(feature = "metal")]
-        let device = q_metal.device();
-        #[cfg(feature = "metal")]
-        let command_buffer = device.command_buffer()?;
-        #[cfg(feature = "metal")]
-        let kernels = metal_kernels::Kernels::default();
-
-        #[cfg(feature = "metal")]
-        metal_kernels::call_fused_rope(
-            device.device(),
-            &*command_buffer,
-            kernels,
-            dtype,
-            q_metal.buffer(),
-            q_layout.start_offset() * dtype.size_in_bytes(),
-            k_metal.buffer(),
-            k_layout.start_offset() * dtype.size_in_bytes(),
-            cos_metal.buffer(),
-            cos_layout.start_offset() * dtype.size_in_bytes(),
-            sin_metal.buffer(),
-            sin_layout.start_offset() * dtype.size_in_bytes(),
-            pos_metal.buffer(),
-            pos_layout.start_offset() * std::mem::size_of::<i64>(),
-            q_bh,
-            k_bh,
-            seq_len_u32,
-            d_u32,
+        let layout = resolve_rope_layout(q, k)?;
+        launch_fused_rope_metal(
+            q,
+            k,
+            cos,
+            sin,
+            positions,
             is_interleaved,
+            layout.d() as usize,
         )
-        .map_err(|e| candle_core::Error::Msg(format!("Metal fused_rope error: {:?}", e)))?;
+    }
 
-        // Note: We don't call commit/wait - candle's MetalDevice manages command buffer lifecycle
-        // The command buffer will be committed when candle synchronizes or at the end of the operation
-
-        Ok(())
+    /// Apply fused rotary embedding in-place to only the leading `rotary_dim`
+    /// channels of Q/K tensors on non-CUDA backends.
+    #[cfg(not(feature = "cuda"))]
+    pub fn apply_inplace_partial(
+        q: &Tensor,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        positions: &Tensor,
+        is_interleaved: bool,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        launch_fused_rope_metal(q, k, cos, sin, positions, is_interleaved, rotary_dim)
     }
 
     /// Apply fused rotary embedding (Metal version) - returns new tensors

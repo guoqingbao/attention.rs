@@ -21,6 +21,70 @@
 #include <metal_stdlib>
 using namespace metal;
 
+constant uint ROPE_LAYOUT_BATCH_MAJOR = 0;
+constant uint ROPE_LAYOUT_TOKEN_MAJOR = 1;
+
+inline uint rope_interleaved_pair_index(
+    uint local_idx,
+    uint num_heads,
+    uint seq_len,
+    uint full_pairs,
+    uint rotary_pairs,
+    uint layout,
+    thread uint& t_idx,
+    thread uint& d_idx
+) {
+    if (layout == ROPE_LAYOUT_TOKEN_MAJOR) {
+        const uint pairs_per_token = num_heads * rotary_pairs;
+        t_idx = local_idx / pairs_per_token;
+        const uint rem = local_idx % pairs_per_token;
+        const uint h_idx = rem / rotary_pairs;
+        d_idx = rem % rotary_pairs;
+        return (t_idx * num_heads + h_idx) * full_pairs + d_idx;
+    }
+
+    const uint pairs_per_bh = seq_len * rotary_pairs;
+    const uint bh_idx = local_idx / pairs_per_bh;
+    const uint rem = local_idx % pairs_per_bh;
+    t_idx = rem / rotary_pairs;
+    d_idx = rem % rotary_pairs;
+    return (bh_idx * seq_len + t_idx) * full_pairs + d_idx;
+}
+
+inline void rope_non_interleaved_indices(
+    uint local_idx,
+    uint num_heads,
+    uint seq_len,
+    uint d,
+    uint rotary_pairs,
+    uint layout,
+    thread uint& t_idx,
+    thread uint& i_d,
+    thread uint& i1,
+    thread uint& i2
+) {
+    uint base;
+
+    if (layout == ROPE_LAYOUT_TOKEN_MAJOR) {
+        const uint pairs_per_token = num_heads * rotary_pairs;
+        t_idx = local_idx / pairs_per_token;
+        const uint rem = local_idx % pairs_per_token;
+        const uint h_idx = rem / rotary_pairs;
+        i_d = rem % rotary_pairs;
+        base = (t_idx * num_heads + h_idx) * d;
+    } else {
+        const uint pairs_per_bh = seq_len * rotary_pairs;
+        const uint bh_idx = local_idx / pairs_per_bh;
+        const uint rem = local_idx % pairs_per_bh;
+        t_idx = rem / rotary_pairs;
+        i_d = rem % rotary_pairs;
+        base = (bh_idx * seq_len + t_idx) * d;
+    }
+
+    i1 = base + i_d;
+    i2 = base + rotary_pairs + i_d;
+}
+
 // ============================================================================
 // Interleaved RoPE with Position Selection
 // Adjacent pairs: (x0, x1), (x2, x3), ...
@@ -38,11 +102,14 @@ kernel void fused_rope_i_f32(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_num_pairs = q_bh * seq_len * half_d;
-    const uint k_num_pairs = k_bh * seq_len * half_d;
+    const uint full_pairs = d / 2;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_num_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_num_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_num_pairs + k_num_pairs;
     
     if (idx >= total_pairs) return;
@@ -50,22 +117,32 @@ kernel void fused_rope_i_f32(
     const bool is_q = (idx < q_num_pairs);
     const uint local_idx = is_q ? idx : (idx - q_num_pairs);
     
-    const uint d_idx = local_idx % half_d;
-    const uint t_idx = (local_idx / half_d) % seq_len;
+    uint t_idx;
+    uint d_idx;
+    const uint pair_idx = rope_interleaved_pair_index(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        full_pairs,
+        rotary_pairs,
+        layout,
+        t_idx,
+        d_idx
+    );
     
     const long pos = positions[t_idx];
-    const uint cs_idx = pos * half_d + d_idx;
+    const uint cs_idx = pos * rotary_pairs + d_idx;
     const float c = cos[cs_idx];
     const float s = sin[cs_idx];
     
     device float2* ptr = is_q ? q : k;
-    float2 v = ptr[local_idx];
+    float2 v = ptr[pair_idx];
     
     float2 result;
     result.x = v.x * c - v.y * s;
     result.y = v.x * s + v.y * c;
     
-    ptr[local_idx] = result;
+    ptr[pair_idx] = result;
 }
 
 // F16 interleaved - uses half2 for vectorized pair access, F32 compute for precision
@@ -79,11 +156,14 @@ kernel void fused_rope_i_f16(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_num_pairs = q_bh * seq_len * half_d;
-    const uint k_num_pairs = k_bh * seq_len * half_d;
+    const uint full_pairs = d / 2;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_num_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_num_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_num_pairs + k_num_pairs;
     
     if (idx >= total_pairs) return;
@@ -91,18 +171,28 @@ kernel void fused_rope_i_f16(
     const bool is_q = (idx < q_num_pairs);
     const uint local_idx = is_q ? idx : (idx - q_num_pairs);
     
-    const uint d_idx = local_idx % half_d;
-    const uint t_idx = (local_idx / half_d) % seq_len;
+    uint t_idx;
+    uint d_idx;
+    const uint pair_idx = rope_interleaved_pair_index(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        full_pairs,
+        rotary_pairs,
+        layout,
+        t_idx,
+        d_idx
+    );
     
     const long pos = positions[t_idx];
-    const uint cs_idx = pos * half_d + d_idx;
+    const uint cs_idx = pos * rotary_pairs + d_idx;
     
     // F32 compute for precision (like CUDA)
     const float c = float(cos[cs_idx]);
     const float s = float(sin[cs_idx]);
     
     device half2* ptr = is_q ? q : k;
-    half2 v = ptr[local_idx];
+    half2 v = ptr[pair_idx];
     
     float vx = float(v.x);
     float vy = float(v.y);
@@ -111,7 +201,7 @@ kernel void fused_rope_i_f16(
     result.x = half(vx * c - vy * s);
     result.y = half(vx * s + vy * c);
     
-    ptr[local_idx] = result;
+    ptr[pair_idx] = result;
 }
 
 // BF16 interleaved - uses Bfloat2_ for vectorized pair access, native BF16 compute
@@ -125,11 +215,14 @@ kernel void fused_rope_i_bf16(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_num_pairs = q_bh * seq_len * half_d;
-    const uint k_num_pairs = k_bh * seq_len * half_d;
+    const uint full_pairs = d / 2;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_num_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_num_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_num_pairs + k_num_pairs;
     
     if (idx >= total_pairs) return;
@@ -137,24 +230,34 @@ kernel void fused_rope_i_bf16(
     const bool is_q = (idx < q_num_pairs);
     const uint local_idx = is_q ? idx : (idx - q_num_pairs);
     
-    const uint d_idx = local_idx % half_d;
-    const uint t_idx = (local_idx / half_d) % seq_len;
+    uint t_idx;
+    uint d_idx;
+    const uint pair_idx = rope_interleaved_pair_index(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        full_pairs,
+        rotary_pairs,
+        layout,
+        t_idx,
+        d_idx
+    );
     
     const long pos = positions[t_idx];
-    const uint cs_idx = pos * half_d + d_idx;
+    const uint cs_idx = pos * rotary_pairs + d_idx;
     
     // Native BF16 compute (like CUDA's __hmul, __hsub, __hadd)
     const bfloat16_t c = cos[cs_idx];
     const bfloat16_t s = sin[cs_idx];
     
     device Bfloat2_* ptr = is_q ? q : k;
-    Bfloat2_ v = ptr[local_idx];
+    Bfloat2_ v = ptr[pair_idx];
     
     Bfloat2_ result;
     result.x = v.x * c - v.y * s;
     result.y = v.x * s + v.y * c;
     
-    ptr[local_idx] = result;
+    ptr[pair_idx] = result;
 }
 
 // ============================================================================
@@ -173,11 +276,13 @@ kernel void fused_rope_f32(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_pairs = q_bh * seq_len * half_d;
-    const uint k_pairs = k_bh * seq_len * half_d;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_pairs + k_pairs;
     
     if (idx >= total_pairs) return;
@@ -185,20 +290,27 @@ kernel void fused_rope_f32(
     const bool is_q = (idx < q_pairs);
     const uint local_idx = is_q ? idx : (idx - q_pairs);
     
-    const uint pairs_per_bh = seq_len * half_d;
-    const uint i_bh = local_idx / pairs_per_bh;
-    const uint remainder = local_idx % pairs_per_bh;
-    const uint i_t = remainder / half_d;
-    const uint i_d = remainder % half_d;
+    uint i_t;
+    uint i_d;
+    uint i1;
+    uint i2;
+    rope_non_interleaved_indices(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        d,
+        rotary_pairs,
+        layout,
+        i_t,
+        i_d,
+        i1,
+        i2
+    );
     
     const long pos = positions[i_t];
-    const uint cs_idx = pos * half_d + i_d;
+    const uint cs_idx = pos * rotary_pairs + i_d;
     const float c = cos[cs_idx];
     const float s = sin[cs_idx];
-    
-    const uint td = seq_len * d;
-    const uint i1 = i_bh * td + i_t * d + i_d;
-    const uint i2 = i1 + half_d;
     
     device float* ptr = is_q ? q : k;
     float x1 = ptr[i1];
@@ -220,11 +332,13 @@ kernel void fused_rope_f16(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_pairs = q_bh * seq_len * half_d;
-    const uint k_pairs = k_bh * seq_len * half_d;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_pairs + k_pairs;
     
     if (idx >= total_pairs) return;
@@ -232,22 +346,29 @@ kernel void fused_rope_f16(
     const bool is_q = (idx < q_pairs);
     const uint local_idx = is_q ? idx : (idx - q_pairs);
     
-    const uint pairs_per_bh = seq_len * half_d;
-    const uint i_bh = local_idx / pairs_per_bh;
-    const uint remainder = local_idx % pairs_per_bh;
-    const uint i_t = remainder / half_d;
-    const uint i_d = remainder % half_d;
+    uint i_t;
+    uint i_d;
+    uint i1;
+    uint i2;
+    rope_non_interleaved_indices(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        d,
+        rotary_pairs,
+        layout,
+        i_t,
+        i_d,
+        i1,
+        i2
+    );
     
     const long pos = positions[i_t];
-    const uint cs_idx = pos * half_d + i_d;
+    const uint cs_idx = pos * rotary_pairs + i_d;
     
     // F32 compute for precision
     const float c = float(cos[cs_idx]);
     const float s = float(sin[cs_idx]);
-    
-    const uint td = seq_len * d;
-    const uint i1 = i_bh * td + i_t * d + i_d;
-    const uint i2 = i1 + half_d;
     
     device half* ptr = is_q ? q : k;
     float x1 = float(ptr[i1]);
@@ -269,11 +390,13 @@ kernel void fused_rope_bf16(
     constant uint& k_bh [[buffer(6)]],
     constant uint& seq_len [[buffer(7)]],
     constant uint& d [[buffer(8)]],
+    constant uint& rotary_dim [[buffer(9)]],
+    constant uint& layout [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    const uint half_d = d / 2;
-    const uint q_pairs = q_bh * seq_len * half_d;
-    const uint k_pairs = k_bh * seq_len * half_d;
+    const uint rotary_pairs = rotary_dim / 2;
+    const uint q_pairs = q_bh * seq_len * rotary_pairs;
+    const uint k_pairs = k_bh * seq_len * rotary_pairs;
     const uint total_pairs = q_pairs + k_pairs;
     
     if (idx >= total_pairs) return;
@@ -281,22 +404,29 @@ kernel void fused_rope_bf16(
     const bool is_q = (idx < q_pairs);
     const uint local_idx = is_q ? idx : (idx - q_pairs);
     
-    const uint pairs_per_bh = seq_len * half_d;
-    const uint i_bh = local_idx / pairs_per_bh;
-    const uint remainder = local_idx % pairs_per_bh;
-    const uint i_t = remainder / half_d;
-    const uint i_d = remainder % half_d;
+    uint i_t;
+    uint i_d;
+    uint i1;
+    uint i2;
+    rope_non_interleaved_indices(
+        local_idx,
+        is_q ? q_bh : k_bh,
+        seq_len,
+        d,
+        rotary_pairs,
+        layout,
+        i_t,
+        i_d,
+        i1,
+        i2
+    );
     
     const long pos = positions[i_t];
-    const uint cs_idx = pos * half_d + i_d;
+    const uint cs_idx = pos * rotary_pairs + i_d;
     
     // Native BF16 compute
     const bfloat16_t c = cos[cs_idx];
     const bfloat16_t s = sin[cs_idx];
-    
-    const uint td = seq_len * d;
-    const uint i1 = i_bh * td + i_t * d + i_d;
-    const uint i2 = i1 + half_d;
     
     device bfloat16_t* ptr = is_q ? q : k;
     bfloat16_t x1 = ptr[i1];
