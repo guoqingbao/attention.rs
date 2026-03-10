@@ -12,6 +12,605 @@ use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum RopeLayout {
+    BatchMajor {
+        q_bh: u32,
+        k_bh: u32,
+        seq_len: u32,
+        d: u32,
+    },
+    TokenMajor {
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+    },
+}
+
+#[cfg(feature = "cuda")]
+impl RopeLayout {
+    fn positions_len(self) -> usize {
+        match self {
+            Self::BatchMajor { seq_len, .. } => seq_len as usize,
+            Self::TokenMajor { num_tokens, .. } => num_tokens as usize,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn resolve_rope_layout(q: &Tensor, k: &Tensor) -> Result<RopeLayout> {
+    match (q.dims().len(), k.dims().len()) {
+        (4, 4) => {
+            let (b, q_h, seq_len, d) = q.dims4()?;
+            let (kb, k_h, k_seq_len, kd) = k.dims4()?;
+            if b != kb || seq_len != k_seq_len || d != kd {
+                candle_core::bail!(
+                    "Q and K batch/seq_len/head_dim must match, got Q: {:?}, K: {:?}",
+                    q.shape(),
+                    k.shape()
+                );
+            }
+            Ok(RopeLayout::BatchMajor {
+                q_bh: (b * q_h) as u32,
+                k_bh: (b * k_h) as u32,
+                seq_len: seq_len as u32,
+                d: d as u32,
+            })
+        }
+        (3, 3) => {
+            let (num_tokens, q_heads, d) = q.dims3()?;
+            let (k_num_tokens, k_heads, kd) = k.dims3()?;
+            if num_tokens != k_num_tokens || d != kd {
+                candle_core::bail!(
+                    "Q and K num_tokens/head_dim must match, got Q: {:?}, K: {:?}",
+                    q.shape(),
+                    k.shape()
+                );
+            }
+            Ok(RopeLayout::TokenMajor {
+                num_tokens: num_tokens as u32,
+                q_heads: q_heads as u32,
+                k_heads: k_heads as u32,
+                d: d as u32,
+            })
+        }
+        _ => candle_core::bail!(
+            "FusedRope expects Q and K to be both 4D [batch, heads, seq, dim] or both 3D [tokens, heads, dim], got Q: {:?}, K: {:?}",
+            q.shape(),
+            k.shape()
+        ),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn launch_fused_rope(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &Tensor,
+    is_interleaved: bool,
+) -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::CudaStorageSlice;
+
+    let layout = resolve_rope_layout(q, k)?;
+    let expected_positions_len = layout.positions_len();
+    let pos_shape = positions.dims();
+    if pos_shape.len() != 1 || pos_shape[0] != expected_positions_len {
+        candle_core::bail!(
+            "positions should be [{}], got {:?}",
+            expected_positions_len,
+            pos_shape
+        );
+    }
+
+    let positions = if positions.dtype() != DType::I64 {
+        positions.to_dtype(DType::I64)?
+    } else {
+        positions.clone()
+    };
+
+    if !q.is_contiguous()
+        || !k.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+        || !positions.is_contiguous()
+    {
+        candle_core::bail!("All tensors (q, k, cos, sin, positions) must be contiguous");
+    }
+
+    let dtype = q.dtype();
+    if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
+        candle_core::bail!(
+            "Q, K, cos, sin must have same dtype, got Q: {:?}, K: {:?}, cos: {:?}, sin: {:?}",
+            q.dtype(),
+            k.dtype(),
+            cos.dtype(),
+            sin.dtype()
+        );
+    }
+
+    let dev = q.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    let q_storage = q.storage_and_layout().0;
+    let k_storage = k.storage_and_layout().0;
+    let cos_storage = cos.storage_and_layout().0;
+    let sin_storage = sin.storage_and_layout().0;
+    let pos_storage = positions.storage_and_layout().0;
+
+    let q_cuda = match &*q_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("Q must be on CUDA"),
+    };
+    let k_cuda = match &*k_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("K must be on CUDA"),
+    };
+    let cos_cuda = match &*cos_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cos must be on CUDA"),
+    };
+    let sin_cuda = match &*sin_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("sin must be on CUDA"),
+    };
+    let pos_cuda = match &*pos_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("positions must be on CUDA"),
+    };
+
+    let pos_ptr = match &pos_cuda.slice {
+        CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
+        _ => candle_core::bail!("positions must be I64"),
+    };
+
+    match dtype {
+        DType::F32 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+
+            unsafe {
+                match layout {
+                    RopeLayout::BatchMajor {
+                        q_bh,
+                        k_bh,
+                        seq_len,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_f32(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        } else {
+                            ffi::fused_rope_f32(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        }
+                    }
+                    RopeLayout::TokenMajor {
+                        num_tokens,
+                        q_heads,
+                        k_heads,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_tok_major_f32(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        } else {
+                            ffi::fused_rope_tok_major_f32(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        DType::F16 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+
+            unsafe {
+                match layout {
+                    RopeLayout::BatchMajor {
+                        q_bh,
+                        k_bh,
+                        seq_len,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_f16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        } else {
+                            ffi::fused_rope_f16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        }
+                    }
+                    RopeLayout::TokenMajor {
+                        num_tokens,
+                        q_heads,
+                        k_heads,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_tok_major_f16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        } else {
+                            ffi::fused_rope_tok_major_f16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        DType::BF16 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+
+            unsafe {
+                match layout {
+                    RopeLayout::BatchMajor {
+                        q_bh,
+                        k_bh,
+                        seq_len,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_bf16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        } else {
+                            ffi::fused_rope_bf16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, q_bh, k_bh, seq_len, d,
+                                stream,
+                            );
+                        }
+                    }
+                    RopeLayout::TokenMajor {
+                        num_tokens,
+                        q_heads,
+                        k_heads,
+                        d,
+                    } => {
+                        if is_interleaved {
+                            ffi::fused_rope_i_tok_major_bf16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        } else {
+                            ffi::fused_rope_tok_major_bf16(
+                                q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens, q_heads,
+                                k_heads, d, stream,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => candle_core::bail!("FusedRope only supports F32, F16, BF16, got {:?}", dtype),
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn launch_fused_rope_partial_token_major(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &Tensor,
+    is_interleaved: bool,
+    rotary_dim: usize,
+) -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::CudaStorageSlice;
+
+    let (num_tokens, q_heads, full_d) = q.dims3()?;
+    let (k_num_tokens, k_heads, k_d) = k.dims3()?;
+    if num_tokens != k_num_tokens || full_d != k_d {
+        candle_core::bail!(
+            "Q and K num_tokens/head_dim must match, got Q: {:?}, K: {:?}",
+            q.shape(),
+            k.shape()
+        );
+    }
+    if rotary_dim == 0 || rotary_dim > full_d || rotary_dim % 2 != 0 {
+        candle_core::bail!(
+            "partial fused rope requires even rotary_dim in 1..={}, got {}",
+            full_d,
+            rotary_dim
+        );
+    }
+    if positions.dims() != [num_tokens] {
+        candle_core::bail!(
+            "positions should be [{}], got {:?}",
+            num_tokens,
+            positions.dims()
+        );
+    }
+    if cos.dims().len() != 2 || sin.dims().len() != 2 {
+        candle_core::bail!(
+            "cos/sin should be 2D full tables, got cos {:?}, sin {:?}",
+            cos.shape(),
+            sin.shape()
+        );
+    }
+
+    let positions = if positions.dtype() != DType::I64 {
+        positions.to_dtype(DType::I64)?
+    } else {
+        positions.clone()
+    };
+
+    if !q.is_contiguous()
+        || !k.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+        || !positions.is_contiguous()
+    {
+        candle_core::bail!("All tensors (q, k, cos, sin, positions) must be contiguous");
+    }
+
+    let dtype = q.dtype();
+    if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
+        candle_core::bail!(
+            "Q, K, cos, sin must have same dtype, got Q: {:?}, K: {:?}, cos: {:?}, sin: {:?}",
+            q.dtype(),
+            k.dtype(),
+            cos.dtype(),
+            sin.dtype()
+        );
+    }
+
+    let dev = q.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    let q_storage = q.storage_and_layout().0;
+    let k_storage = k.storage_and_layout().0;
+    let cos_storage = cos.storage_and_layout().0;
+    let sin_storage = sin.storage_and_layout().0;
+    let pos_storage = positions.storage_and_layout().0;
+
+    let q_cuda = match &*q_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("Q must be on CUDA"),
+    };
+    let k_cuda = match &*k_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("K must be on CUDA"),
+    };
+    let cos_cuda = match &*cos_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cos must be on CUDA"),
+    };
+    let sin_cuda = match &*sin_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("sin must be on CUDA"),
+    };
+    let pos_cuda = match &*pos_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("positions must be on CUDA"),
+    };
+
+    let pos_ptr = match &pos_cuda.slice {
+        CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
+        _ => candle_core::bail!("positions must be I64"),
+    };
+
+    match dtype {
+        DType::F32 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                _ => candle_core::bail!("Expected F32"),
+            };
+            unsafe {
+                if is_interleaved {
+                    ffi::fused_rope_i_partial_tok_major_f32(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                } else {
+                    ffi::fused_rope_partial_tok_major_f32(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                }
+            }
+        }
+        DType::F16 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected F16"),
+            };
+            unsafe {
+                if is_interleaved {
+                    ffi::fused_rope_i_partial_tok_major_f16(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                } else {
+                    ffi::fused_rope_partial_tok_major_f16(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                }
+            }
+        }
+        DType::BF16 => {
+            let q_ptr = match &q_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let k_ptr = match &k_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let cos_ptr = match &cos_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            let sin_ptr = match &sin_cuda.slice {
+                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                _ => candle_core::bail!("Expected BF16"),
+            };
+            unsafe {
+                if is_interleaved {
+                    ffi::fused_rope_i_partial_tok_major_bf16(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                } else {
+                    ffi::fused_rope_partial_tok_major_bf16(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        pos_ptr,
+                        num_tokens as u32,
+                        q_heads as u32,
+                        k_heads as u32,
+                        rotary_dim as u32,
+                        full_d as u32,
+                        stream,
+                    );
+                }
+            }
+        }
+        _ => candle_core::bail!("FusedRope only supports F32, F16, BF16, got {:?}", dtype),
+    }
+
+    Ok(())
+}
+
 /// Fused Rotary Position Embedding
 ///
 /// Applies rotary position embedding to Q and K tensors using optimized CUDA kernels.
@@ -25,10 +624,13 @@ impl FusedRope {
     ///
     /// # Arguments
     /// * `q` - Query tensor, shape [batch, num_q_heads, seq_len, head_dim]
+    ///   or packed [num_tokens, num_q_heads, head_dim]
     /// * `k` - Key tensor, shape [batch, num_kv_heads, seq_len, head_dim]
+    ///   or packed [num_tokens, num_kv_heads, head_dim]
     /// * `cos` - FULL cosine table, shape [max_seq_len, head_dim/2]
     /// * `sin` - FULL sine table, shape [max_seq_len, head_dim/2]
-    /// * `positions` - Position indices, shape [seq_len] (i64)
+    /// * `positions` - Position indices, shape [seq_len] for 4D inputs or
+    ///   [num_tokens] for packed token-major inputs
     /// * `is_interleaved` - If true, uses interleaved layout (adjacent pairs)
     ///
     /// # Returns
@@ -42,254 +644,7 @@ impl FusedRope {
         positions: &Tensor,
         is_interleaved: bool,
     ) -> Result<(Tensor, Tensor)> {
-        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        use candle_core::cuda_backend::CudaStorageSlice;
-
-        // Validate inputs - Q and K can have different head counts (GQA)
-        let (b, q_h, seq_len, d) = q.dims4()?;
-        let (kb, k_h, k_seq_len, kd) = k.dims4()?;
-
-        if b != kb || seq_len != k_seq_len || d != kd {
-            candle_core::bail!(
-                "Q and K batch/seq_len/head_dim must match, got Q: {:?}, K: {:?}",
-                q.shape(),
-                k.shape()
-            );
-        }
-
-        // Positions should be 1D with length seq_len
-        let pos_shape = positions.dims();
-        if pos_shape.len() != 1 || pos_shape[0] != seq_len {
-            candle_core::bail!(
-                "positions should be [seq_len], got {:?}, expected [{}]",
-                pos_shape,
-                seq_len
-            );
-        }
-
-        // Ensure positions is i64
-        let positions = if positions.dtype() != DType::I64 {
-            positions.to_dtype(DType::I64)?
-        } else {
-            positions.clone()
-        };
-
-        // Check contiguity - bail if not contiguous (avoid hidden allocations)
-        if !q.is_contiguous()
-            || !k.is_contiguous()
-            || !cos.is_contiguous()
-            || !sin.is_contiguous()
-            || !positions.is_contiguous()
-        {
-            candle_core::bail!("All tensors (q, k, cos, sin, positions) must be contiguous");
-        }
-
-        // Validate dtypes match (except positions which is always i64)
-        let dtype = q.dtype();
-        if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
-            candle_core::bail!(
-                "Q, K, cos, sin must have same dtype, got Q: {:?}, K: {:?}, cos: {:?}, sin: {:?}",
-                q.dtype(),
-                k.dtype(),
-                cos.dtype(),
-                sin.dtype()
-            );
-        }
-
-        // Get device
-        let dev = q.device().as_cuda_device()?;
-        let stream = *dev.cu_stream() as i64;
-
-        // Calculate kernel parameters
-        let q_bh = (b * q_h) as u32;
-        let k_bh = (b * k_h) as u32;
-        let seq_len_u32 = seq_len as u32;
-        let d_u32 = d as u32;
-
-        // Clone for output
-
-        // Get storage
-        let q_out_storage = q.storage_and_layout().0;
-        let k_out_storage = k.storage_and_layout().0;
-        let cos_storage = cos.storage_and_layout().0;
-        let sin_storage = sin.storage_and_layout().0;
-        let pos_storage = positions.storage_and_layout().0;
-
-        let q_out_cuda = match &*q_out_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("Q must be on CUDA"),
-        };
-        let k_out_cuda = match &*k_out_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("K must be on CUDA"),
-        };
-        let cos_cuda = match &*cos_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cos must be on CUDA"),
-        };
-        let sin_cuda = match &*sin_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("sin must be on CUDA"),
-        };
-        let pos_cuda = match &*pos_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("positions must be on CUDA"),
-        };
-
-        // Get positions pointer
-        let pos_ptr = match &pos_cuda.slice {
-            CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
-            _ => candle_core::bail!("positions must be I64"),
-        };
-
-        match dtype {
-            DType::F32 => {
-                let q_ptr = match &q_out_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let k_ptr = match &k_out_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_f32(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_f32(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            DType::F16 => {
-                let q_ptr = match &q_out_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let k_ptr = match &k_out_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_f16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_f16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            DType::BF16 => {
-                let q_ptr = match &q_out_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let k_ptr = match &k_out_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_bf16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_bf16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            _ => candle_core::bail!("FusedRope only supports F32, F16, BF16, got {:?}", dtype),
-        }
-
+        launch_fused_rope(q, k, cos, sin, positions, is_interleaved)?;
         Ok((q.to_owned(), k.to_owned()))
     }
 
@@ -305,229 +660,22 @@ impl FusedRope {
         positions: &Tensor,
         is_interleaved: bool,
     ) -> Result<()> {
-        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        use candle_core::cuda_backend::CudaStorageSlice;
+        launch_fused_rope(q, k, cos, sin, positions, is_interleaved)
+    }
 
-        let (b, q_h, seq_len, d) = q.dims4()?;
-        let (kb, k_h, k_seq_len, kd) = k.dims4()?;
-
-        if b != kb || seq_len != k_seq_len || d != kd {
-            candle_core::bail!(
-                "Q and K batch/seq_len/head_dim must match, got Q: {:?}, K: {:?}",
-                q.shape(),
-                k.shape()
-            );
-        }
-
-        // Check contiguity - bail if not contiguous (avoid hidden allocations)
-        if !q.is_contiguous() || !k.is_contiguous() || !cos.is_contiguous() || !sin.is_contiguous()
-        {
-            candle_core::bail!("All tensors (q, k, cos, sin) must be contiguous");
-        }
-
-        let positions = if positions.dtype() != DType::I64 {
-            positions.to_dtype(DType::I64)?
-        } else {
-            positions.clone()
-        };
-        if !positions.is_contiguous() {
-            candle_core::bail!("positions must be contiguous");
-        }
-
-        let dtype = q.dtype();
-        if k.dtype() != dtype || cos.dtype() != dtype || sin.dtype() != dtype {
-            candle_core::bail!("Q, K, cos, sin must have same dtype");
-        }
-
-        let dev = q.device().as_cuda_device()?;
-        let stream = *dev.cu_stream() as i64;
-
-        let q_bh = (b * q_h) as u32;
-        let k_bh = (b * k_h) as u32;
-        let seq_len_u32 = seq_len as u32;
-        let d_u32 = d as u32;
-
-        let q_storage = q.storage_and_layout().0;
-        let k_storage = k.storage_and_layout().0;
-        let cos_storage = cos.storage_and_layout().0;
-        let sin_storage = sin.storage_and_layout().0;
-        let pos_storage = positions.storage_and_layout().0;
-
-        let q_cuda = match &*q_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("Q must be on CUDA"),
-        };
-        let k_cuda = match &*k_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("K must be on CUDA"),
-        };
-        let cos_cuda = match &*cos_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cos must be on CUDA"),
-        };
-        let sin_cuda = match &*sin_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("sin must be on CUDA"),
-        };
-        let pos_cuda = match &*pos_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => candle_core::bail!("positions must be on CUDA"),
-        };
-
-        let pos_ptr = match &pos_cuda.slice {
-            CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
-            _ => candle_core::bail!("positions must be I64"),
-        };
-
-        match dtype {
-            DType::F32 => {
-                let q_ptr = match &q_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let k_ptr = match &k_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
-                    _ => candle_core::bail!("Expected F32"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_f32(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_f32(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            DType::F16 => {
-                let q_ptr = match &q_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let k_ptr = match &k_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected F16"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_f16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_f16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            DType::BF16 => {
-                let q_ptr = match &q_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let k_ptr = match &k_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let cos_ptr = match &cos_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-                let sin_ptr = match &sin_cuda.slice {
-                    CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
-                    _ => candle_core::bail!("Expected BF16"),
-                };
-
-                unsafe {
-                    if is_interleaved {
-                        ffi::fused_rope_i_bf16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    } else {
-                        ffi::fused_rope_bf16(
-                            q_ptr,
-                            k_ptr,
-                            cos_ptr,
-                            sin_ptr,
-                            pos_ptr,
-                            q_bh,
-                            k_bh,
-                            seq_len_u32,
-                            d_u32,
-                            stream,
-                        );
-                    }
-                }
-            }
-            _ => candle_core::bail!("FusedRope only supports F32, F16, BF16, got {:?}", dtype),
-        }
-
-        Ok(())
+    /// Apply fused rotary embedding in-place to only the leading `rotary_dim`
+    /// channels of packed token-major Q/K tensors.
+    #[cfg(feature = "cuda")]
+    pub fn apply_inplace_partial(
+        q: &Tensor,
+        k: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        positions: &Tensor,
+        is_interleaved: bool,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        launch_fused_rope_partial_token_major(q, k, cos, sin, positions, is_interleaved, rotary_dim)
     }
 
     /// Convenience: non-interleaved RoPE

@@ -75,6 +75,131 @@ pub struct PagedAttention {
 }
 
 impl PagedAttention {
+    fn batch_major_qkv(
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, usize, usize, usize)> {
+        match (query.dims().len(), key.dims().len(), value.dims().len()) {
+            (4, 4, 4) => {
+                let (_, attention_heads, seq_len, head_size) = query.shape().dims4()?;
+                let (_, key_value_heads, key_seq_len, key_head_size) = key.shape().dims4()?;
+                let (_, value_heads, value_seq_len, value_head_size) = value.shape().dims4()?;
+                if key_seq_len != seq_len
+                    || value_seq_len != seq_len
+                    || key_head_size != head_size
+                    || value_head_size != head_size
+                    || value_heads != key_value_heads
+                {
+                    candle_core::bail!(
+                        "Q/K/V layout mismatch, got Q {:?}, K {:?}, V {:?}",
+                        query.shape(),
+                        key.shape(),
+                        value.shape()
+                    );
+                }
+                Ok((
+                    query.clone(),
+                    key.clone(),
+                    value.clone(),
+                    attention_heads,
+                    key_value_heads,
+                    head_size,
+                ))
+            }
+            (3, 3, 3) => {
+                let (seq_len, attention_heads, head_size) = query.shape().dims3()?;
+                let (key_seq_len, key_value_heads, key_head_size) = key.shape().dims3()?;
+                let (value_seq_len, value_heads, value_head_size) = value.shape().dims3()?;
+                if key_seq_len != seq_len
+                    || value_seq_len != seq_len
+                    || key_head_size != head_size
+                    || value_head_size != head_size
+                    || value_heads != key_value_heads
+                {
+                    candle_core::bail!(
+                        "packed Q/K/V layout mismatch, got Q {:?}, K {:?}, V {:?}",
+                        query.shape(),
+                        key.shape(),
+                        value.shape()
+                    );
+                }
+                Ok((
+                    query.transpose(0, 1)?.unsqueeze(0)?,
+                    key.transpose(0, 1)?.unsqueeze(0)?,
+                    value.transpose(0, 1)?.unsqueeze(0)?,
+                    attention_heads,
+                    key_value_heads,
+                    head_size,
+                ))
+            }
+            _ => candle_core::bail!(
+                "paged attention expects 3D packed or 4D batch-major Q/K/V, got Q {:?}, K {:?}, V {:?}",
+                query.shape(),
+                key.shape(),
+                value.shape()
+            ),
+        }
+    }
+
+    #[cfg(any(feature = "flash-attn", feature = "flashinfer"))]
+    fn packed_qkv(
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, usize, usize, usize)> {
+        match (query.dims().len(), key.dims().len(), value.dims().len()) {
+            (4, 4, 4) => {
+                let (_, attention_heads, _, head_size) = query.shape().dims4()?;
+                let (_, key_value_heads, _, _) = key.shape().dims4()?;
+                let query = query
+                    .transpose(1, 2)?
+                    .reshape(((), attention_heads, head_size))?;
+                let key = key
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                let value = value
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                Ok((query, key, value, attention_heads, key_value_heads, head_size))
+            }
+            (3, 3, 3) => {
+                let (_, attention_heads, head_size) = query.shape().dims3()?;
+                let (_, key_value_heads, key_head_size) = key.shape().dims3()?;
+                let (_, value_heads, value_head_size) = value.shape().dims3()?;
+                if key_head_size != head_size || value_head_size != head_size {
+                    candle_core::bail!(
+                        "packed Q/K/V head_dim mismatch, got Q {:?}, K {:?}, V {:?}",
+                        query.shape(),
+                        key.shape(),
+                        value.shape()
+                    );
+                }
+                if value_heads != key_value_heads {
+                    candle_core::bail!(
+                        "packed K/V head count mismatch, got K {:?}, V {:?}",
+                        key.shape(),
+                        value.shape()
+                    );
+                }
+                Ok((
+                    query.clone(),
+                    key.clone(),
+                    value.clone(),
+                    attention_heads,
+                    key_value_heads,
+                    head_size,
+                ))
+            }
+            _ => candle_core::bail!(
+                "flash attention expects 3D packed or 4D batch-major Q/K/V, got Q {:?}, K {:?}, V {:?}",
+                query.shape(),
+                key.shape(),
+                value.shape()
+            ),
+        }
+    }
+
     fn maybe_update_kv_scales(&self, key: &Tensor, value: &Tensor) -> Result<()> {
         if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
             if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
@@ -142,8 +267,8 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        let (_, attention_heads, _, head_size) = query.shape().dims4()?;
-        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+        let (query, key, value, attention_heads, key_value_heads, head_size) =
+            Self::batch_major_qkv(query, key, value)?;
         fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
             if n_rep == 1 {
                 Ok(x)
@@ -274,18 +399,9 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        let (_, attention_heads, _, head_size) = query.shape().dims4()?;
-        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+        let (query, key, value, _attention_heads, _key_value_heads, _head_size) =
+            Self::packed_qkv(query, key, value)?;
         let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
-        let query = query
-            .transpose(1, 2)?
-            .reshape(((), attention_heads, head_size))?;
-        let key = key
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
-        let value = value
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
         let softcap = Some(softcapping.unwrap_or(0.0f64) as f32);
         let window_size_right = self.sliding_window.map(|_| 0);
 
@@ -376,8 +492,8 @@ impl PagedAttention {
     ) -> Result<Tensor> {
         #[cfg(feature = "flashinfer")]
         if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
-            let (_, attention_heads, _, head_size) = query.shape().dims4()?;
-            let (_, key_value_heads, _, _) = key.shape().dims4()?;
+            let (query, key, value, attention_heads, key_value_heads, head_size) =
+                Self::packed_qkv(query, key, value)?;
             let group_size = attention_heads / key_value_heads;
             let flashinfer_prefill_group_supported =
                 matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64);
@@ -397,17 +513,6 @@ impl PagedAttention {
                         );
                     }
                 }
-
-                let query = query
-                    .transpose(1, 2)?
-                    .reshape(((), attention_heads, head_size))?;
-                let key = key
-                    .transpose(1, 2)?
-                    .reshape(((), key_value_heads, head_size))?;
-
-                let value = value
-                    .transpose(1, 2)?
-                    .reshape(((), key_value_heads, head_size))?;
 
                 self.maybe_update_kv_scales(&key, &value)?;
 
@@ -542,8 +647,8 @@ impl PagedAttention {
         // The following for paged attention
         let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
 
-        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
-        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+        let (query, key, value, attention_heads, key_value_heads, head_size) =
+            Self::batch_major_qkv(query, key, value)?;
 
         // Write KvCache for SDP + Paged Attention
         let key = key

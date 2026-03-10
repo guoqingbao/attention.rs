@@ -777,6 +777,169 @@ extern "C" {
         stream: i64,
     );
 
+    // Token-major variants for packed [num_tokens, num_heads, head_dim] tensors.
+    pub fn fused_rope_tok_major_f32(
+        q: *mut f32,
+        k: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_tok_major_f16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_tok_major_bf16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_tok_major_f32(
+        q: *mut f32,
+        k: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_tok_major_f16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_tok_major_bf16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_partial_tok_major_f32(
+        q: *mut f32,
+        k: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_partial_tok_major_f16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_partial_tok_major_bf16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_partial_tok_major_f32(
+        q: *mut f32,
+        k: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_partial_tok_major_f16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
+    pub fn fused_rope_i_partial_tok_major_bf16(
+        q: *mut c_void,
+        k: *mut c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        positions: *const i64,
+        num_tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotary_d: u32,
+        full_d: u32,
+        stream: i64,
+    );
+
     pub fn fp8_matmul_f16(
         input: *const c_void,     // [M, K]
         weight: *const u8,        // [N, K]
@@ -836,6 +999,41 @@ extern "C" {
         sm_version: c_int,
         stream: i64,
     );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_blockscale_workspace_size_bf16(m: c_int, n: c_int, k: c_int) -> usize;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_blockscale_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        weight_scale: *const f32,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: i64,
+    ) -> c_int;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_blockscale_workspace_size_fp8(m: c_int, n: c_int, k: c_int) -> usize;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_blockscale_fp8(
+        input: *const c_void,
+        input_scale: *const f32,
+        weight: *const c_void,
+        weight_scale: *const f32,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: i64,
+    ) -> c_int;
 
     pub fn moe_fp8_calculate_expert_offsets(
         expert_ids: *const i32,

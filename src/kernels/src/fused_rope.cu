@@ -185,6 +185,522 @@ fused_rope_i_bf16_kernel(
 #endif
 
 // ============================================================================
+// Token-major RoPE with Position Selection
+// ============================================================================
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_tok_major_f32_kernel(
+    float2* __restrict__ q,
+    float2* __restrict__ k,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const float c = cos[cs_idx];
+        const float s = sin[cs_idx];
+
+        float2* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * half_d + d_idx;
+        const float2 v = ptr[pair_idx];
+
+        float2 result;
+        result.x = v.x * c - v.y * s;
+        result.y = v.x * s + v.y * c;
+        ptr[pair_idx] = result;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_tok_major_f16_kernel(
+    __half2* __restrict__ q,
+    __half2* __restrict__ k,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const float c = __half2float(cos[cs_idx]);
+        const float s = __half2float(sin[cs_idx]);
+
+        __half2* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * half_d + d_idx;
+        const __half2 v = ptr[pair_idx];
+
+        __half2 result;
+        result.x = __float2half(__half2float(v.x) * c - __half2float(v.y) * s);
+        result.y = __float2half(__half2float(v.x) * s + __half2float(v.y) * c);
+        ptr[pair_idx] = result;
+    }
+}
+
+#ifndef NO_BF16_KERNEL
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_tok_major_bf16_kernel(
+    __nv_bfloat162* __restrict__ q,
+    __nv_bfloat162* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const __nv_bfloat16 c = cos[cs_idx];
+        const __nv_bfloat16 s = sin[cs_idx];
+
+        __nv_bfloat162* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * half_d + d_idx;
+        const __nv_bfloat162 v = ptr[pair_idx];
+
+        __nv_bfloat162 result;
+        result.x = __hsub(__hmul(v.x, c), __hmul(v.y, s));
+        result.y = __hadd(__hmul(v.x, s), __hmul(v.y, c));
+        ptr[pair_idx] = result;
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_tok_major_f32_kernel(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t d
+) {
+    const uint32_t half_d = d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const float c = cos[cs_idx];
+        const float s = sin[cs_idx];
+
+        float* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * d + d_idx;
+        const float x = ptr[base];
+        const float y = ptr[base + half_d];
+        ptr[base] = x * c - y * s;
+        ptr[base + half_d] = y * c + x * s;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_tok_major_f16_kernel(
+    __half* __restrict__ q,
+    __half* __restrict__ k,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t d
+) {
+    const uint32_t half_d = d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const float c = __half2float(cos[cs_idx]);
+        const float s = __half2float(sin[cs_idx]);
+
+        __half* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * d + d_idx;
+        const float x = __half2float(ptr[base]);
+        const float y = __half2float(ptr[base + half_d]);
+        ptr[base] = __float2half(x * c - y * s);
+        ptr[base + half_d] = __float2half(y * c + x * s);
+    }
+}
+
+#ifndef NO_BF16_KERNEL
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_tok_major_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t d
+) {
+    const uint32_t half_d = d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_d);
+        const uint32_t d_idx = local_idx % half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_d + d_idx;
+        const __nv_bfloat16 c = cos[cs_idx];
+        const __nv_bfloat16 s = sin[cs_idx];
+
+        __nv_bfloat16* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * d + d_idx;
+        const __nv_bfloat16 x = ptr[base];
+        const __nv_bfloat16 y = ptr[base + half_d];
+        ptr[base] = __hsub(__hmul(x, c), __hmul(y, s));
+        ptr[base + half_d] = __hadd(__hmul(y, c), __hmul(x, s));
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_partial_tok_major_f32_kernel(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_d,
+    const uint32_t full_d
+) {
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_rotary_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_rotary_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_rotary_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_rotary_d);
+        const uint32_t d_idx = local_idx % half_rotary_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_rotary_d + d_idx;
+        const float c = cos[cs_idx];
+        const float s = sin[cs_idx];
+
+        float* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * full_d + d_idx;
+        const float x = ptr[base];
+        const float y = ptr[base + half_rotary_d];
+        ptr[base] = x * c - y * s;
+        ptr[base + half_rotary_d] = y * c + x * s;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_partial_tok_major_f16_kernel(
+    __half* __restrict__ q,
+    __half* __restrict__ k,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_d,
+    const uint32_t full_d
+) {
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_rotary_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_rotary_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_rotary_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_rotary_d);
+        const uint32_t d_idx = local_idx % half_rotary_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_rotary_d + d_idx;
+        const float c = __half2float(cos[cs_idx]);
+        const float s = __half2float(sin[cs_idx]);
+
+        __half* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * full_d + d_idx;
+        const float x = __half2float(ptr[base]);
+        const float y = __half2float(ptr[base + half_rotary_d]);
+        ptr[base] = __float2half(x * c - y * s);
+        ptr[base + half_rotary_d] = __float2half(y * c + x * s);
+    }
+}
+
+#ifndef NO_BF16_KERNEL
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_partial_tok_major_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_d,
+    const uint32_t full_d
+) {
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t q_pairs = num_tokens * q_heads * half_rotary_d;
+    const uint32_t k_pairs = num_tokens * k_heads * half_rotary_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / half_rotary_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * half_rotary_d);
+        const uint32_t d_idx = local_idx % half_rotary_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * half_rotary_d + d_idx;
+        const __nv_bfloat16 c = cos[cs_idx];
+        const __nv_bfloat16 s = sin[cs_idx];
+
+        __nv_bfloat16* ptr = is_q ? q : k;
+        const uint32_t base = (token_idx * heads + head_idx) * full_d + d_idx;
+        const __nv_bfloat16 x = ptr[base];
+        const __nv_bfloat16 y = ptr[base + half_rotary_d];
+        ptr[base] = __hsub(__hmul(x, c), __hmul(y, s));
+        ptr[base + half_rotary_d] = __hadd(__hmul(y, c), __hmul(x, s));
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_partial_tok_major_f32_kernel(
+    float2* __restrict__ q,
+    float2* __restrict__ k,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_half_d,
+    const uint32_t full_half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * rotary_half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * rotary_half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / rotary_half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * rotary_half_d);
+        const uint32_t d_idx = local_idx % rotary_half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * rotary_half_d + d_idx;
+        const float c = cos[cs_idx];
+        const float s = sin[cs_idx];
+
+        float2* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * full_half_d + d_idx;
+        const float2 v = ptr[pair_idx];
+
+        float2 result;
+        result.x = v.x * c - v.y * s;
+        result.y = v.x * s + v.y * c;
+        ptr[pair_idx] = result;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_partial_tok_major_f16_kernel(
+    __half2* __restrict__ q,
+    __half2* __restrict__ k,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_half_d,
+    const uint32_t full_half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * rotary_half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * rotary_half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / rotary_half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * rotary_half_d);
+        const uint32_t d_idx = local_idx % rotary_half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * rotary_half_d + d_idx;
+        const float c = __half2float(cos[cs_idx]);
+        const float s = __half2float(sin[cs_idx]);
+
+        __half2* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * full_half_d + d_idx;
+        const __half2 v = ptr[pair_idx];
+
+        __half2 result;
+        result.x = __float2half(__half2float(v.x) * c - __half2float(v.y) * s);
+        result.y = __float2half(__half2float(v.x) * s + __half2float(v.y) * c);
+        ptr[pair_idx] = result;
+    }
+}
+
+#ifndef NO_BF16_KERNEL
+__global__ void __launch_bounds__(BLOCK_SIZE)
+fused_rope_i_partial_tok_major_bf16_kernel(
+    __nv_bfloat162* __restrict__ q,
+    __nv_bfloat162* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    const int64_t* __restrict__ positions,
+    const uint32_t num_tokens,
+    const uint32_t q_heads,
+    const uint32_t k_heads,
+    const uint32_t rotary_half_d,
+    const uint32_t full_half_d
+) {
+    const uint32_t q_pairs = num_tokens * q_heads * rotary_half_d;
+    const uint32_t k_pairs = num_tokens * k_heads * rotary_half_d;
+    const uint32_t total_pairs = q_pairs + k_pairs;
+
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_pairs;
+         idx += gridDim.x * blockDim.x) {
+        const bool is_q = idx < q_pairs;
+        const uint32_t local_idx = is_q ? idx : (idx - q_pairs);
+        const uint32_t heads = is_q ? q_heads : k_heads;
+        const uint32_t head_idx = (local_idx / rotary_half_d) % heads;
+        const uint32_t token_idx = local_idx / (heads * rotary_half_d);
+        const uint32_t d_idx = local_idx % rotary_half_d;
+
+        const int64_t pos = positions[token_idx];
+        const uint32_t cs_idx = pos * rotary_half_d + d_idx;
+        const __nv_bfloat16 c = cos[cs_idx];
+        const __nv_bfloat16 s = sin[cs_idx];
+
+        __nv_bfloat162* ptr = is_q ? q : k;
+        const uint32_t pair_idx = (token_idx * heads + head_idx) * full_half_d + d_idx;
+        const __nv_bfloat162 v = ptr[pair_idx];
+
+        __nv_bfloat162 result;
+        result.x = __hsub(__hmul(v.x, c), __hmul(v.y, s));
+        result.y = __hadd(__hmul(v.x, s), __hmul(v.y, c));
+        ptr[pair_idx] = result;
+    }
+}
+#endif
+
+// ============================================================================
 // Non-Interleaved RoPE with Position Selection
 // ============================================================================
 
@@ -478,6 +994,234 @@ extern "C" void fused_rope_i_bf16(
         (__nv_bfloat162*)q, (__nv_bfloat162*)k,
         (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
         positions, q_pairs, k_pairs, seq_len, half_d
+    );
+#endif
+}
+
+extern "C" void fused_rope_tok_major_f32(
+    float* q, float* k,
+    const float* cos, const float* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_tok_major_f32_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        q, k, cos, sin, positions, num_tokens, q_heads, k_heads, d
+    );
+}
+
+extern "C" void fused_rope_tok_major_f16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_tok_major_f16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__half*)q, (__half*)k, (const __half*)cos, (const __half*)sin,
+        positions, num_tokens, q_heads, k_heads, d
+    );
+}
+
+extern "C" void fused_rope_tok_major_bf16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+#ifndef NO_BF16_KERNEL
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_tok_major_bf16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)q, (__nv_bfloat16*)k,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        positions, num_tokens, q_heads, k_heads, d
+    );
+#endif
+}
+
+extern "C" void fused_rope_i_tok_major_f32(
+    float* q, float* k,
+    const float* cos, const float* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_tok_major_f32_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (float2*)q, (float2*)k, cos, sin, positions, num_tokens, q_heads, k_heads, half_d
+    );
+}
+
+extern "C" void fused_rope_i_tok_major_f16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_tok_major_f16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__half2*)q, (__half2*)k, (const __half*)cos, (const __half*)sin,
+        positions, num_tokens, q_heads, k_heads, half_d
+    );
+}
+
+extern "C" void fused_rope_i_tok_major_bf16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_d = d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_d;
+#ifndef NO_BF16_KERNEL
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_tok_major_bf16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat162*)q, (__nv_bfloat162*)k,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        positions, num_tokens, q_heads, k_heads, half_d
+    );
+#endif
+}
+
+extern "C" void fused_rope_partial_tok_major_f32(
+    float* q, float* k,
+    const float* cos, const float* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_rotary_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_partial_tok_major_f32_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        q, k, cos, sin, positions, num_tokens, q_heads, k_heads, rotary_d, full_d
+    );
+}
+
+extern "C" void fused_rope_partial_tok_major_f16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_rotary_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_partial_tok_major_f16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__half*)q, (__half*)k, (const __half*)cos, (const __half*)sin,
+        positions, num_tokens, q_heads, k_heads, rotary_d, full_d
+    );
+}
+
+extern "C" void fused_rope_partial_tok_major_bf16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t half_rotary_d = rotary_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * half_rotary_d;
+#ifndef NO_BF16_KERNEL
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_partial_tok_major_bf16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat16*)q, (__nv_bfloat16*)k,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        positions, num_tokens, q_heads, k_heads, rotary_d, full_d
+    );
+#endif
+}
+
+extern "C" void fused_rope_i_partial_tok_major_f32(
+    float* q, float* k,
+    const float* cos, const float* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t rotary_half_d = rotary_d / 2;
+    const uint32_t full_half_d = full_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * rotary_half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_partial_tok_major_f32_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (float2*)q, (float2*)k, cos, sin, positions,
+        num_tokens, q_heads, k_heads, rotary_half_d, full_half_d
+    );
+}
+
+extern "C" void fused_rope_i_partial_tok_major_f16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t rotary_half_d = rotary_d / 2;
+    const uint32_t full_half_d = full_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * rotary_half_d;
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_partial_tok_major_f16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__half2*)q, (__half2*)k, (const __half*)cos, (const __half*)sin,
+        positions, num_tokens, q_heads, k_heads, rotary_half_d, full_half_d
+    );
+}
+
+extern "C" void fused_rope_i_partial_tok_major_bf16(
+    void* q, void* k,
+    const void* cos, const void* sin,
+    const int64_t* positions,
+    uint32_t num_tokens, uint32_t q_heads, uint32_t k_heads,
+    uint32_t rotary_d, uint32_t full_d,
+    int64_t stream_ptr
+) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const uint32_t rotary_half_d = rotary_d / 2;
+    const uint32_t full_half_d = full_d / 2;
+    const uint32_t total = num_tokens * (q_heads + k_heads) * rotary_half_d;
+#ifndef NO_BF16_KERNEL
+    dim3 grid = get_optimal_grid(total);
+    fused_rope_i_partial_tok_major_bf16_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        (__nv_bfloat162*)q, (__nv_bfloat162*)k,
+        (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin,
+        positions, num_tokens, q_heads, k_heads, rotary_half_d, full_half_d
     );
 #endif
 }
