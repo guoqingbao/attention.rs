@@ -4,7 +4,7 @@ use crate::cuda_utils;
 use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;

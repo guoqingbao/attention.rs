@@ -58,7 +58,7 @@ attention-rs = { git = "https://github.com/guoqingbao/attention.rs" }
 
 - `cuda`: Enable CUDA kernels and optimizations.
 - `metal`: Enable Metal kernels for Apple Silicon.
-- `flash-attn`: Enable Flash Attention integration.
+- `flashattn`: Enable Flash Attention integration.
 - `flashinfer`: Enable FlashInfer integration.
 - `cutlass`: Enable CUTLASS-optimized FP8 kernels (requires CUDA).
 

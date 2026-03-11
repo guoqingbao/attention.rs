@@ -186,7 +186,7 @@ extern "C" void call_reshape_and_cache(
       CALL_RESHAPE_AND_CACHE(float, uint8_t);
     }
 #else
-    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flash-attn or context-cache enabled).");
+    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flashattn or context-cache enabled).");
 #endif
   } else {
     if (dtype == 0){
@@ -235,7 +235,7 @@ extern "C" void call_reshape_and_cache_flash(
       CALL_RESHAPE_AND_CACHE_FLASH(float, uint8_t);
     }
 #else
-    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flash-attn or context-cache enalbed).");
+    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flashattn or context-cache enalbed).");
 #endif
   } else {
     if (dtype == 0){

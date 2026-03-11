@@ -538,7 +538,7 @@ extern "C" void paged_attention_prefill(
       #endif
     }
 #else
-    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flash-attn or context-cache enabled).");
+    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flashattn or context-cache enabled).");
 #endif
   } else {
     if (dtype == 2) {

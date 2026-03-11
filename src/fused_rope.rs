@@ -28,6 +28,7 @@ enum RopeLayout {
     },
 }
 
+#[allow(dead_code)]
 impl RopeLayout {
     fn positions_len(self) -> usize {
         match self {

@@ -885,7 +885,7 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(feature = "flash-decoding")]
+        #[cfg(feature = "flashattn")]
         if kc_rank != 4 {
             candle::bail!(
                 "flash-attention expects `key_cache` tensor to be of rank 4 \
@@ -893,7 +893,7 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(not(feature = "flash-decoding"))]
+        #[cfg(not(feature = "flashattn"))]
         if kc_rank != 5 {
             candle::bail!(
                 "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -923,14 +923,14 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        #[cfg(feature = "flash-decoding")]
+        #[cfg(feature = "flashattn")]
         let (block_size, _x) = {
             // [num_blocks, block_size, num_heads, head_size]
             let (_, block_size, _, _) = kc_l.shape().dims4()?;
             (block_size, 1)
         };
 
-        #[cfg(not(feature = "flash-decoding"))]
+        #[cfg(not(feature = "flashattn"))]
         let (block_size, x) = {
             let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
@@ -1005,7 +1005,7 @@ impl ReshapeCache {
             };
 
         unsafe {
-            #[cfg(feature = "flash-decoding")]
+            #[cfg(feature = "flashattn")]
             {
                 assert!(
                     k_scales_ptr.is_null() && v_scales_ptr.is_null(),
@@ -1036,7 +1036,7 @@ impl ReshapeCache {
                     *dev.cu_stream() as i64,
                 );
             }
-            #[cfg(not(feature = "flash-decoding"))]
+            #[cfg(not(feature = "flashattn"))]
             {
                 kernels::ffi::call_reshape_and_cache(
                     k_ptr,

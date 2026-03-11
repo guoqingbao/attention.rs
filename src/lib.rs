@@ -142,7 +142,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(any(feature = "flash-attn", feature = "flashinfer"))]
+    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
     fn packed_qkv(
         query: &Tensor,
         key: &Tensor,
@@ -347,7 +347,7 @@ impl PagedAttention {
         Tensor::cat(&vec_attn, 2)?.contiguous()?.transpose(1, 2)
     }
 
-    #[cfg(feature = "flash-attn")]
+    #[cfg(feature = "flashattn")]
     pub fn flash_var_len(
         &self,
         query: &Tensor,
@@ -388,7 +388,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(feature = "flash-attn")]
+    #[cfg(feature = "flashattn")]
     pub fn flash_forward(
         &self,
         query: &Tensor,
@@ -422,8 +422,8 @@ impl PagedAttention {
             return self.flash_var_len(&query, &key, &value, input_metadata, softcapping);
         }
 
-        #[cfg(feature = "flash-decoding")]
         if input_metadata.is_prefill {
+            // prefill with kvcache
             return flashattn_rs::flash_attn_with_kvcache_advanced(
                 &query,
                 key_cache.as_ref().unwrap(),
@@ -443,36 +443,27 @@ impl PagedAttention {
             );
         }
 
-        #[cfg(not(feature = "flash-decoding"))]
-        if input_metadata.is_prefill {
-            candle_core::bail!("Invalid pattern for flash_forward");
-        }
+        // Decoding with kvcache
+        let block_tables = input_metadata.block_tables.as_ref().unwrap();
+        let context_lens = input_metadata.context_lens.as_ref().unwrap();
 
-        #[cfg(feature = "flash-decoding")]
-        {
-            let block_tables = input_metadata.block_tables.as_ref().unwrap();
-            let context_lens = input_metadata.context_lens.as_ref().unwrap();
-
-            flashattn_rs::flash_attn_with_kvcache_advanced(
-                &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
-                key_cache.as_ref().unwrap(),
-                value_cache.as_ref().unwrap(),
-                context_lens,
-                block_tables,
-                None,
-                None,
-                self.scale as f32,
-                false,
-                self.sliding_window,
-                window_size_right,
-                None,
-                softcap,
-                0,
-                None,
-            )
-        }
-        #[cfg(not(feature = "flash-decoding"))]
-        candle_core::bail!("Invalid pattern for flash_forward")
+        flashattn_rs::flash_attn_with_kvcache_advanced(
+            &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
+            key_cache.as_ref().unwrap(),
+            value_cache.as_ref().unwrap(),
+            context_lens,
+            block_tables,
+            None,
+            None,
+            self.scale as f32,
+            false,
+            self.sliding_window,
+            window_size_right,
+            None,
+            softcap,
+            0,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -600,25 +591,8 @@ impl PagedAttention {
             }
         }
 
-        #[cfg(feature = "flash-decoding")]
+        #[cfg(feature = "flashattn")]
         if !input_metadata.disable_flash_attn.unwrap_or(false) {
-            return self.flash_forward(
-                query,
-                key,
-                value,
-                key_cache,
-                value_cache,
-                input_metadata,
-                softcapping,
-            );
-        }
-
-        if !input_metadata.disable_flash_attn.unwrap_or(false)
-            && input_metadata.is_prefill
-            && input_metadata.block_tables.is_none()
-        {
-            // non context-cache prefill with flash-attn
-            #[cfg(feature = "flash-attn")]
             return self.flash_forward(
                 query,
                 key,
@@ -685,7 +659,7 @@ impl PagedAttention {
 
         //decoding with paged-attn
 
-        //if flash-decoding (flash-attn with prefill kvcache) feature not enabled, use our custom paged attention for chunked prefill
+        //if flashattn (flashattn with prefill kvcache) feature not enabled, use our custom paged attention for chunked prefill
         let cu_seqlens_q = if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
             assert!(
                 input_metadata.cu_seqlens_q.as_ref().is_some(),
