@@ -74,13 +74,12 @@ extern "C" int flashinfer_fp8_blockscale_bf16(const void* input, const void* wei
     }
 
     auto& runner = get_runner();
-    size_t required =
-        runner.getWorkspaceSize(static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k), 1, 1);
-    if (workspace == nullptr || workspace_size < required) {
+    if (workspace == nullptr && workspace_size > 0) {
       return 2;
     }
-
-    runner.configureWorkspace(reinterpret_cast<char*>(workspace));
+    if (workspace_size > 0) {
+      runner.configureWorkspace(reinterpret_cast<char*>(workspace));
+    }
     runner.gemm(output, input, weight, m, n, k, reinterpret_cast<cudaStream_t>(stream_), nullptr,
                 weight_scale);
     return 0;
@@ -117,12 +116,10 @@ extern "C" int flashinfer_fp8_blockscale_fp8(const void* input, const float* inp
     }
 
     auto& runner = get_runner_fp8();
-    size_t required =
-        runner.getWorkspaceSize(static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k), 1, 1);
-    if (required > 0 && (workspace == nullptr || workspace_size < required)) {
+    if (workspace == nullptr && workspace_size > 0) {
       return 2;
     }
-    if (required > 0) {
+    if (workspace_size > 0) {
       runner.configureWorkspace(reinterpret_cast<char*>(workspace));
     }
 

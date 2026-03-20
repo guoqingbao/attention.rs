@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "44077f4" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "44077f4" }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "b63bf40" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "b63bf40" }
 #candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038", optional = true }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
@@ -24,7 +24,7 @@ rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.4.2", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true}
-flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7c972a4", optional = true }
+flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7b2fbbd", optional = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]

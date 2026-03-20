@@ -333,12 +333,16 @@ pub fn fp8_matmul_flashinfer(
     let cu_dev = dev.as_cuda_device()?;
     let stream = *cu_dev.cu_stream() as i64;
     let m_padded = (m + 4 - 1) / 4 * 4;
-    let out = Tensor::zeros((m, n), DType::BF16, dev)?;
+    let out = unsafe { Tensor::empty_((m, n), DType::BF16, dev)? };
     let k_over_128 = k / 128;
-    let input_q = Tensor::zeros((m, k), DType::U8, dev)?;
+    let input_q = unsafe { Tensor::empty_((m, k), DType::U8, dev)? };
     // FlashInfer/DeepGEMM expects scales_a to use an M-aligned leading stride.
     // Their own tests allocate [K/128, M_padded] and treat only the first M columns as live.
-    let input_scale = Tensor::zeros((k_over_128, m_padded), DType::F32, dev)?;
+    let input_scale = if m_padded == m {
+        unsafe { Tensor::empty_((k_over_128, m_padded), DType::F32, dev)? }
+    } else {
+        Tensor::zeros((k_over_128, m_padded), DType::F32, dev)?
+    };
     let scale_stride = input_scale.stride()[0] as i32;
     let q_ptr = get_cuda_slice::<u8>(&input_q)? as *mut std::ffi::c_void;
     let s_ptr = get_cuda_slice::<f32>(&input_scale)? as *mut f32;
@@ -487,19 +491,23 @@ pub fn fp8_matmul_cutlass(
     let alignment = 4;
     let m_padded = (m + alignment - 1) / alignment * alignment;
     let pad_len = m_padded - m;
-    let input_padded = if pad_len > 0 {
-        input.pad_with_zeros(0, 0, pad_len)?
-    } else {
-        input.clone()
-    };
 
-    let mut output = Tensor::zeros((if pad_len > 0 { m_padded } else { m }, n), dtype, dev)?;
+    let mut output =
+        unsafe { Tensor::empty_((if pad_len > 0 { m_padded } else { m }, n), dtype, dev)? };
     let cu_dev = dev.as_cuda_device()?;
     let stream = *cu_dev.cu_stream() as i64;
     let k_over_128 = (k + 127) / 128;
 
-    let input_q = Tensor::zeros((m_padded, k), DType::U8, &dev)?;
-    let input_scale_base = Tensor::zeros((k_over_128, m_padded), DType::F32, &dev)?;
+    let input_q = if pad_len == 0 {
+        unsafe { Tensor::empty_((m_padded, k), DType::U8, &dev)? }
+    } else {
+        Tensor::zeros((m_padded, k), DType::U8, &dev)?
+    };
+    let input_scale_base = if pad_len == 0 {
+        unsafe { Tensor::empty_((k_over_128, m_padded), DType::F32, &dev)? }
+    } else {
+        Tensor::zeros((k_over_128, m_padded), DType::F32, &dev)?
+    };
     let input_scale = input_scale_base.t()?;
     let scale_stride = input_scale.stride()[1] as i32;
 
@@ -507,13 +515,13 @@ pub fn fp8_matmul_cutlass(
     let s_ptr = get_cuda_slice::<f32>(&input_scale)? as *mut f32;
 
     let inp_ptr = if dtype == DType::F16 {
-        get_cuda_slice::<half::f16>(&input_padded)?
+        get_cuda_slice::<half::f16>(input)?
     } else {
-        get_cuda_slice::<half::bf16>(&input_padded)?
+        get_cuda_slice::<half::bf16>(input)?
     };
 
     unsafe {
-        let num_groups = m_padded * k_over_128;
+        let num_groups = m * k_over_128;
         let group_size = 128;
         let num_groups_per_row = k_over_128;
         ffi::fp8_quantize_per_token_group_launch(

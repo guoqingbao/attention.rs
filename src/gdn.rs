@@ -1336,7 +1336,7 @@ pub fn gated_rmsnorm_silu_mul(
 /// - `q`, `k`: `[bh, seq, k_dim]`
 /// - `v`: `[bh, seq, v_dim]`
 /// - `g`, `beta`: `[bh, seq]`
-/// - `state`: `[bh, k_dim, v_dim]` (updated in place)
+/// - CUDA `state`: `[bh, v_dim, k_dim]` (updated in place)
 ///
 /// Note: this function expects caller-side q/k normalization to already be applied.
 #[cfg(feature = "cuda")]
@@ -1358,10 +1358,11 @@ pub fn gated_delta_rule_recurrence(
 
             let original_shape = state.shape().clone();
             let (bh_s, k_dim_s, v_dim_s) = if original_shape.rank() == 4 {
-                let (b, h, k, v) = state.dims4()?;
+                let (b, h, v, k) = state.dims4()?;
                 (b * h, k, v)
             } else {
-                state.dims3()?
+                let (bh_s, v_dim_s, k_dim_s) = state.dims3()?;
+                (bh_s, k_dim_s, v_dim_s)
             };
 
             if bh != bh_k
@@ -1403,10 +1404,10 @@ pub fn gated_delta_rule_recurrence(
             }
 
             let out_dtype = q_c.dtype();
-            let g_f32 = if g.dtype() == DType::F32 {
-                ensure_contiguous(g)?
+            let decay_f32 = if g.dtype() == DType::F32 {
+                ensure_contiguous(g)?.exp()?.contiguous()?
             } else {
-                g.to_dtype(DType::F32)?.contiguous()?
+                g.to_dtype(DType::F32)?.exp()?.contiguous()?
             };
             let beta_f32 = if beta.dtype() == DType::F32 {
                 ensure_contiguous(beta)?
@@ -1430,7 +1431,7 @@ pub fn gated_delta_rule_recurrence(
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
             let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_f32)? as *const f32;
+            let g_ptr = get_cuda_const_ptr(&decay_f32)? as *const f32;
             let beta_ptr = get_cuda_const_ptr(&beta_f32)? as *const f32;
             let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
             let stream = *dev.cu_stream() as i64;
@@ -1505,7 +1506,7 @@ pub fn gated_delta_rule_decode_slots(
     v: &Tensor,    // [batch, heads, v_dim]
     g: &Tensor,    // [batch, heads]
     beta: &Tensor, // [batch, heads]
-    state: &mut Tensor, // [max_batch, heads, k_dim, v_dim]
+    state: &mut Tensor, // CUDA: [max_batch, heads, v_dim, k_dim]
     slots: &Tensor, // [batch] i64
 ) -> Result<Tensor> {
     match q.device() {
@@ -1513,7 +1514,7 @@ pub fn gated_delta_rule_decode_slots(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let g_c = ensure_contiguous(g)?;
+            let decay_c = ensure_contiguous(g)?.exp()?.contiguous()?;
             let beta_c = ensure_contiguous(beta)?;
 
             let (bq, hq, kq) = q.dims3()?;
@@ -1581,7 +1582,7 @@ pub fn gated_delta_rule_decode_slots(
                 let q_ptr = get_cuda_const_ptr(&q_c)? as *const f32;
                 let k_ptr = get_cuda_const_ptr(&k_c)? as *const f32;
                 let v_ptr = get_cuda_const_ptr(&v_c)? as *const f32;
-                let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+                let g_ptr = get_cuda_const_ptr(&decay_c)? as *const f32;
                 let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
                 let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
                 let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
@@ -1622,7 +1623,7 @@ pub fn gated_delta_rule_decode_slots(
                 let q_ptr = get_cuda_const_ptr(&q_c)?;
                 let k_ptr = get_cuda_const_ptr(&k_c)?;
                 let v_ptr = get_cuda_const_ptr(&v_c)?;
-                let g_ptr = get_cuda_const_ptr(&g_c)?;
+                let g_ptr = get_cuda_const_ptr(&decay_c)?;
                 let beta_ptr = get_cuda_const_ptr(&beta_c)?;
                 let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
                 let out_ptr = get_cuda_mut_ptr(&out)?;
@@ -1749,7 +1750,7 @@ pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
 /// - `q`, `k`: `[total_tokens, num_heads, k_dim]`
 /// - `v`: `[total_tokens, num_heads, v_dim]`
 /// - `g`, `beta`: `[total_tokens, num_heads]`
-/// - `state`: `[max_batch, num_heads, k_dim, v_dim]` (FP32, updated in place)
+/// - CUDA `state`: `[max_batch, num_heads, v_dim, k_dim]` (FP32, updated in place)
 /// - `slots`: `[batch]` i64
 /// - `cu_seqlens`: `[batch + 1]` u32
 #[cfg(feature = "cuda")]
@@ -1768,7 +1769,7 @@ pub fn gated_delta_rule_recurrence_varlen(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let g_c = ensure_contiguous(g)?;
+            let decay_c = ensure_contiguous(g)?.exp()?.contiguous()?;
             let beta_c = ensure_contiguous(beta)?;
 
             let (total_tokens, num_heads, k_dim) = q_c.dims3()?;
@@ -1803,7 +1804,7 @@ pub fn gated_delta_rule_recurrence_varlen(
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
             let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_c)?;
+            let g_ptr = get_cuda_const_ptr(&decay_c)?;
             let beta_ptr = get_cuda_const_ptr(&beta_c)?;
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;

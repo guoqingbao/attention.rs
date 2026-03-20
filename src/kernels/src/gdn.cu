@@ -55,6 +55,15 @@ __device__ __forceinline__ float silu_float(float x) {
     return x / (1.0f + expf(-x));
 }
 
+static constexpr int GDN_WARP_SIZE = 32;
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = GDN_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return __shfl_sync(0xffffffff, val, 0);
+}
+
 // =============================================================================
 // Gated Delta Rule Recurrence (DeltaNet core)
 // =============================================================================
@@ -64,9 +73,9 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     const T* __restrict__ q,          // [BH, S, K]
     const T* __restrict__ k,          // [BH, S, K]
     const T* __restrict__ v,          // [BH, S, V]
-    const float* __restrict__ g,      // [BH, S]
+    const float* __restrict__ g,      // [BH, S] decay = exp(g)
     const float* __restrict__ beta,   // [BH, S]
-    float* __restrict__ state,        // [BH, K, V] (in/out)
+    float* __restrict__ state,        // [BH, V, K] (in/out)
     float* __restrict__ out,          // [BH, S, V]
     int seq_len,
     int v_dim) {
@@ -84,7 +93,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
-    float* state_bh = state + bh * BK * v_dim;
+    float* state_bh = state + bh * BK * v_dim + v_idx * BK;
     float* out_bh = out + bh * seq_len * v_dim;
 
     // Shared memory layout: k_buf[BK] + q_buf[BK] + scalars[2]
@@ -92,12 +101,12 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     __shared__ float q_buf[BK];
     __shared__ float scalars[2]; // decay, beta_t
 
-    // K1: Load state — state is [K, V], access pattern state[j * v_dim + v_idx]
-    // is non-coalesced. Each thread loads its own column (v_idx is unique per thread).
+    // State is stored transposed as [V, K], so each thread owns one contiguous
+    // value column and walks K in registers.
     float s[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s[j] = state_bh[j * v_dim + v_idx];
+        s[j] = state_bh[j];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -106,9 +115,8 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
         for (int j = tid; j < BK; j += BV) {
             k_buf[j] = to_float(k_bh[t * BK + j]);
         }
-        // Broadcast scalars via shared memory (K3 for prefill)
         if (tid == 0) {
-            scalars[0] = expf(g_bh[t]);
+            scalars[0] = g_bh[t];
             scalars[1] = beta_bh[t];
         }
         __syncthreads();
@@ -147,7 +155,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     // Store state back
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        state_bh[j * v_dim + v_idx] = s[j];
+        state_bh[j] = s[j];
     }
 }
 
@@ -156,9 +164,9 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const T* __restrict__ q,          // [BH, S, K]
     const T* __restrict__ k,          // [BH, S, K]
     const T* __restrict__ v,          // [BH, S, V]
-    const float* __restrict__ g,      // [BH, S]
+    const float* __restrict__ g,      // [BH, S] decay = exp(g)
     const float* __restrict__ beta,   // [BH, S]
-    float* __restrict__ state,        // [BH, K, V] (in/out)
+    float* __restrict__ state,        // [BH, V, K] (in/out)
     float* __restrict__ out,          // [BH, S, V]
     int seq_len,
     int k_dim,
@@ -177,7 +185,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
-    float* state_bh = state + bh * k_dim * v_dim;
+    float* state_bh = state + bh * k_dim * v_dim + v_idx * k_dim;
     float* out_bh = out + bh * seq_len * v_dim;
 
     // Dynamic shared memory: k_buf[k_dim] + q_buf[k_dim] + scalars[2]
@@ -188,7 +196,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
     float s[MAX_K];
     for (int j = 0; j < k_dim; ++j) {
-        s[j] = state_bh[j * v_dim + v_idx];
+        s[j] = state_bh[j];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -196,7 +204,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
             k_buf[j] = to_float(k_bh[t * k_dim + j]);
         }
         if (tid == 0) {
-            scalars_buf[0] = expf(g_bh[t]);
+            scalars_buf[0] = g_bh[t];
             scalars_buf[1] = beta_bh[t];
         }
         __syncthreads();
@@ -229,7 +237,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     }
 
     for (int j = 0; j < k_dim; ++j) {
-        state_bh[j * v_dim + v_idx] = s[j];
+        state_bh[j] = s[j];
     }
 }
 
@@ -343,9 +351,9 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const T* __restrict__ q,      // [batch, heads, k_dim]
     const T* __restrict__ k,      // [batch, heads, k_dim]
     const T* __restrict__ v,      // [batch, heads, v_dim]
-    const T* __restrict__ g,      // [batch, heads]
+    const T* __restrict__ g,      // [batch, heads] decay = exp(g)
     const T* __restrict__ beta,   // [batch, heads]
-    T* __restrict__ state,        // [max_batch, heads, k_dim, v_dim]
+    T* __restrict__ state,        // [max_batch, heads, v_dim, k_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, heads, v_dim]
     int batch,
@@ -363,14 +371,13 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const int64_t slot = slots[b];
     if (slot < 0) return;
 
-    // K3: broadcast scalars via shared memory — one expf instead of BV
     extern __shared__ float smem[];
     float* q_smem = smem;                  // [BK]
     float* k_smem = smem + BK;             // [BK]
     float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
 
     if (tid == 0) {
-        scalars[0] = expf(to_float(g[bh]));
+        scalars[0] = to_float(g[bh]);
         scalars[1] = to_float(beta[bh]);
     }
 
@@ -384,15 +391,12 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const float decay = scalars[0];
     const float beta_t = scalars[1];
 
-    // K5: state pointer — stride v_dim between k elements (non-coalesced)
-    // We load into registers; cooperative smem load not beneficial for decode
-    // because each thread accesses a different v_idx column.
-    T* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
+    T* state_bh = state + (((slot * heads + h) * v_dim + v_idx) * k_dim);
 
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? to_float(state_bh[j * v_dim]) : 0.0f;
+        s_buf[j] = (j < k_dim) ? to_float(state_bh[j]) : 0.0f;
     }
 
     float kv_mem = 0.0f;
@@ -426,7 +430,7 @@ __global__ void gated_delta_rule_decode_slots_kernel(
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
         if (j < k_dim) {
-            state_bh[j * v_dim] = from_float<T>(s_buf[j]);
+            state_bh[j] = from_float<T>(s_buf[j]);
         }
     }
 
@@ -438,9 +442,9 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const T* __restrict__ q,      // [batch, heads, k_dim]
     const T* __restrict__ k,      // [batch, heads, k_dim]
     const T* __restrict__ v,      // [batch, heads, v_dim]
-    const T* __restrict__ g,      // [batch, heads]
+    const T* __restrict__ g,      // [batch, heads] decay = exp(g)
     const T* __restrict__ beta,   // [batch, heads]
-    float* __restrict__ state,    // [max_batch, heads, k_dim, v_dim]
+    float* __restrict__ state,    // [max_batch, heads, v_dim, k_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, heads, v_dim]
     int batch,
@@ -458,14 +462,13 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const int64_t slot = slots[b];
     if (slot < 0) return;
 
-    // K3: broadcast scalars via shared memory
     extern __shared__ float smem[];
     float* q_smem = smem;
     float* k_smem = smem + BK;
     float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
 
     if (tid == 0) {
-        scalars[0] = expf(to_float(g[bh]));
+        scalars[0] = to_float(g[bh]);
         scalars[1] = to_float(beta[bh]);
     }
 
@@ -479,12 +482,12 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const float decay = scalars[0];
     const float beta_t = scalars[1];
 
-    float* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
+    float* state_bh = state + (((slot * heads + h) * v_dim + v_idx) * k_dim);
 
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? state_bh[j * v_dim] : 0.0f;
+        s_buf[j] = (j < k_dim) ? state_bh[j] : 0.0f;
     }
 
     float kv_mem = 0.0f;
@@ -518,7 +521,7 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
         if (j < k_dim) {
-            state_bh[j * v_dim] = s_buf[j];
+            state_bh[j] = s_buf[j];
         }
     }
 
@@ -1509,14 +1512,14 @@ extern "C" void l2_norm_last_dim_bf16(
 // Accepts native dtype inputs, computes in FP32
 // =============================================================================
 
-template <typename T, int BV, int BK>
+template <typename T, int BK, int WARPS_PER_BLOCK>
 __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const T* __restrict__ q,          // [total_tokens, num_heads, k_dim]
     const T* __restrict__ k,          // [total_tokens, num_heads, k_dim]
     const T* __restrict__ v,          // [total_tokens, num_heads, v_dim]
-    const T* __restrict__ g,          // [total_tokens, num_heads]
+    const T* __restrict__ g,          // [total_tokens, num_heads] decay = exp(g)
     const T* __restrict__ beta,       // [total_tokens, num_heads]
-    float* __restrict__ state,        // [max_batch, num_heads, k_dim, v_dim]
+    float* __restrict__ state,        // [max_batch, num_heads, v_dim, k_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,              // [total_tokens, num_heads, v_dim]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
@@ -1524,15 +1527,14 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     int num_heads,
     int k_dim,
     int v_dim) {
-    const int v_tile = blockIdx.x;
     const int seq_head = blockIdx.y; // batch_idx * num_heads + head_idx
-    const int tid = threadIdx.x;
-    const int v_idx = v_tile * BV + tid;
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int v_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     if (v_idx >= v_dim || seq_head >= batch * num_heads) return;
 
     const int seq_idx = seq_head / num_heads;
     const int head_idx = seq_head % num_heads;
-    const int head_k_idx = head_idx;
     const int64_t slot = slots[seq_idx];
     if (slot < 0) return;
 
@@ -1546,90 +1548,69 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const int token_stride_v = num_heads * v_dim;
     const int token_stride_g = num_heads;
 
-    const T* q_base = q + start * token_stride_k + head_k_idx * k_dim;
-    const T* k_base = k + start * token_stride_k + head_k_idx * k_dim;
+    const T* q_base = q + start * token_stride_k + head_idx * k_dim;
+    const T* k_base = k + start * token_stride_k + head_idx * k_dim;
     const T* v_base = v + start * token_stride_v + head_idx * v_dim;
     const T* g_base = g + start * token_stride_g + head_idx;
     const T* beta_base = beta + start * token_stride_g + head_idx;
     T* out_base = out + start * token_stride_v + head_idx * v_dim;
 
-    float* state_bh = state + ((slot * num_heads + head_idx) * k_dim) * v_dim + v_idx;
+    float* state_col = state + (((slot * num_heads + head_idx) * v_dim + v_idx) * k_dim);
 
-    // Shared memory: 
-    // k_buf[4][BK]
-    // q_buf[4][BK]
-    // scl[4][2]
-    // Total: 2 * 4 * BK * 2 (k+q) + 16 (scl) floats.
-    // For BK=128: 1024 + 1024 + 16 = 2064 floats = ~8KB.
-    extern __shared__ float smem[];
-    float* k_buf = smem;                 // [4*BK]
-    float* q_buf = smem + 4 * BK;        // [4*BK]
-    float* scl = smem + 8 * BK;          // [8]
-
-    // Load state into registers
-    float s[BK];
+    constexpr int ROWS_PER_LANE = (BK + GDN_WARP_SIZE - 1) / GDN_WARP_SIZE;
+    float s_shard[ROWS_PER_LANE];
 #pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        s[j] = state_bh[j * v_dim];
+    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+        const int k_idx = r * GDN_WARP_SIZE + lane;
+        s_shard[r] = (k_idx < k_dim) ? state_col[k_idx] : 0.0f;
     }
 
-    for (int t = 0; t < seq_len; t += 4) {
-        // Load phase: Load t..t+3
-        #pragma unroll
-        for (int sub = 0; sub < 4; ++sub) {
-            if (t + sub < seq_len) {
-                // Cooperative load k
-                for (int j = tid; j < k_dim; j += BV) {
-                    k_buf[sub * BK + j] = to_float(k_base[(t + sub) * token_stride_k + j]);
-                }
-                // Cooperative load q
-                for (int j = tid; j < k_dim; j += BV) {
-                    q_buf[sub * BK + j] = to_float(q_base[(t + sub) * token_stride_k + j]);
-                }
-                if (tid == 0) {
-                    scl[sub * 2 + 0] = expf(to_float(g_base[(t + sub) * token_stride_g]));
-                    scl[sub * 2 + 1] = to_float(beta_base[(t + sub) * token_stride_g]);
-                }
-            }
-        }
-        
-        __syncthreads();
+    for (int t = 0; t < seq_len; ++t) {
+        const T* q_t = q_base + t * token_stride_k;
+        const T* k_t = k_base + t * token_stride_k;
+        const T* v_t = v_base + t * token_stride_v;
 
-        // Compute phase: Process t..t+3
-        #pragma unroll
-        for (int sub = 0; sub < 4; ++sub) {
-            if (t + sub < seq_len) {
-                const float decay = scl[sub * 2 + 0];
-                const float beta_t = scl[sub * 2 + 1];
-                const float v_t = to_float(v_base[(t + sub) * token_stride_v + v_idx]);
-
-                float kv_mem = 0.0f;
-                #pragma unroll
-                for (int j = 0; j < BK; ++j) {
-                    s[j] *= decay;
-                    kv_mem = __fmaf_rn(s[j], k_buf[sub * BK + j], kv_mem);
-                }
-
-                const float delta = (v_t - kv_mem) * beta_t;
-
-                float y_t = 0.0f;
-                #pragma unroll
-                for (int j = 0; j < BK; ++j) {
-                    s[j] = __fmaf_rn(k_buf[sub * BK + j], delta, s[j]);
-                    y_t = __fmaf_rn(s[j], q_buf[sub * BK + j], y_t);
-                }
-
-                out_base[(t + sub) * token_stride_v + v_idx] = from_float<T>(y_t);
-            }
+        float q_reg[ROWS_PER_LANE];
+        float k_reg[ROWS_PER_LANE];
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            q_reg[r] = (k_idx < k_dim) ? to_float(q_t[k_idx]) : 0.0f;
+            k_reg[r] = (k_idx < k_dim) ? to_float(k_t[k_idx]) : 0.0f;
         }
 
-        __syncthreads();
+        const float decay = to_float(g_base[t * token_stride_g]);
+        const float beta_t = to_float(beta_base[t * token_stride_g]);
+
+        float kv_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            s_shard[r] *= decay;
+            kv_partial = __fmaf_rn(s_shard[r], k_reg[r], kv_partial);
+        }
+        const float kv_mem = warp_reduce_sum(kv_partial);
+        const float delta = (to_float(v_t[v_idx]) - kv_mem) * beta_t;
+
+        float y_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            s_shard[r] = __fmaf_rn(k_reg[r], delta, s_shard[r]);
+            y_partial = __fmaf_rn(s_shard[r], q_reg[r], y_partial);
+        }
+        const float y_t = warp_reduce_sum(y_partial);
+
+        if (lane == 0) {
+            out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+        }
     }
 
-    // Store state back
+    // Store the transposed [V, K] state back.
 #pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        state_bh[j * v_dim] = s[j];
+    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+        const int k_idx = r * GDN_WARP_SIZE + lane;
+        if (k_idx < k_dim) {
+            state_col[k_idx] = s_shard[r];
+        }
     }
 }
 
@@ -1640,20 +1621,18 @@ void launch_gated_delta_rule_recurrence_varlen(
     const uint32_t* cu_seqlens,
     int batch, int num_heads, int k_dim, int v_dim,
     cudaStream_t stream) {
-    constexpr int BV = 64;
-    dim3 grid((v_dim + BV - 1) / BV, batch * num_heads);
-    dim3 block(BV);
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
+    dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
 
     if (k_dim == 64) {
         constexpr int BK = 64;
-        size_t smem = (8 * BK + 8) * sizeof(float); // 4 way * 2 (k+q)
-        gated_delta_rule_recurrence_varlen_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
+        gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, slots, out, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
     } else if (k_dim == 128) {
         constexpr int BK = 128;
-        size_t smem = (8 * BK + 8) * sizeof(float);
-        gated_delta_rule_recurrence_varlen_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
+        gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, slots, out, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
     } else {
