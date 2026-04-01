@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");
+    println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -101,6 +102,7 @@ fn main() -> Result<()> {
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
+        println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
         // DO not change this, this featch custom flashinfer v0.6.2 headers
         // which is compatible with our code (added more gqa group_size)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(

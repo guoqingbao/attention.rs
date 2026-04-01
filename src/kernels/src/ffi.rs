@@ -2119,4 +2119,115 @@ extern "C" {
         limit: f32,
         stream: i64,
     );
+
+    // =========================================================================
+    // MLA (Multi-head Latent Attention) cache update
+    // =========================================================================
+
+    pub fn concat_and_cache_mla(
+        ckv: *const c_void,
+        k_pe: *const c_void,
+        ckv_cache: *mut c_void,
+        kpe_cache: *mut c_void,
+        slot_mapping: *const i64,
+        num_tokens: c_int,
+        kv_lora_rank: c_int,
+        kpe_head_dim: c_int,
+        block_size: c_int,
+        ckv_stride: c_int,
+        kpe_stride: c_int,
+        stream: i64,
+        dtype: u32,
+    );
+
+    // =========================================================================
+    // FlashInfer MLA decode (plan + run)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_decode_plan_wrapper(
+        kv_indptr_host: *const i32,
+        batch_size: c_int,
+        num_qo_heads: c_int,
+        page_size: c_int,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: i64,
+        enable_cuda_graph: bool,
+        dtype: u32,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_decode_run_wrapper(
+        o: *mut c_void,
+        q_nope: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        kv_last_page_len: *const i32,
+        batch_size: c_int,
+        num_qo_heads: c_int,
+        page_size: c_int,
+        sm_scale: f32,
+        rope_scale: f32,
+        rope_theta: f32,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        plan_info: *const i64,
+        dtype: u32,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // FlashInfer MLA prefill (plan + run)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_prefill_plan_wrapper(
+        qo_indptr_host: *const i32,
+        kv_indptr_host: *const i32,
+        kv_len_arr_host: *const i32,
+        batch_size: c_int,
+        num_heads: c_int,
+        head_dim_ckv: c_int,
+        causal: bool,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: i64,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_prefill_run_wrapper(
+        o: *mut c_void,
+        q_nope: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        kv_indices: *const i32,
+        num_heads: c_int,
+        page_size: c_int,
+        sm_scale: f32,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        plan_info: *const i64,
+        causal: bool,
+        dtype: u32,
+        stream: i64,
+    );
 }

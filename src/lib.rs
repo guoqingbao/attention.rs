@@ -26,9 +26,10 @@ pub mod cache;
 pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod gdn;
-pub mod mamba_cache;
+pub mod mla;
 pub mod mxfp4_linear;
 pub mod nvfp4_linear;
+pub mod mamba_cache;
 pub mod ops;
 pub mod swiglu;
 
@@ -50,10 +51,13 @@ pub struct FlashInferMetadata {
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
     pub decode_plan_info: Option<Vec<i64>>,
+    pub mla_decode_plan_info: Option<Vec<i64>>,
+    pub mla_prefill_plan_info: Option<Vec<i64>>,
 }
 
 pub struct InputMetadata {
     pub is_prefill: bool,
+    pub is_mla: bool,
     pub sequence_ids: Option<Vec<usize>>,
     pub mamba_slot_mapping: Option<Tensor>,
     pub slot_mapping: Tensor,
