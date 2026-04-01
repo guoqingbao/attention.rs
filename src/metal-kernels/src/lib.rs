@@ -1255,6 +1255,143 @@ pub fn call_fp8_matmul(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// MoE GEMM
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_moe_gemm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    input_offset: usize,
+    weights: &Buffer,
+    weights_offset: usize,
+    sorted_token_ids: &Buffer,
+    sorted_token_ids_offset: usize,
+    expert_ids: &Buffer,
+    expert_ids_offset: usize,
+    topk_weights: Option<(&Buffer, usize)>,
+    output: &Buffer,
+    output_offset: usize,
+    num_experts: i32,
+    topk: i32,
+    size_m: i32,
+    size_n: i32,
+    size_k: i32,
+    is_prefill: bool,
+) -> Result<(), MetalKernelError> {
+    let use_gemv = !is_prefill && size_m <= 128;
+    let has_topk_weights: i32 = if topk_weights.is_some() { 1 } else { 0 };
+
+    // Dummy buffer for nullable topk_weights
+    let dummy_offset: usize = 0;
+
+    if use_gemv {
+        let name = match ty {
+            DType::F16 => "moe_gemv_half",
+            DType::BF16 => "moe_gemv_bfloat16",
+            other => {
+                return Err(MetalKernelError::DTypeMismatch {
+                    expected: vec![DType::F16, DType::BF16],
+                    got: other,
+                })
+            }
+        };
+        let pipeline = kernels.load_pipeline(device, name.to_string())?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(0, Some(input), input_offset as NSUInteger);
+        encoder.set_buffer(1, Some(weights), weights_offset as NSUInteger);
+        encoder.set_buffer(
+            2,
+            Some(sorted_token_ids),
+            sorted_token_ids_offset as NSUInteger,
+        );
+        encoder.set_buffer(3, Some(expert_ids), expert_ids_offset as NSUInteger);
+        if let Some((tw_buf, tw_off)) = topk_weights {
+            encoder.set_buffer(4, Some(tw_buf), tw_off as NSUInteger);
+        } else {
+            encoder.set_buffer(4, Some(output), dummy_offset as NSUInteger);
+        }
+        encoder.set_buffer(5, Some(output), output_offset as NSUInteger);
+        utils::set_param(encoder, 6, num_experts);
+        utils::set_param(encoder, 7, topk);
+        utils::set_param(encoder, 8, size_m);
+        utils::set_param(encoder, 9, size_n);
+        utils::set_param(encoder, 10, size_k);
+        utils::set_param(encoder, 11, has_topk_weights);
+
+        let thread_group_size = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let thread_groups_count = MTLSize {
+            width: size_n as u64,
+            height: size_m as u64,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    } else {
+        const BLOCK_M: u64 = 32;
+        const BLOCK_N: u64 = 32;
+
+        let name = match ty {
+            DType::F16 => "moe_gemm_half_32_32_32",
+            DType::BF16 => "moe_gemm_bfloat16_32_32_32",
+            other => {
+                return Err(MetalKernelError::DTypeMismatch {
+                    expected: vec![DType::F16, DType::BF16],
+                    got: other,
+                })
+            }
+        };
+        let pipeline = kernels.load_pipeline(device, name.to_string())?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(0, Some(input), input_offset as NSUInteger);
+        encoder.set_buffer(1, Some(weights), weights_offset as NSUInteger);
+        encoder.set_buffer(
+            2,
+            Some(sorted_token_ids),
+            sorted_token_ids_offset as NSUInteger,
+        );
+        encoder.set_buffer(3, Some(expert_ids), expert_ids_offset as NSUInteger);
+        if let Some((tw_buf, tw_off)) = topk_weights {
+            encoder.set_buffer(4, Some(tw_buf), tw_off as NSUInteger);
+        } else {
+            encoder.set_buffer(4, Some(output), dummy_offset as NSUInteger);
+        }
+        encoder.set_buffer(5, Some(output), output_offset as NSUInteger);
+        utils::set_param(encoder, 6, num_experts);
+        utils::set_param(encoder, 7, topk);
+        utils::set_param(encoder, 8, size_m);
+        utils::set_param(encoder, 9, size_n);
+        utils::set_param(encoder, 10, size_k);
+        utils::set_param(encoder, 11, has_topk_weights);
+
+        let thread_group_size = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let thread_groups_count = MTLSize {
+            width: (size_n as u64 + BLOCK_N - 1) / BLOCK_N,
+            height: (size_m as u64 + BLOCK_M - 1) / BLOCK_M,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    }
+    Ok(())
+}
+
 fn gdn_type_name(ty: DType) -> Result<&'static str, MetalKernelError> {
     match ty {
         DType::F32 => Ok("float"),

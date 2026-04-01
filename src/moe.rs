@@ -845,7 +845,127 @@ pub fn moe_gemm_fp8(
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "metal")]
+pub fn moe_gemm(
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    use candle_core as candle;
+    use candle_core::{DType, Storage};
+
+    let (input_rows, size_k1) = input.dims2()?;
+    let size_m = if topk_weights.is_none() {
+        input_rows * topk
+    } else {
+        input_rows
+    };
+    let (num_experts, size_n, size_k) = weights.dims3()?;
+    assert!(
+        size_k == size_k1,
+        "input {:?} and weight {:?} last dim mismatch!",
+        size_k1,
+        size_k
+    );
+
+    let dtype = input.dtype();
+    if dtype != DType::F16 && dtype != DType::BF16 {
+        candle_core::bail!(
+            "moe_gemm on Metal only supports f16/bf16 inputs, got {:?}",
+            dtype
+        );
+    }
+
+    let dev = input.device();
+    let metal_dev = dev.as_metal_device()?;
+    let command_buffer = metal_dev.command_buffer()?;
+    let command_buffer = command_buffer.as_ref();
+
+    let output = Tensor::zeros((size_m, size_n), dtype, dev)?;
+
+    {
+        let (input_s, input_l) = input.storage_and_layout();
+        let input_s = match &*input_s {
+            Storage::Metal(s) => s,
+            _ => candle::bail!("input must be a metal tensor"),
+        };
+
+        let (weights_s, weights_l) = weights.storage_and_layout();
+        let weights_s = match &*weights_s {
+            Storage::Metal(s) => s,
+            _ => candle::bail!("weights must be a metal tensor"),
+        };
+
+        let (sti_s, sti_l) = sorted_token_ids.storage_and_layout();
+        let sti_s = match &*sti_s {
+            Storage::Metal(s) => s,
+            _ => candle::bail!("sorted_token_ids must be a metal tensor"),
+        };
+
+        let (eid_s, eid_l) = experts_ids.storage_and_layout();
+        let eid_s = match &*eid_s {
+            Storage::Metal(s) => s,
+            _ => candle::bail!("experts_ids must be a metal tensor"),
+        };
+
+        let topk_weights_buf = if let Some(tw) = topk_weights {
+            let (tw_s, tw_l) = tw.storage_and_layout();
+            let tw_s = match &*tw_s {
+                Storage::Metal(s) => s,
+                _ => candle::bail!("topk_weights must be a metal tensor"),
+            };
+            Some((
+                tw_s.buffer().clone(),
+                tw_l.start_offset() * tw.dtype().size_in_bytes(),
+            ))
+        } else {
+            None
+        };
+
+        let (output_s, output_l) = output.storage_and_layout();
+        let output_s = match &*output_s {
+            Storage::Metal(s) => s,
+            _ => candle::bail!("output must be a metal tensor"),
+        };
+
+        let tw_ref = topk_weights_buf
+            .as_ref()
+            .map(|(buf, off)| (buf as &metal::Buffer, *off));
+
+        metal_kernels::call_moe_gemm(
+            metal_dev.device(),
+            command_buffer,
+            metal_kernels::Kernels::default(),
+            dtype,
+            input_s.buffer(),
+            input_l.start_offset() * dtype.size_in_bytes(),
+            weights_s.buffer(),
+            weights_l.start_offset() * dtype.size_in_bytes(),
+            sti_s.buffer(),
+            sti_l.start_offset() * sorted_token_ids.dtype().size_in_bytes(),
+            eid_s.buffer(),
+            eid_l.start_offset() * experts_ids.dtype().size_in_bytes(),
+            tw_ref,
+            output_s.buffer(),
+            output_l.start_offset() * dtype.size_in_bytes(),
+            num_experts as i32,
+            topk as i32,
+            size_m as i32,
+            size_n as i32,
+            size_k as i32,
+            is_prefill,
+        )
+        .map_err(candle_core::Error::wrap)?;
+    }
+
+    Ok(output)
+}
+
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub fn moe_gemm(
     _: &Tensor,
     _: &Tensor,
@@ -1040,7 +1160,58 @@ pub fn moe_gemm_gguf(
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "metal")]
+pub fn moe_gemm_gguf(
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+    dtype: candle_core::DType,
+) -> Result<Tensor> {
+    use candle_core::DType;
+
+    let _shape = weights.shape().dims3()?;
+    let dequant = weights.dequantize_f16(input.device())?;
+
+    let compute_dtype = if dtype == DType::F16 || dtype == DType::BF16 {
+        dtype
+    } else {
+        DType::F16
+    };
+
+    let input_cast = if input.dtype() != compute_dtype {
+        input.to_dtype(compute_dtype)?
+    } else {
+        input.clone()
+    };
+
+    let dequant = if dequant.dtype() != compute_dtype {
+        dequant.to_dtype(compute_dtype)?
+    } else {
+        dequant
+    };
+
+    let result = moe_gemm(
+        &input_cast,
+        &dequant,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+        is_prefill,
+    )?;
+
+    if result.dtype() != DType::F32 {
+        result.to_dtype(DType::F32)
+    } else {
+        Ok(result)
+    }
+}
+
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub fn moe_gemm_gguf(
     _: &Tensor,
     _: &QTensor,
