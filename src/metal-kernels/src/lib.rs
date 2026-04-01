@@ -1392,6 +1392,155 @@ pub fn call_moe_gemm(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// MXFP4 matmul
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_mxfp4_matmul(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: (&Buffer, usize),
+    w: (&Buffer, usize),
+    scales: (&Buffer, usize),
+    bias: (&Buffer, usize),
+    out: &Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    has_bias: bool,
+) -> Result<(), MetalKernelError> {
+    let name = match ty {
+        DType::F16 => "mxfp4_matmul_f16",
+        DType::BF16 => "mxfp4_matmul_bf16",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
+    encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
+    encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
+    encoder.set_buffer(3, Some(bias.0), bias.1 as NSUInteger);
+    encoder.set_buffer(4, Some(out), 0 as NSUInteger);
+    utils::set_param(encoder, 5, m as i32);
+    utils::set_param(encoder, 6, n as i32);
+    utils::set_param(encoder, 7, k as i32);
+    utils::set_param(encoder, 8, has_bias as i32);
+
+    // 8 simdgroups * 32 = 256 threads per threadgroup
+    let group_dims = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid_dims = MTLSize {
+        width: ((n + 7) / 8) as u64,
+        height: m as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 MoE GEMM
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_mxfp4_moe_gemm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: (&Buffer, usize),
+    w: (&Buffer, usize),
+    scales: (&Buffer, usize),
+    biases: (&Buffer, usize),
+    indices: (&Buffer, usize),
+    out: &Buffer,
+    num_tokens: usize,
+    topk: usize,
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    has_bias: bool,
+    input_has_topk_dim: bool,
+    reuse_topk: bool,
+) -> Result<(), MetalKernelError> {
+    let name = match (reuse_topk, ty) {
+        (true, DType::F16) => "mxfp4_moe_gemm_reuse_f16",
+        (true, DType::BF16) => "mxfp4_moe_gemm_reuse_bf16",
+        (false, DType::F16) => "mxfp4_moe_gemm_split_f16",
+        (false, DType::BF16) => "mxfp4_moe_gemm_split_bf16",
+        (_, other) => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    if reuse_topk {
+        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
+        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
+        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
+        encoder.set_buffer(3, Some(biases.0), biases.1 as NSUInteger);
+        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
+        encoder.set_buffer(5, Some(out), 0 as NSUInteger);
+        utils::set_param(encoder, 6, num_tokens as i32);
+        utils::set_param(encoder, 7, topk as i32);
+        utils::set_param(encoder, 8, num_experts as i32);
+        utils::set_param(encoder, 9, n as i32);
+        utils::set_param(encoder, 10, k as i32);
+        utils::set_param(encoder, 11, has_bias as i32);
+    } else {
+        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
+        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
+        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
+        encoder.set_buffer(3, Some(biases.0), biases.1 as NSUInteger);
+        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
+        encoder.set_buffer(5, Some(out), 0 as NSUInteger);
+        utils::set_param(encoder, 6, num_tokens as i32);
+        utils::set_param(encoder, 7, topk as i32);
+        utils::set_param(encoder, 8, num_experts as i32);
+        utils::set_param(encoder, 9, n as i32);
+        utils::set_param(encoder, 10, k as i32);
+        utils::set_param(encoder, 11, has_bias as i32);
+        utils::set_param(encoder, 12, input_has_topk_dim as i32);
+    }
+
+    let group_dims = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid_dims = MTLSize {
+        width: ((n + 7) / 8) as u64,
+        height: num_tokens as u64,
+        depth: if reuse_topk { 1 } else { topk as u64 },
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
 fn gdn_type_name(ty: DType) -> Result<&'static str, MetalKernelError> {
     match ty {
         DType::F32 => Ok("float"),

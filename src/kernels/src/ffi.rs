@@ -1784,4 +1784,164 @@ extern "C" {
         v_dim: c_int,
         stream: i64,
     );
+
+    // =========================================================================
+    // MXFP4 GEMM
+    // =========================================================================
+
+    pub fn mxfp4_matmul_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_get_max_smem_optin() -> c_int;
+
+    pub fn mxfp4_moe_grouped_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
 }

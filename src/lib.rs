@@ -27,6 +27,7 @@ pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod gdn;
 pub mod mamba_cache;
+pub mod mxfp4_linear;
 pub mod ops;
 
 #[cfg(feature = "flashinfer")]
