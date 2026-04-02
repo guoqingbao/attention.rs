@@ -696,6 +696,11 @@ extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                       output, M, N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
 }
+#else
+extern "C" void mxfp4_matmul_smallm_bf16(const void *, const uint8_t *,
+                                          const uint8_t *, const void *,
+                                          void *, int, int, int, bool,
+                                          cudaStream_t) {}
 #endif
 
 extern "C" void mxfp4_matmul_f16(const __half *input,
@@ -735,6 +740,11 @@ mxfp4_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
                                    N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
 }
+#else
+extern "C" void mxfp4_matmul_bf16(const void *, const uint8_t *,
+                                    const uint8_t *, const void *,
+                                    void *, int, int, int, bool,
+                                    cudaStream_t) {}
 #endif
 
 extern "C" void mxfp4_indexed_moe_gemm_f16(
@@ -781,6 +791,11 @@ extern "C" void mxfp4_indexed_moe_gemm_bf16(
           topk, num_experts, N, K, has_bias, input_has_topk_dim);
   CUDA_CHECK(cudaGetLastError());
 }
+#else
+extern "C" void mxfp4_indexed_moe_gemm_bf16(
+    const void *, const uint8_t *, const uint8_t *, const void *,
+    const uint32_t *, void *, int, int, int, int, int, bool, bool,
+    cudaStream_t) {}
 #endif
 
 extern "C" int mxfp4_get_max_smem_optin() {
@@ -836,4 +851,9 @@ extern "C" void mxfp4_moe_grouped_gemm_bf16(
           topk, num_experts, N, K, has_bias, input_has_topk_dim);
   CUDA_CHECK(cudaGetLastError());
 }
+#else
+extern "C" void mxfp4_moe_grouped_gemm_bf16(
+    const void *, const uint8_t *, const uint8_t *, const void *,
+    const uint32_t *, void *, int, int, int, int, int, bool, bool,
+    cudaStream_t) {}
 #endif
