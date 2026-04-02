@@ -1808,6 +1808,32 @@ extern "C" {
     // MXFP4 GEMM
     // =========================================================================
 
+    pub fn mxfp4_matmul_smallm_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_smallm_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
     pub fn mxfp4_matmul_f16(
         input: *const c_void,
         weight: *const u8,

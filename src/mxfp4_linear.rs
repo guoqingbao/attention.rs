@@ -212,20 +212,44 @@ pub fn mxfp4_matmul(
                 let stream = *cuda_dev.cu_stream() as i64;
 
                 unsafe {
-                    match dtype {
-                        DType::F16 => {
-                            ffi::mxfp4_matmul_wmma_f16(
-                                input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr, m as i32,
-                                n as i32, k as i32, has_bias, stream,
-                            );
+                    if m < 32 {
+                        match dtype {
+                            DType::F16 => {
+                                ffi::mxfp4_matmul_smallm_f16(
+                                    input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr,
+                                    m as i32, n as i32, k as i32, has_bias, stream,
+                                );
+                            }
+                            DType::BF16 => {
+                                ffi::mxfp4_matmul_smallm_bf16(
+                                    input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr,
+                                    m as i32, n as i32, k as i32, has_bias, stream,
+                                );
+                            }
+                            _ => candle_core::bail!(
+                                "mxfp4_matmul CUDA: unsupported dtype {:?}",
+                                dtype
+                            ),
                         }
-                        DType::BF16 => {
-                            ffi::mxfp4_matmul_wmma_bf16(
-                                input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr, m as i32,
-                                n as i32, k as i32, has_bias, stream,
-                            );
+                    } else {
+                        match dtype {
+                            DType::F16 => {
+                                ffi::mxfp4_matmul_wmma_f16(
+                                    input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr,
+                                    m as i32, n as i32, k as i32, has_bias, stream,
+                                );
+                            }
+                            DType::BF16 => {
+                                ffi::mxfp4_matmul_wmma_bf16(
+                                    input_ptr, weight_ptr, scale_ptr, bias_ptr, output_ptr,
+                                    m as i32, n as i32, k as i32, has_bias, stream,
+                                );
+                            }
+                            _ => candle_core::bail!(
+                                "mxfp4_matmul CUDA: unsupported dtype {:?}",
+                                dtype
+                            ),
                         }
-                        _ => candle_core::bail!("mxfp4_matmul CUDA: unsupported dtype {:?}", dtype),
                     }
                 }
             }
@@ -448,9 +472,9 @@ pub fn mxfp4_moe_gemm(
             let base_smem: usize = 24576; // WMMA path
             let needed_smem = token_list_bytes + base_smem;
             let max_smem = unsafe { ffi::mxfp4_get_max_smem_optin() } as usize;
-            let use_fused = num_tokens > 1 && needed_smem <= max_smem;
+            let use_fused = num_tokens >= 32 && needed_smem <= max_smem;
 
-            if num_tokens > 1 && !use_fused {
+            if num_tokens >= 32 && !use_fused {
                 return mxfp4_grouped_moe_gemm_fallback(
                     &input,
                     &weights,

@@ -524,11 +524,179 @@ __global__ void mxfp4_moe_grouped_gemm_tiled(
   }
 }
 
+// Small-M matmul: dot-product per output element, one warp per N, M rows per block.
+// Grid: (ceil(N/BLOCK_N_SM), M)  Block: (BLOCK_N_SM * 32)
+// Each warp computes one dot product over K, then warp-reduces.
+constexpr int BLOCK_N_SM = 8;
+
+template <typename T>
+__launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
+    void mxfp4_matmul_smallm_kernel(const T *__restrict__ input,
+                                    const uint8_t *__restrict__ weight,
+                                    const uint8_t *__restrict__ weight_scale,
+                                    const T *__restrict__ bias,
+                                    T *__restrict__ output, int M, int N,
+                                    int K, bool has_bias) {
+  extern __shared__ float s_input[];
+
+  const uint32_t LUT0 = 0x03020100;
+  const uint32_t LUT1 = 0x0C080604;
+  const uint32_t LUT2 = 0xFDFEFF00;
+  const uint32_t LUT3 = 0xF4F8FAFC;
+
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int row = blockIdx.y;
+  const int n_base = blockIdx.x * BLOCK_N_SM;
+  const int n_idx = n_base + warp_id;
+  const int weight_row_stride = K / 2;
+  const int scale_stride = CEILDIV(K, MXFP4_BLOCK_SIZE);
+
+  if (row >= M) return;
+
+  const T *in_row = input + (size_t)row * K;
+  const int smem_stride = K + CEILDIV(K, WARP_SIZE);
+
+  for (int k = tid; k < K; k += block_size) {
+    const int smem_idx = k + (k / WARP_SIZE);
+    if constexpr (std::is_same_v<T, half>) {
+      s_input[smem_idx] = __half2float(__ldg(&in_row[k]));
+    } else {
+      s_input[smem_idx] = __bfloat162float(__ldg(&in_row[k]));
+    }
+  }
+  __syncthreads();
+
+  if (n_idx >= N) return;
+
+  const uint8_t *w_row = weight + (size_t)n_idx * weight_row_stride;
+  const uint8_t *w_scale_row = weight_scale + (size_t)n_idx * scale_stride;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+
+  for (int k = lane_id * MXFP4_BLOCK_SIZE; k < K;
+       k += WARP_SIZE * MXFP4_BLOCK_SIZE) {
+    float w_scale =
+        e8m0_to_float(__ldg(&w_scale_row[k / MXFP4_BLOCK_SIZE])) * 0.5f;
+
+    uint4 w_vec = *reinterpret_cast<const uint4 *>(w_row + k / 2);
+    const float *in = s_input + (k + (k / WARP_SIZE));
+
+    {
+      int2 w_int8 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
+      acc0 = fmaf(in[0], (float)(int8_t)(w_int8.x) * w_scale, acc0);
+      acc1 = fmaf(in[1], (float)(int8_t)(w_int8.y) * w_scale, acc1);
+      acc0 = fmaf(in[2], (float)(int8_t)(w_int8.x >> 8) * w_scale, acc0);
+      acc1 = fmaf(in[3], (float)(int8_t)(w_int8.y >> 8) * w_scale, acc1);
+      acc0 = fmaf(in[4], (float)(int8_t)(w_int8.x >> 16) * w_scale, acc0);
+      acc1 = fmaf(in[5], (float)(int8_t)(w_int8.y >> 16) * w_scale, acc1);
+      acc0 = fmaf(in[6], (float)(int8_t)(w_int8.x >> 24) * w_scale, acc0);
+      acc1 = fmaf(in[7], (float)(int8_t)(w_int8.y >> 24) * w_scale, acc1);
+    }
+    {
+      int2 w_int8 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
+      acc0 = fmaf(in[8], (float)(int8_t)(w_int8.x) * w_scale, acc0);
+      acc1 = fmaf(in[9], (float)(int8_t)(w_int8.y) * w_scale, acc1);
+      acc0 = fmaf(in[10], (float)(int8_t)(w_int8.x >> 8) * w_scale, acc0);
+      acc1 = fmaf(in[11], (float)(int8_t)(w_int8.y >> 8) * w_scale, acc1);
+      acc0 = fmaf(in[12], (float)(int8_t)(w_int8.x >> 16) * w_scale, acc0);
+      acc1 = fmaf(in[13], (float)(int8_t)(w_int8.y >> 16) * w_scale, acc1);
+      acc0 = fmaf(in[14], (float)(int8_t)(w_int8.x >> 24) * w_scale, acc0);
+      acc1 = fmaf(in[15], (float)(int8_t)(w_int8.y >> 24) * w_scale, acc1);
+    }
+    {
+      int2 w_int8 = get_int_from_table_16(w_vec.z, LUT0, LUT1, LUT2, LUT3);
+      acc0 = fmaf(in[16], (float)(int8_t)(w_int8.x) * w_scale, acc0);
+      acc1 = fmaf(in[17], (float)(int8_t)(w_int8.y) * w_scale, acc1);
+      acc0 = fmaf(in[18], (float)(int8_t)(w_int8.x >> 8) * w_scale, acc0);
+      acc1 = fmaf(in[19], (float)(int8_t)(w_int8.y >> 8) * w_scale, acc1);
+      acc0 = fmaf(in[20], (float)(int8_t)(w_int8.x >> 16) * w_scale, acc0);
+      acc1 = fmaf(in[21], (float)(int8_t)(w_int8.y >> 16) * w_scale, acc1);
+      acc0 = fmaf(in[22], (float)(int8_t)(w_int8.x >> 24) * w_scale, acc0);
+      acc1 = fmaf(in[23], (float)(int8_t)(w_int8.y >> 24) * w_scale, acc1);
+    }
+    {
+      int2 w_int8 = get_int_from_table_16(w_vec.w, LUT0, LUT1, LUT2, LUT3);
+      acc0 = fmaf(in[24], (float)(int8_t)(w_int8.x) * w_scale, acc0);
+      acc1 = fmaf(in[25], (float)(int8_t)(w_int8.y) * w_scale, acc1);
+      acc0 = fmaf(in[26], (float)(int8_t)(w_int8.x >> 8) * w_scale, acc0);
+      acc1 = fmaf(in[27], (float)(int8_t)(w_int8.y >> 8) * w_scale, acc1);
+      acc0 = fmaf(in[28], (float)(int8_t)(w_int8.x >> 16) * w_scale, acc0);
+      acc1 = fmaf(in[29], (float)(int8_t)(w_int8.y >> 16) * w_scale, acc1);
+      acc0 = fmaf(in[30], (float)(int8_t)(w_int8.x >> 24) * w_scale, acc0);
+      acc1 = fmaf(in[31], (float)(int8_t)(w_int8.y >> 24) * w_scale, acc1);
+    }
+  }
+
+  float acc = acc0 + acc1;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
+  }
+
+  if (lane_id == 0) {
+    if (has_bias && bias != nullptr) {
+      if constexpr (std::is_same_v<T, half>) {
+        acc += __half2float(__ldg(&bias[n_idx]));
+      } else {
+        acc += __bfloat162float(__ldg(&bias[n_idx]));
+      }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      output[(size_t)row * N + n_idx] = __float2half(acc);
+    } else {
+      output[(size_t)row * N + n_idx] = __float2bfloat16(acc);
+    }
+  }
+}
+
 } // namespace mxfp4_gemm
 
 // ============================================================================
 // C API
 // ============================================================================
+
+extern "C" void mxfp4_matmul_smallm_f16(const __half *input,
+                                         const uint8_t *weight,
+                                         const uint8_t *weight_scale,
+                                         const __half *bias, __half *output,
+                                         int M, int N, int K, bool has_bias,
+                                         cudaStream_t stream) {
+  using namespace mxfp4_gemm;
+  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
+  dim3 block(THREADS);
+  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
+  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
+
+  mxfp4_gemm::mxfp4_matmul_smallm_kernel<half>
+      <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
+                                      output, M, N, K, has_bias);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+#ifndef NO_BF16_KERNEL
+extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
+                                          const uint8_t *weight,
+                                          const uint8_t *weight_scale,
+                                          const __nv_bfloat16 *bias,
+                                          __nv_bfloat16 *output,
+                                          int M, int N, int K, bool has_bias,
+                                          cudaStream_t stream) {
+  using namespace mxfp4_gemm;
+  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
+  dim3 block(THREADS);
+  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
+  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
+
+  mxfp4_gemm::mxfp4_matmul_smallm_kernel<__nv_bfloat16>
+      <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
+                                      output, M, N, K, has_bias);
+  CUDA_CHECK(cudaGetLastError());
+}
+#endif
 
 extern "C" void mxfp4_matmul_f16(const __half *input,
                                   const uint8_t *weight,
