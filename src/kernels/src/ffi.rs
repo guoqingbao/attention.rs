@@ -1341,6 +1341,25 @@ extern "C" {
         stream: i64,
     ) -> i32;
 
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fused_moe_mxfp4(
+        input: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        gate_up_weights: *const u8,
+        gate_up_scales: *const u8,
+        down_weights: *const u8,
+        down_scales: *const u8,
+        output: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_experts: i32,
+        top_k: i32,
+        input_dtype: i32,
+        stream: i64,
+    ) -> i32;
+
     pub fn causal_conv1d_fwd_f32(
         x: *const f32,
         weight: *const f32,
@@ -1782,6 +1801,222 @@ extern "C" {
         num_heads: c_int,
         k_dim: c_int,
         v_dim: c_int,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // MXFP4 GEMM
+    // =========================================================================
+
+    pub fn mxfp4_matmul_smallm_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_smallm_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_get_max_smem_optin() -> c_int;
+
+    pub fn mxfp4_moe_grouped_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_f16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_f32(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
         stream: i64,
     );
 }

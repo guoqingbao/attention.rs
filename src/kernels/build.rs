@@ -37,6 +37,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_llama4.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_cutlass_heuristic.cpp");
     println!("cargo:rerun-if-changed=src/gdn.cu");
+    println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
+    println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
+    println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -88,6 +91,9 @@ fn main() -> Result<()> {
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
+            }
+            if compute_cap >= 100 {
+                builder = builder.arg("-DENABLE_FP4");
             }
         }
     }
