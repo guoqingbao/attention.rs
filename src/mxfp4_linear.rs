@@ -10,6 +10,110 @@ use candle_core::{Result, Tensor};
 
 pub const MXFP4_BLOCK_SIZE: usize = 32;
 
+/// FlashInfer-accelerated MXFP4 fused MoE GEMM for Blackwell (SM100+).
+/// Returns Ok(output) on success, or Err if not available / not supported.
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+pub fn flashinfer_mxfp4_fused_moe(
+    input: &Tensor,
+    topk_ids: &Tensor,
+    topk_weights: &Tensor,
+    gate_up_weights: &Tensor,
+    gate_up_scales: &Tensor,
+    down_weights: &Tensor,
+    down_scales: &Tensor,
+    num_tokens: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_experts: usize,
+    top_k: usize,
+) -> Result<Tensor> {
+    use candle_core::Storage;
+
+    let dev = input.device();
+    let dtype = input.dtype();
+
+    let sm_version = crate::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0) as usize;
+    if sm_version < 100 {
+        candle_core::bail!("flashinfer_mxfp4_fused_moe requires Blackwell (sm100+)");
+    }
+
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let input_dtype_code: i32 = match dtype {
+        DType::F16 => 0,
+        DType::BF16 => 1,
+        _ => candle_core::bail!(
+            "flashinfer_mxfp4_fused_moe: unsupported input dtype {:?}",
+            dtype
+        ),
+    };
+
+    let output = Tensor::zeros((num_tokens, hidden_size), dtype, dev)?;
+
+    fn flashinfer_cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    {
+        let (input_s, _) = input.storage_and_layout();
+        let input_ptr = flashinfer_cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+
+        let (topk_ids_s, _) = topk_ids.storage_and_layout();
+        let topk_ids_ptr = flashinfer_cuda_ptr(&topk_ids_s, DType::U32)? as *const i32;
+
+        let (topk_weights_s, _) = topk_weights.storage_and_layout();
+        let topk_weights_ptr = flashinfer_cuda_ptr(&topk_weights_s, DType::F32)? as *const f32;
+
+        let (gate_up_w_s, _) = gate_up_weights.storage_and_layout();
+        let gate_up_w_ptr = flashinfer_cuda_ptr(&gate_up_w_s, DType::U8)? as *const u8;
+        let (gate_up_s_s, _) = gate_up_scales.storage_and_layout();
+        let gate_up_s_ptr = flashinfer_cuda_ptr(&gate_up_s_s, DType::U8)? as *const u8;
+        let (down_w_s, _) = down_weights.storage_and_layout();
+        let down_w_ptr = flashinfer_cuda_ptr(&down_w_s, DType::U8)? as *const u8;
+        let (down_s_s, _) = down_scales.storage_and_layout();
+        let down_s_ptr = flashinfer_cuda_ptr(&down_s_s, DType::U8)? as *const u8;
+        let (output_s, _) = output.storage_and_layout();
+        let output_ptr = flashinfer_cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+        let status = unsafe {
+            ffi::flashinfer_fused_moe_mxfp4(
+                input_ptr,
+                topk_ids_ptr,
+                topk_weights_ptr,
+                gate_up_w_ptr,
+                gate_up_s_ptr,
+                down_w_ptr,
+                down_s_ptr,
+                output_ptr,
+                num_tokens as i32,
+                hidden_size as i32,
+                intermediate_size as i32,
+                num_experts as i32,
+                top_k as i32,
+                input_dtype_code,
+                stream,
+            )
+        };
+
+        if status != 0 {
+            candle_core::bail!("flashinfer_fused_moe_mxfp4 returned error code {}", status);
+        }
+    }
+
+    Ok(output)
+}
+
 /// MXFP4 linear: output = input @ weight^T [+ bias]
 ///
 /// * `input` - [M, K] in F16/BF16
@@ -72,6 +176,18 @@ pub fn mxfp4_matmul(
         candle_core::Device::Cuda(cuda_dev) => {
             use candle_core::Storage;
 
+            fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+                match s {
+                    Storage::Cuda(c) => match dtype {
+                        DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                        DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                        DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                        _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+                    },
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                }
+            }
+
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
@@ -81,35 +197,14 @@ pub fn mxfp4_matmul(
                 let (scale_s, _) = scale.storage_and_layout();
                 let (output_s, _) = output.storage_and_layout();
 
-                let input_ptr = match &*input_s {
-                    Storage::Cuda(c) => {
-                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
-                    }
-                    _ => candle_core::bail!("input must be cuda"),
-                };
-                let weight_ptr = match &*weight_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
-                    _ => candle_core::bail!("weight must be cuda"),
-                };
-                let scale_ptr = match &*scale_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
-                    _ => candle_core::bail!("scale must be cuda"),
-                };
-                let output_ptr = match &*output_s {
-                    Storage::Cuda(c) => {
-                        *c.as_cuda_slice::<u8>()?.device_ptr() as *mut std::ffi::c_void
-                    }
-                    _ => candle_core::bail!("output must be cuda"),
-                };
+                let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+                let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const u8;
+                let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const u8;
+                let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
 
                 let bias_ptr = if let Some(b) = bias {
                     let (b_s, _) = b.storage_and_layout();
-                    match &*b_s {
-                        Storage::Cuda(c) => {
-                            *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
-                        }
-                        _ => candle_core::bail!("bias must be cuda"),
-                    }
+                    cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
                 } else {
                     std::ptr::null()
                 };
@@ -374,45 +469,34 @@ pub fn mxfp4_moe_gemm(
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
+                fn cuda_ptr_moe(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+                    match s {
+                        Storage::Cuda(c) => match dtype {
+                            DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                            DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                            DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                            DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                            _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+                        },
+                        _ => candle_core::bail!("tensor must be on CUDA"),
+                    }
+                }
+
                 let (input_s, _) = input.storage_and_layout();
                 let (weights_s, _) = weights.storage_and_layout();
                 let (scales_s, _) = weight_scales.storage_and_layout();
                 let (indices_s, _) = indices.storage_and_layout();
                 let (output_s, _) = output.storage_and_layout();
 
-                let input_ptr = match &*input_s {
-                    Storage::Cuda(c) => {
-                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
-                    }
-                    _ => candle_core::bail!("input must be cuda"),
-                };
-                let weights_ptr = match &*weights_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
-                    _ => candle_core::bail!("weights must be cuda"),
-                };
-                let scales_ptr = match &*scales_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
-                    _ => candle_core::bail!("scales must be cuda"),
-                };
-                let indices_ptr = match &*indices_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u32>()?.device_ptr() as *const u32,
-                    _ => candle_core::bail!("indices must be cuda"),
-                };
-                let output_ptr = match &*output_s {
-                    Storage::Cuda(c) => {
-                        *c.as_cuda_slice::<u8>()?.device_ptr() as *mut std::ffi::c_void
-                    }
-                    _ => candle_core::bail!("output must be cuda"),
-                };
+                let input_ptr = cuda_ptr_moe(&input_s, dtype)? as *const std::ffi::c_void;
+                let weights_ptr = cuda_ptr_moe(&weights_s, DType::U8)? as *const u8;
+                let scales_ptr = cuda_ptr_moe(&scales_s, DType::U8)? as *const u8;
+                let indices_ptr = cuda_ptr_moe(&indices_s, DType::U32)? as *const u32;
+                let output_ptr = cuda_ptr_moe(&output_s, dtype)? as *mut std::ffi::c_void;
 
                 let biases_ptr = if let Some(b) = biases {
                     let (b_s, _) = b.storage_and_layout();
-                    match &*b_s {
-                        Storage::Cuda(c) => {
-                            *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
-                        }
-                        _ => candle_core::bail!("biases must be cuda"),
-                    }
+                    cuda_ptr_moe(&b_s, b.dtype())? as *const std::ffi::c_void
                 } else {
                     std::ptr::null()
                 };

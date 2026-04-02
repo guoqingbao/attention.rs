@@ -91,6 +91,9 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
             }
+            if compute_cap >= 100 {
+                builder = builder.arg("-DENABLE_FP4");
+            }
         }
     }
 

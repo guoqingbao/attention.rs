@@ -1341,6 +1341,25 @@ extern "C" {
         stream: i64,
     ) -> i32;
 
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fused_moe_mxfp4(
+        input: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        gate_up_weights: *const u8,
+        gate_up_scales: *const u8,
+        down_weights: *const u8,
+        down_scales: *const u8,
+        output: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_experts: i32,
+        top_k: i32,
+        input_dtype: i32,
+        stream: i64,
+    ) -> i32;
+
     pub fn causal_conv1d_fwd_f32(
         x: *const f32,
         weight: *const f32,
