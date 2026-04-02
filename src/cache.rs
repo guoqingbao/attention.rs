@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use candle_core::{backend::BackendDevice, Device, Result, Storage, Tensor};
 use std::collections::HashMap;
 

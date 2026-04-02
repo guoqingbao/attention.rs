@@ -183,6 +183,13 @@ impl PagedAttention {
                     _ => candle::bail!("k_scales must be a cuda tensor"),
                 };
                 let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+                if k_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        k_scales_layout.shape().elem_count()
+                    );
+                }
 
                 let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
@@ -190,6 +197,13 @@ impl PagedAttention {
                     _ => candle::bail!("v_scales must be a cuda tensor"),
                 };
                 let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+                if v_scales_layout.shape().elem_count() != num_kv_heads {
+                    candle::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        v_scales_layout.shape().elem_count()
+                    );
+                }
                 (
                     *k_scales.device_ptr() as *const core::ffi::c_void,
                     *v_scales.device_ptr() as *const core::ffi::c_void,
@@ -219,47 +233,96 @@ impl PagedAttention {
             let o_stride_tokens = q_l.stride()[0] as i32;
             let sinks_ptr = std::ptr::null();
 
-            let query_start_len_ptr = {
+            let (query_start_len_ptr, num_query_seqs) = {
                 let (cu_query_lens, cu_query_lens_layout) = cu_query_lens.storage_and_layout();
                 let cu_query_lens = match &*cu_query_lens {
                     candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
                     _ => candle::bail!("cu_query_lens must be a cuda tensor"),
                 };
                 let cu_query_lens = cu_query_lens.slice(cu_query_lens_layout.start_offset()..);
-                *cu_query_lens.device_ptr()
+                let num_query_seqs = cu_query_lens_layout.shape().dims1()?.saturating_sub(1);
+                (*cu_query_lens.device_ptr(), num_query_seqs)
             };
 
             unsafe {
-                kernels::ffi::paged_attention_prefill(
-                    out_ptr,
-                    q_ptr,
-                    kc_ptr,
-                    vc_ptr,
-                    k_scales_ptr,
-                    v_scales_ptr,
-                    num_kv_heads as c_int,
-                    self.softmax_scale,
-                    bt_ptr,
-                    cl_ptr,
-                    block_size as c_int,
-                    self.max_context_len as c_int,
-                    num_seqs_bt as c_int,
-                    num_heads as c_int,
-                    self.num_query_tokens as c_int,
-                    head_size as c_int,
-                    max_num_blocks_per_seq as c_int,
-                    q_stride as c_int,
-                    num_blocks as c_int,
-                    kv_block_stride as c_int,
-                    kv_head_stride as c_int,
-                    internal_type,
-                    self.softcapping,
-                    o_stride_tokens as c_int,
-                    query_start_len_ptr as *const u32,
-                    sinks_ptr as *const f32,
-                    self.sliding_window as c_int,
-                    *dev.cu_stream() as i64,
-                )
+                // Calculate shared memory requirement for optimized kernel:
+                // smem_size = 32 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
+                // sizeof(cache_t) = 2 for fp16/bf16, 1 for fp8
+                let cache_elem_size = if k_scales_ptr.is_null() {
+                    2usize
+                } else {
+                    1usize
+                };
+                let smem_size = 32 + 2 * head_size * block_size * cache_elem_size;
+
+                // Use optimized kernel with shared memory tiling when:
+                // 1. Tokens attention with KV cache is large (i.e., >1024 tokens)
+                // 2. Single sequence (optimized kernel assumes all tokens in chunk share same KV blocks)
+                // 3. Shared memory fits within 64KB (minimum on modern GPUs, extended via cudaFuncSetAttribute)
+                let single_seq = num_query_seqs == 1 && num_seqs_bt == 1;
+                if num_seqs > 1024 && single_seq && smem_size <= 64 * 1024 {
+                    kernels::ffi::paged_attention_prefill_opt(
+                        out_ptr,
+                        q_ptr,
+                        kc_ptr,
+                        vc_ptr,
+                        k_scales_ptr,
+                        v_scales_ptr,
+                        num_kv_heads as c_int,
+                        self.softmax_scale,
+                        bt_ptr,
+                        cl_ptr,
+                        block_size as c_int,
+                        self.max_context_len as c_int,
+                        num_seqs_bt as c_int,
+                        num_heads as c_int,
+                        self.num_query_tokens as c_int,
+                        head_size as c_int,
+                        max_num_blocks_per_seq as c_int,
+                        q_stride as c_int,
+                        num_blocks as c_int,
+                        kv_block_stride as c_int,
+                        kv_head_stride as c_int,
+                        internal_type,
+                        self.softcapping,
+                        o_stride_tokens as c_int,
+                        query_start_len_ptr as *const u32,
+                        sinks_ptr as *const f32,
+                        self.sliding_window as c_int,
+                        *dev.cu_stream() as i64,
+                    )
+                } else {
+                    kernels::ffi::paged_attention_prefill(
+                        out_ptr,
+                        q_ptr,
+                        kc_ptr,
+                        vc_ptr,
+                        k_scales_ptr,
+                        v_scales_ptr,
+                        num_kv_heads as c_int,
+                        self.softmax_scale,
+                        bt_ptr,
+                        cl_ptr,
+                        block_size as c_int,
+                        self.max_context_len as c_int,
+                        num_seqs_bt as c_int,
+                        num_heads as c_int,
+                        self.num_query_tokens as c_int,
+                        head_size as c_int,
+                        max_num_blocks_per_seq as c_int,
+                        q_stride as c_int,
+                        num_blocks as c_int,
+                        kv_block_stride as c_int,
+                        kv_head_stride as c_int,
+                        internal_type,
+                        self.softcapping,
+                        o_stride_tokens as c_int,
+                        query_start_len_ptr as *const u32,
+                        sinks_ptr as *const f32,
+                        self.sliding_window as c_int,
+                        *dev.cu_stream() as i64,
+                    )
+                }
             }
         } else if use_v1 {
             unsafe {
@@ -285,6 +348,7 @@ impl PagedAttention {
                     kv_head_stride as c_int,
                     internal_type,
                     self.softcapping,
+                    self.sliding_window,
                     *dev.cu_stream() as i64,
                 )
             }
@@ -325,6 +389,7 @@ impl PagedAttention {
                     kv_head_stride as c_int,
                     internal_type,
                     self.softcapping,
+                    self.sliding_window,
                     *dev.cu_stream() as i64,
                 )
             }
@@ -457,17 +522,33 @@ impl PagedAttention {
         }
         let (k_scale, v_scale) =
             if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
-                let (k_scales, _) = k_scales.storage_and_layout();
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
                 let k_scales = match &*k_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
+                let k_len = k_scales_layout.shape().elem_count();
+                if k_len != 1 && k_len != num_kv_heads {
+                    candle_core::bail!(
+                        "k_scales length must be 1 or num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        k_len
+                    )
+                }
 
-                let (v_scales, _) = v_scales.storage_and_layout();
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
+                let v_len = v_scales_layout.shape().elem_count();
+                if v_len != 1 && v_len != num_kv_heads {
+                    candle_core::bail!(
+                        "v_scales length must be 1 or num_kv_heads ({}), got {}",
+                        num_kv_heads,
+                        v_len
+                    )
+                }
 
                 (Some(k_scales.clone()), Some(v_scales.clone()))
             } else {
@@ -521,6 +602,8 @@ impl PagedAttention {
                 qs.buffer(),
                 qs_l.start_offset() * qs.dtype().size_in_bytes(),
                 alibi_storage_and_offset,
+                k_scale.clone(),
+                v_scale.clone(),
                 None,
                 num_kv_heads as i32,
                 self.softmax_scale,
@@ -839,7 +922,7 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(feature = "flash-decoding")]
+        #[cfg(feature = "flashattn")]
         if kc_rank != 4 {
             candle::bail!(
                 "flash-attention expects `key_cache` tensor to be of rank 4 \
@@ -847,7 +930,15 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(not(feature = "flash-decoding"))]
+        #[cfg(all(not(feature = "flashattn"), feature = "flash-decoding"))]
+        if kc_rank != 4 {
+            candle::bail!(
+                "flash-decoding expects `key_cache` tensor to be of rank 4 \
+                    (key_cache: {kc_l:?})"
+            )
+        }
+
+        #[cfg(all(not(feature = "flashattn"), not(feature = "flash-decoding")))]
         if kc_rank != 5 {
             candle::bail!(
                 "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -877,13 +968,20 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-    #[cfg(feature = "flash-decoding")]
-    let (num_blocks, block_size, _x) = {
-        let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
-        (num_blocks, block_size, 1)
-    };
+        #[cfg(feature = "flashattn")]
+        let (block_size, _x) = {
+            // [num_blocks, block_size, num_heads, head_size]
+            let (_, block_size, _, _) = kc_l.shape().dims4()?;
+            (block_size, 1)
+        };
 
-        #[cfg(not(feature = "flash-decoding"))]
+        #[cfg(all(not(feature = "flashattn"), feature = "flash-decoding"))]
+        let (_num_blocks, block_size, _x) = {
+            let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
+            (num_blocks, block_size, 1)
+        };
+
+        #[cfg(all(not(feature = "flashattn"), not(feature = "flash-decoding")))]
         let (block_size, x) = {
             let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
@@ -927,6 +1025,13 @@ impl ReshapeCache {
                     _ => candle::bail!("k_scales must be a cuda tensor"),
                 };
                 let k_scales = k_scales.slice(k_scales_layout.start_offset()..);
+                if k_scales_layout.shape().elem_count() != num_heads {
+                    candle::bail!(
+                        "k_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        k_scales_layout.shape().elem_count()
+                    );
+                }
 
                 let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
@@ -934,6 +1039,13 @@ impl ReshapeCache {
                     _ => candle::bail!("v_scales must be a cuda tensor"),
                 };
                 let v_scales = v_scales.slice(v_scales_layout.start_offset()..);
+                if v_scales_layout.shape().elem_count() != num_heads {
+                    candle::bail!(
+                        "v_scales length must equal num_kv_heads ({}), got {}",
+                        num_heads,
+                        v_scales_layout.shape().elem_count()
+                    );
+                }
 
                 (
                     *k_scales.device_ptr() as *const core::ffi::c_void,
@@ -944,7 +1056,7 @@ impl ReshapeCache {
             };
 
         unsafe {
-            #[cfg(feature = "flash-decoding")]
+            #[cfg(feature = "flashattn")]
             {
                 assert!(
                     k_scales_ptr.is_null() && v_scales_ptr.is_null(),
@@ -975,7 +1087,7 @@ impl ReshapeCache {
                     *dev.cu_stream() as i64,
                 );
             }
-            #[cfg(not(feature = "flash-decoding"))]
+            #[cfg(not(feature = "flashattn"))]
             {
                 kernels::ffi::call_reshape_and_cache(
                     k_ptr,
@@ -1102,17 +1214,33 @@ impl ReshapeCache {
 
         let (k_scale, v_scale) =
             if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {
-                let (k_scales, _) = k_scales.storage_and_layout();
+                let (k_scales, k_scales_layout) = k_scales.storage_and_layout();
                 let k_scales = match &*k_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("k_scales must be a metal tensor"),
                 };
+                let k_len = k_scales_layout.shape().elem_count();
+                if k_len != 1 && k_len != num_heads {
+                    candle_core::bail!(
+                        "k_scales length must be 1 or num_kv_heads ({}), got {}",
+                        num_heads,
+                        k_len
+                    )
+                }
 
-                let (v_scales, _) = v_scales.storage_and_layout();
+                let (v_scales, v_scales_layout) = v_scales.storage_and_layout();
                 let v_scales = match &*v_scales {
                     candle::Storage::Metal(c) => c,
                     _ => candle::bail!("v_scales must be a metal tensor"),
                 };
+                let v_len = v_scales_layout.shape().elem_count();
+                if v_len != 1 && v_len != num_heads {
+                    candle_core::bail!(
+                        "v_scales length must be 1 or num_kv_heads ({}), got {}",
+                        num_heads,
+                        v_len
+                    )
+                }
 
                 (Some(k_scales.clone()), Some(v_scales.clone()))
             } else {

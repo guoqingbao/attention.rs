@@ -115,8 +115,8 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
     // No work to do. Terminate the thread block.
     return;
   }
-  float k_scale = is_quantized ? k_scales[0] : 1.0;
-  float v_scale = is_quantized ? v_scales[0] : 1.0;
+  float k_scale = 1.0;
+  float v_scale = 1.0;
 
   const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
@@ -221,7 +221,7 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
         } else {
           Quant_vec fp8_k_vec = *reinterpret_cast<const device Quant_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          
+          k_scale = k_scales[0];
           k_vecs[j] = scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scale);
         }
       }
@@ -342,6 +342,7 @@ template <typename T, typename cache_t, bool is_quantized, int HEAD_SIZE, int BL
           v_vec = *reinterpret_cast<const device V_vec*>(v_ptr + offset);
         } else {
           Quant_vec fp8_v_vec = *reinterpret_cast<const device Quant_vec *>(v_ptr + offset);
+          v_scale = v_scales[0];
           v_vec = scaled_convert<V_vec, Quant_vec>(fp8_v_vec, v_scale);
         }
 

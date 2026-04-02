@@ -746,27 +746,39 @@ static inline float from_bits(uint b) { return as_type<float>(b); }
 
 
 inline float softmax_fp8_to_float(uint8_t v) {
-  const uint s = v >> 7;
-  const uint exp = (v >> 3) & 0xF;
-  const uint man = v & 0x7;
-
-  if (exp == 0) { // zero / sub-normal
-    if (man == 0)
-      return s ? -0.f : 0.f;
-    const float m = float(man) / 8.f; // already scaled by 2^-3
-    float val = ldexp(m, 1 - 7);      // 2^(1-bias) = 2^-6
-    return s ? -val : val;
+  // Fast path for normal numbers (Exponent 1..15)
+  // E4M3FN: 1 Sign, 4 Exp, 3 Mant. Bias 7.
+  // FP32:   1 Sign, 8 Exp, 23 Mant. Bias 127.
+  
+  const uint8_t s_mask = 0x80;
+  const uint8_t e_mask = 0x78;
+  const uint8_t m_mask = 0x07;
+  
+  uint8_t exp8 = (v & e_mask) >> 3;
+  uint8_t man8 = (v & m_mask);
+  
+  if (exp8 > 0) {
+      // Normals (inc. Exp=15 which is normal in E4M3FN unless mant=7)
+      if (exp8 == 0xF && man8 == 0x7) return NAN; // NaN
+      
+      uint32_t sign = (v & s_mask) << 24;
+      // New Exp = OldExp - 7 + 127 = OldExp + 120
+      uint32_t exp32 = (uint32_t(exp8) + 120) << 23;
+      // New Mant = OldMant << 20 (align 3 bits to top of 23)
+      uint32_t man32 = uint32_t(man8) << 20;
+      
+      return as_type<float>(sign | exp32 | man32);
   }
-
-  if (exp == 0xF) { // Inf / NaN  (E4M3FN keeps only NaN)
-    if (man != 0)
-      return NAN;
-    return s ? -INFINITY : INFINITY;
+  
+  // Subnormals (Exp=0) & Zero
+  if (man8 == 0) {
+      return (v & s_mask) ? -0.0f : 0.0f;
   }
-
-  const float m = 1.f + float(man) / 8.f;
-  float val = ldexp(m, int(exp) - 7);
-  return s ? -val : val;
+  
+  // Denorm fallback (computation)
+  const float m = float(man8) / 8.f; 
+  float val = ldexp(m, -6); // 2^(1-7) = -6
+  return (v & s_mask) ? -val : val;
 }
 
 inline uint8_t float_to_softmax_fp8(float f) {
@@ -779,11 +791,13 @@ inline uint8_t float_to_softmax_fp8(float f) {
   // special cases
   if (exp == 0xFF) { // Inf or NaN
     if (mant != 0) {
-      // produce a quiet NaN: sign=0, exp=1111, mant != 0
-      return (uchar)((0 << 7) | (0xF << 3) | 1);
+      // NaN: exp=1111, mant=111 (E4M3FN reserves only this for NaN)
+      // 0x7F (Positive NaN) or 0xFF (Negative NaN)
+      return (uchar)((0 << 7) | (0xF << 3) | 0x7);
     } else {
-      // Inf
-      return (uchar)((sign << 7) | (0xF << 3) | 0);
+      // Inf -> saturate to max finite (E4M3FN has no Inf)
+      // Max finite is Exp=15, Mant=6 (+/- 448)
+      return (uchar)((sign << 7) | (0xF << 3) | 0x6);
     }
   }
 
@@ -805,9 +819,10 @@ inline uint8_t float_to_softmax_fp8(float f) {
     // subnormal float -- handled below
   }
 
-  // Overflow -> set to Inf
-  if (new_exp >= 0xF) {
-    return (uchar)((sign << 7) | (0xF << 3)); // Inf
+  // Overflow -> saturate to max finite (E4M3FN)
+  // Max exp is 15. If new_exp > 15, saturate.
+  if (new_exp > 0xF) {
+    return (uchar)((sign << 7) | (0xF << 3) | 0x6);
   }
 
   // Underflow -> could become subnormal or zero in FP8
@@ -859,11 +874,21 @@ inline uint8_t float_to_softmax_fp8(float f) {
       // mantissa overflow -> increment exponent
       truncated = 0;
       new_exp += 1;
-      if (new_exp >= 0xF) {
-        // overflow to Inf
-        return (uchar)((sign << 7) | (0xF << 3));
+      if (new_exp > 0xF) {
+        // overflow to max finite
+        return (uchar)((sign << 7) | (0xF << 3) | 0x6);
       }
     }
+  }
+
+  // E4M3FN Check:
+  // If we rounded up to Exp=15, Mant=7 (NaN), we should saturate to Max Finite?
+  // Or is it actually strict?
+  // Spec says operations that overflow saturate. Rounding 447.5 to 448 is Valid (Exp=15, Man=6).
+  // Rounding to > 448 -> Max Finite.
+  // Exp=15, Mant=7 is "NaN".
+  if (new_exp == 0xF && truncated == 0x7) {
+      truncated = 0x6; // Clamp to max finite
   }
 
   uchar out = (uchar)((sign << 7) | ((new_exp & 0xF) << 3) | (truncated & 0x7));

@@ -27,8 +27,8 @@ template<typename T, typename cache_t, bool is_quantized>
     // Padding token that should be ignored.
     return;
   }
-  float k_scale = is_quantized ? k_scales[0] : 1.0;
-  float v_scale = is_quantized ? v_scales[0] : 1.0;
+  float k_scale = 1.0;
+  float v_scale = 1.0;
 
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
@@ -56,6 +56,8 @@ template<typename T, typename cache_t, bool is_quantized>
       key_cache[tgt_key_idx] = key[src_key_idx];
       value_cache[tgt_value_idx] = value[src_value_idx];
     } else {
+      k_scale = k_scales[0];
+      v_scale = v_scales[0];
       key_cache[tgt_key_idx] = scaled_convert<cache_t, T>(key[src_key_idx], k_scale);
       value_cache[tgt_value_idx] = scaled_convert<cache_t, T>(value[src_value_idx], v_scale);
     }    

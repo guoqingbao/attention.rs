@@ -677,6 +677,159 @@ struct FloatVec<Half8_> {
   using Type = Float8_;
 };
 
+// FP8 vector data types (packed).
+template<>
+struct Vec<uint8_t, 1> {
+  using Type = uint8_t;
+};
+template<>
+struct Vec<uint8_t, 2> {
+  using Type = uint16_t;
+};
+template<>
+struct Vec<uint8_t, 4> {
+  using Type = uint32_t;
+};
+template<>
+struct Vec<uint8_t, 8> {
+  using Type = uint2;
+};
+
+// FP8 E4M3FN -> float conversion.
+static inline float softmax_fp8_to_float(uint8_t v) {
+  const uint8_t s_mask = 0x80;
+  const uint8_t e_mask = 0x78;
+  const uint8_t m_mask = 0x07;
+
+  uint8_t exp8 = (v & e_mask) >> 3;
+  uint8_t man8 = (v & m_mask);
+
+  if (exp8 > 0) {
+    if (exp8 == 0xF && man8 == 0x7) return NAN;
+    uint32_t sign = (v & s_mask) << 24;
+    uint32_t exp32 = (uint32_t(exp8) + 120) << 23;
+    uint32_t man32 = uint32_t(man8) << 20;
+    return as_type<float>(sign | exp32 | man32);
+  }
+
+  if (man8 == 0) {
+    return (v & s_mask) ? -0.0f : 0.0f;
+  }
+
+  const float m = float(man8) / 8.f;
+  float val = ldexp(m, -6);
+  return (v & s_mask) ? -val : val;
+}
+
+template <typename Tout, typename Tin>
+inline Tout scaled_vec_conversion(Tin x, float scale);
+
+// fp8 -> half
+template <>
+inline half scaled_vec_conversion<half, uint8_t>(uint8_t a, float scale) {
+  float f = softmax_fp8_to_float(a);
+  return static_cast<half>(f * scale);
+}
+// fp8x2 -> half2
+template <>
+inline half2 scaled_vec_conversion<half2, uint16_t>(uint16_t a, float scale) {
+  half2 ret;
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  ret.x = static_cast<half>(softmax_fp8_to_float(b0) * scale);
+  ret.y = static_cast<half>(softmax_fp8_to_float(b1) * scale);
+  return ret;
+}
+// fp8x4 -> half4
+template <>
+inline half4 scaled_vec_conversion<half4, uint32_t>(uint32_t a, float scale) {
+  half4 ret;
+  half2 ar = scaled_vec_conversion<half2, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  half2 br = scaled_vec_conversion<half2, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  ret.x = ar.x;
+  ret.y = ar.y;
+  ret.z = br.x;
+  ret.w = br.y;
+  return ret;
+}
+// fp8x8 -> half8
+template <>
+inline Half8_ scaled_vec_conversion<Half8_, uint2>(uint2 a, float scale) {
+  Half8_ ret;
+  ret.x = scaled_vec_conversion<half4, uint32_t>(a.x, scale);
+  ret.y = scaled_vec_conversion<half4, uint32_t>(a.y, scale);
+  return ret;
+}
+
+// fp8 -> bfloat16
+template <>
+inline bfloat16_t scaled_vec_conversion<bfloat16_t, uint8_t>(uint8_t a, float scale) {
+  float f = softmax_fp8_to_float(a);
+  return static_cast<bfloat16_t>(f * scale);
+}
+// fp8x2 -> bfloat2
+template <>
+inline Bfloat2_ scaled_vec_conversion<Bfloat2_, uint16_t>(uint16_t a, float scale) {
+  Bfloat2_ res;
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  res.x = scaled_vec_conversion<bfloat16_t, uint8_t>(b0, scale);
+  res.y = scaled_vec_conversion<bfloat16_t, uint8_t>(b1, scale);
+  return res;
+}
+// fp8x4 -> bfloat4
+template <>
+inline Bfloat4_ scaled_vec_conversion<Bfloat4_, uint32_t>(uint32_t a, float scale) {
+  Bfloat4_ res;
+  res.x = scaled_vec_conversion<Bfloat2_, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  res.y = scaled_vec_conversion<Bfloat2_, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  return res;
+}
+// fp8x8 -> bfloat8
+template <>
+inline Bfloat8_ scaled_vec_conversion<Bfloat8_, uint2>(uint2 a, float scale) {
+  Bfloat8_ res;
+  res.x = scaled_vec_conversion<Bfloat4_, uint32_t>(a.x, scale);
+  res.y = scaled_vec_conversion<Bfloat4_, uint32_t>(a.y, scale);
+  return res;
+}
+
+// fp8 -> float
+template <>
+inline float scaled_vec_conversion<float, uint8_t>(uint8_t a, float scale) {
+  return softmax_fp8_to_float(a) * scale;
+}
+// fp8x2 -> float2
+template <>
+inline float2 scaled_vec_conversion<float2, uint16_t>(uint16_t a, float scale) {
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  float2 res;
+  res.x = scaled_vec_conversion<float, uint8_t>(b0, scale);
+  res.y = scaled_vec_conversion<float, uint8_t>(b1, scale);
+  return res;
+}
+// fp8x4 -> float4
+template <>
+inline float4 scaled_vec_conversion<float4, uint32_t>(uint32_t a, float scale) {
+  float4 res;
+  float2 ar = scaled_vec_conversion<float2, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
+  float2 br = scaled_vec_conversion<float2, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  res.x = ar.x;
+  res.y = ar.y;
+  res.z = br.x;
+  res.w = br.y;
+  return res;
+}
+// fp8x8 -> float8
+template <>
+inline Float8_ scaled_vec_conversion<Float8_, uint2>(uint2 a, float scale) {
+  Float8_ res;
+  res.x = scaled_vec_conversion<float4, uint32_t>(a.x, scale);
+  res.y = scaled_vec_conversion<float4, uint32_t>(a.y, scale);
+  return res;
+}
+
 template<>
 inline float mul(half a, half b) {
   return (float)a * (float)b;
@@ -842,62 +995,38 @@ struct Qk_dot {
 #define UINT32_MAX 0xFFFFFFFF
 
 /**
- * @brief Performs paged attention for the prefill (prompt processing) stage.
+ * @brief Optimized paged attention for the prefill (prompt processing) stage.
  *
- * This kernel is designed to process a batch of new query tokens. The core strategy is to assign a single thread to compute the attention output for a single token.
- * It uses an online softmax algorithm to compute scores block by block without requiring a large shared memory allocation for the full attention matrix.
+ * This kernel processes a batch of new query tokens with **shared memory tiling**
+ * for cooperative K/V block loading and **binary search** for O(log N) sequence lookup.
+ * All threads in a threadgroup cooperatively load K/V tiles into threadgroup memory,
+ * then each thread computes attention for its assigned token from fast local memory.
  *
  * @tparam T The data type of the input and output tensors (e.g., float, half).
+ * @tparam cache_t The KV cache storage type (same as T, or uint8_t for FP8).
  * @tparam HEAD_SIZE The dimension of each attention head.
  * @tparam BLOCK_SIZE The number of tokens stored in each block of the KV cache.
- * @tparam TOKEN_CHUNK_SIZE The number of threads in a threadgroup, where each thread processes one token from a "chunk". This must match the host-side launch configuration.
+ * @tparam TOKEN_CHUNK_SIZE The number of threads in a threadgroup.
  *
  * @author Guoqing Bao
  * This kernel is part of the vllm.rs project
+ *
+ * Optimizations over the baseline:
+ *  - Threadgroup Memory Tiling: Cooperative loading of K/V blocks reduces global memory bandwidth.
+ *  - Binary Search: O(log N) sequence lookup instead of O(N) linear scan.
+ *  - Proper Barrier Discipline: No `continue` before barriers; all threads hit barriers uniformly.
+ *
  * @section Dispatch Logic
- * The kernel is launched with a 3D grid of threadgroups and a 1D threadgroup configuration.
- * - **Threadgroup Size (threads_per_threadgroup):** `(TOKEN_CHUNK_SIZE, 1, 1)`
- * - **Grid Size (threadgroups_per_grid):** `(num_queries_per_kv, num_kv_heads, num_token_chunks)`
- *
- * This maps the problem as follows:
- * - `threadgroup_position_in_grid.x` (`qh_base_idx`): The index of the query head within a group that shares a KV head.
- * - `threadgroup_position_in_grid.y` (`kv_head_idx`): The index of the key-value head.
- * - `threadgroup_position_in_grid.z` (`token_chunk_idx`): The index of the token chunk.
- * - `thread_position_in_threadgroup.x` (`tid`): The lane within the token chunk.
- *
- * Each thread's unique token is identified by `token_chunk_idx * TOKEN_CHUNK_SIZE + tid`.
- *
- * @param out The output buffer for attention results. Shape: `[num_query_tokens, num_query_heads, HEAD_SIZE]`.
- * @param q The input query tensor. Shape: `[num_query_tokens, num_query_heads, HEAD_SIZE]`.
- * @param k_cache The paged key-cache.
- * @param v_cache The paged value-cache.
- * @param num_kv_heads The number of key-value heads for Grouped-Query Attention.
- * @param sm_scale The scale factor applied to the QK dot product (e.g., `1/sqrt(HEAD_SIZE)`).
- * @param block_tables Maps logical sequence blocks to physical cache blocks. Shape: `[num_seqs, max_num_blocks_per_seq]`.
- * @param seq_lens Contains the full context length of each sequence.
- * @param block_table_stride Stride of the `block_tables` tensor, equal to `max_num_blocks_per_seq`.
- * @param num_seqs The number of sequences in the batch.
- * @param num_query_heads The total number of query heads.
- * @param num_query_tokens The total number of tokens being processed.
- * @param softcapping The softcapping value for `tanh` activation on attention scores.
- * @param o_stride_tokens The stride of the output tensor's first dimension.
- * @param query_start_len Indicates the start token index for each sequence in the flattened query tensor.
- * @param alibi_slopes Optional buffer with ALiBi slopes for positional bias.
- * @param k_scale Unused parameter, kept for signature compatibility.
- * @param v_scale Unused parameter, kept for signature compatibility.
- * @param sinks Optional buffer for sink attention.
- * @param sliding_window The sliding window size for attention, if used.
- * @param total_num_blocks The total number of physical blocks allocated in the KV cache.
- * @param kv_block_stride The stride between physical blocks in the KV cache.
- * @param kv_head_stride The stride between KV heads in the KV cache.
+ * - **Threadgroup Size:** `(TOKEN_CHUNK_SIZE, 1, 1)`
+ * - **Grid Size:** `(num_queries_per_kv, num_kv_heads, num_token_chunks)`
  **/
-template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
+template<typename T, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 [[kernel]] void chunked_prefill_paged_attention(
     // Buffer mappings
     device T* out [[buffer(0)]],                    // [num_all_tokens_new, num_query_heads, HEAD_SIZE]
     device const T* q [[buffer(1)]],                // [num_all_tokens_new, num_query_heads, HEAD_SIZE]
-    device const T* k_cache [[buffer(2)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE/x, BLOCK_SIZE, x]
-    device const T* v_cache [[buffer(3)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE, BLOCK_SIZE]
+    device const cache_t* k_cache [[buffer(2)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE/x, BLOCK_SIZE, x]
+    device const cache_t* v_cache [[buffer(3)]],          // [num_k_blocks, num_kv_heads, HEAD_SIZE, BLOCK_SIZE]
     const constant int& num_kv_heads [[buffer(4)]],
     const constant float& sm_scale [[buffer(5)]],
     device const uint32_t* block_tables [[buffer(6)]],
@@ -910,86 +1039,119 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     const constant int& o_stride_tokens [[buffer(13)]],
     device const uint32_t* query_start_len [[buffer(14)]],
     device const float* alibi_slopes [[buffer(15)]],
-    // The following parameters are kept for signature compatibility but are marked unused.
-    const constant float& k_scale [[buffer(16)]],   // not used
-    const constant float& v_scale [[buffer(17)]],   // not used
+    device const float* k_scales [[buffer(16)]],
+    device const float* v_scales [[buffer(17)]],
     device const float* sinks [[buffer(18)]],
     const constant int& sliding_window [[buffer(19)]],
     const constant int& total_num_blocks [[buffer(20)]],
     const constant int& kv_block_stride [[buffer(21)]],
     const constant int& kv_head_stride [[buffer(22)]],
     // Threading grid attributes
-    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], // equivalent to blockIdx
-    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]] // equivalent to threadIdx
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]
 ) {
     // Constants and Type Definitions
-    constexpr int THREAD_GROUP_SIZE = 1; // Used for Qk_dot template, as in the source CUDA kernel
+    constexpr int THREAD_GROUP_SIZE = 1;
     constexpr int VEC_SIZE = 16 / sizeof(T);
     constexpr int NUM_VECS = HEAD_SIZE / VEC_SIZE;
+    constexpr bool is_quantized = !is_same_v<T, cache_t>;
 
     // --- Thread and Grid Mapping ---
-    // In CUDA: tid = threadIdx.x
     const int tid = thread_position_in_threadgroup.x;
-    // In CUDA: lane = tid % TOKEN_CHUNK_SIZE. Since the launch likely uses TOKEN_CHUNK_SIZE threads, tid is the lane.
     const int lane = tid;
 
-    // In CUDA: blockIdx.x, blockIdx.y, blockIdx.z
     const int qh_base_idx = threadgroup_position_in_grid.x;
     const int kv_head_idx = threadgroup_position_in_grid.y;
     const int token_chunk_idx = threadgroup_position_in_grid.z;
 
-    // Calculate the specific token this thread is responsible for
-    const int token_start = token_chunk_idx * TOKEN_CHUNK_SIZE + lane;
+    const int chunk_start = token_chunk_idx * TOKEN_CHUNK_SIZE;
+    const int token_start = chunk_start + lane;
 
     constexpr int NUM_BLOCK_VECS = BLOCK_SIZE / VEC_SIZE;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
-    constexpr int X = 16 / sizeof(T); // Sub-vector size
+    constexpr int X = 16 / sizeof(cache_t);
     const bool use_alibi = (alibi_slopes != nullptr);
     const bool use_sinks = (sinks != nullptr);
 
-    // Strides for indexing q/o tensors
     const int64_t q_stride_tokens = (int64_t)num_query_heads * (int64_t)HEAD_SIZE;
     const int64_t q_stride_heads  = (int64_t)HEAD_SIZE;
     const int64_t o_stride_heads  = (int64_t)HEAD_SIZE;
 
-    // --- Find which sequence this token belongs to ---
-    int seq_idx = 0;
-    for (int i = 0; i < num_seqs; i++) {
-        int s = query_start_len[i];
-        int e = query_start_len[i + 1];
-        if (token_start >= s && token_start < e) {
-          seq_idx = i;
-          if ((e - s) <= 0) return; // No work for this thread
-          break;
+    // --- Threadgroup Memory Layout ---
+    // SeqInfo: sequence metadata computed by lane 0 and broadcast to all threads
+    // KV tile: A single [HEAD_SIZE * BLOCK_SIZE] buffer used sequentially for K then V
+    struct SeqInfo {
+        int seq_idx;
+        int num_blocks;
+        int start_block_idx;
+        int start_token_idx;
+    };
+
+    threadgroup SeqInfo shared_seq_info[1];
+    threadgroup cache_t kv_smem[HEAD_SIZE * BLOCK_SIZE];
+
+    // --- Lane 0: Binary search for sequence index, broadcast via threadgroup memory ---
+    if (lane == 0) {
+        int seq_idx = 0;
+        // Binary search: O(log N) instead of O(N) linear scan
+        if (chunk_start < (int)query_start_len[num_seqs] && chunk_start >= (int)query_start_len[0]) {
+            int left = 0, right = num_seqs - 1;
+            while (left <= right) {
+                int mid = (left + right) / 2;
+                if ((int)query_start_len[mid + 1] <= chunk_start) {
+                    left = mid + 1;
+                } else if ((int)query_start_len[mid] > chunk_start) {
+                    right = mid - 1;
+                } else {
+                    seq_idx = mid;
+                    break;
+                }
+            }
         }
+
+        uint32_t seq_len_full = seq_lens[seq_idx];
+        int num_blocks_local = (int)DIVIDE_ROUND_UP(seq_len_full, BLOCK_SIZE);
+
+        int start_token_idx = 0;
+        int start_block_idx = 0;
+        if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
+            start_token_idx = (int)seq_len_full - sliding_window;
+            start_block_idx = start_token_idx / BLOCK_SIZE;
+        }
+
+        shared_seq_info[0].seq_idx = seq_idx;
+        shared_seq_info[0].num_blocks = num_blocks_local;
+        shared_seq_info[0].start_block_idx = start_block_idx;
+        shared_seq_info[0].start_token_idx = start_token_idx;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // All threads read the shared sequence info
+    const int seq_idx = shared_seq_info[0].seq_idx;
+    const int num_blocks = shared_seq_info[0].num_blocks;
+    const int start_block_idx = shared_seq_info[0].start_block_idx;
+    const int start_token_idx = shared_seq_info[0].start_token_idx;
     const uint32_t seq_len_full = seq_lens[seq_idx];
-    const int num_blocks = (int)DIVIDE_ROUND_UP(seq_len_full, BLOCK_SIZE);
     device const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
-    const int context_len = (int)seq_len_full - 1;
 
-    // Vectorized types for Q and K
+    // Vector types
     using Q_vec = typename Vec<T, VEC_SIZE>::Type;
     using K_vec = typename Vec<T, VEC_SIZE>::Type;
     using Float_vec = typename Vec<float, VEC_SIZE>::Type;
+    using Quant_vec = typename Vec<cache_t, VEC_SIZE>::Type;
 
-    // Buffers for q, k, and temporary storage
     Q_vec q_vec[NUM_VECS];
-    K_vec k_vec[NUM_VECS];
     float qk_block[BLOCK_SIZE];
 
-    // Determine active head and token
     const int query_head_idx = kv_head_idx * num_queries_per_kv + qh_base_idx;
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
     const bool lane_active = token_start < num_query_tokens;
 
-    // Compute offsets in q and output tensors
+    // Load Q
     const int64_t q_off = (int64_t)token_start * q_stride_tokens + (int64_t)query_head_idx * q_stride_heads;
     const int64_t o_off = (int64_t)token_start * (int64_t)o_stride_tokens + (int64_t)query_head_idx * o_stride_heads;
 
-    // --- Load Q vector for this token and head ---
     if (head_active && lane_active) {
       #pragma unroll
       for (int k = 0; k < NUM_VECS; k++) {
@@ -1004,96 +1166,128 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     float alibi = (use_alibi && head_active && lane_active) ? alibi_slopes[query_head_idx] : 0.0f;
     float L = 1.0f;
 
-    // --- Iterate over all KV blocks ---
-    for (int blk = 0; blk < num_blocks; ++blk) {
+    constexpr int elems_per_block = HEAD_SIZE * BLOCK_SIZE;
+
+    // --- Main Loop Over KV Blocks ---
+    for (int blk = start_block_idx; blk < num_blocks; ++blk) {
         const uint32_t physical_block = block_table_for_seq[blk];
-        const bool valid_block = (physical_block != UINT32_MAX) && ((uint64_t)physical_block < (uint64_t)total_num_blocks);
-        const int block_start_token_idx = blk * BLOCK_SIZE;
+        const bool valid_block = (physical_block != UINT32_MAX) &&
+                                 ((uint64_t)physical_block < (uint64_t)total_num_blocks);
 
-        if (block_start_token_idx < (int)seq_len_full && sliding_window > 0) {
-            if (blk > 2 && (context_len - block_start_token_idx - BLOCK_SIZE) >= sliding_window) continue;
+        // --- PHASE 1: Load K and Compute Q*K ---
+        if (valid_block) {
+            const int64_t kv_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
+            device const cache_t* k_src = k_cache + kv_base;
+            for (int i = tid; i < elems_per_block; i += TOKEN_CHUNK_SIZE) {
+                kv_smem[i] = k_src[i];
+            }
         }
 
-        // --- Compute q·k for each token in this block ---
-        bool in_contexts[BLOCK_SIZE] = { false };
-        for (int b = 0; b < BLOCK_SIZE; ++b) {
-            const int token_idx_in_full = block_start_token_idx + b;
-            bool in_context = token_idx_in_full < (int)seq_len_full;
+        // BARRIER 1: All threads finish loading K
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            if (in_context && sliding_window > 0) {
-                if (blk > 2 && (context_len - token_idx_in_full) >= sliding_window) in_context = false;
+        const int block_in_full = blk * BLOCK_SIZE;
+        bool in_contexts[BLOCK_SIZE];
+
+        if (valid_block) {
+            for (int b = 0; b < BLOCK_SIZE; ++b) {
+                const int token_idx_in_full = block_in_full + b;
+
+                bool in_context = (token_idx_in_full < (int)seq_len_full);
+                bool in_window = (token_idx_in_full >= start_token_idx);
+                in_contexts[b] = in_context && in_window;
+
+                if (!in_context || !in_window || !lane_active) {
+                    qk_block[b] = -FLT_MAX;
+                } else {
+                    K_vec k_vec_local[NUM_VECS];
+                    #pragma unroll
+                    for (int k = 0; k < NUM_VECS; k++) {
+                      int d = k * VEC_SIZE;
+                      int gy = d / X;
+                      int gx = d % X;
+                      int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
+                      if constexpr (!is_quantized) {
+                        k_vec_local[k] = *reinterpret_cast<threadgroup const K_vec*>(&kv_smem[smem_idx]);
+                      } else {
+                        Quant_vec fp8_k_vec = *reinterpret_cast<threadgroup const Quant_vec*>(&kv_smem[smem_idx]);
+                        k_vec_local[k] = scaled_vec_conversion<K_vec, Quant_vec>(fp8_k_vec, k_scales[0]);
+                      }
+                    }
+
+                    float qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
+                    if (softcapping != 1.0f) {
+                      qk = tanh(qk / softcapping) * softcapping;
+                    }
+                    if (use_alibi) {
+                        qk += alibi * float(token_idx_in_full - ((int)seq_len_full - 1));
+                    }
+                    qk_block[b] = qk;
+                }
+            } // end b loop
+        } // end valid_block
+
+        // BARRIER 2: Ensure everyone has consumed K before overwriting with V
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- PHASE 2: Load V and Compute P*V ---
+        if (valid_block) {
+            const int64_t kv_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
+            device const cache_t* v_src = v_cache + kv_base;
+            for (int i = tid; i < elems_per_block; i += TOKEN_CHUNK_SIZE) {
+                kv_smem[i] = v_src[i];
             }
-            in_contexts[b] = in_context;
+        }
 
-            if (!in_context || !valid_block || !lane_active) {
-              qk_block[b] = -FLT_MAX;
-              continue;
-            }
+        // BARRIER 3: Wait for V load
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Load K vector from kcache
+        if (valid_block && head_active && lane_active) {
+            // Online softmax
+            float Smax = -FLT_MAX;
             #pragma unroll
-            for (int k = 0; k < NUM_VECS; k++) {
-              int d = k * VEC_SIZE;
-              int gy = d / X;
-              int64_t k_idx = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride +
-                              (int64_t)gy * (BLOCK_SIZE * X) + (int64_t)b * X;
-              k_vec[k] = *reinterpret_cast<device const K_vec*>(k_cache + k_idx);
+            for (int b = 0; b < BLOCK_SIZE; ++b) Smax = max(Smax, qk_block[b]);
+
+            const float m_j = max(M, Smax);
+            const float alpha = exp(M - m_j);
+            M = m_j;
+            L = L * alpha;
+            #pragma unroll
+            for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
+
+            float acc_lane = 0.0f;
+            Float_vec p_vec[NUM_BLOCK_VECS];
+            #pragma unroll
+            for (int b = 0; b < BLOCK_SIZE; ++b) {
+              if (in_contexts[b]) {
+                  const float P = exp(qk_block[b] - M);
+                  reinterpret_cast<thread float*>(&p_vec[b / VEC_SIZE])[b % VEC_SIZE] = P;
+                  acc_lane += P;
+              } else {
+                  reinterpret_cast<thread float*>(&p_vec[b / VEC_SIZE])[b % VEC_SIZE] = 0.0f;
+              }
             }
 
-            // Compute dot product q·k
-            float qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vec, k_vec) * sm_scale;
-            if (softcapping != 1.0f) {
-              qk = tanh(qk / softcapping) * softcapping;
+            Float_vec v;
+            for (int k = 0; k < HEAD_SIZE; ++k) {
+              threadgroup const cache_t* v_row_ptr = kv_smem + (int64_t)k * BLOCK_SIZE;
+              for (int b = 0; b < NUM_BLOCK_VECS; b++) {
+                threadgroup const cache_t* src = v_row_ptr + b * VEC_SIZE;
+                if constexpr (!is_quantized) {
+                  to_float(v, *reinterpret_cast<threadgroup const K_vec*>(src));
+                } else {
+                  Quant_vec fp8_v_vec = *reinterpret_cast<threadgroup const Quant_vec*>(src);
+                  v = scaled_vec_conversion<Float_vec, Quant_vec>(fp8_v_vec, v_scales[0]);
+                }
+                acc_vec[k] += dot(p_vec[b], v);
+              }
             }
-            qk_block[b] = qk;
 
-            // Add ALiBi positional bias if enabled
-            if (use_alibi) {
-                qk_block[b] += alibi * float(token_idx_in_full - context_len);
-            }
+            L += acc_lane;
         }
 
-        if (!head_active || !lane_active || !valid_block) continue;
-
-        // --- Softmax computation (online normalization) ---
-        float Smax = -FLT_MAX;
-        #pragma unroll
-        for (int b = 0; b < BLOCK_SIZE; ++b) Smax = max(Smax, qk_block[b]);
-
-        const float m_j = max(M, Smax);
-        const float alpha = exp(M - m_j);
-        M = m_j;
-        L = L * alpha;
-        #pragma unroll
-        for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
-
-        // --- Compute softmax weights and accumulate P·V ---
-        float acc_lane = 0.0f;
-        Float_vec p_vec[NUM_BLOCK_VECS];
-        #pragma unroll
-        for (int b = 0; b < BLOCK_SIZE; ++b) {
-          if (in_contexts[b]) {
-              const float P = exp(qk_block[b] - M);
-              reinterpret_cast<thread float*>(&p_vec[b / VEC_SIZE])[b % VEC_SIZE] = P;
-              acc_lane += P;
-          } else {
-              reinterpret_cast<thread float*>(&p_vec[b / VEC_SIZE])[b % VEC_SIZE] = 0.0f;
-          }
-        }
-
-        // Load V block and compute weighted sum
-        const int64_t v_base_block = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
-        Float_vec v;
-        for (int k = 0; k < HEAD_SIZE; ++k) {
-          device const T* v_row_ptr = v_cache + v_base_block + (int64_t)k * BLOCK_SIZE;
-          for (int b = 0; b < NUM_BLOCK_VECS; b++) {
-            device const T* src = v_row_ptr + b * VEC_SIZE;
-            to_float(v, *reinterpret_cast<device const K_vec*>(src));
-            acc_vec[k] += dot(p_vec[b], v);
-          }
-        }
-
-        L += acc_lane; // update softmax normalization
+        // BARRIER 4: Ensure V is fully consumed before next block iteration overwrites it
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     } // end block loop
 
     using O_vec = typename Vec<T, VEC_SIZE>::Type;
@@ -1113,13 +1307,13 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
     }
 }
 
-#define instantiate_prefill_attention_inner(type, head_size, block_size, token_chunk_size) \
-    template [[host_name("chunked_prefill_" #type "_hs" #head_size "_bs" #block_size "_tcs" #token_chunk_size)]] \
-    [[kernel]] void chunked_prefill_paged_attention<type, head_size, block_size, token_chunk_size>( \
+#define instantiate_prefill_attention_inner(type, cache_type, head_size, block_size, token_chunk_size, suffix) \
+    template [[host_name("chunked_prefill_" #type suffix "_hs" #head_size "_bs" #block_size "_tcs" #token_chunk_size)]] \
+    [[kernel]] void chunked_prefill_paged_attention<type, cache_type, head_size, block_size, token_chunk_size>( \
         device type* out [[buffer(0)]], \
         device const type* q [[buffer(1)]], \
-        device const type* k_cache [[buffer(2)]], \
-        device const type* v_cache [[buffer(3)]], \
+        device const cache_type* k_cache [[buffer(2)]], \
+        device const cache_type* v_cache [[buffer(3)]], \
         const constant int& num_kv_heads [[buffer(4)]], \
         const constant float& sm_scale [[buffer(5)]], \
         device const uint32_t* block_tables [[buffer(6)]], \
@@ -1132,8 +1326,8 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
         const constant int& o_stride_tokens [[buffer(13)]], \
         device const uint32_t* query_start_len [[buffer(14)]], \
         device const float* alibi_slopes [[buffer(15)]], \
-        const constant float& k_scale [[buffer(16)]], \
-        const constant float& v_scale [[buffer(17)]], \
+        device const float* k_scales [[buffer(16)]], \
+        device const float* v_scales [[buffer(17)]], \
         device const float* sinks [[buffer(18)]], \
         const constant int& sliding_window [[buffer(19)]], \
         const constant int& total_num_blocks [[buffer(20)]], \
@@ -1143,23 +1337,27 @@ template<typename T, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
         uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]);
 
 // Instantiate for various head sizes
-#define instantiate_prefill_attention_heads(type, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 64,  block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 96,  block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 128, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 192, block_size, token_chunk_size) \
-    instantiate_prefill_attention_inner(type, 256, block_size, token_chunk_size)
+#define instantiate_prefill_attention_heads(type, cache_type, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 64,  block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 96,  block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 128, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 192, block_size, token_chunk_size, suffix) \
+    instantiate_prefill_attention_inner(type, cache_type, 256, block_size, token_chunk_size, suffix)
 
 // Instantiate for various block sizes
-#define instantiate_prefill_attention_block_size(type, token_chunk_size) \
-    instantiate_prefill_attention_heads(type, 32, token_chunk_size) \
-    instantiate_prefill_attention_heads(type, 64, token_chunk_size)
+#define instantiate_prefill_attention_block_size(type, cache_type, token_chunk_size, suffix) \
+    instantiate_prefill_attention_heads(type, cache_type, 32, token_chunk_size, suffix) \
+    instantiate_prefill_attention_heads(type, cache_type, 64, token_chunk_size, suffix)
 
 // Main instantiation macro for a given type
-#define instantiate_prefill_attention(type) \
-    instantiate_prefill_attention_block_size(type, 64) // Using a fixed TOKEN_CHUNK_SIZE of 64
+#define instantiate_prefill_attention(type, cache_type, suffix) \
+    instantiate_prefill_attention_block_size(type, cache_type, 64, suffix) // Using a fixed TOKEN_CHUNK_SIZE of 64
 
 // Call the macros to generate kernels for different data types
-instantiate_prefill_attention(float)
-instantiate_prefill_attention(half)
-instantiate_prefill_attention(bfloat16_t)
+instantiate_prefill_attention(float, float, "")
+instantiate_prefill_attention(half, half, "")
+instantiate_prefill_attention(bfloat16_t, bfloat16_t, "")
+
+instantiate_prefill_attention(float, uint8_t, "_uint8_t")
+instantiate_prefill_attention(half, uint8_t, "_uint8_t")
+instantiate_prefill_attention(bfloat16_t, uint8_t, "_uint8_t")

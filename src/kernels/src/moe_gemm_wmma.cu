@@ -43,6 +43,7 @@
 #include <cstring>
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
+#include "attention/dtype_fp8.cuh"
 #include "moe/moe_utils.cuh"
 using namespace nvcuda::wmma;
 
@@ -212,6 +213,7 @@ __global__ void moe_gemm_grouped_kernel(
 
             // Accumulate into c_frag (which persists across k_base iterations)
             mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();// V100 fix?
         } // end k_base loop (we have a fully-accumulated c_frag for this m_base tile)
 
         // Store the accumulated c_frag to C_sh (shared) once per warp
@@ -247,6 +249,200 @@ __global__ void moe_gemm_grouped_kernel(
     } // end m_base loop
 }
 
+/**
+ *  @brief  WMMA-based grouped MoE GEMM kernel with FP8 weights.
+ *
+ *  Same structure as moe_gemm_grouped_kernel but loads FP8 (uint8_t) weights
+ *  and converts them to T (half/bf16) using block-wise scales before WMMA.
+ *
+ *  @tparam T               Output data type: half or nv_bfloat16
+ *  @param weights          [num_experts, size_n, size_k] FP8 weights as uint8_t
+ *  @param weight_scales    [num_experts, scale_n_dim, scale_k_dim] block-wise scales
+ *  @param block_size_n     Block size in N dimension for scales
+ *  @param block_size_k     Block size in K dimension for scales
+ */
+template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
+__global__ void moe_gemm_grouped_kernel_fp8(
+    const T* __restrict__ input,              // [size_m, size_k]
+    const uint8_t* __restrict__ weights,      // [num_experts, size_n, size_k] FP8
+    const float* __restrict__ weight_scales,  // [num_experts, scale_n_dim, scale_k_dim]
+    const int32_t* __restrict__ sorted_token_ids, // [size_m]
+    const int32_t* __restrict__ expert_offsets,   // [num_experts + 1]
+    const float* __restrict__ topk_weights,   // [size_m]
+    T* __restrict__ output,                   // [size_m, size_n]
+    const int num_experts, const int topk,
+    const int32_t size_m,
+    const int32_t size_n,
+    const int32_t size_k,
+    const int block_size_n,
+    const int block_size_k
+) {
+    // Get Segment and N-Tile for this Block
+    const int expert_id = blockIdx.x;
+    const int n_tile_idx = blockIdx.y;
+    if (expert_id < 0 || expert_id >= num_experts) return;
+    const int segment_start = expert_offsets[expert_id];
+    const int segment_end = expert_offsets[expert_id + 1];
+    const int num_rows_in_segment = segment_end - segment_start;
+
+    if (num_rows_in_segment == 0) return;
+
+    const int n_base = n_tile_idx * N_BLK;
+    if (n_base >= size_n) return;
+
+    // FP8 weight pointer for this expert
+    const uint8_t* expert_w = weights + (size_t)expert_id * (size_t)size_n * (size_t)size_k;
+    
+    // Scale layout: [num_experts, scale_n_dim, scale_k_dim]
+    const int scale_n_dim = CEILDIV(size_n, block_size_n);
+    const int scale_k_dim = CEILDIV(size_k, block_size_k);
+    const float* expert_scales = weight_scales + (size_t)expert_id * scale_n_dim * scale_k_dim;
+
+    extern __shared__ uint8_t smem_bytes[];
+    
+    // A tile: [M_BLK, K_BLK] (row-major) - input (T)
+    T* A_sh = reinterpret_cast<T*>(smem_bytes);
+    // B tile: [N_BLK, K_BLK] (row-major) - weights converted to T
+    T* B_sh = reinterpret_cast<T*>(A_sh + M_BLK * K_BLK);
+    uint8_t* C_ptr = reinterpret_cast<uint8_t*>(B_sh + N_BLK * K_BLK);
+
+    // align next pointer to float alignment
+    size_t offset = reinterpret_cast<uintptr_t>(C_ptr) % alignof(float);
+    if (offset != 0) {
+        C_ptr += (alignof(float) - offset);
+    }
+    float* C_sh = reinterpret_cast<float*>(C_ptr);
+
+    const int threadId = threadIdx.x;
+    const int warpId = threadId / 32;
+    const int laneId = threadId % 32;
+    const int warp_m_idx = warpId / WARPS_N;
+    const int warp_n_idx = warpId % WARPS_N;
+
+    const int B_ELEMS_PER_BLOCK = N_BLK * K_BLK;
+    const int A_ELEMS_PER_BLOCK = M_BLK * K_BLK;
+    VecT zero_vec;
+    zero_vec.x = zero_vec.y = zero_vec.z = zero_vec.w = 0.0f;
+    
+    for (int m_base = 0; m_base < num_rows_in_segment; m_base += M_BLK) {
+        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+        fill_fragment(c_frag, 0.0f);
+
+        for (int k_base = 0; k_base < size_k; k_base += K_BLK) {
+            // Load B Tile (FP8 Weights) into B_sh, converting to T with scales.
+            // Vectorize along K (4 fp8 values at a time).
+            constexpr int K_VEC = K_BLK / 4;
+            const int B_VEC_ELEMS = N_BLK * K_VEC;
+            for (int i = threadId; i < B_VEC_ELEMS; i += BLOCK_THREADS) {
+                int n_local = i / K_VEC;
+                int k_vec = i - n_local * K_VEC;
+                int k_local = k_vec * 4;
+
+                int n_global = n_base + n_local;
+                int k_global = k_base + k_local;
+
+                int scale_n_idx = n_global / block_size_n;
+                bool in_bounds = n_global < size_n && (k_global + 3) < size_k;
+                bool scale_uniform = block_size_k >= 4 &&
+                                     (k_global % block_size_k) <= (block_size_k - 4);
+
+                if (in_bounds && scale_uniform) {
+                    const uint32_t w4 = *reinterpret_cast<const uint32_t*>(
+                        &expert_w[(size_t)n_global * size_k + k_global]
+                    );
+                    int scale_k_idx = k_global / block_size_k;
+                    float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+                    if constexpr (std::is_same<T, half>::value) {
+                        *reinterpret_cast<uint2*>(&B_sh[n_local * K_BLK + k_local]) = 
+                            vllm::fp8::scaled_convert<uint2, uint32_t>(w4, scale);
+                    } else {
+#ifndef NO_BF16_KERNEL
+                        *reinterpret_cast<vllm::bf16_4_t*>(&B_sh[n_local * K_BLK + k_local]) =
+                            vllm::fp8::scaled_convert<vllm::bf16_4_t, uint32_t>(w4, scale);
+#endif
+                    }
+                } else {
+                    for (int kk = 0; kk < 4; ++kk) {
+                        int kg = k_global + kk;
+                        if (n_global < size_n && kg < size_k) {
+                            int scale_k_idx = kg / block_size_k;
+                            float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+                            uint8_t fp8_val = expert_w[(size_t)n_global * size_k + kg];
+                            B_sh[n_local * K_BLK + k_local + kk] =
+                                static_cast<T>(vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
+                        } else {
+                            B_sh[n_local * K_BLK + k_local + kk] = static_cast<T>(0);
+                        }
+                    }
+                }
+            }
+
+            // Load A Tile (Inputs) - same as regular kernel
+            const int VEC_ELEMS_A = A_ELEMS_PER_BLOCK / VEC_SIZE;
+            for (int i = threadId; i < VEC_ELEMS_A; i += BLOCK_THREADS) {
+                int idx = i * VEC_SIZE;
+                int m_local = idx / K_BLK;
+                int k_local = idx % K_BLK;
+
+                int m_seg = m_base + m_local;
+                int k_global = k_base + k_local;
+
+                if (m_seg < num_rows_in_segment && k_global < size_k) {
+                    int token_pair_index = segment_start + m_seg; 
+                    int token_index = sorted_token_ids[token_pair_index];
+                    int input_index = token_index / (topk_weights? 1: topk);
+                    *reinterpret_cast<VecT*>(&A_sh[m_local * K_BLK + k_local]) = *reinterpret_cast<const VecT*>(
+                        &input[(size_t)input_index * size_k + k_global]
+                    );
+                } else {
+                    *reinterpret_cast<VecT*>(&A_sh[m_local * K_BLK + k_local]) = zero_vec;
+                }
+            }
+
+            __syncthreads();
+
+            // Compute with WMMA
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, T, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, T, col_major> b_frag;
+
+            const T* A_sh_ptr = A_sh + (warp_m_idx * WMMA_M * K_BLK);
+            const T* B_sh_ptr = B_sh + (warp_n_idx * WMMA_N * K_BLK);
+
+            load_matrix_sync(a_frag, A_sh_ptr, K_BLK);
+            load_matrix_sync(b_frag, B_sh_ptr, K_BLK);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+
+        // Store results
+        float* C_sh_ptr = C_sh + (warp_m_idx * WMMA_M * N_BLK) + (warp_n_idx * WMMA_N);
+        store_matrix_sync(C_sh_ptr, c_frag, N_BLK, mem_row_major);
+        __syncthreads();
+
+        // Write to global memory
+        const int C_ELEMS_PER_BLOCK = M_BLK * N_BLK;
+        for (int i = threadId; i < C_ELEMS_PER_BLOCK; i += BLOCK_THREADS) {
+            int m_local_c = i / N_BLK;
+            int n_local_c = i % N_BLK;
+
+            int m_seg = m_base + m_local_c;
+            int n_global = n_base + n_local_c;
+
+            if (m_seg < num_rows_in_segment && n_global < size_n) {
+                int token_pair_index = segment_start + m_seg;
+                if (token_pair_index < size_m) {
+                    int token_index = sorted_token_ids[token_pair_index];
+                    float val = C_sh[m_local_c * N_BLK + n_local_c]; 
+                    if (topk_weights) {
+                        val *= topk_weights[token_index];
+                    }
+                    vllm::from_float(output[(size_t)token_index * size_n + n_global], val);
+                }
+            }
+        }
+    }
+}
+
 #define LAUNCH_MOE_WMMA(DTYPE, WMMA_M, WMMA_N, WARPS_N)\
     moe_gemm_grouped_kernel<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
         reinterpret_cast<const DTYPE*>(input),\
@@ -257,6 +453,20 @@ __global__ void moe_gemm_grouped_kernel(
         reinterpret_cast<DTYPE*>(output),\
         num_experts, topk,\
         size_m, size_n, size_k \
+    );\
+
+#define LAUNCH_MOE_WMMA_FP8(DTYPE, WMMA_M, WMMA_N, WARPS_N)\
+    moe_gemm_grouped_kernel_fp8<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
+        reinterpret_cast<const DTYPE*>(input),\
+        weights_u8,\
+        weight_scales,\
+        sorted_token_ids,\
+        expert_offsets,\
+        topk_weights,\
+        reinterpret_cast<DTYPE*>(output),\
+        num_experts, topk,\
+        size_m, size_n, size_k,\
+        block_size_n, block_size_k \
     );\
 
 extern "C" void moe_gemm_wmma(
@@ -308,6 +518,64 @@ extern "C" void moe_gemm_wmma(
             LAUNCH_MOE_WMMA(nv_bfloat16, 16, 16, 2)
         } else {
             LAUNCH_MOE_WMMA(nv_bfloat16, 8, 32, 1)
+        }
+        #endif
+    }
+}
+
+extern "C" void moe_gemm_wmma_fp8(
+    const void* input,                // [size_m, size_k] in half/bf16
+    const uint8_t* weights,           // [num_experts, size_n, size_k] FP8 as uint8_t
+    const float* weight_scales,       // [num_experts, scale_n_dim, scale_k_dim]
+    const int32_t* sorted_token_ids,  // [size_m] (Device)
+    const int32_t* expert_ids,        // [size_m * topk]
+    const float* topk_weights,        // [size_m] (Device, can be nullptr)
+    void* output,                     // [size_m, size_n]
+    int32_t* expert_counts,           // prealloc [num_experts]
+    int32_t* expert_offsets,          // prealloc [num_experts + 1]
+    int num_experts,
+    int topk,
+    int size_m,
+    int size_n,
+    int size_k,
+    int block_size_n,
+    int block_size_k,
+    int data_type,                    // 0 = half, 1 = bfloat16 (for input/output)
+    bool is_prefill,
+    cudaStream_t stream
+) {
+    if (is_prefill) {
+        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    } else {
+        calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    }
+
+    int grid_n = CEILDIV(size_n, N_BLK);
+    dim3 grid(num_experts, grid_n, 1);
+    dim3 block(BLOCK_THREADS, 1, 1);
+
+    // Shared memory: A_sh[M_BLK, K_BLK] + B_sh[N_BLK, K_BLK]
+    size_t A_sh_bytes = M_BLK * K_BLK * 2; // (32*16 * 2) = 1024
+    size_t B_sh_bytes = N_BLK * K_BLK * 2; // (32*16 * 2) = 1024
+    size_t C_sh_bytes = M_BLK * N_BLK * sizeof(float);
+    size_t AB_bytes = A_sh_bytes + B_sh_bytes;
+    size_t pad = (16 - (AB_bytes % 16)) % 16; 
+    size_t smem_bytes = AB_bytes + pad + C_sh_bytes;
+
+    const uint8_t* weights_u8 = weights;
+
+    if (data_type == 0) { // half
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA_FP8(half, 16, 16, 2)
+        } else {
+            LAUNCH_MOE_WMMA_FP8(half, 8, 32, 1)
+        }
+    } else if (data_type == 1) { // bfloat16
+        #ifndef NO_BF16_KERNEL
+        if (is_prefill) {
+            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 16, 16, 2)
+        } else {
+            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 8, 32, 1)
         }
         #endif
     }

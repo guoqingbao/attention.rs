@@ -1,17 +1,21 @@
 [package]
 name = "kernels"
-version = "0.1.6"
+version = "0.4.2"
 edition = "2021"
-description = "Paged attention kernels for Rust"
+description = "Attention, MoE and GEMM kernels for Rust"
 categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 
 [build-dependencies]
-bindgen_cuda = {git = "https://github.com/guoqingbao/bindgen_cuda.git", version= "0.1.6"}
+cudaforge = "0.1.5"
 anyhow = { version = "1", features = ["backtrace"] }
+sha2 = "0.10"
+ureq = { version = "2.10", default-features = true }
 
 [features]
 no-marlin = []
 no-fp8-kvcache = []
+cutlass = []
+flashinfer = []

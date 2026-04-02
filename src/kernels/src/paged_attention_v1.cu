@@ -54,7 +54,8 @@
     q_stride,                                                                                 \
     kv_block_stride,                                                                          \
     kv_head_stride,\
-    softscapping);
+    softscapping,\
+    sliding_window);
 
 // TODO(woosuk): Tune NUM_THREADS.
 template<
@@ -83,6 +84,7 @@ void paged_attention_v1_launcher(
   int kv_block_stride,
   int kv_head_stride,
   float softscapping,
+  int sliding_window,
   int64_t stream_
   ) {
 
@@ -151,6 +153,7 @@ void paged_attention_v1_launcher(
     kv_block_stride,                                                \
     kv_head_stride, \
     softscapping, \
+    sliding_window,\
     stream);
 
 // NOTE(woosuk): To reduce the compilation time, we omitted block sizes
@@ -191,6 +194,7 @@ extern "C" void paged_attention_v1(
 
   uint32_t dtype,      // 0 => f16; 1 => bf16; 2 => f32
   float softscapping,
+  int sliding_window,
   int64_t stream
   ) {
   bool is_quantized = (k_scales != nullptr) && (v_scales != nullptr);
@@ -216,7 +220,7 @@ extern "C" void paged_attention_v1(
       #endif
     }
 #else
-    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flash-attn or context-cache enabled).");
+    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flashattn or context-cache enabled).");
 #endif
   }
 }

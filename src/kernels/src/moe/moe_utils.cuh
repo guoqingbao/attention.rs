@@ -1,4 +1,7 @@
-#undef __CUDA_FP8_TYPES_EXIST__
+// #undef __CUDA_FP8_TYPES_EXIST__
+#ifndef NO_HARDWARE_FP8
+  #include "cuda_fp8.h"
+#endif
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>

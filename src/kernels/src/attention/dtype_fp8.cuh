@@ -1,4 +1,7 @@
 #pragma once
+#ifndef NO_HARDWARE_FP8
+  #include "cuda_fp8.h"
+#endif
 #include <assert.h>
 #include <float.h>
 #include <stdint.h>
@@ -13,6 +16,7 @@
 
 #include <cmath>
 #include <limits>
+#include <cuda_fp16.h>
 
 namespace vllm {
 
@@ -36,8 +40,8 @@ struct Vec<uint8_t, 8> {
 
 namespace fp8 {
 
-#define MIN_FP8_VALUE (-447.0f) // -max representable normal fp8 E4M3
-#define MAX_FP8_VALUE (447.0f)  // max representable normal fp8 E4M3
+#define MIN_FP8_VALUE (-448.0f) // min finite fp8 E4M3FN
+#define MAX_FP8_VALUE (448.0f)  // max finite fp8 E4M3FN
 
   // --- softmax FP8 (E4M3) software fast conversions on GPU Arch < 900 ---
 // Author: Guoqing Bao,
@@ -52,11 +56,11 @@ static inline __device__ uint8_t softmax_float_to_fp8_e4m3(float f) {
   // special cases
   if (exp == 0xFF) { // Inf or NaN
     if (mant != 0) {
-      // produce a quiet NaN: sign=0, exp=1111, mant != 0
-      return (uint8_t)((0 << 7) | (0xF << 3) | 1);
+      // NaN: exp=1111, mant=111 (E4M3FN reserves only this for NaN)
+      return (uint8_t)((0 << 7) | (0xF << 3) | 0x7);
     } else {
-      // Inf
-      return (uint8_t)((sign << 7) | (0xF << 3) | 0);
+      // Inf -> saturate to max finite
+      return (uint8_t)((sign << 7) | (0xF << 3) | 0x6);
     }
   }
 
@@ -78,9 +82,9 @@ static inline __device__ uint8_t softmax_float_to_fp8_e4m3(float f) {
     // subnormal float -- handled below
   }
 
-  // Overflow -> set to Inf
-  if (new_exp >= 0xF) {
-    return (uint8_t)((sign << 7) | (0xF << 3)); // Inf
+  // Overflow -> saturate to max finite (E4M3FN)
+  if (new_exp > 0xF) {
+    return (uint8_t)((sign << 7) | (0xF << 3) | 0x6);
   }
 
   // Underflow -> could become subnormal or zero in FP8
@@ -132,11 +136,16 @@ static inline __device__ uint8_t softmax_float_to_fp8_e4m3(float f) {
       // mantissa overflow -> increment exponent
       truncated = 0;
       new_exp += 1;
-      if (new_exp >= 0xF) {
-        // overflow to Inf
-        return (uint8_t)((sign << 7) | (0xF << 3));
+      if (new_exp > 0xF) {
+        // overflow to max finite
+        return (uint8_t)((sign << 7) | (0xF << 3) | 0x6);
       }
     }
+  }
+
+  // exp=1111 with mant=111 is NaN in E4M3FN, clamp to max finite instead
+  if (new_exp == 0xF && truncated == 0x7) {
+    truncated = 0x6;
   }
 
   uint8_t out = (uint8_t)((sign << 7) | ((new_exp & 0xF) << 3) | (truncated & 0x7));
@@ -167,16 +176,10 @@ static inline __device__ float softmax_fp8_to_float_e4m3(uint8_t x) {
       uint32_t bits = (sign << 31) | ((uint32_t)e << 23) | mant32;
       return __uint_as_float(bits);
     }
-  } else if (exp == 0xF) {
-    // Inf/NaN
-    if (mant == 0) {
-      uint32_t bits = (sign << 31) | (0xFFu << 23);
-      return __uint_as_float(bits);
-    } else {
-      // NaN - produce a quiet NaN
-      uint32_t bits = (0u << 31) | (0xFFu << 23) | (1u << 22);
-      return __uint_as_float(bits);
-    }
+  } else if (exp == 0xF && mant == 0x7) {
+    // NaN - produce a quiet NaN
+    uint32_t bits = (0u << 31) | (0xFFu << 23) | (1u << 22);
+    return __uint_as_float(bits);
   } else {
     int new_exp = exp - FP8_BIAS + FP32_BIAS;
     uint32_t mant32 = (uint32_t)mant << (23 - 3);
@@ -186,14 +189,11 @@ static inline __device__ float softmax_fp8_to_float_e4m3(uint8_t x) {
 }
 
 // --- Dispatch wrappers that prefer NV intrinsics when available ---
-#ifndef NO_HARDWARE_FP8
-  #include "cuda_fp8.h"
-#endif
 
   // If native fp8 intrinsics exist, use them.
   static inline __device__ uint8_t dispatch_float_to_fp8(float f) {
     // use NV intrinsic that returns __nv_fp8_storage_t (uint8-ish)
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(NO_HARDWARE_FP8)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && !defined(NO_HARDWARE_FP8)
     __nv_fp8_storage_t r = __nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3);
     return (uint8_t)r;
 #else
@@ -201,9 +201,8 @@ static inline __device__ float softmax_fp8_to_float_e4m3(uint8_t x) {
 #endif
   }
   static inline __device__ float dispatch_fp8_to_float(uint8_t a) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && !defined(NO_HARDWARE_FP8)
-    __half_raw hr = __nv_cvt_fp8_to_halfraw(a, __NV_E4M3);
-    return half_to_float(hr.x);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && !defined(NO_HARDWARE_FP8)
+    return __half2float(__nv_cvt_fp8_to_halfraw(a, __NV_E4M3));
 #else
     return softmax_fp8_to_float_e4m3(a);
 #endif
@@ -221,7 +220,7 @@ template <>
 __inline__ __device__ uint16_t scaled_vec_conversion<uint16_t, uint8_t>(
     const uint8_t& a, const float scale) {
   float f = dispatch_fp8_to_float(a);
-  return float_to_half(f * scale);
+  return __float2half(f * scale);
 }
 
 // fp8x2 -> half2
@@ -234,8 +233,8 @@ __inline__ __device__ uint32_t scaled_vec_conversion<uint32_t, uint16_t>(
   } tmp;
   uint8_t b0 = (uint8_t)(a & 0xFFu);
   uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
-  tmp.u16[0] = float_to_half(dispatch_fp8_to_float(b0) * scale);
-  tmp.u16[1] = float_to_half(dispatch_fp8_to_float(b1) * scale);
+  tmp.u16[0] = __float2half(dispatch_fp8_to_float(b0) * scale);
+  tmp.u16[1] = __float2half(dispatch_fp8_to_float(b1) * scale);
   return tmp.u32;
 }
 
@@ -320,17 +319,25 @@ __inline__ __device__ float scaled_vec_conversion<float, uint8_t>(
 template <>
 __inline__ __device__ float2 scaled_vec_conversion<float2, uint16_t>(
     const uint16_t& a, const float scale) {
-  uint32_t tmp = scaled_vec_conversion<uint32_t, uint16_t>(a, scale);
-  return half2_to_float2(tmp);
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  return make_float2(dispatch_fp8_to_float(b0) * scale,
+                     dispatch_fp8_to_float(b1) * scale);
 }
 
 // fp8x4 -> float4
 template <>
 __inline__ __device__ Float4_ scaled_vec_conversion<Float4_, uint32_t>(
     const uint32_t& a, const float scale) {
+  uint8_t b0 = (uint8_t)(a & 0xFFu);
+  uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
+  uint8_t b2 = (uint8_t)((a >> 16u) & 0xFFu);
+  uint8_t b3 = (uint8_t)((a >> 24u) & 0xFFu);
   Float4_ res;
-  res.x = scaled_vec_conversion<float2, uint16_t>((uint16_t)(a & 0xFFFFu), scale);
-  res.y = scaled_vec_conversion<float2, uint16_t>((uint16_t)((a >> 16u) & 0xFFFFu), scale);
+  res.x = make_float2(dispatch_fp8_to_float(b0) * scale,
+                      dispatch_fp8_to_float(b1) * scale);
+  res.y = make_float2(dispatch_fp8_to_float(b2) * scale,
+                      dispatch_fp8_to_float(b3) * scale);
   return res;
 }
 
@@ -352,7 +359,8 @@ __inline__ __device__ Float8_ scaled_vec_conversion<Float8_, uint2>(
 template <>
 __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, uint16_t>(
     const uint16_t& a, const float scale) {
-  float f = fminf(fmaxf(half_to_float(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  // float f = fminf(fmaxf(__half2float(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  float f = __half2float(a) / scale;
   return dispatch_float_to_fp8(f);
 }
 
@@ -360,7 +368,8 @@ __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, uint16_t>(
 template <>
 __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, __nv_bfloat16>(
     const __nv_bfloat16& a, const float scale) {
-  float f = fminf(fmaxf(__bfloat162float(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  // float f = fminf(fmaxf(__bfloat162float(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  float f = __bfloat162float(a) / scale;
   return dispatch_float_to_fp8(f);
 }
 
@@ -368,7 +377,8 @@ __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, __nv_bfloat16>(
 template <>
 __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, float>(
     const float& a, const float scale) {
-  float f = fminf(fmaxf(a / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  // float f = fminf(fmaxf(a / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
+  float f = a / scale;
   return dispatch_float_to_fp8(f);
 }
 

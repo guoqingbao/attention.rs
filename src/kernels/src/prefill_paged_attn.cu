@@ -158,8 +158,8 @@ __global__ void chunked_prefill_paged_attention_kernel(
     const int token_start = blockIdx.z * TOKEN_CHUNK_SIZE + lane;
 
      // Total number of elements in K and V cache
-    int64_t k_cache_num_elems = total_num_blocks * kv_block_stride;
-    int64_t v_cache_num_elems = total_num_blocks * kv_block_stride;
+    // int64_t k_cache_num_elems = total_num_blocks * kv_block_stride;
+    // int64_t v_cache_num_elems = total_num_blocks * kv_block_stride;
 
     const int num_queries_per_kv = num_query_heads / num_kv_heads;
     const int X = 16 / sizeof(cache_t); // sub-vector size
@@ -187,7 +187,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     const uint32_t seq_len_full = seq_lens[seq_idx];
     const int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
     const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
-    const int context_len = (int)seq_len_full - 1;
+    // const int context_len = (int)seq_len_full - 1;
 
     // Vectorized types for Q and K
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
@@ -224,8 +224,18 @@ __global__ void chunked_prefill_paged_attention_kernel(
     float alibi = (use_alibi && head_active && lane_active) ? alibi_slopes[query_head_idx] : 0.f;
     float L = 1.f;
 
+    // Sliding Window Calculation
+    // We only attend to tokens in range [start_token_idx, seq_len_full)
+    int start_token_idx = 0;
+    int start_block_idx = 0;
+    if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
+        start_token_idx = (int)seq_len_full - sliding_window;
+        start_block_idx = start_token_idx / BLOCK_SIZE;
+    }
+
     // --- Iterate over all KV blocks ---
-    for (int blk = 0; blk < num_blocks; ++blk) {
+    // Start from start_block_idx instead of 0
+    for (int blk = start_block_idx; blk < num_blocks; ++blk) {
         const uint32_t physical_block = block_table_for_seq[blk];
         const bool valid_block =
             (physical_block != UINT32_MAX) &&
@@ -237,10 +247,16 @@ __global__ void chunked_prefill_paged_attention_kernel(
         bool in_contexts[BLOCK_SIZE] = { false };
         for (int b = 0; b < BLOCK_SIZE; ++b) {
             const int token_idx_in_full = block_in_full + b;
-            bool in_context = token_idx_in_full < (int)seq_len_full;
-            in_contexts[b] = in_context;
+            
+            // Masking logic: Must be in valid context AND within sliding window
+            bool in_context = (token_idx_in_full < (int)seq_len_full);
+            bool in_window = (token_idx_in_full >= start_token_idx);
 
-            if (!in_context || !valid_block || !lane_active) {
+            // Store status for P·V later
+            in_contexts[b] = in_context && in_window;
+
+            // If invalid, mask out QK
+            if (!in_context || !in_window || !valid_block || !lane_active) {
               qk_block[b] = -INFINITY;
               continue;
             }
@@ -257,7 +273,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               } else {
                 Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(
                     &k_cache[k_idx]);
-                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, *k_scales);
+                k_vec[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scales[kv_head_idx]);
               }
             }
 
@@ -296,7 +312,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
-          if (in_contexts[b]) {
+          if (in_contexts[b]) { // Uses the updated context check (window + valid)
               const float P = __expf(qk_block[b] - M);
               reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
               acc_lane += P;
@@ -319,7 +335,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
               v = to_float(*reinterpret_cast<const K_vec*>(src));
             } else {
               Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec *>(src);
-              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, *v_scales);
+              v = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, v_scales[kv_head_idx]);
             }
 
             acc_vec[k] += dot(p_vec[b], v);
@@ -410,7 +426,7 @@ void paged_attention_prefill_launcher(
   const float* alibi_slopes_ptr = nullptr;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
   int VEC_SIZE = 16 / sizeof(T);
-  int NUM_VECS  = head_size / VEC_SIZE;
+  // int NUM_VECS  = head_size / VEC_SIZE;
 
   int num_token_chunks = (num_query_tokens + TOKEN_CHUNK_SIZE - 1) / TOKEN_CHUNK_SIZE;
   dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);
@@ -522,7 +538,7 @@ extern "C" void paged_attention_prefill(
       #endif
     }
 #else
-    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flash-attn or context-cache enabled).");
+    throw std::runtime_error("Error: FP8 KV-cache is disabled (possiblly because flashattn or context-cache enabled).");
 #endif
   } else {
     if (dtype == 2) {

@@ -38,7 +38,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::CudaStorageSlice;
         let dev = k.device();
-        let elem_count = k_layout.shape().elem_count();
+        let _ = k_layout.shape().elem_count();
 
         use std::ffi::c_void;
 
@@ -78,27 +78,40 @@ impl candle::InplaceOp2 for KvScaleUpdate {
         let k_scales_ptr = *k_scales.device_ptr() as *mut f32;
         let v_scales_ptr = *v_scales.device_ptr() as *mut f32;
         unsafe {
+            let (num_tokens, num_heads, head_dim) =
+                if let Ok((b, s, h, d)) = k_layout.shape().dims4() {
+                    ((b * s) as i64, h as i32, d as i32)
+                } else {
+                    let (t, h, d) = k_layout.shape().dims3()?;
+                    (t as i64, h as i32, d as i32)
+                };
             match k.dtype() {
-                DType::F32 => ffi::update_kv_scales_f32(
+                DType::F32 => ffi::update_kv_scales_per_head_f32(
                     src_ptr,
                     dst_ptr,
-                    elem_count as i64,
+                    num_tokens,
+                    num_heads,
+                    head_dim,
                     k_scales_ptr,
                     v_scales_ptr,
                     stream,
                 ),
-                DType::F16 => ffi::update_kv_scales_f16(
+                DType::F16 => ffi::update_kv_scales_per_head_f16(
                     src_ptr,
                     dst_ptr,
-                    elem_count as i64,
+                    num_tokens,
+                    num_heads,
+                    head_dim,
                     k_scales_ptr,
                     v_scales_ptr,
                     stream,
                 ),
-                DType::BF16 => ffi::update_kv_scales_bf16(
+                DType::BF16 => ffi::update_kv_scales_per_head_bf16(
                     src_ptr,
                     dst_ptr,
-                    elem_count as i64,
+                    num_tokens,
+                    num_heads,
+                    head_dim,
                     k_scales_ptr,
                     v_scales_ptr,
                     stream,
@@ -126,7 +139,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
             DType::F32 => metal_kernels::PagedAttentionDType::F32,
             dtype => candle_core::bail!("dtype {dtype:?} is not supported"),
         };
-        let elem_count = k_l.shape().elem_count();
+        let _ = k_l.shape().elem_count();
 
         let dev = k.device();
         let (k_scales, _) = self.k_scales.storage_and_layout();
@@ -144,14 +157,22 @@ impl candle::InplaceOp2 for KvScaleUpdate {
         let command_buffer = dev.command_buffer()?;
         command_buffer.set_label("update-scales");
 
-        metal_kernels::call_update_scales(
+        let (num_tokens, num_heads, head_dim) = if let Ok((b, s, h, d)) = k_l.shape().dims4() {
+            ((b * s) as i64, h as i32, d as i32)
+        } else {
+            let (t, h, d) = k_l.shape().dims3()?;
+            (t as i64, h as i32, d as i32)
+        };
+        metal_kernels::call_update_scales_per_head(
             dev.device(),
             &command_buffer,
             metal_kernels::Kernels::default(),
             internal_type,
             k.buffer(),
             v.buffer(),
-            elem_count as i64,
+            num_tokens,
+            num_heads,
+            head_dim,
             k_scales.buffer(),
             v_scales.buffer(),
         )

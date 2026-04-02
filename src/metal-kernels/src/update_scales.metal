@@ -46,47 +46,47 @@ float to_float_abs<bfloat16_t>(bfloat16_t x) {
 }
 
 
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
+#define THREADS_PER_TG 256
+
 template <typename T>
-kernel void compute_and_update_scales_kernel(
+kernel void compute_and_update_scales_per_head_kernel(
     device const T* k [[buffer(0)]],
     device const T* v [[buffer(1)]],
-    constant long& num_elements [[buffer(2)]],
-    device atomic_uint* k_scales [[buffer(3)]],
-    device atomic_uint* v_scales [[buffer(4)]],
-    uint3 blockIdx [[threadgroup_position_in_grid]], // equivalent to blockIdx
-    uint3 threadIdx [[thread_position_in_threadgroup]], // equivalent to threadIdx
-    uint3 gridDim [[threadgroups_per_grid]],
-    uint3 blockDim [[threads_per_threadgroup]]
+    constant long& num_tokens [[buffer(2)]],
+    constant int& num_heads [[buffer(3)]],
+    constant int& head_dim [[buffer(4)]],
+    device float* k_scales [[buffer(5)]],
+    device float* v_scales [[buffer(6)]],
+    uint3 threadIdx [[thread_position_in_threadgroup]]
 ) {
-    device float* sdata = nullptr;
-    device float* s_k = sdata;
-    device float* s_v = sdata + blockDim.x;
-    const int tid = threadIdx.x;
-    const int bdim = blockDim.x;
-    const int gdim = gridDim.x;
-    long global_thread_index = (long)blockIdx.x * bdim + tid;
+    const uint tid = threadIdx.x;
+    if (tid >= THREADS_PER_TG) {
+        return;
+    }
+
+    threadgroup float s_k[THREADS_PER_TG];
+    threadgroup float s_v[THREADS_PER_TG];
+
+    const long total_elems = num_tokens * (long)num_heads * (long)head_dim;
+    long idx = (long)tid;
+    long stride = (long)THREADS_PER_TG;
 
     float local_max_k = 0.0f;
     float local_max_v = 0.0f;
 
-    long idx = global_thread_index;
-    long stride = (long)bdim * (long)gdim;
-
-    while (idx < num_elements) {
-        float avk = to_float_abs<T>(k[idx]);
-        float avv = to_float_abs<T>(v[idx]);
+    for (long i = idx; i < total_elems; i += stride) {
+        float avk = to_float_abs<T>(k[i]);
+        float avv = to_float_abs<T>(v[i]);
         if (avk > local_max_k) local_max_k = avk;
         if (avv > local_max_v) local_max_v = avv;
-        idx += stride;
     }
 
-    // Store per-thread maxima to shared memory
     s_k[tid] = local_max_k;
     s_v[tid] = local_max_v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Parallel reduction in shared memory to find block maxima
-    for (int s = bdim >> 1; s > 0; s >>= 1) {
+    for (int s = THREADS_PER_TG >> 1; s > 0; s >>= 1) {
         if (tid < s) {
             if (s_k[tid + s] > s_k[tid]) s_k[tid] = s_k[tid + s];
             if (s_v[tid + s] > s_v[tid]) s_v[tid] = s_v[tid + s];
@@ -94,36 +94,26 @@ kernel void compute_and_update_scales_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Update global scales atomically from thread 0
     if (tid == 0) {
         float candidate_k_scale = s_k[0] / DIV_CONST;
         float candidate_v_scale = s_v[0] / DIV_CONST;
-
-        float cur_k_scale = (float)atomic_load_explicit(k_scales, memory_order_relaxed);
-        float cur_v_scale = (float)atomic_load_explicit(v_scales, memory_order_relaxed);
-        if (candidate_k_scale > cur_k_scale) {
-            atomic_exchange_explicit(k_scales, candidate_k_scale, memory_order_relaxed);
-        }
-
-        if (candidate_v_scale > cur_v_scale) {
-            atomic_exchange_explicit(v_scales, candidate_v_scale, memory_order_relaxed);
-        }
+        k_scales[0] = max(k_scales[0], candidate_k_scale);
+        v_scales[0] = max(v_scales[0], candidate_v_scale);
     }
 }
 
-#define instantiate_compute_and_update_scales(type)        \
-  template [[host_name("compute_and_update_scales_" #type)]]                \
-  kernel void compute_and_update_scales_kernel<type>( \
+#define instantiate_compute_and_update_scales_per_head(type)        \
+  template [[host_name("compute_and_update_scales_per_head_" #type)]]                \
+  kernel void compute_and_update_scales_per_head_kernel<type>( \
     device const type* k [[buffer(0)]],                    \
     device const type* v [[buffer(1)]],                    \
-    constant long& num_elements [[buffer(2)]],             \
-    device atomic_uint* k_scales [[buffer(3)]],\
-    device atomic_uint* v_scales [[buffer(4)]],\
-    uint3 blockIdx [[threadgroup_position_in_grid]], \
-    uint3 threadIdx [[thread_position_in_threadgroup]], \
-    uint3 gridDim [[threadgroups_per_grid]],\
-    uint3 blockDim [[threads_per_threadgroup]]);
+    constant long& num_tokens [[buffer(2)]],               \
+    constant int& num_heads [[buffer(3)]],                 \
+    constant int& head_dim [[buffer(4)]],                  \
+    device float* k_scales [[buffer(5)]],                  \
+    device float* v_scales [[buffer(6)]],                  \
+    uint3 threadIdx [[thread_position_in_threadgroup]]);
 
-instantiate_compute_and_update_scales(float)
-instantiate_compute_and_update_scales(half)
-instantiate_compute_and_update_scales(bfloat16_t)
+instantiate_compute_and_update_scales_per_head(float)
+instantiate_compute_and_update_scales_per_head(half)
+instantiate_compute_and_update_scales_per_head(bfloat16_t)

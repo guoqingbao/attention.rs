@@ -34,9 +34,9 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         unsafe {
             ffi::topk_softmax(
                 *logits.device_ptr() as *const f32,
-                *token_expert_indices.device_ptr() as *const i32,
-                *topk_weights.device_ptr() as *const f32,
-                *topk_indices.device_ptr() as *const u32,
+                *token_expert_indices.device_ptr() as *mut i32,
+                *topk_weights.device_ptr() as *mut f32,
+                *topk_indices.device_ptr() as *mut u32,
                 num_experts as i32,
                 num_tokens as i32,
                 topk as i32,

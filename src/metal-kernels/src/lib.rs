@@ -748,6 +748,8 @@ pub fn paged_attention_v2(
 /// * `seq_lens` - A buffer containing the full context length of each sequence.
 /// * `query_start_len` - A buffer indicating the start token index for each sequence in the flattened query tensor.
 /// * `alibi_slopes` - Optional buffer containing ALiBi slopes for positional bias.
+/// * `k_scale` - Optional buffer for per-head FP8 K scales.
+/// * `v_scale` - Optional buffer for per-head FP8 V scales.
 /// * `sinks` - Optional buffer for sink attention.
 /// * `num_kv_heads` - The number of key-value heads (for Grouped-Query Attention).
 /// * `scale` - The softmax scaling factor (typically `1.0 / sqrt(head_size)`).
@@ -784,6 +786,8 @@ pub fn paged_attention_prefill(
     query_start_len: &Buffer,
     query_start_len_offset: usize,
     alibi_slopes: Option<(MetalStorage, usize)>,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
     sinks: Option<(MetalStorage, usize)>,
     // Scalar Parameters
     num_kv_heads: i32,
@@ -803,6 +807,7 @@ pub fn paged_attention_prefill(
 ) -> Result<(), MetalKernelError> {
     // This value must match the `token_chunk_size` used in the .metal instantiation macros
     const TOKEN_CHUNK_SIZE: u64 = 64;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     // 1. Construct the unique kernel name from its template parameters.
     let type_name = match ty {
@@ -810,10 +815,17 @@ pub fn paged_attention_prefill(
         PagedAttentionDType::BF16 => "bfloat16_t",
         PagedAttentionDType::F16 => "half",
     };
-    let name = format!(
-        "chunked_prefill_{}_hs{}_bs{}_tcs{}",
-        type_name, head_size, block_size, TOKEN_CHUNK_SIZE
-    );
+    let name = if quantized_cache {
+        format!(
+            "chunked_prefill_{}_uint8_t_hs{}_bs{}_tcs{}",
+            type_name, head_size, block_size, TOKEN_CHUNK_SIZE
+        )
+    } else {
+        format!(
+            "chunked_prefill_{}_hs{}_bs{}_tcs{}",
+            type_name, head_size, block_size, TOKEN_CHUNK_SIZE
+        )
+    };
 
     // 2. Load the pipeline. The prefill kernel does not use function constants.
     let pipeline = kernels.load_pipeline(device, name)?;
@@ -876,18 +888,12 @@ pub fn paged_attention_prefill(
     if let Some((slop, offset)) = alibi_slopes {
         encoder.set_buffer(15, Some(slop.buffer()), offset as NSUInteger);
     }
-    // Set unused k_scale and v_scale for signature compatibility
-    let dummy_scale = 1.0f32;
-    encoder.set_bytes(
-        16,
-        size_of_val(&dummy_scale),
-        &dummy_scale as *const _ as *const c_void,
-    );
-    encoder.set_bytes(
-        17,
-        size_of_val(&dummy_scale),
-        &dummy_scale as *const _ as *const c_void,
-    );
+    if let Some(k_scale) = k_scale {
+        encoder.set_buffer(16, Some(k_scale.buffer()), 0);
+    }
+    if let Some(v_scale) = v_scale {
+        encoder.set_buffer(17, Some(v_scale.buffer()), 0);
+    }
     if let Some((sk, offset)) = sinks {
         encoder.set_buffer(18, Some(sk.buffer()), offset as NSUInteger);
     }
@@ -994,21 +1000,24 @@ pub fn call_causal_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_update_scales(
+#[allow(clippy::too_many_arguments)]
+pub fn call_update_scales_per_head(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     ty: PagedAttentionDType,
     k: &Buffer,
     v: &Buffer,
-    num_elements: i64,
+    num_tokens: i64,
+    num_heads: i32,
+    head_dim: i32,
     k_scales: &Buffer,
     v_scales: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let name = match ty {
-        PagedAttentionDType::F32 => "compute_and_update_scales_float",
-        PagedAttentionDType::BF16 => "compute_and_update_scales_bfloat16_t",
-        PagedAttentionDType::F16 => "compute_and_update_scales_half",
+        PagedAttentionDType::F32 => "compute_and_update_scales_per_head_float",
+        PagedAttentionDType::BF16 => "compute_and_update_scales_per_head_bfloat16_t",
+        PagedAttentionDType::F16 => "compute_and_update_scales_per_head_half",
     };
 
     let pipeline = kernels.load_pipeline(device, name.to_string())?;
@@ -1017,30 +1026,858 @@ pub fn call_update_scales(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Set the parameters
     set_params!(
         encoder,
         (
-            (k, 0),        // k buffer
-            (v, 0),        // v buffer
-            num_elements,  // total number of elements
-            (k_scales, 0), // k scale
-            (v_scales, 0)  // v scale
+            (k, 0),
+            (v, 0),
+            num_tokens,
+            num_heads,
+            head_dim,
+            (k_scales, 0),
+            (v_scales, 0)
         )
     );
 
-    // Dispatch the kernel
-    let thread_groups_count = MTLSize {
-        width: (num_elements as u64 + 511) / 512,
+    let threads_per_threadgroup = MTLSize {
+        width: 256,
         height: 1,
         depth: 1,
     };
-    let threads_per_threadgroup = MTLSize {
-        width: 512,
+    let thread_groups_count = MTLSize {
+        width: 1,
         height: 1,
         depth: 1,
     };
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
+/// Fused Rotary Position Embedding with position selection
+///
+/// This kernel fuses index_select + RoPE into a single kernel.
+/// Supports GQA (different head counts for Q and K).
+///
+/// # Arguments
+/// * `q` - Query buffer [batch, num_q_heads, seq_len, head_dim]
+/// * `k` - Key buffer [batch, num_kv_heads, seq_len, head_dim]
+/// * `cos` - Full cosine table [max_seq_len, head_dim/2]
+/// * `sin` - Full sine table [max_seq_len, head_dim/2]
+/// * `positions` - Position indices [seq_len] (i64)
+/// * `q_bh` - batch * num_q_heads
+/// * `k_bh` - batch * num_kv_heads
+/// * `seq_len` - sequence length
+/// * `d` - head_dim
+/// * `rotary_dim` - number of channels to rotate
+/// * `is_interleaved` - if true, use interleaved RoPE layout
+/// * `is_token_major` - if true, Q/K layout is [tokens, heads, dim]
+#[allow(clippy::too_many_arguments)]
+pub fn call_fused_rope(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    cos: &Buffer,
+    cos_offset: usize,
+    sin: &Buffer,
+    sin_offset: usize,
+    positions: &Buffer,
+    positions_offset: usize,
+    q_bh: u32,
+    k_bh: u32,
+    seq_len: u32,
+    d: u32,
+    rotary_dim: u32,
+    is_interleaved: bool,
+    is_token_major: bool,
+) -> Result<(), MetalKernelError> {
+    let type_name = match ty {
+        DType::F32 => "f32",
+        DType::BF16 => "bf16",
+        DType::F16 => "f16",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F32, DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+
+    let name = if is_interleaved {
+        format!("fused_rope_i_{}", type_name)
+    } else {
+        format!("fused_rope_{}", type_name)
+    };
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (cos, cos_offset),
+            (sin, sin_offset),
+            (positions, positions_offset),
+            q_bh,
+            k_bh,
+            seq_len,
+            d,
+            rotary_dim,
+            if is_token_major { 1u32 } else { 0u32 }
+        )
+    );
+
+    // Calculate total number of pairs
+    let rotary_pairs = rotary_dim / 2;
+    let total_pairs = ((q_bh + k_bh) * seq_len * rotary_pairs) as u64;
+
+    // Dispatch with 256 threads per threadgroup
+    let threads_per_threadgroup = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: (total_pairs + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_fp8_matmul(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    input_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    weight_scale: &Buffer,
+    weight_scale_offset: usize,
+    output: &Buffer,
+    output_offset: usize,
+    m: i32,
+    n: i32,
+    k: i32,
+    scale_row_stride: i32,
+    block_size_y: i32,
+    block_size_x: i32,
+) -> Result<(), MetalKernelError> {
+    let is_gemv = m <= 8;
+    let name = match ty {
+        DType::F16 => {
+            if is_gemv {
+                "fp8_gemv_half"
+            } else if m <= 16 {
+                "fp8_matmul_half_16_32_32"
+            } else {
+                "fp8_matmul_half_32_32_32"
+            }
+        }
+        DType::BF16 => {
+            if is_gemv {
+                "fp8_gemv_bfloat16"
+            } else if m <= 16 {
+                "fp8_matmul_bfloat16_16_32_32"
+            } else {
+                "fp8_matmul_bfloat16_32_32_32"
+            }
+        }
+        _ => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: ty,
+            })
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            (input, input_offset),
+            (weight, weight_offset),
+            (weight_scale, weight_scale_offset),
+            (output, output_offset),
+            m,
+            n,
+            k,
+            scale_row_stride,
+            block_size_y,
+            block_size_x
+        )
+    );
+
+    if is_gemv {
+        // Grid: (N * 32, M, 1)
+        let thread_group_size = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let thread_groups_count = MTLSize {
+            width: n as u64, // (N * 32) / 32 = N
+            height: m as u64,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    } else {
+        let thread_group_size = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let m_block = if m <= 16 { 16 } else { 32 };
+        let thread_groups_count = MTLSize {
+            width: (n as u64 + 31) / 32,
+            height: (m as u64 + m_block - 1) / m_block,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    }
+    Ok(())
+}
+
+fn gdn_type_name(ty: DType) -> Result<&'static str, MetalKernelError> {
+    match ty {
+        DType::F32 => Ok("float"),
+        DType::F16 => Ok("half"),
+        DType::BF16 => Ok("bfloat16_t"),
+        other => Err(MetalKernelError::DTypeMismatch {
+            expected: vec![DType::F32, DType::F16, DType::BF16],
+            got: other,
+        }),
+    }
+}
+
+fn gdn_recurrence_kernel_name(
+    base: &str,
+    ty: DType,
+    k_dim: i32,
+) -> Result<String, MetalKernelError> {
+    let ty_name = gdn_type_name(ty)?;
+    let bk = match k_dim {
+        64 => 64,
+        128 => 128,
+        _ => {
+            return Err(MetalKernelError::FailedToCreatePipeline(format!(
+                "{base}: unsupported k_dim={k_dim}, expected 64 or 128"
+            )))
+        }
+    };
+    Ok(format!("{base}_{ty_name}_k{bk}"))
+}
+
+fn gdn_conv_kernel_name(
+    base: &str,
+    ty: DType,
+    kernel_size: i32,
+) -> Result<String, MetalKernelError> {
+    let ty_name = gdn_type_name(ty)?;
+    match kernel_size {
+        2..=4 => Ok(format!("{base}_{ty_name}_k{kernel_size}")),
+        _ => Err(MetalKernelError::FailedToCreatePipeline(format!(
+            "{base}: unsupported kernel_size={kernel_size}, expected 2, 3, or 4"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_causal_conv1d_fwd(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: &Buffer,
+    x_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    bias: Option<(&Buffer, usize)>,
+    conv_state: &Buffer,
+    conv_state_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    cu_seqlens: &Buffer,
+    cu_seqlens_offset: usize,
+    batch_size: i32,
+    d_conv: i32,
+    kernel_size: i32,
+    activation_silu: bool,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_conv_kernel_name("gdn_causal_conv1d_fwd", ty, kernel_size)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(x), x_offset as NSUInteger);
+    encoder.set_buffer(1, Some(weight), weight_offset as NSUInteger);
+    if let Some((bias, offset)) = bias {
+        encoder.set_buffer(2, Some(bias), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(2, None, 0);
+    }
+    encoder.set_buffer(3, Some(conv_state), conv_state_offset as NSUInteger);
+    encoder.set_buffer(4, Some(out), out_offset as NSUInteger);
+    encoder.set_buffer(5, Some(cu_seqlens), cu_seqlens_offset as NSUInteger);
+    utils::set_param(encoder, 6, batch_size);
+    utils::set_param(encoder, 7, d_conv);
+    utils::set_param(encoder, 8, activation_silu);
+
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((d_conv as u64) + 255) / 256,
+        height: batch_size as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_causal_conv1d_update(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: &Buffer,
+    x_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    bias: Option<(&Buffer, usize)>,
+    conv_state: &Buffer,
+    conv_state_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch_size: i32,
+    d_conv: i32,
+    kernel_size: i32,
+    activation_silu: bool,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_conv_kernel_name("gdn_causal_conv1d_update", ty, kernel_size)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(x), x_offset as NSUInteger);
+    encoder.set_buffer(1, Some(weight), weight_offset as NSUInteger);
+    if let Some((bias, offset)) = bias {
+        encoder.set_buffer(2, Some(bias), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(2, None, 0);
+    }
+    encoder.set_buffer(3, Some(conv_state), conv_state_offset as NSUInteger);
+    encoder.set_buffer(4, Some(out), out_offset as NSUInteger);
+    utils::set_param(encoder, 5, batch_size);
+    utils::set_param(encoder, 6, d_conv);
+    utils::set_param(encoder, 7, activation_silu);
+
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((d_conv as u64) + 255) / 256,
+        height: batch_size as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_causal_conv1d_update_slots(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: &Buffer,
+    x_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    bias: Option<(&Buffer, usize)>,
+    conv_state: &Buffer,
+    conv_state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch_size: i32,
+    d_conv: i32,
+    kernel_size: i32,
+    activation_silu: bool,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_conv_kernel_name("gdn_causal_conv1d_update_slots", ty, kernel_size)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(x), x_offset as NSUInteger);
+    encoder.set_buffer(1, Some(weight), weight_offset as NSUInteger);
+    if let Some((bias, offset)) = bias {
+        encoder.set_buffer(2, Some(bias), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(2, None, 0);
+    }
+    encoder.set_buffer(3, Some(conv_state), conv_state_offset as NSUInteger);
+    encoder.set_buffer(4, Some(slots), slots_offset as NSUInteger);
+    encoder.set_buffer(5, Some(out), out_offset as NSUInteger);
+    utils::set_param(encoder, 6, batch_size);
+    utils::set_param(encoder, 7, d_conv);
+    utils::set_param(encoder, 8, activation_silu);
+
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((d_conv as u64) + 255) / 256,
+        height: batch_size as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_fused_gating(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    a_log_ty: DType,
+    a_log: &Buffer,
+    a_log_offset: usize,
+    a: &Buffer,
+    a_offset: usize,
+    b: &Buffer,
+    b_offset: usize,
+    dt_bias: &Buffer,
+    dt_bias_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    total_elements: i32,
+    num_heads: i32,
+) -> Result<(), MetalKernelError> {
+    let name = match (ty, a_log_ty) {
+        (DType::F32, DType::F32) => "gdn_fused_gating_float".to_string(),
+        (DType::F16, DType::F16) => "gdn_fused_gating_half".to_string(),
+        (DType::BF16, DType::BF16) => "gdn_fused_gating_bfloat16_t".to_string(),
+        (DType::F16, DType::F32) => "gdn_fused_gating_half_alog_f32".to_string(),
+        (DType::BF16, DType::F32) => "gdn_fused_gating_bfloat16_t_alog_f32".to_string(),
+        _ => {
+            return Err(MetalKernelError::FailedToCreatePipeline(format!(
+                "unsupported fused gating dtypes: a={ty:?}, a_log={a_log_ty:?}"
+            )))
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (a_log, a_log_offset),
+            (a, a_offset),
+            (b, b_offset),
+            (dt_bias, dt_bias_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            total_elements,
+            num_heads
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((total_elements as u64) + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_l2_norm_last_dim(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    input_offset: usize,
+    output: &Buffer,
+    output_offset: usize,
+    rows: i32,
+    dim: i32,
+    eps: f32,
+) -> Result<(), MetalKernelError> {
+    let name = format!("gdn_l2_norm_last_dim_{}", gdn_type_name(ty)?);
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (input, input_offset),
+            (output, output_offset),
+            rows,
+            dim,
+            eps
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_rmsnorm_silu_mul(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    weight_ty: DType,
+    x: &Buffer,
+    x_offset: usize,
+    z: &Buffer,
+    z_offset: usize,
+    gamma: &Buffer,
+    gamma_offset: usize,
+    bias: Option<(&Buffer, usize)>,
+    out: &Buffer,
+    out_offset: usize,
+    rows: i32,
+    value_dim: i32,
+    group_size: i32,
+    eps: f32,
+    per_group_weights: bool,
+    has_bias: bool,
+) -> Result<(), MetalKernelError> {
+    let name = match (ty, weight_ty) {
+        (DType::F32, DType::F32) => "gdn_gated_rmsnorm_silu_mul_float".to_string(),
+        (DType::F16, DType::F16) => "gdn_gated_rmsnorm_silu_mul_half".to_string(),
+        (DType::BF16, DType::BF16) => "gdn_gated_rmsnorm_silu_mul_bfloat16_t".to_string(),
+        (DType::F16, DType::F32) => "gdn_gated_rmsnorm_silu_mul_half_wf32".to_string(),
+        (DType::BF16, DType::F32) => "gdn_gated_rmsnorm_silu_mul_bfloat16_t_wf32".to_string(),
+        _ => {
+            return Err(MetalKernelError::FailedToCreatePipeline(format!(
+                "unsupported gated_rmsnorm dtypes: x={ty:?}, weight={weight_ty:?}"
+            )))
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(x), x_offset as NSUInteger);
+    encoder.set_buffer(1, Some(z), z_offset as NSUInteger);
+    encoder.set_buffer(2, Some(gamma), gamma_offset as NSUInteger);
+    if let Some((bias, offset)) = bias {
+        encoder.set_buffer(3, Some(bias), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(3, None, 0);
+    }
+    encoder.set_buffer(4, Some(out), out_offset as NSUInteger);
+    utils::set_param(encoder, 5, rows);
+    utils::set_param(encoder, 6, value_dim);
+    utils::set_param(encoder, 7, group_size);
+    utils::set_param(encoder, 8, eps);
+    utils::set_param(encoder, 9, per_group_weights);
+    utils::set_param(encoder, 10, has_bias);
+
+    let num_groups = (value_dim / group_size) as u64;
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: rows as u64 * num_groups,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_recurrence(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    bh: i32,
+    seq_len: i32,
+    k_dim: i32,
+    v_dim: i32,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_recurrence", ty, k_dim)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (v, v_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            (state, state_offset),
+            (out, out_offset),
+            bh,
+            seq_len,
+            v_dim
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((v_dim as u64) + 63) / 64,
+        height: bh as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_decode_slots(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch: i32,
+    heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_decode_slots", ty, k_dim)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (v, v_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            (state, state_offset),
+            (slots, slots_offset),
+            (out, out_offset),
+            batch,
+            heads,
+            k_dim,
+            v_dim
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((v_dim as u64) + 63) / 64,
+        height: (batch * heads) as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_recurrence_varlen(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    cu_seqlens: &Buffer,
+    cu_seqlens_offset: usize,
+    batch: i32,
+    num_heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_recurrence_varlen", ty, k_dim)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (v, v_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            (state, state_offset),
+            (slots, slots_offset),
+            (out, out_offset),
+            (cu_seqlens, cu_seqlens_offset),
+            batch,
+            num_heads,
+            k_dim,
+            v_dim
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((v_dim as u64) + 63) / 64,
+        height: (batch * num_heads) as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_mamba_scatter_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    src: &Buffer,
+    src_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    num_rows: i32,
+    row_elems: i32,
+    src_row_stride: i64,
+    dst_row_stride: i64,
+) -> Result<(), MetalKernelError> {
+    let name = format!("gdn_mamba_scatter_rows_{}", gdn_type_name(ty)?);
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (src, src_offset),
+            (dst, dst_offset),
+            (slots, slots_offset),
+            num_rows,
+            row_elems,
+            src_row_stride,
+            dst_row_stride
+        )
+    );
+
+    let total = (num_rows as u64) * (row_elems as u64);
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: (total + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     Ok(())
 }
