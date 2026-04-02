@@ -745,20 +745,111 @@ pub fn decode_plan(
     }
 }
 
-pub struct FlashInferPrefill {
+/// Compute the prefill plan once per model forward. Returns a tagged i64 vector (16 elements).
+/// Tag at [0]: 0 = non-SM90 PrefillPlanInfo, 1 = SM90 PrefillPlanSM90Info.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_plan(
+    dev: &candle_core::Device,
+    q_cu_seqlens_host: &[u32],
+    indptr_host: &[u32],
+    kv_len_arr_host: &[u32],
+    total_num_rows: u32,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    out_dtype: DType,
+    window_left: Option<i32>,
+) -> Result<Vec<i64>> {
+    let dev = dev.as_cuda_device()?;
+    let out_data_type: i32 = if out_dtype == DType::BF16 { 1 } else { 0 };
+
+    let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+        get_or_init_workspace(dev, false)?;
+
+    let mut plan_info = [0i64; 16];
+    unsafe {
+        kernels::ffi::flashinfer_prefill_plan_wrapper(
+            q_cu_seqlens_host.as_ptr() as *const i32,
+            indptr_host.as_ptr() as *const i32,
+            kv_len_arr_host.as_ptr() as *const i32,
+            total_num_rows as i32,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            false,
+            window_left.unwrap_or(-1),
+            out_data_type,
+            ws_float_ptr,
+            WORKSPACE_FLOAT_SIZE,
+            ws_int_ptr,
+            WORKSPACE_INT_SIZE,
+            page_locked_ptr,
+            page_locked_size,
+            plan_info.as_mut_ptr(),
+            *dev.cu_stream() as i64,
+        );
+    }
+    Ok(plan_info.to_vec())
+}
+
+/// Run prefill using a pre-computed plan (from `prefill_plan`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_with_plan(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    last_len: &Tensor,
+    q_cu_seqlens: &Tensor,
+    total_num_rows: u32,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+    window_left: Option<i32>,
+    logits_soft_cap: Option<f32>,
+    plan_info: &[i64],
+) -> Result<Tensor> {
+    let op = FlashInferPrefillWithPlan {
+        key_cache: key_cache.clone(),
+        value_cache: value_cache.clone(),
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
+        indices: indices.clone(),
+        indptr: indptr.clone(),
+        last_len: last_len.clone(),
+        q_cu_seqlens: q_cu_seqlens.clone(),
+        total_num_rows,
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+        window_left: window_left.unwrap_or(-1),
+        logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
+        plan_info: plan_info.to_vec(),
+    };
+    q.apply_op1(op)
+}
+
+struct FlashInferPrefillWithPlan {
     pub key_cache: Tensor,
     pub value_cache: Tensor,
     pub k_scale: Option<Tensor>,
     pub v_scale: Option<Tensor>,
     pub indices: Tensor,
-    pub indptr: Tensor,        // Device tensor for paged_kv
-    pub indptr_host: Vec<u32>, // Host data for planning
+    pub indptr: Tensor,
     pub last_len: Tensor,
-    pub last_len_host: Option<Vec<u32>>,
-    pub kv_len_arr_host: Option<Vec<u32>>,
-    pub q_cu_seqlens: Tensor,        // Device tensor for kernel params
-    pub q_cu_seqlens_host: Vec<u32>, // Host data for planning
-    pub total_num_rows: u32,         // Total tokens (from host)
+    pub q_cu_seqlens: Tensor,
+    pub total_num_rows: u32,
     pub block_size: usize,
     pub num_qo_heads: usize,
     pub num_kv_heads: usize,
@@ -766,11 +857,12 @@ pub struct FlashInferPrefill {
     pub sm_scale: f32,
     pub window_left: i32,
     pub logits_soft_cap: f32,
+    pub plan_info: Vec<i64>,
 }
 
-impl candle::CustomOp1 for FlashInferPrefill {
+impl candle::CustomOp1 for FlashInferPrefillWithPlan {
     fn name(&self) -> &'static str {
-        "flashinfer-prefill"
+        "flashinfer-prefill-with-plan"
     }
 
     fn cpu_fwd(
@@ -782,39 +874,7 @@ impl candle::CustomOp1 for FlashInferPrefill {
     }
 
     fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
-        match q.dtype() {
-            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
-            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
-            DType::U8 => self.cuda_fwd_impl::<u8>(q, q_l),
-            _ => candle::bail!("unsupported dtype"),
-        }
-    }
-}
-
-impl FlashInferPrefill {
-    fn cuda_fwd_impl<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
-    >(
-        &self,
-        q: &CudaStorage,
-        q_l: &Layout,
-    ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
-        let (_total_tokens, _num_heads, _head_dim) = q_l.shape().dims3()?;
-        if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
-            candle::bail!(
-                "invalid flashinfer prefill head config: qo_heads={} kv_heads={}",
-                self.num_qo_heads,
-                self.num_kv_heads
-            );
-        }
-        let group_size = self.num_qo_heads / self.num_kv_heads;
-        if !is_supported_flashinfer_gqa_group_size(group_size) {
-            candle::bail!(
-                "flashinfer prefill only supports gqa group_size in [1,2,3,4,6,8,16,32,64], got {}",
-                group_size
-            );
-        }
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -824,108 +884,65 @@ impl FlashInferPrefill {
             Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indices_l.start_offset()..),
             _ => candle::bail!("indices must be cuda"),
         };
-
         let (indptr, indptr_l) = self.indptr.storage_and_layout();
         let indptr_ptr = match &*indptr {
             Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indptr_l.start_offset()..),
             _ => candle::bail!("indptr must be cuda"),
         };
-
         let (last_len, last_len_l) = self.last_len.storage_and_layout();
         let last_len_ptr = match &*last_len {
             Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(last_len_l.start_offset()..),
             _ => candle::bail!("last_len must be cuda"),
         };
-
         let (q_lens, q_lens_l) = self.q_cu_seqlens.storage_and_layout();
         let q_lens_ptr = match &*q_lens {
             Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(q_lens_l.start_offset()..),
             _ => candle::bail!("q_cu_seqlens must be cuda"),
         };
 
-        // 0: F16, 1: BF16, 2: U8 (FP8)
-        let data_type = match self.key_cache.dtype() {
+        let data_type: i32 = match self.key_cache.dtype() {
             DType::U8 => 2,
             DType::BF16 => 1,
             _ => 0,
         };
+        let out_data_type: i32 = if q.dtype() == DType::BF16 { 1 } else { 0 };
 
-        if data_type == 2 {
-            let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-            if sm < 90 {
-                candle::bail!("flashinfer fp8 prefill requires sm90+, got sm{}", sm);
-            }
-            if q.dtype() != DType::F16 && q.dtype() != DType::BF16 {
-                candle::bail!("flashinfer fp8 prefill requires f16/bf16 q");
-            }
-        }
-
-        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out =
+            unsafe { dev.alloc::<u8>(q_l.shape().elem_count() * q.dtype().size_in_bytes()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
 
-        let batch_size = self.q_cu_seqlens_host.len() - 1;
-
-        // Use static workspace buffers
-        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
-            get_or_init_workspace(dev, false)?;
+        let batch_size = self.q_cu_seqlens.dim(0)? - 1;
+        let (ws_float_ptr, _, ws_int_ptr, _) = {
+            let (f, i, pl, pls) = get_or_init_workspace(dev, false)?;
+            (f, WORKSPACE_FLOAT_SIZE, i, WORKSPACE_INT_SIZE)
+        };
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
-        let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
         let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
-            let k_scales = self
+            let ks = self
                 .k_scale
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("fp8 prefill requires k_scale"))?;
-            let v_scales = self
+            let vs = self
                 .v_scale
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::msg("fp8 prefill requires v_scale"))?;
-            let k_scale_ptr = get_cuda_f32_ptr(k_scales)?;
-            let v_scale_ptr = get_cuda_f32_ptr(v_scales)?;
-            (k_scale_ptr, v_scale_ptr)
+            (get_cuda_f32_ptr(ks)?, get_cuda_f32_ptr(vs)?)
         } else {
             (std::ptr::null(), std::ptr::null())
         };
 
-        let last_len_host = if let Some(v) = &self.last_len_host {
-            v.as_slice()
-        } else {
-            candle::bail!("flashinfer prefill requires last_len_host in metadata");
-        };
-        if last_len_host.len() != batch_size {
-            candle::bail!(
-                "last_len_host length must be batch_size ({}), got {}",
-                batch_size,
-                last_len_host.len()
-            );
-        }
-        let kv_len_arr_host = if let Some(v) = &self.kv_len_arr_host {
-            if v.len() != batch_size {
-                candle::bail!(
-                    "kv_len_arr_host length must be batch_size ({}), got {}",
-                    batch_size,
-                    v.len()
-                );
-            }
-            v.as_slice()
-        } else {
-            candle::bail!("flashinfer prefill requires kv_len_arr_host in metadata");
-        };
-
         unsafe {
-            kernels::ffi::flashinfer_prefill_wrapper(
+            kernels::ffi::flashinfer_prefill_run_wrapper(
                 out_ptr,
                 q_ptr,
                 *q_lens_ptr.device_ptr() as *const i32,
-                self.q_cu_seqlens_host.as_ptr().cast(), // Host pointer for planning
-                kv_len_arr_host.as_ptr().cast(),
                 self.total_num_rows as i32,
                 kc_ptr,
                 vc_ptr,
                 *indices_ptr.device_ptr() as *const i32,
                 *indptr_ptr.device_ptr() as *const i32,
-                self.indptr_host.as_ptr().cast(), // Host pointer for planning
                 *last_len_ptr.device_ptr() as *const i32,
                 batch_size as i32,
                 self.num_qo_heads as i32,
@@ -939,18 +956,31 @@ impl FlashInferPrefill {
                 WORKSPACE_FLOAT_SIZE,
                 ws_int_ptr,
                 WORKSPACE_INT_SIZE,
-                page_locked_ptr,
-                page_locked_size,
-                false,
                 self.window_left,
                 self.logits_soft_cap,
                 data_type,
                 out_data_type,
+                self.plan_info.as_ptr(),
                 *dev.cu_stream() as i64,
             );
         }
 
-        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        let elem_count = q_l.shape().elem_count();
+        let out_slice = out.slice(0..elem_count * q.dtype().size_in_bytes());
+        let out = match q.dtype() {
+            DType::F16 => {
+                let typed: CudaSlice<half::f16> = unsafe { out_slice.transmute(elem_count) };
+                CudaStorage::wrap_cuda_slice(typed, dev.clone())
+            }
+            DType::BF16 => {
+                let typed: CudaSlice<half::bf16> = unsafe { out_slice.transmute(elem_count) };
+                CudaStorage::wrap_cuda_slice(typed, dev.clone())
+            }
+            _ => {
+                let typed: CudaSlice<u8> = unsafe { out_slice.transmute(elem_count) };
+                CudaStorage::wrap_cuda_slice(typed, dev.clone())
+            }
+        };
         Ok((out, q_l.shape().clone()))
     }
 }
@@ -1109,54 +1139,6 @@ impl FlashInferRaggedPrefill {
         let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
         Ok((out, q_l.shape().clone()))
     }
-}
-
-pub fn prefill(
-    q: &Tensor,
-    key_cache: &Tensor,
-    value_cache: &Tensor,
-    k_scale: Option<&Tensor>,
-    v_scale: Option<&Tensor>,
-    indices: &Tensor,
-    indptr: &Tensor,
-    indptr_host: &[u32], // Host slice for planning
-    last_len: &Tensor,
-    last_len_host: Option<&[u32]>,
-    kv_len_arr_host: Option<&[u32]>,
-    q_cu_seqlens: &Tensor,
-    q_cu_seqlens_host: &[u32], // Host slice for planning
-    total_num_rows: u32,       // Total tokens (from host)
-    block_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    sm_scale: f32,
-    window_left: Option<i32>,
-    logits_soft_cap: Option<f32>,
-) -> Result<Tensor> {
-    let op = FlashInferPrefill {
-        key_cache: key_cache.clone(),
-        value_cache: value_cache.clone(),
-        k_scale: k_scale.cloned(),
-        v_scale: v_scale.cloned(),
-        indices: indices.clone(),
-        indptr: indptr.clone(),
-        indptr_host: indptr_host.to_vec(),
-        last_len: last_len.clone(),
-        last_len_host: last_len_host.map(|v| v.to_vec()),
-        kv_len_arr_host: kv_len_arr_host.map(|v| v.to_vec()),
-        q_cu_seqlens: q_cu_seqlens.clone(),
-        q_cu_seqlens_host: q_cu_seqlens_host.to_vec(),
-        total_num_rows,
-        block_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        sm_scale,
-        window_left: window_left.unwrap_or(-1),
-        logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
-    };
-    q.apply_op1(op)
 }
 
 #[allow(clippy::too_many_arguments)]

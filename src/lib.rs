@@ -26,10 +26,10 @@ pub mod cache;
 pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod gdn;
+pub mod mamba_cache;
 pub mod mla;
 pub mod mxfp4_linear;
 pub mod nvfp4_linear;
-pub mod mamba_cache;
 pub mod ops;
 pub mod swiglu;
 
@@ -45,12 +45,12 @@ pub struct FlashInferMetadata {
     pub last_len: Tensor,
     pub last_len_host: Option<Vec<u32>>,
     pub kv_len_arr_host: Option<Vec<u32>>,
-    pub cu_seqlens_q_host: Option<Vec<u32>>,
     pub total_num_rows: Option<u32>,
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
     pub decode_plan_info: Option<Vec<i64>>,
+    pub prefill_plan_info: Option<Vec<i64>>,
     pub mla_decode_plan_info: Option<Vec<i64>>,
     pub mla_prefill_plan_info: Option<Vec<i64>>,
 }
@@ -543,7 +543,12 @@ impl PagedAttention {
                 };
 
                 return if input_metadata.is_prefill {
-                    crate::flashinfer::prefill(
+                    let plan_info = fm.prefill_plan_info.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg(
+                            "flashinfer prefill requires prefill_plan_info (plan+run path)",
+                        )
+                    })?;
+                    crate::flashinfer::prefill_with_plan(
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),
@@ -551,12 +556,8 @@ impl PagedAttention {
                         self.v_scale.as_ref(),
                         &fm.indices,
                         &fm.indptr,
-                        &fm.indptr_host,
                         &fm.last_len,
-                        fm.last_len_host.as_deref(),
-                        fm.kv_len_arr_host.as_deref(),
                         input_metadata.cu_seqlens_q.as_ref().unwrap(),
-                        fm.cu_seqlens_q_host.as_ref().unwrap(),
                         fm.total_num_rows.unwrap(),
                         block_size,
                         attention_heads,
@@ -565,6 +566,7 @@ impl PagedAttention {
                         self.scale as f32,
                         Some(self.sliding_window.unwrap_or(0) as i32),
                         Some(softcapping.unwrap_or(0.0f64) as f32),
+                        plan_info,
                     )
                 } else {
                     let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {

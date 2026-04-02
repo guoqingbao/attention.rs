@@ -742,213 +742,6 @@ void flashinfer_decode_run_wrapper(
 #endif
 }
 
-void flashinfer_prefill_wrapper(
-    void* out_ptr,
-    void* q_ptr,
-    int32_t* q_cu_seqlens,      // Device pointer for kernel params
-    int32_t* q_cu_seqlens_host, // Host pointer for planning (avoids D2H copy)
-    int32_t* kv_len_arr_host,   // Host pointer for kv lengths (fp8 sm90 plan)
-    int32_t total_num_rows,     // Total tokens (from host to avoid D2H + read)
-    void* k_data, void* v_data,
-    int32_t* indices,
-    int32_t* indptr,            // Device pointer for paged_kv
-    int32_t* indptr_host,       // Host pointer for planning (avoids D2H copy)
-    int32_t* last_len,
-    int32_t batch_size,
-    int32_t num_qo_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t page_size,
-    float sm_scale,
-    const float* k_scale_ptr,
-    const float* v_scale_ptr,
-    void* workspace_float,
-    size_t workspace_float_size,
-    void* workspace_int,
-    size_t workspace_int_size,
-    void* page_locked_int_buffer,
-    size_t page_locked_int_size,
-    bool enable_cuda_graph,
-    int32_t window_left,
-    float logits_soft_cap,
-    int32_t data_type,
-    int32_t out_data_type,
-    cudaStream_t stream
-) {
-#ifdef USE_FLASHINFER
-    const float rope_scale = 1.0f;
-    const float rope_theta = 10000.0f;
-    if (data_type == 2) {
-        #if defined(FLASHINFER_ENABLE_FP8_E4M3)
-        flashinfer_prefill_wrapper_fp8(
-            out_ptr, q_ptr, q_cu_seqlens, q_cu_seqlens_host, kv_len_arr_host, total_num_rows,
-            k_data, v_data, indices, indptr, indptr_host, last_len,
-            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
-            k_scale_ptr, v_scale_ptr, workspace_float, workspace_float_size, workspace_int,
-            workspace_int_size, page_locked_int_buffer, page_locked_int_size, enable_cuda_graph,
-            data_type, out_data_type, stream
-        );
-        #endif
-        return;
-    }
-
-#if defined(SM_90_PASS)
-    if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
-        return;
-    }
-    if (q_cu_seqlens_host == nullptr || indptr_host == nullptr || kv_len_arr_host == nullptr) {
-        return;
-    }
-    {
-        using IdType = int32_t;
-
-        PrefillPlanSM90Info plan_info;
-        PrefillSM90Plan<int32_t>(
-            workspace_float, workspace_float_size,
-            workspace_int, page_locked_int_buffer, workspace_int_size,
-            plan_info,
-            q_cu_seqlens_host, indptr_host, kv_len_arr_host,
-            total_num_rows, batch_size,
-            num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-            true /* causal */, enable_cuda_graph,
-            (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
-            stream
-        );
-
-        auto run_sm90 = [&]() {
-            if (out_data_type != data_type) {
-                return;
-            }
-            auto run_non_fp8 = [&](auto dtype_val) {
-                using DTypeKV = decltype(dtype_val);
-                using DTypeQ = DTypeKV;
-                using DTypeOut = DTypeKV;
-
-                BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-                FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-                    params, q_ptr, k_data, v_data, out_ptr,
-                    num_qo_heads, num_kv_heads, head_dim, page_size,
-                    total_num_rows, sm_scale, indices, workspace_int, window_left, logits_soft_cap, plan_info);
-
-                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-                    if (plan_info.same_schedule_for_all_heads) {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                            params, false, stream);
-                    } else {
-                        BatchPrefillWithPagedKVCacheDispatched<
-                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                            params, false, stream);
-                    }
-                });
-            };
-
-            if (data_type == 1) {
-                run_non_fp8(cutlass::bfloat16_t{});
-            } else {
-                run_non_fp8(cutlass::half_t{});
-            }
-        };
-
-        run_sm90();
-    }
-    return;
-#else
-    if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
-        return;
-    }
-
-    auto run_prefill = [&](auto dtype_kv_val) {
-        using DTypeKV = decltype(dtype_kv_val);
-        using DTypeQ = DTypeKV;
-        using DTypeOut = DTypeKV;
-        using IdType = int32_t;
-
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            paged_kv_t<DTypeKV, IdType> paged_kv(
-                num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
-                (DTypeKV*)k_data, (DTypeKV*)v_data,
-                indices, indptr, last_len
-            );
-
-            PrefillPlanInfo plan_info;
-            if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
-                return;
-            }
-            void* page_locked_buffer = page_locked_int_buffer;
-
-            PrefillPlan<int32_t>(
-                workspace_float, workspace_float_size,
-                workspace_int, page_locked_buffer, workspace_int_size,
-                plan_info,
-                q_cu_seqlens_host, indptr_host, total_num_rows,
-                batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-                enable_cuda_graph, sizeof(DTypeOut),
-                window_left > 0 ? window_left : -1 /* window_left */, 0 /* fixed_split_size */, false /* disable_split_kv */, 0,
-                stream
-            );
-
-            using ParamsType = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
-            ParamsType params(
-                (DTypeQ*)q_ptr, paged_kv, nullptr /* custom_mask */, q_cu_seqlens,
-                nullptr /* mask indptr */, nullptr /* q rope offset */,
-                (DTypeOut*)out_ptr, nullptr /* lse */, nullptr /* alibi */,
-                num_qo_heads, num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                window_left > 0 ? window_left : -1 /* window */, logits_soft_cap /* logits_cap */, sm_scale, rope_scale, rope_theta
-            );
-
-            params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
-            params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
-            params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
-            params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
-            params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-            params.max_total_num_rows = plan_info.total_num_rows;
-            params.padded_batch_size = plan_info.padded_batch_size;
-            params.partition_kv = plan_info.split_kv;
-            params.merge_indptr = nullptr;
-            params.block_valid_mask = nullptr;
-            if (plan_info.split_kv) {
-                params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
-                if (plan_info.enable_cuda_graph) {
-                    params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
-                }
-            }
-            params.total_num_rows = nullptr;
-            if (plan_info.enable_cuda_graph) {
-                params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
-            }
-
-            DTypeOut* tmp_v = nullptr;
-            float* tmp_s = nullptr;
-            if (plan_info.split_kv) {
-                tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-                tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
-            }
-            
-            using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-
-            DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                BatchPrefillWithPagedKVCacheDispatched<
-                    CTA_TILE_Q, HEAD_DIM, HEAD_DIM, 
-                    PosEncodingMode::kNone, false, MaskMode::kCausal,
-                    AttentionType,
-                    ParamsType>(
-                    params, tmp_v, tmp_s, false /* pdl */, stream
-                );
-            });
-        });
-    };
-
-    if (data_type == 1) {
-        run_prefill(nv_bfloat16{});
-    } else {
-        run_prefill(half{});
-    }
-#endif
-#endif
-}
-
 void flashinfer_prefill_ragged_wrapper(
     void* out_ptr,
     void* q_ptr,
@@ -1113,6 +906,252 @@ void flashinfer_prefill_ragged_wrapper(
         run_ragged(nv_bfloat16{});
     } else {
         run_ragged(half{});
+    }
+#endif
+#endif
+}
+
+// ============================================================================
+// Separated prefill plan + run (plan computed once per forward, reused by layers)
+// Plan output: int64_t[16] tagged vector
+//   [0] = tag: 0 = non-SM90 PrefillPlanInfo (15 values at [1..15])
+//              1 = SM90 PrefillPlanSM90Info (9 values at [1..9])
+// ============================================================================
+
+void flashinfer_prefill_plan_wrapper(
+    int32_t* q_cu_seqlens_host,
+    int32_t* indptr_host,
+    int32_t* kv_len_arr_host,
+    int32_t total_num_rows,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    bool enable_cuda_graph,
+    int32_t window_left,
+    int32_t out_data_type,
+    void* workspace_float, size_t workspace_float_size,
+    void* workspace_int, size_t workspace_int_size,
+    void* page_locked_buffer, size_t page_locked_size,
+    int64_t* plan_info_out,
+    cudaStream_t stream)
+{
+#ifdef USE_FLASHINFER
+    if (page_locked_buffer == nullptr || page_locked_size < workspace_int_size) {
+        fprintf(stderr, "[flashinfer][prefill_plan] page_locked_buffer too small\n");
+        return;
+    }
+    if (q_cu_seqlens_host == nullptr || indptr_host == nullptr || kv_len_arr_host == nullptr) {
+        fprintf(stderr, "[flashinfer][prefill_plan] host pointers are null\n");
+        return;
+    }
+
+#if defined(SM_90_PASS)
+    {
+        PrefillPlanSM90Info plan_info;
+        PrefillSM90Plan<int32_t>(
+            workspace_float, workspace_float_size,
+            workspace_int, page_locked_buffer, workspace_int_size,
+            plan_info,
+            q_cu_seqlens_host, indptr_host, kv_len_arr_host,
+            total_num_rows, batch_size,
+            num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+            true /* causal */, enable_cuda_graph,
+            (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+            stream
+        );
+        if (plan_info_out != nullptr) {
+            plan_info_out[0] = 1; // tag: SM90
+            auto vec = plan_info.ToVector();
+            for (int i = 0; i < 9; ++i) {
+                plan_info_out[1 + i] = vec[i];
+            }
+        }
+    }
+#else
+    {
+        PrefillPlanInfo plan_info;
+        PrefillPlan<int32_t>(
+            workspace_float, workspace_float_size,
+            workspace_int, page_locked_buffer, workspace_int_size,
+            plan_info,
+            q_cu_seqlens_host, indptr_host, total_num_rows,
+            batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+            enable_cuda_graph, (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+            window_left > 0 ? window_left : -1, 0, false, 0,
+            stream
+        );
+        if (plan_info_out != nullptr) {
+            plan_info_out[0] = 0; // tag: non-SM90
+            auto vec = plan_info.ToVector();
+            for (int i = 0; i < 15; ++i) {
+                plan_info_out[1 + i] = vec[i];
+            }
+        }
+    }
+#endif
+#endif
+}
+
+void flashinfer_prefill_run_wrapper(
+    void* out_ptr,
+    void* q_ptr,
+    int32_t* q_cu_seqlens,
+    int32_t total_num_rows,
+    void* k_data, void* v_data,
+    int32_t* indices,
+    int32_t* indptr,
+    int32_t* last_len,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_float, size_t workspace_float_size,
+    void* workspace_int, size_t workspace_int_size,
+    int32_t window_left,
+    float logits_soft_cap,
+    int32_t data_type,
+    int32_t out_data_type,
+    const int64_t* plan_info_vec,
+    cudaStream_t stream)
+{
+#ifdef USE_FLASHINFER
+    if (plan_info_vec == nullptr) {
+        fprintf(stderr, "[flashinfer][prefill_run] plan_info is null\n");
+        return;
+    }
+    const float rope_scale = 1.0f;
+    const float rope_theta = 10000.0f;
+    int64_t tag = plan_info_vec[0];
+    const int64_t* plan_data = plan_info_vec + 1;
+
+    if (data_type == 2) {
+        fprintf(stderr, "[flashinfer][prefill_run] FP8 not supported in split plan/run path\n");
+        return;
+    }
+
+#if defined(SM_90_PASS)
+    if (tag != 1) {
+        fprintf(stderr, "[flashinfer][prefill_run] SM90 build but plan tag=%lld (expected 1)\n", (long long)tag);
+        return;
+    }
+    {
+        PrefillPlanSM90Info plan_info;
+        std::vector<int64_t> vec(plan_data, plan_data + 9);
+        plan_info.FromVector(vec);
+
+        auto run_sm90 = [&](auto dtype_val) {
+            using DTypeKV = decltype(dtype_val);
+            using DTypeQ = DTypeKV;
+            using DTypeOut = DTypeKV;
+            using IdType = int32_t;
+
+            BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+            FillSM90PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+                params, q_ptr, k_data, v_data, out_ptr,
+                num_qo_heads, num_kv_heads, head_dim, page_size,
+                total_num_rows, sm_scale, indices, workspace_int, window_left, logits_soft_cap, plan_info);
+
+            using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+            DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+                if (plan_info.same_schedule_for_all_heads) {
+                    BatchPrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                        params, false, stream);
+                } else {
+                    BatchPrefillWithPagedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                        params, false, stream);
+                }
+            });
+        };
+        if (data_type == 1) {
+            run_sm90(cutlass::bfloat16_t{});
+        } else {
+            run_sm90(cutlass::half_t{});
+        }
+    }
+#else
+    if (tag != 0) {
+        fprintf(stderr, "[flashinfer][prefill_run] non-SM90 build but plan tag=%lld (expected 0)\n", (long long)tag);
+        return;
+    }
+    {
+        PrefillPlanInfo plan_info;
+        std::vector<int64_t> vec(plan_data, plan_data + 15);
+        plan_info.FromVector(vec);
+
+        auto run_prefill = [&](auto dtype_kv_val) {
+            using DTypeKV = decltype(dtype_kv_val);
+            using DTypeQ = DTypeKV;
+            using DTypeOut = DTypeKV;
+            using IdType = int32_t;
+
+            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                paged_kv_t<DTypeKV, IdType> paged_kv(
+                    num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
+                    (DTypeKV*)k_data, (DTypeKV*)v_data,
+                    indices, indptr, last_len
+                );
+
+                using ParamsType = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+                ParamsType params(
+                    (DTypeQ*)q_ptr, paged_kv, nullptr, q_cu_seqlens,
+                    nullptr, nullptr,
+                    (DTypeOut*)out_ptr, nullptr, nullptr,
+                    num_qo_heads, num_qo_heads * head_dim, head_dim,
+                    window_left > 0 ? window_left : -1, logits_soft_cap, sm_scale, rope_scale, rope_theta
+                );
+
+                params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
+                params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
+                params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
+                params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
+                params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
+                params.max_total_num_rows = plan_info.total_num_rows;
+                params.padded_batch_size = plan_info.padded_batch_size;
+                params.partition_kv = plan_info.split_kv;
+                params.merge_indptr = nullptr;
+                params.block_valid_mask = nullptr;
+                if (plan_info.split_kv) {
+                    params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
+                    if (plan_info.enable_cuda_graph) {
+                        params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
+                    }
+                }
+                params.total_num_rows = nullptr;
+                if (plan_info.enable_cuda_graph) {
+                    params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
+                }
+
+                DTypeOut* tmp_v = nullptr;
+                float* tmp_s = nullptr;
+                if (plan_info.split_kv) {
+                    tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
+                    tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+                }
+
+                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                    BatchPrefillWithPagedKVCacheDispatched<
+                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                        PosEncodingMode::kNone, false, MaskMode::kCausal,
+                        AttentionType, ParamsType>(
+                        params, tmp_v, tmp_s, false, stream
+                    );
+                });
+            });
+        };
+        if (data_type == 1) {
+            run_prefill(nv_bfloat16{});
+        } else {
+            run_prefill(half{});
+        }
     }
 #endif
 #endif
