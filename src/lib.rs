@@ -29,6 +29,7 @@ pub mod gdn;
 pub mod mamba_cache;
 pub mod mxfp4_linear;
 pub mod ops;
+pub mod swiglu;
 
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;

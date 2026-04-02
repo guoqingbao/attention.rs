@@ -1989,4 +1989,34 @@ extern "C" {
         input_has_topk_dim: bool,
         stream: i64,
     );
+
+    pub fn gptoss_swiglu_f16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_f32(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
 }

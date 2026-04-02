@@ -39,6 +39,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/gdn.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
+    println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
