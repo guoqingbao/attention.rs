@@ -1,6 +1,6 @@
 use crate::param::{dim3, FWD_KVCACHE_ATTN_OP_PARAS, VARLEN_ATTN_FWD_OP_PARAS};
 use candle_core::gcu_backend::ubridge::gcu_device::driv;
-use core::ffi::c_void;
+use core::ffi::{c_void, c_int};
 #[link(name = "flashkernels")] // links with libflashkernels.so
 extern "C" {
     pub fn flash_attn_fwd_host(

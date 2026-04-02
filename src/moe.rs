@@ -462,22 +462,32 @@ fn indexed_moe_func<
     )?)
 }
 
+/// GCU `moe_gemm` with the same 7-argument signature as the upstream CUDA version.
+///
+/// On GCU the underlying kernel uses indexed MoE (input × expert-weights selected
+/// by per-token expert indices). The `sorted_token_ids` tensor is repurposed as
+/// the expert-index tensor expected by the GCU kernel.
+///
+/// `topk_weights`, `experts_ids`, `topk`, and `is_prefill` are accepted for API
+/// compatibility but the actual weighting / reduction is done by the caller in
+/// `candle-vllm`'s MoE layer (same as upstream).
 #[cfg(feature = "gcu")]
 pub fn moe_gemm(
     input: &Tensor,
     weights: &Tensor,
-    // topk_weights: &Option<Tensor>,
-    // sorted_token_ids: &Tensor,
-    indices: &Tensor,
-    // experts_ids: &Tensor,
-    // topk: usize,
-    // is_prefill: bool,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    _experts_ids: &Tensor,
+    topk: usize,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
     use candle_core::DType;
     use half::{bf16, f16};
+    let _ = topk_weights;
+    let _ = topk;
     match input.dtype() {
-        DType::F16 => indexed_moe_func::<f16>(input, weights, indices),
-        DType::BF16 => indexed_moe_func::<bf16>(input, weights, indices),
+        DType::F16 => indexed_moe_func::<f16>(input, weights, sorted_token_ids),
+        DType::BF16 => indexed_moe_func::<bf16>(input, weights, sorted_token_ids),
         dt => {
             candle::bail!("indexed_moe is only supported for f16 and bf16 ({dt:?})")
         }

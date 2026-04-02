@@ -672,6 +672,7 @@ impl candle::CustomOp1 for PagedAttention {
                 self.max_context_len,
                 self.softmax_scale,
                 self.softcapping,
+                self.cu_query_lens.as_ref(),
             ),
             DType::BF16 => gcu_paged_attention::<half::bf16>(
                 q,
@@ -684,6 +685,7 @@ impl candle::CustomOp1 for PagedAttention {
                 self.max_context_len,
                 self.softmax_scale,
                 self.softcapping,
+                self.cu_query_lens.as_ref(),
             ),
             dt => {
                 candle::bail!("reshape_and_cache is only supported for f16 and bf16 ({dt:?})")
@@ -875,12 +877,11 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        #[cfg(feature = "flash-decoding")]
-        let (block_size, _x) = {
-            // [num_blocks, block_size, num_heads, head_size]
-            let (_, block_size, _, _) = kc_l.shape().dims4()?;
-            (block_size, 1)
-        };
+    #[cfg(feature = "flash-decoding")]
+    let (num_blocks, block_size, _x) = {
+        let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
+        (num_blocks, block_size, 1)
+    };
 
         #[cfg(not(feature = "flash-decoding"))]
         let (block_size, x) = {
@@ -1254,6 +1255,7 @@ pub fn gcu_paged_attention<
     max_context_len: usize,
     softmax_scale: f32,
     softcapping: f32,
+    cu_query_lens: Option<&Tensor>,
 ) -> Result<(GcuStorage, Shape)> {
     use candle::gcu_backend::ubridge;
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
@@ -1274,18 +1276,6 @@ pub fn gcu_paged_attention<
     let vc = match &*vc {
         Storage::Gcu(vc) => vc,
         _ => candle::bail!("value_cache must be a gcu tensor"),
-    };
-
-    let (bt, bt_l) = block_tables.storage_and_layout();
-    let bt = match &*bt {
-        Storage::Gcu(bt) => bt,
-        _ => candle::bail!("block_tables must be a gcu tensor"),
-    };
-
-    let (cl, cl_l) = context_lens.storage_and_layout();
-    let cl = match &*cl {
-        Storage::Gcu(cl) => cl,
-        _ => candle::bail!("context_lens must be a gcu tensor"),
     };
 
     let q_rank = q_l.stride().len();
@@ -1313,20 +1303,7 @@ pub fn gcu_paged_attention<
         )
     }
 
-    let q = q.as_gcu_slice::<T>()?;
-    let kc = kc.as_gcu_slice::<T>()?;
-    let vc = vc.as_gcu_slice::<T>()?;
-    let cl = cl.as_gcu_slice::<u32>()?; // Should be i32!
-    let bt = bt.as_gcu_slice::<u32>()?; // Should be i32!
-
-    // Get cuda views for all tensors
-    let q = q.slice(q_l.start_offset()..);
-    let kc = kc.slice(kc_l.start_offset()..);
-    let vc = vc.slice(vc_l.start_offset()..);
-    let cl = cl.slice(cl_l.start_offset()..);
-    let bt = bt.slice(bt_l.start_offset()..);
-
-    let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
+    let (num_query_tokens, num_heads, head_size) = q_l.shape().dims3()?;
     if !(head_size == 64
         || head_size == 80
         || head_size == 96
@@ -1338,15 +1315,7 @@ pub fn gcu_paged_attention<
         candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128 or 256");
     }
 
-    let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
-
-    if num_seqs_bt != num_seqs {
-        candle::bail!(
-            "shape mismatch block_tables {:?}, expected {:?}",
-            bt_l.shape(),
-            (num_seqs, max_num_blocks_per_seq)
-        )
-    }
+    let (num_seqs_bt, max_num_blocks_per_seq) = block_tables.shape().dims2()?;
 
     let (num_blocks, num_kv_heads, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
     if head_size_kc != head_size / x {
@@ -1365,22 +1334,83 @@ pub fn gcu_paged_attention<
         )
     }
 
-    if (num_seqs) != cl_l.shape().dims1()? {
-        candle::bail!(
-            "shape mismatch context_lens {:?}, expected {:?}",
-            cl_l.shape(),
-            (num_seqs)
-        )
-    }
+    // For chunked prefill (cu_query_lens is set), expand block_tables and
+    // context_lens so each query token gets its sequence's row, since the
+    // GCU paged_attention_v1 kernel expects num_seqs == num_query_tokens.
+    let (block_tables_expanded, context_lens_expanded) = if let Some(cu_ql) = cu_query_lens {
+        let cu_ql_vec: Vec<u32> = cu_ql.to_vec1()?;
+        let num_seqs = cu_ql_vec.len() - 1;
+        let bt_data: Vec<Vec<u32>> = (0..num_seqs)
+            .map(|i| block_tables.get(i).unwrap().to_vec1::<u32>().unwrap())
+            .collect();
+        let cl_data: Vec<u32> = context_lens.to_vec1()?;
+
+        let mut expanded_bt: Vec<u32> = Vec::with_capacity(num_query_tokens * max_num_blocks_per_seq);
+        let mut expanded_cl: Vec<u32> = Vec::with_capacity(num_query_tokens);
+
+        for seq_idx in 0..num_seqs {
+            let start = cu_ql_vec[seq_idx] as usize;
+            let end = cu_ql_vec[seq_idx + 1] as usize;
+            let num_tokens = end - start;
+            for _ in 0..num_tokens {
+                expanded_bt.extend_from_slice(&bt_data[seq_idx]);
+                expanded_cl.push(cl_data[seq_idx]);
+            }
+        }
+
+        let device = block_tables.device();
+        let bt_expanded = Tensor::from_vec(
+            expanded_bt,
+            (num_query_tokens, max_num_blocks_per_seq),
+            device,
+        )?;
+        let cl_expanded = Tensor::from_vec(expanded_cl, (num_query_tokens,), device)?;
+        (bt_expanded, cl_expanded)
+    } else {
+        if num_seqs_bt != num_query_tokens {
+            candle::bail!(
+                "shape mismatch block_tables {:?}, expected {:?}",
+                block_tables.shape(),
+                (num_query_tokens, max_num_blocks_per_seq)
+            )
+        }
+        if num_query_tokens != context_lens.shape().dims1()? {
+            candle::bail!(
+                "shape mismatch context_lens {:?}, expected {:?}",
+                context_lens.shape(),
+                (num_query_tokens)
+            )
+        }
+        (block_tables.clone(), context_lens.clone())
+    };
+
+    let (bt, bt_l) = block_tables_expanded.storage_and_layout();
+    let bt = match &*bt {
+        Storage::Gcu(bt) => bt,
+        _ => candle::bail!("block_tables must be a gcu tensor"),
+    };
+
+    let (cl, cl_l) = context_lens_expanded.storage_and_layout();
+    let cl = match &*cl {
+        Storage::Gcu(cl) => cl,
+        _ => candle::bail!("context_lens must be a gcu tensor"),
+    };
+
+    let q = q.as_gcu_slice::<T>()?;
+    let kc = kc.as_gcu_slice::<T>()?;
+    let vc = vc.as_gcu_slice::<T>()?;
+    let cl = cl.as_gcu_slice::<u32>()?;
+    let bt = bt.as_gcu_slice::<u32>()?;
+
+    let q = q.slice(q_l.start_offset()..);
+    let kc = kc.slice(kc_l.start_offset()..);
+    let vc = vc.slice(vc_l.start_offset()..);
+    let cl = cl.slice(cl_l.start_offset()..);
+    let bt = bt.slice(bt_l.start_offset()..);
 
     let q_stride = q_l.stride()[0];
     let kv_block_stride = kc_l.stride()[0];
     let kv_head_stride = kc_l.stride()[1];
-
-    // let partition_size = 512;
-    // let max_num_partitions = (self.max_context_len + partition_size - 1) / partition_size;
-    // let use_v1 = (max_num_partitions == 1 || num_seqs * num_heads > 512)
-    //     && partition_size % block_size == 0;
 
     let elem_count = out_shape.elem_count();
     let out = dev.alloc::<T>(elem_count).w()?;
@@ -1396,7 +1426,7 @@ pub fn gcu_paged_attention<
         cl.device_ptr(),
         block_size as i32,
         max_context_len as i32,
-        num_seqs as i32,
+        num_query_tokens as i32,
         num_heads as i32,
         head_size as i32,
         max_num_blocks_per_seq as i32,
@@ -1422,11 +1452,8 @@ fn gcu_update_cache<
     value_cache: &Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
-    use candle::gcu_backend::ubridge;
-    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
-    use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
-    use candle::gcu_backend::{kernel_name, Map1, WrapErr};
     use candle::Storage;
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
     let dev = key.device().as_gcu_device()?;
     let (k, k_l) = key.storage_and_layout();
     let k = match &*k {
@@ -1467,7 +1494,7 @@ fn gcu_update_cache<
         candle::bail!("paged-attention expects input tensors of rank 3 (k: {k_l:?}, v: {v_l:?})")
     }
 
-    #[cfg(feature = "flash-decoding")]
+    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
     if kc_rank != 4 {
         candle::bail!(
             "flash-attention expects `key_cache` tensor to be of rank 4 \
@@ -1475,7 +1502,7 @@ fn gcu_update_cache<
         )
     }
 
-    #[cfg(not(feature = "flash-decoding"))]
+    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
     if kc_rank != 5 {
         candle::bail!(
             "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -1502,22 +1529,21 @@ fn gcu_update_cache<
     let kc = kc.slice(kc_l.start_offset()..);
     let vc = vc.slice(vc_l.start_offset()..);
     let s = s.slice(s_l.start_offset()..);
-    let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
 
     let (num_tokens, num_heads, head_size) = k_l.shape().dims3()?;
     if (num_tokens, num_heads, head_size) != v_l.shape().dims3()? {
         candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
     }
 
-    #[cfg(feature = "flash-decoding")]
-    let (block_size, _x) = {
+    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
+    let (num_blocks, block_size, _x) = {
         // [num_blocks, block_size, num_heads, head_size]
-        let (_, block_size, _, _) = kc_l.shape().dims4()?;
-        (block_size, 1)
+        let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
+        (num_blocks, block_size, 1)
     };
 
-    #[cfg(not(feature = "flash-decoding"))]
-    let (block_size, x) = {
+    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
+    let (num_blocks, block_size, x) = {
         let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
         if num_heads_kc != num_heads || head_size_kc != head_size / x {
             candle::bail!(
@@ -1534,7 +1560,7 @@ fn gcu_update_cache<
                 vc_l.shape()
             )
         }
-        (block_size, x)
+        (num_blocks, block_size, x)
     };
 
     if (num_tokens) != s_l.shape().dims1()? {
@@ -1544,48 +1570,67 @@ fn gcu_update_cache<
             (num_tokens)
         )
     }
+    let key_stride = k_l.stride()[0] as i32;
+    let value_stride = v_l.stride()[0] as i32;
 
-    #[cfg(feature = "flash-decoding")]
+    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
     {
         let block_stride = kc_l.stride()[0];
         let page_stride = kc_l.stride()[1];
         let head_stride = kc_l.stride()[2];
         let stream = dev.stream_inner().expect("Unable to obtain stream");
 
-        use gcu_kernels::param::topsopDataType;
-        let data_type = match query.dtype() {
+        use gcu_kernels::param::{dim3, topsopDataType};
+        use std::ffi::{c_int, c_void};
+        let data_type = match key.dtype() {
             DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
             DType::BF16 => topsopDataType::TOPSOP_DATA_BF16,
             _ => candle_core::bail!("Unsupport data type for flash attention!"),
         };
 
-        gcu_kernels::ffi::reshape_and_cache_flash_host(
-            dim3 { x: 2, y: 1, z: 1 },
-            dim3 { x: 12, y: 1, z: 1 },
-            *k.device_ptr() as c_void,
-            *v.device_ptr() as c_void,
-            *s.device_ptr() as c_void,
-            *kc.device_ptr() as c_void,
-            *vc.device_ptr() as c_void,
-            data_type as i32,
-            num_tokens as c_int,
-            num_heads as c_int,
-            head_size as c_int,
-            num_blocks as c_int,
-            block_size as c_int,
-            key_stride as c_int,
-            value_stride as c_int,
-            block_stride as c_int,
-            page_stride as c_int,
-            head_stride as c_int,
-            stream,
-        );
+        // The GCU kernel expects int32 slot_mapping, but candle stores it as i64.
+        // Convert on CPU and upload to device since GCU to_dtype(i64→u32) is unreliable.
+        let slot_i64_cpu: Vec<i64> = slot_mapping.to_vec1()?;
+        let slot_i32_cpu: Vec<i32> = slot_i64_cpu.iter().map(|&v| v as i32).collect();
+        let slot_i32_tensor = Tensor::from_vec(slot_i32_cpu, slot_mapping.shape(), slot_mapping.device())?;
+        let (si32_storage, si32_layout) = slot_i32_tensor.storage_and_layout();
+        let si32_gcu = match &*si32_storage {
+            Storage::Gcu(g) => g,
+            _ => candle::bail!("slot_mapping must be a gcu tensor"),
+        };
+        let si32_slice = si32_gcu.as_gcu_slice::<i32>()?;
+        let si32_slice = si32_slice.slice(si32_layout.start_offset()..);
+
+        unsafe {
+            gcu_kernels::ffi::reshape_and_cache_flash_host(
+                dim3 { x: 2, y: 1, z: 1 },
+                dim3 { x: 12, y: 1, z: 1 },
+                k.device_ptr() as *const c_void,
+                v.device_ptr() as *const c_void,
+                si32_slice.device_ptr() as *const c_void,
+                kc.device_ptr() as *mut c_void,
+                vc.device_ptr() as *mut c_void,
+                data_type as i32,
+                num_tokens as c_int,
+                num_heads as c_int,
+                head_size as c_int,
+                num_blocks as c_int,
+                block_size as c_int,
+                key_stride as c_int,
+                value_stride as c_int,
+                block_stride as c_int,
+                page_stride as c_int,
+                head_stride as c_int,
+                stream,
+            );
+        }
     }
 
-    #[cfg(not(feature = "flash-decoding"))]
+    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
     {
-        let key_stride = k_l.stride()[0] as i32;
-        let value_stride = v_l.stride()[0] as i32;
+        use candle::gcu_backend::ubridge;
+        use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
+        use candle::gcu_backend::{kernel_name, Map1, WrapErr};
         let func = dev.get_or_load_func(&kernel_name::<T>("reshape_and_cache"), ubridge::CACHE)?;
         let params = (
             k.device_ptr(),

@@ -1,3 +1,4 @@
+pub mod fp8_linear;
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
@@ -27,6 +28,7 @@ pub struct InputMetadata {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
+    pub disable_flash_attn: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -223,7 +225,9 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(feature = "flash-attn")]
+    /// flash_forward uses flash-decoding KV cache layout [num_blocks, block_size, num_kv_heads, head_size].
+    /// Only available when flash-decoding feature is enabled.
+    #[cfg(feature = "flash-decoding")]
     pub fn flash_forward(
         &self,
         query: &Tensor,
@@ -237,19 +241,19 @@ impl PagedAttention {
         let (_, attention_heads, _, head_size) = query.shape().dims4()?;
         let (_, key_value_heads, _, _) = key.shape().dims4()?;
         let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
-        let query = query
+        let query_3d = query
             .transpose(1, 2)?
             .reshape(((), attention_heads, head_size))?;
-        let key = key
+        let key_3d = key
             .transpose(1, 2)?
             .reshape(((), key_value_heads, head_size))?;
-        let value = value
+        let value_3d = value
             .transpose(1, 2)?
             .reshape(((), key_value_heads, head_size))?;
 
         reshape_and_cache(
-            &key,
-            &value,
+            &key_3d,
+            &value_3d,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
             self.k_scale.as_ref(),
@@ -259,40 +263,61 @@ impl PagedAttention {
 
         if input_metadata.is_prefill {
             return if input_metadata.block_tables.is_none() {
-                // prefill without kvcache
-                self.flash_var_len(&query, &key, &value, input_metadata, softcapping)
+                self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping)
             } else {
-                // prefill with kvcache
-                self.flash_var_len(
-                    &query,
-                    key_cache.as_ref().unwrap(),
-                    value_cache.as_ref().unwrap(),
-                    input_metadata,
-                    softcapping,
-                )
+                // prefix cache hit — per-sequence flash_attn_with_kvcache
+                let block_tables = input_metadata.block_tables.as_ref().unwrap();
+                let context_lens = input_metadata.context_lens.as_ref().unwrap();
+                let cu_seqlens_q = input_metadata.cu_seqlens_q.as_ref().unwrap().to_vec1::<u32>()?;
+                let num_seqs = cu_seqlens_q.len() - 1;
+
+                let mut outputs = Vec::new();
+                for i in 0..num_seqs {
+                    let start = cu_seqlens_q[i] as usize;
+                    let end = cu_seqlens_q[i + 1] as usize;
+                    let seq_q_len = end - start;
+                    let q_seq = query_3d.narrow(0, start, seq_q_len)?.unsqueeze(0)?;
+                    let bt_seq = block_tables.get(i)?.unsqueeze(0)?;
+                    let cl_seq = context_lens.narrow(0, i, 1)?;
+
+                    let out = gcu_kernels::flash_attn_with_kvcache(
+                        &q_seq,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        &cl_seq,
+                        &Some(bt_seq),
+                        self.scale as f32,
+                        Some(softcapping.unwrap_or(0.0f64) as f32),
+                        &None,
+                        None,
+                        None,
+                        true,
+                    )?;
+                    outputs.push(out.squeeze(0)?);
+                }
+                Ok(Tensor::cat(&outputs, 0)?)
             };
         }
 
-        #[cfg(feature = "flash-decoding")]
-        {
-            let block_tables = input_metadata.block_tables.as_ref().unwrap();
-            let context_lens = input_metadata.context_lens.as_ref().unwrap();
-            gcu_kernels::flash_attn_with_kvcache(
-                &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
-                key_cache.as_ref().unwrap(),
-                value_cache.as_ref().unwrap(),
-                input_metadata.cu_seqlens_k.as_ref().unwrap(),
-                block_tables,
-                self.scale as f32,
-                Some(softcapping.unwrap_or(0.0f64) as f32),
-                &None,
-                None,
-                None,
-                false,
-            )
-        }
-        #[cfg(not(feature = "flash-decoding"))]
-        candle_core::bail!("Invalid pattern for flash_forward")
+        // decode — use flash_attn_with_kvcache kernel
+        let block_tables = input_metadata.block_tables.as_ref().unwrap();
+        let context_lens = input_metadata.context_lens.as_ref().unwrap();
+
+        let q_input = query_3d.unsqueeze(1)?;
+        let out = gcu_kernels::flash_attn_with_kvcache(
+            &q_input,
+            key_cache.as_ref().unwrap(),
+            value_cache.as_ref().unwrap(),
+            context_lens,
+            &Some(block_tables.to_owned()),
+            self.scale as f32,
+            Some(softcapping.unwrap_or(0.0f64) as f32),
+            &None,
+            None,
+            None,
+            false,
+        )?;
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -318,19 +343,7 @@ impl PagedAttention {
         }
 
         #[cfg(feature = "flash-decoding")]
-        return self.flash_forward(
-            query,
-            key,
-            value,
-            key_cache,
-            value_cache,
-            input_metadata,
-            softcapping,
-        );
-
-        if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
-            // non context-cache prefill with flash-attn
-            #[cfg(feature = "flash-attn")]
+        if !input_metadata.disable_flash_attn.unwrap_or(false) {
             return self.flash_forward(
                 query,
                 key,
@@ -340,6 +353,39 @@ impl PagedAttention {
                 input_metadata,
                 softcapping,
             );
+        }
+
+        if !input_metadata.disable_flash_attn.unwrap_or(false)
+            && input_metadata.is_prefill
+            && input_metadata.block_tables.is_none()
+        {
+            #[cfg(feature = "flash-attn")]
+            {
+                let (_, attention_heads, _, head_size) = query.shape().dims4()?;
+                let (_, key_value_heads, _, _) = key.shape().dims4()?;
+                let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+                let query_3d = query
+                    .transpose(1, 2)?
+                    .reshape(((), attention_heads, head_size))?;
+                let key_3d = key
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+                let value_3d = value
+                    .transpose(1, 2)?
+                    .reshape(((), key_value_heads, head_size))?;
+
+                reshape_and_cache(
+                    &key_3d,
+                    &value_3d,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    &slot_mapping,
+                )?;
+
+                return self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping);
+            }
         }
 
         let mut att = if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
@@ -394,11 +440,6 @@ impl PagedAttention {
             .reshape(((), attention_heads, head_size))?;
 
         //decoding with paged-attn
-        let max_context_len = if self.sliding_window.is_some() {
-            self.sliding_window.unwrap()
-        } else {
-            input_metadata.max_context_len
-        };
 
         //if flash-decoding (flash-attn with prefill kvcache) feature not enabled, use our custom paged attention for chunked prefill
         let cu_seqlens_q = if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
@@ -421,7 +462,7 @@ impl PagedAttention {
             block_tables,
             context_lens,
             None,
-            max_context_len,
+            input_metadata.max_context_len,
             self.scale,
             softcapping.unwrap_or(1.0f64) as f32,
             cu_seqlens_q,

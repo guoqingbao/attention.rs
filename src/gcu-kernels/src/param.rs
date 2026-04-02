@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -107,6 +107,7 @@ pub struct VARLEN_ATTN_FWD_OP_PARAS {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct FWD_KVCACHE_ATTN_OP_PARAS {
     pub data_type: i32,
     pub softmax_scale: f32,
@@ -330,7 +331,7 @@ pub fn build_varlen_params(
         }
     }
 
-    let mut params = VARLEN_ATTN_FWD_OP_PARAS {
+    let params = VARLEN_ATTN_FWD_OP_PARAS {
         is_varlen: true,
         use_fuse: false,
         packed_type: 0,
@@ -387,13 +388,14 @@ pub fn build_varlen_params(
     Ok(params)
 }
 
+#[allow(unused)]
 pub fn build_kvcache_params(
     query: &Tensor,  // [B, Sq, Hq, D]
     kcache: &Tensor, // [Bc, Sk, Hkv, D]
     vcache: &Tensor,
     key: &Option<Tensor>, // new KV (optional)
     value: &Option<Tensor>,
-    seqlens_k: &Option<Tensor>,
+    context_lens: &Option<Tensor>,
     rotary_cos: &Option<Tensor>,
     rotary_sin: &Option<Tensor>,
     cache_batch_idx: &Option<Tensor>,
@@ -412,7 +414,7 @@ pub fn build_kvcache_params(
 ) -> Result<FWD_KVCACHE_ATTN_OP_PARAS> {
     /* ---------------- flags ---------------- */
     let kv_en = key.is_some();
-    let seqlens_k_en = seqlens_k.is_some();
+    let seqlens_k_en = context_lens.is_some();
     let rotary_en = rotary_cos.is_some();
     let cache_batch_idx_en = cache_batch_idx.is_some();
     let leftpad_k_en = leftpad_k.is_some();
@@ -440,6 +442,7 @@ pub fn build_kvcache_params(
         (0, 0, 0)
     };
 
+    assert!([16, 32, 64, 128].contains(&page_block_size), "block size msut be 16, 32, 64, or 128.");
     /* ---------------- rotary ---------------- */
     let (seqlen_ro, rotary_dim) = if rotary_en {
         let cos = rotary_cos.as_ref().unwrap();
@@ -488,7 +491,7 @@ pub fn build_kvcache_params(
     let mut kv_seq_sub = 512;
     let bpe = match query.dtype() {
         DType::F16 | DType::BF16 => 2,
-        _ => return Err(anyhow!("unsupported dtype")),
+        _ => candle_core::bail!("unsupported dtype"),
     };
 
     let thread_group = 2; // C++ runtime chooses 1 or 2; 2 is safe default
@@ -498,8 +501,10 @@ pub fn build_kvcache_params(
 
     /* ---------------- SMALL_SIZE heuristic ---------------- */
     let total_task = batch * kv_num_heads;
-    let threads = (dim_blocks.x * dim_threads.x * 2) as i32;
-    let small_size = if total_task >= threads / 2 { 3072 } else { 512 };
+    let _threads = (dim_blocks.x * dim_threads.x * 2) as i32;
+    // Use a large SMALL_SIZE to keep decode in the single-thread-per-task path
+    // which is stable; the split-KV large path has issues on current GCU firmware.
+    let small_size = if total_task >= 24 { 8192 } else { 8192 };
 
     let data_type = match query.dtype() {
         DType::F16 => topsopDataType::TOPSOP_DATA_FP16,

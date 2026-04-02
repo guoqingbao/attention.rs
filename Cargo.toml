@@ -20,6 +20,6 @@ metal-kernels = {path = "./src/metal-kernels", version="0.1.0", optional = true}
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "dep:gcu-kernels"]
 graph = ["gcu", "candle-core/graph"]
 flash-attn = []
-flash-decoding = []
+flash-decoding = ["flash-attn"]
 flash-context = []
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]

@@ -3,7 +3,7 @@ pub mod param;
 use candle_core as candle;
 use candle_core::{DType, Result, Storage, Tensor};
 use ffi::{flash_attn_fwd_host, fwd_kvcache_attn_host, varlen_attn_fwd_host};
-use param::{build_flash_params, build_varlen_params, dim3};
+use param::{build_flash_params, build_varlen_params, build_kvcache_params, dim3};
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -174,7 +174,7 @@ fn flash_attn_varlen_func<
             ptr::null(),
             block_table
                 .as_ref()
-                .map_or(ptr::null(), |t| gcu_device_ptr!(t, T) as *const c_void),
+                .map_or(ptr::null(), |t| gcu_device_ptr!(t, u32) as *const c_void),
             alibi_slopes
                 .as_ref()
                 .map_or(ptr::null(), |t| gcu_device_ptr!(t, T) as *const c_void),
@@ -250,7 +250,7 @@ fn flash_attn_kvcache_func<
     query: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
-    cu_seqlens_k: &Tensor,
+    context_lens: &Tensor,
     block_table: &Option<Tensor>,
     softmax_scale: f32,
     softcap: Option<f32>,
@@ -261,13 +261,14 @@ fn flash_attn_kvcache_func<
 ) -> Result<Tensor> {
     use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
     use candle_core::gcu_backend::WrapErr;
+    assert!(query.dim(0)? == context_lens.dim(0)?, "shape mismatch");
     let params = build_kvcache_params(
         query,
         key_cache,
         value_cache,
         &None,
         &None,
-        &Some(cu_seqlens_k),
+        &Some(context_lens.to_owned()),
         &None,
         &None,
         &None, //cache_batch_idx,
@@ -279,10 +280,10 @@ fn flash_attn_kvcache_func<
         causal,
         window_size_left,
         window_size_right,
-        false,      //is_rotary_interleaved,//TODO
-        num_splits, //TODO
-        dim3(2, 1, 1),
-        dim3(12, 1, 1),
+        true,      //is_rotary_interleaved,//TODO
+        0, //num_splits, //TODO
+        dim3 { x: 2, y: 1, z: 1 },
+        dim3 { x: 12, y: 1, z: 1 },
     )?;
     let dev = query.device().as_gcu_device()?;
     let query_ptr = gcu_device_ptr!(query, T);
@@ -291,7 +292,7 @@ fn flash_attn_kvcache_func<
 
     let output = dev.alloc::<T>(query.elem_count()).w()?;
     let softmax_lse = dev
-        .alloc::<f32>(query.shape().dim(0)? * query.shape().dim(1)?)
+        .alloc::<f32>(query.shape().dim(0)? * query.shape().dim(1)? * query.shape().dim(2)?)
         .w()?;
     let stream = dev.stream_inner().expect("Unable to obtain stream");
     unsafe {
@@ -307,12 +308,12 @@ fn flash_attn_kvcache_func<
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            gcu_device_ptr!(cu_seqlens_k, u32) as *const c_void,
+            gcu_device_ptr!(context_lens, u32) as *const c_void,
             ptr::null(), //cache_batch_idx_ptr,
             ptr::null(),
             block_table
                 .as_ref()
-                .map_or(ptr::null(), |t| gcu_device_ptr!(t, T) as *const c_void),
+                .map_or(ptr::null(), |t| gcu_device_ptr!(t, u32) as *const c_void),
             alibi_slopes
                 .as_ref()
                 .map_or(ptr::null(), |t| gcu_device_ptr!(t, T) as *const c_void),
@@ -340,12 +341,11 @@ pub fn flash_attn_with_kvcache(
     causal: bool,
 ) -> Result<Tensor> {
     use half::{bf16, f16};
-    match key.dtype() {
+    match query.dtype() {
         DType::F16 => flash_attn_kvcache_func::<f16>(
             query,
             key_cache,
             value_cache,
-            cu_seqlens_q,
             cu_seqlens_k,
             block_table,
             softmax_scale,
@@ -359,7 +359,6 @@ pub fn flash_attn_with_kvcache(
             query,
             key_cache,
             value_cache,
-            cu_seqlens_q,
             cu_seqlens_k,
             block_table,
             softmax_scale,
