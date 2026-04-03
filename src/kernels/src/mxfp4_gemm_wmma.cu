@@ -1,12 +1,43 @@
 /**
- * MXFP4 GEMM with WMMA tensor core acceleration (Ampere+ / compute >= 80).
+ * @brief CUDA kernels for MXFP4 GEMM and MoE GEMM using WMMA (Warp Matrix
+ *        Multiply-Accumulate) Tensor Core acceleration (Ampere+ / SM >= 80).
  *
- * Dequantizes MXFP4 weights to FP16/BF16 in shared memory using vectorized
- * uint4 loads + LUT-based dequantization, then uses WMMA fragments for
- * 16x16x16 tensor core matrix multiply-accumulate.
+ * This file implements two WMMA-accelerated kernel families:
+ *   1. mxfp4_matmul_wmma_kernel            – Dense GEMM for medium-to-large M
+ *      (prefill), dequantizing MXFP4 weights to FP16/BF16 in shared memory
+ *      then accumulating via 16x16x16 WMMA fragments.
+ *   2. mxfp4_moe_grouped_gemm_wmma_kernel  – Mixture-of-Experts GEMM with
+ *      top-k expert selection, using the same WMMA tiled approach with
+ *      per-expert segment indexing and dynamic shared memory.
  *
- * Block tile: 64x64x32 (M_BLK x N_BLK x K_BLK)
- * 8 warps (4x2), 256 threads.
+ * MXFP4 Format (OCP Microscaling):
+ * - FP4 E2M1: 1 sign bit, 2 exponent bits, 1 mantissa bit
+ * - Block size: 32 elements per scale
+ * - Scale: E8M0 format (8-bit exponent, stored as u8 with bias 127)
+ * - 2 FP4 values packed per byte (nibbles)
+ *
+ * Copyright (c) 2025, Eric L Buehler.  All rights reserved.
+ * https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-quant/kernels/mxfp4/mxfp4_gemm_wmma.cu
+ * Notes:
+ * - Block tile: 64x64x32 (M_BLK x N_BLK x K_BLK), 8 warps (4x2), 256 threads
+ * - Vectorized uint4 loads for weights, LUT-based FP4 dequantization to FP16/BF16
+ *   in shared memory before WMMA fragment loads
+ * - Shared memory layout: tiles for A (input), B (dequantized weights), and C
+ *   (output accumulator)
+ * - MoE kernel uses dynamic shared memory for segment offset tables
+ * - BF16 dummy stubs provided for V100 (NO_BF16_KERNEL)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <cstdint>

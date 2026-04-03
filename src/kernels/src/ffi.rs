@@ -1989,4 +1989,100 @@ extern "C" {
         input_has_topk_dim: bool,
         stream: i64,
     );
+
+    // ======================================================================
+    // NVFP4 GEMM kernels (block_size=16, FP8 E4M3 block scales + F32 global)
+    // ======================================================================
+
+    pub fn nvfp4_matmul_smallm_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_smallm_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_indexed_moe_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_indexed_moe_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
 }

@@ -1,11 +1,43 @@
 /**
- * MXFP4 GEMM kernels with LUT-based dequantization.
+ * @brief CUDA kernels for MXFP4 (OCP Microscaling FP4) GEMM, MoE GEMM, and
+ *        small-M dot-product GEMM with LUT-based dequantization.
+ *
+ * This file implements three kernel families for MXFP4 quantized weight matrices:
+ *   1. (Newly added) mxfp4_matmul_smallm_kernel  – Dot-product kernel optimized for decode
+ *      (M < 32), one thread-row per output row, no shared memory tiles.
+ *   2. mxfp4_matmul_tiled          – Tiled GEMM for larger M (prefill), using
+ *      shared memory tiles with configurable BM/BN/BK and thread-level tiling.
+ *   3. mxfp4_moe_grouped_gemm_tiled – Indexed Mixture-of-Experts GEMM with
+ *      top-k expert selection, segmented per-expert weight layouts.
  *
  * MXFP4 Format (OCP Microscaling):
  * - FP4 E2M1: 1 sign bit, 2 exponent bits, 1 mantissa bit
  * - Block size: 32 elements per scale
  * - Scale: E8M0 format (8-bit exponent, stored as u8 with bias 127)
  * - 2 FP4 values packed per byte (nibbles)
+ * - Dequantization: x = LUT[nibble] * e8m0_to_float(scale)
+ *
+ * Copyright (c) 2025, Eric L Buehler and Guoqing Bao.  All rights reserved.
+ *
+ * Notes:
+ * - LUT-based FP4 E2M1 dequantization via byte_perm intrinsics for throughput
+ * - Small-M kernel uses warp-stride loops for memory-bound decode workloads
+ * - Tiled GEMM supports FP16 and BF16 output via C++ templates
+ * - MoE kernel handles per-expert indexing with dynamic shared memory for
+ *   segment offsets
+ * - BF16 dummy stubs provided for V100 (NO_BF16_KERNEL)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <cstdint>
@@ -696,11 +728,6 @@ extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                       output, M, N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
 }
-#else
-extern "C" void mxfp4_matmul_smallm_bf16(const void *, const uint8_t *,
-                                          const uint8_t *, const void *,
-                                          void *, int, int, int, bool,
-                                          cudaStream_t) {}
 #endif
 
 extern "C" void mxfp4_matmul_f16(const __half *input,
@@ -740,11 +767,6 @@ mxfp4_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
                                    N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
 }
-#else
-extern "C" void mxfp4_matmul_bf16(const void *, const uint8_t *,
-                                    const uint8_t *, const void *,
-                                    void *, int, int, int, bool,
-                                    cudaStream_t) {}
 #endif
 
 extern "C" void mxfp4_indexed_moe_gemm_f16(
@@ -791,11 +813,6 @@ extern "C" void mxfp4_indexed_moe_gemm_bf16(
           topk, num_experts, N, K, has_bias, input_has_topk_dim);
   CUDA_CHECK(cudaGetLastError());
 }
-#else
-extern "C" void mxfp4_indexed_moe_gemm_bf16(
-    const void *, const uint8_t *, const uint8_t *, const void *,
-    const uint32_t *, void *, int, int, int, int, int, bool, bool,
-    cudaStream_t) {}
 #endif
 
 extern "C" int mxfp4_get_max_smem_optin() {
@@ -851,9 +868,4 @@ extern "C" void mxfp4_moe_grouped_gemm_bf16(
           topk, num_experts, N, K, has_bias, input_has_topk_dim);
   CUDA_CHECK(cudaGetLastError());
 }
-#else
-extern "C" void mxfp4_moe_grouped_gemm_bf16(
-    const void *, const uint8_t *, const uint8_t *, const void *,
-    const uint32_t *, void *, int, int, int, int, int, bool, bool,
-    cudaStream_t) {}
 #endif
