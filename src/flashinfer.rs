@@ -892,6 +892,23 @@ impl candle::CustomOp1 for FlashInferPrefillWithPlan {
     }
 
     fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            DType::U8 => self.cuda_fwd_impl::<u8>(q, q_l),
+            _ => candle::bail!("prefill_with_plan: unsupported q dtype {:?}", q.dtype()),
+        }
+    }
+}
+
+impl FlashInferPrefillWithPlan {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
@@ -925,8 +942,7 @@ impl candle::CustomOp1 for FlashInferPrefillWithPlan {
         };
         let out_data_type: i32 = if q.dtype() == DType::BF16 { 1 } else { 0 };
 
-        let out =
-            unsafe { dev.alloc::<u8>(q_l.shape().elem_count() * q.dtype().size_in_bytes()) }.w()?;
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
 
         let batch_size = self.q_cu_seqlens.dim(0)? - 1;
