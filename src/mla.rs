@@ -1,15 +1,50 @@
-#[cfg(feature = "cuda")]
-use crate::flashinfer::{get_cuda_ptr, get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+use crate::flashinfer::{get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
 #[cfg(feature = "cuda")]
 use crate::kernels;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
 use candle_core::DType;
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
 use candle_core::{Result, Tensor};
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
 const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
+
+#[cfg(feature = "cuda")]
+fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
+    let (s, l) = t.storage_and_layout();
+    match (&*s, t.dtype()) {
+        (Storage::Cuda(c), DType::U8) => Ok(*c
+            .as_cuda_slice::<u8>()?
+            .slice(l.start_offset()..)
+            .device_ptr() as *const core::ffi::c_void),
+        (Storage::Cuda(c), DType::BF16) => Ok(*c
+            .as_cuda_slice::<half::bf16>()?
+            .slice(l.start_offset()..)
+            .device_ptr()
+            as *const core::ffi::c_void),
+        (Storage::Cuda(c), DType::F16) => Ok(*c
+            .as_cuda_slice::<half::f16>()?
+            .slice(l.start_offset()..)
+            .device_ptr() as *const core::ffi::c_void),
+        (Storage::Cuda(c), DType::F32) => Ok(*c
+            .as_cuda_slice::<f32>()?
+            .slice(l.start_offset()..)
+            .device_ptr() as *const core::ffi::c_void),
+        (Storage::Cuda(c), DType::U32) => Ok(*c
+            .as_cuda_slice::<u32>()?
+            .slice(l.start_offset()..)
+            .device_ptr() as *const core::ffi::c_void),
+        _ => candle_core::bail!(
+            "get_cuda_ptr: unsupported dtype {:?} on {:?}",
+            t.dtype(),
+            t.device()
+        ),
+    }
+}
 
 #[cfg(feature = "cuda")]
 fn dtype_to_u32(dtype: DType) -> u32 {
@@ -21,7 +56,7 @@ fn dtype_to_u32(dtype: DType) -> u32 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
 fn mla_flashinfer_dtype(dtype: DType) -> candle_core::Result<u32> {
     match dtype {
         DType::F16 => Ok(0),
