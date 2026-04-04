@@ -109,7 +109,25 @@ pub(crate) fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
                 .device_ptr();
             Ok(ptr as *const core::ffi::c_void)
         }
-        _ => candle::bail!("Tensor must be on CUDA and have U8, BF16, or F16 dtype"),
+        (Storage::Cuda(c), DType::F32) => {
+            let ptr = *c
+                .as_cuda_slice::<f32>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        (Storage::Cuda(c), DType::U32) => {
+            let ptr = *c
+                .as_cuda_slice::<u32>()?
+                .slice(l.start_offset()..)
+                .device_ptr();
+            Ok(ptr as *const core::ffi::c_void)
+        }
+        _ => candle::bail!(
+            "Tensor must be on CUDA with supported dtype, got {:?} on {:?}",
+            t.dtype(),
+            t.device()
+        ),
     }
 }
 
@@ -965,22 +983,7 @@ impl candle::CustomOp1 for FlashInferPrefillWithPlan {
             );
         }
 
-        let elem_count = q_l.shape().elem_count();
-        let out_slice = out.slice(0..elem_count * q.dtype().size_in_bytes());
-        let out = match q.dtype() {
-            DType::F16 => {
-                let typed: CudaSlice<half::f16> = unsafe { out_slice.transmute(elem_count) };
-                CudaStorage::wrap_cuda_slice(typed, dev.clone())
-            }
-            DType::BF16 => {
-                let typed: CudaSlice<half::bf16> = unsafe { out_slice.transmute(elem_count) };
-                CudaStorage::wrap_cuda_slice(typed, dev.clone())
-            }
-            _ => {
-                let typed: CudaSlice<u8> = unsafe { out_slice.transmute(elem_count) };
-                CudaStorage::wrap_cuda_slice(typed, dev.clone())
-            }
-        };
+        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
         Ok((out, q_l.shape().clone()))
     }
 }

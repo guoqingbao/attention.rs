@@ -3,6 +3,8 @@ use crate::flashinfer::{get_cuda_ptr, get_or_init_workspace, WORKSPACE_FLOAT_SIZ
 #[cfg(feature = "cuda")]
 use crate::kernels;
 #[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(feature = "cuda")]
 use candle_core::DType;
 use candle_core::{Result, Tensor};
 

@@ -18,7 +18,7 @@
 
 using namespace flashinfer;
 
-namespace {
+namespace mla_detail {
 
 constexpr uint32_t HEAD_DIM_CKV = 512;
 constexpr uint32_t HEAD_DIM_KPE = 64;
@@ -278,7 +278,9 @@ void mla_prefill_run_typed(
     }
 }
 
-} // anonymous namespace
+} // namespace mla_detail
+
+using namespace mla_detail;
 
 // ============================================================================
 // C API

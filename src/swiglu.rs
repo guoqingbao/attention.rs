@@ -52,85 +52,87 @@ fn gptoss_swiglu_cuda(gate: &Tensor, up: &Tensor, alpha: f32, limit: f32) -> Res
     let dtype = gate.dtype();
     let output = Tensor::zeros(gate.shape(), dtype, gate.device())?;
 
-    let (gate_storage, gate_layout) = gate.storage_and_layout();
-    let (up_storage, up_layout) = up.storage_and_layout();
-    let (out_storage, _out_layout) = output.storage_and_layout();
+    {
+        let (gate_storage, gate_layout) = gate.storage_and_layout();
+        let (up_storage, up_layout) = up.storage_and_layout();
+        let (out_storage, _out_layout) = output.storage_and_layout();
 
-    let gate_cuda = match &*gate_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("Expected CUDA storage for gate"),
-    };
-    let up_cuda = match &*up_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("Expected CUDA storage for up"),
-    };
-    let out_cuda = match &*out_storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => candle_core::bail!("Expected CUDA storage for output"),
-    };
+        let gate_cuda = match &*gate_storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Expected CUDA storage for gate"),
+        };
+        let up_cuda = match &*up_storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Expected CUDA storage for up"),
+        };
+        let out_cuda = match &*out_storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Expected CUDA storage for output"),
+        };
 
-    let dev = gate_cuda.device();
-    let stream = *dev.cu_stream() as i64;
+        let dev = &gate_cuda.device;
+        let stream = *dev.cu_stream() as i64;
 
-    match dtype {
-        DType::F16 => {
-            let gate_slice = gate_cuda.as_cuda_slice::<half::f16>()?;
-            let up_slice = up_cuda.as_cuda_slice::<half::f16>()?;
-            let out_slice = out_cuda.as_cuda_slice::<half::f16>()?;
-            let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
-            let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
-            let out_ptr = *out_slice.device_ptr();
-            unsafe {
-                ffi::gptoss_swiglu_f16(
-                    gate_ptr as *const core::ffi::c_void,
-                    up_ptr as *const core::ffi::c_void,
-                    out_ptr as *mut core::ffi::c_void,
-                    n_elements as u32,
-                    alpha,
-                    limit,
-                    stream,
-                );
+        match dtype {
+            DType::F16 => {
+                let gate_slice = gate_cuda.as_cuda_slice::<half::f16>()?;
+                let up_slice = up_cuda.as_cuda_slice::<half::f16>()?;
+                let out_slice = out_cuda.as_cuda_slice::<half::f16>()?;
+                let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
+                let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
+                let out_ptr = *out_slice.device_ptr();
+                unsafe {
+                    ffi::gptoss_swiglu_f16(
+                        gate_ptr as *const core::ffi::c_void,
+                        up_ptr as *const core::ffi::c_void,
+                        out_ptr as *mut core::ffi::c_void,
+                        n_elements as u32,
+                        alpha,
+                        limit,
+                        stream,
+                    );
+                }
             }
-        }
-        DType::BF16 => {
-            let gate_slice = gate_cuda.as_cuda_slice::<half::bf16>()?;
-            let up_slice = up_cuda.as_cuda_slice::<half::bf16>()?;
-            let out_slice = out_cuda.as_cuda_slice::<half::bf16>()?;
-            let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
-            let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
-            let out_ptr = *out_slice.device_ptr();
-            unsafe {
-                ffi::gptoss_swiglu_bf16(
-                    gate_ptr as *const core::ffi::c_void,
-                    up_ptr as *const core::ffi::c_void,
-                    out_ptr as *mut core::ffi::c_void,
-                    n_elements as u32,
-                    alpha,
-                    limit,
-                    stream,
-                );
+            DType::BF16 => {
+                let gate_slice = gate_cuda.as_cuda_slice::<half::bf16>()?;
+                let up_slice = up_cuda.as_cuda_slice::<half::bf16>()?;
+                let out_slice = out_cuda.as_cuda_slice::<half::bf16>()?;
+                let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
+                let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
+                let out_ptr = *out_slice.device_ptr();
+                unsafe {
+                    ffi::gptoss_swiglu_bf16(
+                        gate_ptr as *const core::ffi::c_void,
+                        up_ptr as *const core::ffi::c_void,
+                        out_ptr as *mut core::ffi::c_void,
+                        n_elements as u32,
+                        alpha,
+                        limit,
+                        stream,
+                    );
+                }
             }
-        }
-        DType::F32 => {
-            let gate_slice = gate_cuda.as_cuda_slice::<f32>()?;
-            let up_slice = up_cuda.as_cuda_slice::<f32>()?;
-            let out_slice = out_cuda.as_cuda_slice::<f32>()?;
-            let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
-            let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
-            let out_ptr = *out_slice.device_ptr();
-            unsafe {
-                ffi::gptoss_swiglu_f32(
-                    gate_ptr as *const core::ffi::c_void,
-                    up_ptr as *const core::ffi::c_void,
-                    out_ptr as *mut core::ffi::c_void,
-                    n_elements as u32,
-                    alpha,
-                    limit,
-                    stream,
-                );
+            DType::F32 => {
+                let gate_slice = gate_cuda.as_cuda_slice::<f32>()?;
+                let up_slice = up_cuda.as_cuda_slice::<f32>()?;
+                let out_slice = out_cuda.as_cuda_slice::<f32>()?;
+                let gate_ptr = *gate_slice.slice(gate_layout.start_offset()..).device_ptr();
+                let up_ptr = *up_slice.slice(up_layout.start_offset()..).device_ptr();
+                let out_ptr = *out_slice.device_ptr();
+                unsafe {
+                    ffi::gptoss_swiglu_f32(
+                        gate_ptr as *const core::ffi::c_void,
+                        up_ptr as *const core::ffi::c_void,
+                        out_ptr as *mut core::ffi::c_void,
+                        n_elements as u32,
+                        alpha,
+                        limit,
+                        stream,
+                    );
+                }
             }
+            _ => candle_core::bail!("gptoss_swiglu: unsupported dtype {:?}", dtype),
         }
-        _ => candle_core::bail!("gptoss_swiglu: unsupported dtype {:?}", dtype),
     }
 
     Ok(output)
@@ -190,7 +192,11 @@ fn gptoss_swiglu_metal(gate: &Tensor, up: &Tensor, alpha: f32, limit: f32) -> Re
         encoder.set_buffer(0, Some(gate_ms.buffer()), gate_offset);
         encoder.set_buffer(1, Some(up_ms.buffer()), up_offset);
         encoder.set_buffer(2, Some(out_ms.buffer()), 0);
-        encoder.set_bytes(3, 4, &(n_elements as u32).to_ne_bytes() as *const _ as *const _);
+        encoder.set_bytes(
+            3,
+            4,
+            &(n_elements as u32).to_ne_bytes() as *const _ as *const _,
+        );
         encoder.set_bytes(4, 4, &alpha.to_ne_bytes() as *const _ as *const _);
         encoder.set_bytes(5, 4, &limit.to_ne_bytes() as *const _ as *const _);
 
