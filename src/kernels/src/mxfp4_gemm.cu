@@ -401,14 +401,38 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
   }
 }
 
-// Fused MoE grouped GEMM: discovers tokens per expert on-GPU, then tiled GEMM
+// Phase 1: Build per-expert token lists in global memory.
+__global__ void mxfp4_moe_scatter_tokens_tiled(
+    const uint32_t *__restrict__ indices,
+    int *__restrict__ g_token_lists,
+    int *__restrict__ g_expert_counts,
+    int total_work, int num_experts, int list_stride) {
+  const int expert_id = blockIdx.y;
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const int block_size = blockDim.x * blockDim.y;
+  int *my_list = g_token_lists + (size_t)expert_id * list_stride;
+  int *my_count = g_expert_counts + expert_id;
+
+  for (int i = tid; i < total_work; i += block_size) {
+    if (__ldg(&indices[i]) == (uint32_t)expert_id) {
+      int pos = atomicAdd(my_count, 1);
+      if (pos < list_stride)
+        my_list[pos] = i;
+    }
+  }
+}
+
+// Phase 2: Tiled GEMM reading per-expert token lists from global memory.
 template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int TM, int TN>
 __global__ void mxfp4_moe_grouped_gemm_tiled(
     const T *__restrict__ input, const uint8_t *__restrict__ weights,
     const uint8_t *__restrict__ weight_scales, const T *__restrict__ biases,
     const uint32_t *__restrict__ indices, T *__restrict__ output,
     int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
-    bool input_has_topk_dim) {
+    bool input_has_topk_dim,
+    const int *__restrict__ g_token_lists,
+    const int *__restrict__ g_expert_counts,
+    int list_stride) {
   constexpr int THREADS_N = BLOCK_N / TN;
   constexpr int THREADS_M = BLOCK_M / TM;
   constexpr int NUM_THREADS = THREADS_N * THREADS_M;
@@ -416,8 +440,6 @@ __global__ void mxfp4_moe_grouped_gemm_tiled(
 
   __shared__ float s_input[BLOCK_M][BK_PAD];
   __shared__ float s_weight[BLOCK_N][BK_PAD];
-  __shared__ int num_my_tokens;
-  extern __shared__ int s_token_list[];
 
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
@@ -428,25 +450,13 @@ __global__ void mxfp4_moe_grouped_gemm_tiled(
   const int expert_id = blockIdx.y;
   const int n_base = blockIdx.x * BLOCK_N;
   const int scale_stride = CEILDIV(K, MXFP4_BLOCK_SIZE);
-  const int total_work = num_tokens * topk;
 
   const uint8_t *expert_weight = weights + (size_t)expert_id * N * (K / 2);
   const uint8_t *expert_scale =
       weight_scales + (size_t)expert_id * N * scale_stride;
 
-  if (tid == 0)
-    num_my_tokens = 0;
-  __syncthreads();
-
-  for (int i = tid; i < total_work; i += NUM_THREADS) {
-    if (__ldg(&indices[i]) == (uint32_t)expert_id) {
-      int pos = atomicAdd(&num_my_tokens, 1);
-      s_token_list[pos] = i;
-    }
-  }
-  __syncthreads();
-
-  const int M_expert = num_my_tokens;
+  const int *token_list = g_token_lists + (size_t)expert_id * list_stride;
+  const int M_expert = g_expert_counts[expert_id];
   if (M_expert == 0)
     return;
 
@@ -467,7 +477,7 @@ __global__ void mxfp4_moe_grouped_gemm_tiled(
 
         float val = 0.0f;
         if (work_pos < M_expert && gk < K) {
-          const int work_idx = s_token_list[work_pos];
+          const int work_idx = token_list[work_pos];
           const int input_row =
               input_has_topk_dim ? work_idx : (work_idx / topk);
           if constexpr (std::is_same_v<T, half>) {
@@ -529,7 +539,7 @@ __global__ void mxfp4_moe_grouped_gemm_tiled(
     for (int i = 0; i < TM; i++) {
       const int work_pos = m_tile * BLOCK_M + threadIdx.y * TM + i;
       if (work_pos < M_expert) {
-        const int work_idx = s_token_list[work_pos];
+        const int work_idx = token_list[work_pos];
 #pragma unroll
         for (int j = 0; j < TN; j++) {
           const int col = n_base + threadIdx.x * TN + j;
@@ -824,25 +834,60 @@ extern "C" int mxfp4_get_max_smem_optin() {
   return max_smem;
 }
 
+template <typename T, int BM, int BN, int BK, int TM, int TN>
+static void launch_moe_tiled(
+    const T *input, const uint8_t *weights, const uint8_t *weight_scales,
+    const T *biases, const uint32_t *indices, T *output,
+    int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
+    bool input_has_topk_dim, cudaStream_t stream) {
+
+  int total_work = num_tokens * topk;
+  int list_stride = total_work;
+
+  int *g_token_lists = nullptr;
+  int *g_expert_counts = nullptr;
+  size_t lists_bytes = (size_t)num_experts * list_stride * sizeof(int);
+  size_t counts_bytes = (size_t)num_experts * sizeof(int);
+  CUDA_CHECK(cudaMallocAsync(&g_token_lists, lists_bytes, stream));
+  CUDA_CHECK(cudaMallocAsync(&g_expert_counts, counts_bytes, stream));
+  CUDA_CHECK(cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream));
+
+  // Phase 1: scatter tokens to per-expert lists
+  {
+    dim3 scatter_block(BN / TN, BM / TM);
+    dim3 scatter_grid(1, num_experts);
+    mxfp4_gemm::mxfp4_moe_scatter_tokens_tiled<<<scatter_grid, scatter_block, 0, stream>>>(
+        indices, g_token_lists, g_expert_counts,
+        total_work, num_experts, list_stride);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Phase 2: tiled GEMM (no dynamic shared memory needed for token lists)
+  {
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid(CEILDIV(N, BN), num_experts);
+
+    mxfp4_gemm::mxfp4_moe_grouped_gemm_tiled<T, BM, BN, BK, TM, TN>
+        <<<grid, block, 0, stream>>>(
+            input, weights, weight_scales, biases, indices, output,
+            num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim,
+            g_token_lists, g_expert_counts, list_stride);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  CUDA_CHECK(cudaFreeAsync(g_token_lists, stream));
+  CUDA_CHECK(cudaFreeAsync(g_expert_counts, stream));
+}
+
 extern "C" void mxfp4_moe_grouped_gemm_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
     const __half *biases, const uint32_t *indices, __half *output,
     int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
     bool input_has_topk_dim, cudaStream_t stream) {
   constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
-  dim3 block(BN / TN, BM / TM);
-  dim3 grid(CEILDIV(N, BN), num_experts);
-  size_t smem = num_tokens * topk * sizeof(int);
-
-  CUDA_CHECK(cudaFuncSetAttribute(
-      mxfp4_gemm::mxfp4_moe_grouped_gemm_tiled<half, BM, BN, BK, TM, TN>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-
-  mxfp4_gemm::mxfp4_moe_grouped_gemm_tiled<half, BM, BN, BK, TM, TN>
-      <<<grid, block, smem, stream>>>(
-          input, weights, weight_scales, biases, indices, output, num_tokens,
-          topk, num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+  launch_moe_tiled<half, BM, BN, BK, TM, TN>(
+      input, weights, weight_scales, biases, indices, output,
+      num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -853,19 +898,8 @@ extern "C" void mxfp4_moe_grouped_gemm_bf16(
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     cudaStream_t stream) {
   constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
-  dim3 block(BN / TN, BM / TM);
-  dim3 grid(CEILDIV(N, BN), num_experts);
-  size_t smem = num_tokens * topk * sizeof(int);
-
-  CUDA_CHECK(cudaFuncSetAttribute(
-      mxfp4_gemm::mxfp4_moe_grouped_gemm_tiled<__nv_bfloat16, BM, BN, BK, TM,
-                                               TN>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-
-  mxfp4_gemm::mxfp4_moe_grouped_gemm_tiled<__nv_bfloat16, BM, BN, BK, TM, TN>
-      <<<grid, block, smem, stream>>>(
-          input, weights, weight_scales, biases, indices, output, num_tokens,
-          topk, num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+  launch_moe_tiled<__nv_bfloat16, BM, BN, BK, TM, TN>(
+      input, weights, weight_scales, biases, indices, output,
+      num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 #endif

@@ -294,7 +294,30 @@ __launch_bounds__(BLOCK_THREADS) __global__
   }
 }
 
-// Fused MoE grouped GEMM with WMMA tensor cores
+// Phase 1: Build per-expert token lists in global memory.
+// Grid: (1, num_experts), Block: 256 threads.
+// g_token_lists: [num_experts, max_tokens_per_expert] — pre-allocated
+// g_expert_counts: [num_experts] — pre-zero'd
+__global__ void mxfp4_moe_scatter_tokens(
+    const uint32_t *__restrict__ indices,
+    int *__restrict__ g_token_lists,
+    int *__restrict__ g_expert_counts,
+    int total_work, int num_experts, int list_stride) {
+  const int expert_id = blockIdx.y;
+  int *my_list = g_token_lists + (size_t)expert_id * list_stride;
+  int *my_count = g_expert_counts + expert_id;
+
+  for (int i = threadIdx.x; i < total_work; i += blockDim.x) {
+    if (__ldg(&indices[i]) == (uint32_t)expert_id) {
+      int pos = atomicAdd(my_count, 1);
+      if (pos < list_stride)
+        my_list[pos] = i;
+    }
+  }
+}
+
+// Phase 2: WMMA GEMM kernel reading per-expert token lists from global memory.
+// Shared memory is now fixed-size (WMMA tiles only, ~24 KB).
 template <typename T>
 __launch_bounds__(BLOCK_THREADS) __global__
     void mxfp4_moe_grouped_gemm_wmma_kernel(
@@ -302,7 +325,10 @@ __launch_bounds__(BLOCK_THREADS) __global__
         const uint8_t *__restrict__ weight_scales, const T *__restrict__ biases,
         const uint32_t *__restrict__ indices, T *__restrict__ output,
         int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
-        bool input_has_topk_dim) {
+        bool input_has_topk_dim,
+        const int *__restrict__ g_token_lists,
+        const int *__restrict__ g_expert_counts,
+        int list_stride) {
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
@@ -312,41 +338,24 @@ __launch_bounds__(BLOCK_THREADS) __global__
   const int expert_id = blockIdx.y;
   const int n_base = blockIdx.x * N_BLK;
   const int threadId = threadIdx.x;
-  const int total_work = num_tokens * topk;
 
   const uint8_t *expert_weight = weights + (size_t)expert_id * N * (K / 2);
   const uint8_t *expert_scale =
       weight_scales + (size_t)expert_id * N * scale_stride;
 
+  const int *token_list = g_token_lists + (size_t)expert_id * list_stride;
+  const int M_expert = g_expert_counts[expert_id];
+  if (M_expert == 0)
+    return;
+
   extern __shared__ uint8_t smem_bytes[];
-  int *s_token_list = reinterpret_cast<int *>(smem_bytes);
-
-  __shared__ int num_my_tokens;
-
-  const int token_list_bytes = ((total_work * (int)sizeof(int)) + 15) & ~15;
-  T *A_sh = reinterpret_cast<T *>(smem_bytes + token_list_bytes);
+  T *A_sh = reinterpret_cast<T *>(smem_bytes);
   T *B_sh = A_sh + M_BLK * K_BLK;
   uint8_t *C_raw = reinterpret_cast<uint8_t *>(B_sh + N_BLK * K_BLK);
   size_t align_off = reinterpret_cast<uintptr_t>(C_raw) % alignof(float);
   if (align_off != 0)
     C_raw += (alignof(float) - align_off);
   float *C_sh = reinterpret_cast<float *>(C_raw);
-
-  if (threadId == 0)
-    num_my_tokens = 0;
-  __syncthreads();
-
-  for (int i = threadId; i < total_work; i += BLOCK_THREADS) {
-    if (__ldg(&indices[i]) == (uint32_t)expert_id) {
-      int pos = atomicAdd(&num_my_tokens, 1);
-      s_token_list[pos] = i;
-    }
-  }
-  __syncthreads();
-
-  const int M_expert = num_my_tokens;
-  if (M_expert == 0)
-    return;
 
   const int warpId = threadId / 32;
   const int warp_m_idx = warpId / WARPS_N;
@@ -372,7 +381,7 @@ __launch_bounds__(BLOCK_THREADS) __global__
         const int gk = k_base + lk;
 
         if (work_pos < M_expert && gk < K) {
-          const int work_idx = s_token_list[work_pos];
+          const int work_idx = token_list[work_pos];
           const int input_row =
               input_has_topk_dim ? work_idx : (work_idx / topk);
           *reinterpret_cast<VecT *>(&A_sh[lm * K_BLK + lk]) =
@@ -445,7 +454,7 @@ __launch_bounds__(BLOCK_THREADS) __global__
       const int gn = n_base + ln;
 
       if (work_pos < M_expert && gn < N) {
-        const int work_idx = s_token_list[work_pos];
+        const int work_idx = token_list[work_pos];
         float val = C_sh[lm * N_BLK + ln];
         if (has_bias && biases != nullptr) {
           if constexpr (std::is_same_v<T, half>) {
@@ -519,27 +528,66 @@ extern "C" void mxfp4_matmul_wmma_bf16(const void *, const uint8_t *,
                                          cudaStream_t) {}
 #endif
 
+// Helper: allocate scatter buffers, launch scatter kernel, then GEMM kernel.
+template <typename T, typename KernelT>
+static void launch_moe_wmma(
+    KernelT kernel_fn,
+    const T *input, const uint8_t *weights, const uint8_t *weight_scales,
+    const T *biases, const uint32_t *indices, T *output,
+    int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
+    bool input_has_topk_dim, cudaStream_t stream) {
+  using namespace mxfp4_wmma;
+
+  int total_work = num_tokens * topk;
+  int list_stride = total_work;
+
+  int *g_token_lists = nullptr;
+  int *g_expert_counts = nullptr;
+  size_t lists_bytes = (size_t)num_experts * list_stride * sizeof(int);
+  size_t counts_bytes = (size_t)num_experts * sizeof(int);
+  CUDA_CHECK(cudaMallocAsync(&g_token_lists, lists_bytes, stream));
+  CUDA_CHECK(cudaMallocAsync(&g_expert_counts, counts_bytes, stream));
+  CUDA_CHECK(cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream));
+
+  // Phase 1: scatter tokens to per-expert lists
+  {
+    dim3 scatter_grid(1, num_experts);
+    dim3 scatter_block(256);
+    mxfp4_wmma::mxfp4_moe_scatter_tokens<<<scatter_grid, scatter_block, 0, stream>>>(
+        indices, g_token_lists, g_expert_counts,
+        total_work, num_experts, list_stride);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Phase 2: GEMM (fixed shared memory — WMMA tiles only)
+  {
+    dim3 grid(CEILDIV(N, N_BLK), num_experts);
+    dim3 block(BLOCK_THREADS);
+    size_t smem = wmma_smem_bytes();
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+
+    kernel_fn<<<grid, block, smem, stream>>>(
+        input, weights, weight_scales, biases, indices, output,
+        num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim,
+        g_token_lists, g_expert_counts, list_stride);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  CUDA_CHECK(cudaFreeAsync(g_token_lists, stream));
+  CUDA_CHECK(cudaFreeAsync(g_expert_counts, stream));
+}
+
 extern "C" void mxfp4_moe_grouped_gemm_wmma_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
     const __half *biases, const uint32_t *indices, __half *output,
     int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
     bool input_has_topk_dim, cudaStream_t stream) {
-  using namespace mxfp4_wmma;
-
-  dim3 grid(CEILDIV(N, N_BLK), num_experts);
-  dim3 block(BLOCK_THREADS);
-  int token_list_bytes = ((num_tokens * topk * (int)sizeof(int)) + 15) & ~15;
-  size_t smem = token_list_bytes + wmma_smem_bytes();
-
-  CUDA_CHECK(
-      cudaFuncSetAttribute(mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<half>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-
-  mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<half>
-      <<<grid, block, smem, stream>>>(
-          input, weights, weight_scales, biases, indices, output, num_tokens,
-          topk, num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+  launch_moe_wmma<half>(
+      mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<half>,
+      input, weights, weight_scales, biases, indices, output,
+      num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -549,22 +597,10 @@ extern "C" void mxfp4_moe_grouped_gemm_wmma_bf16(
     const uint32_t *indices, __nv_bfloat16 *output, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     cudaStream_t stream) {
-  using namespace mxfp4_wmma;
-
-  dim3 grid(CEILDIV(N, N_BLK), num_experts);
-  dim3 block(BLOCK_THREADS);
-  int token_list_bytes = ((num_tokens * topk * (int)sizeof(int)) + 15) & ~15;
-  size_t smem = token_list_bytes + wmma_smem_bytes();
-
-  CUDA_CHECK(cudaFuncSetAttribute(
+  launch_moe_wmma<__nv_bfloat16>(
       mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<__nv_bfloat16>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-
-  mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<__nv_bfloat16>
-      <<<grid, block, smem, stream>>>(
-          input, weights, weight_scales, biases, indices, output, num_tokens,
-          topk, num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+      input, weights, weight_scales, biases, indices, output,
+      num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 #else
 extern "C" void mxfp4_moe_grouped_gemm_wmma_bf16(

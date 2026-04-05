@@ -902,6 +902,7 @@ impl candle::CustomOp1 for FlashInferPrefillWithPlan {
 }
 
 impl FlashInferPrefillWithPlan {
+    #[allow(unused_variables)]
     fn cuda_fwd_impl<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
     >(
