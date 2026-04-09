@@ -10,6 +10,27 @@ use candle_core::{Result, Tensor};
 
 pub const MXFP4_BLOCK_SIZE: usize = 32;
 
+/// Check if hardware MXFP4 (CUTLASS block-scaled tensor ops with Mxf8f6f4 schedule) is available.
+/// Requires Blackwell SM100+ and the cutlass feature.
+#[cfg(feature = "cuda")]
+fn is_hardware_mxfp4_available(dev: &candle_core::Device) -> bool {
+    if !cfg!(feature = "cutlass") {
+        return false;
+    }
+    if let Ok(cuda_dev) = dev.as_cuda_device() {
+        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        sm >= 100
+    } else {
+        false
+    }
+}
+
+/// Pad dimension up to the nearest multiple of `align`.
+#[cfg(feature = "cuda")]
+fn pad_to(val: usize, align: usize) -> usize {
+    (val + align - 1) / align * align
+}
+
 /// FlashInfer-accelerated MXFP4 fused MoE GEMM for Blackwell (SM100+).
 /// Returns Ok(output) on success, or Err if not available / not supported.
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
@@ -182,16 +203,136 @@ pub fn mxfp4_matmul(
                         DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
                         DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
                         DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                        DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
                         _ => candle_core::bail!("unsupported dtype {:?}", dtype),
                     },
                     _ => candle_core::bail!("tensor must be on CUDA"),
                 }
             }
 
+            let use_hardware_mxfp4 = is_hardware_mxfp4_available(dev) && m >= 32;
+
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
-            {
+            if use_hardware_mxfp4 {
+                // Hardware MXFP4 path: quantize activations to FP4+E8M0 -> CUTLASS Mxf8f6f4 GEMM
+                let stream = *cuda_dev.cu_stream() as i64;
+
+                let m_padded = pad_to(m, 128);
+                let k_scale_cols = k / MXFP4_BLOCK_SIZE;
+                let k_scale_padded = pad_to(k_scale_cols, 4);
+                let n_padded = pad_to(n, 128);
+
+                let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
+                let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
+                let act_scales_swizzled =
+                    Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+
+                let weight_scales_swizzled =
+                    Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
+
+                {
+                    let (input_s, _) = input.storage_and_layout();
+                    let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+
+                    let (act_packed_s, _) = act_packed.storage_and_layout();
+                    let act_packed_ptr =
+                        cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (act_scales_s, _) = act_scales.storage_and_layout();
+                    let act_scales_ptr =
+                        cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+                    let act_scales_sw_ptr =
+                        cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (weight_s, _) = weight.storage_and_layout();
+                    let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const std::ffi::c_void;
+
+                    let (scale_s, _) = scale.storage_and_layout();
+                    let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
+
+                    let (wscale_sw_s, _) = weight_scales_swizzled.storage_and_layout();
+                    let wscale_sw_ptr = cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (output_s, _) = output.storage_and_layout();
+                    let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+                    unsafe {
+                        // Step 1: Quantize activations to FP4 with E8M0 block scales
+                        match dtype {
+                            DType::F16 => ffi::mxfp4_quantize_activation_f16(
+                                input_ptr,
+                                act_packed_ptr,
+                                act_scales_ptr,
+                                act_scales_sw_ptr,
+                                m as i32,
+                                k as i32,
+                                m_padded as i32,
+                                k_scale_padded as i32,
+                                stream,
+                            ),
+                            DType::BF16 => ffi::mxfp4_quantize_activation_bf16(
+                                input_ptr,
+                                act_packed_ptr,
+                                act_scales_ptr,
+                                act_scales_sw_ptr,
+                                m as i32,
+                                k as i32,
+                                m_padded as i32,
+                                k_scale_padded as i32,
+                                stream,
+                            ),
+                            _ => candle_core::bail!("mxfp4_matmul: unsupported dtype {:?}", dtype),
+                        }
+
+                        // Step 2: Swizzle weight E8M0 scales to CUTLASS layout
+                        ffi::mxfp4_swizzle_weight_scales_e8m0(
+                            scale_ptr,
+                            wscale_sw_ptr,
+                            n as i32,
+                            k_scale_cols as i32,
+                            n_padded as i32,
+                            k_scale_padded as i32,
+                            stream,
+                        );
+
+                        // Step 3: CUTLASS MXFP4 GEMM
+                        match dtype {
+                            DType::F16 => ffi::mxfp4_cutlass_gemm_f16(
+                                act_packed_ptr as *const std::ffi::c_void,
+                                weight_ptr,
+                                act_scales_sw_ptr as *const std::ffi::c_void,
+                                wscale_sw_ptr as *const std::ffi::c_void,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                stream,
+                            ),
+                            DType::BF16 => ffi::mxfp4_cutlass_gemm_bf16(
+                                act_packed_ptr as *const std::ffi::c_void,
+                                weight_ptr,
+                                act_scales_sw_ptr as *const std::ffi::c_void,
+                                wscale_sw_ptr as *const std::ffi::c_void,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                stream,
+                            ),
+                            _ => candle_core::bail!("mxfp4_matmul: unsupported dtype {:?}", dtype),
+                        }
+                    }
+                }
+
+                if let Some(b) = bias {
+                    return Ok(output.broadcast_add(b)?);
+                }
+            } else {
+                // Software dequant path (existing kernels)
                 let (input_s, _) = input.storage_and_layout();
                 let (weight_s, _) = weight.storage_and_layout();
                 let (scale_s, _) = scale.storage_and_layout();

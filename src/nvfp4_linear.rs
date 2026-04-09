@@ -8,13 +8,44 @@ use candle_core::{Result, Tensor};
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
 
+/// Check if hardware FP4 (CUTLASS block-scaled tensor ops) is available.
+/// Requires Blackwell SM100+ and the cutlass feature.
+#[cfg(feature = "cuda")]
+fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
+    if !cfg!(feature = "cutlass") {
+        return false;
+    }
+    if let Ok(cuda_dev) = dev.as_cuda_device() {
+        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        sm >= 100
+    } else {
+        false
+    }
+}
+
+/// Pad dimension up to the nearest multiple of `align`.
+#[cfg(feature = "cuda")]
+fn pad_to(val: usize, align: usize) -> usize {
+    (val + align - 1) / align * align
+}
+
 /// NVFP4 linear: output = input @ weight^T [+ bias]
 ///
 /// * `input` - [M, K] in F16/BF16
 /// * `weight` - [N, K/2] packed U8 (2 FP4 E2M1 nibbles per byte)
 /// * `scale` - [N, K/16] U8 FP8 E4M3 block scales
-/// * `weight_global_scale` - scalar F32 global scale
+/// * `weight_global_scale` - scalar F32 weight-side global scale
+///   (from `weight_scale_2` or `1/weight_global_scale` in the checkpoint)
+/// * `input_scale` - scalar F32 activation-side global scale
+///   (from `input_scale` or `input_global_scale` in the checkpoint, default 1.0)
+///   Used by the hardware FP4 path to pre-scale activation block scales during
+///   quantization and to compute the GEMM epilogue alpha = input_scale * weight_global_scale.
+///   Ignored by the software path (activations stay in FP16/BF16).
 /// * `bias` - Optional [N] in F16/BF16
+///
+/// On Blackwell (SM100+) with cutlass feature: uses hardware FP4 tensor cores
+/// via CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly).
+/// On older GPUs: uses software dequant path (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [M, N] in same dtype as input
 #[allow(unused)]
@@ -23,6 +54,7 @@ pub fn nvfp4_matmul(
     weight: &Tensor,
     scale: &Tensor,
     weight_global_scale: f32,
+    input_scale: f32,
     bias: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
@@ -78,16 +110,150 @@ pub fn nvfp4_matmul(
                         DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
                         DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
                         DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                        DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
                         _ => candle_core::bail!("unsupported dtype {:?}", dtype),
                     },
                     _ => candle_core::bail!("tensor must be on CUDA"),
                 }
             }
 
+            let use_hardware_fp4 = is_hardware_fp4_available(dev) && m >= 32;
+
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
-            {
+            if use_hardware_fp4 {
+                // Hardware FP4 path: quantize activations -> CUTLASS block-scaled GEMM
+                let stream = *cuda_dev.cu_stream() as i64;
+
+                let m_padded = pad_to(m, 128);
+                let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+                let k_scale_padded = pad_to(k_scale_cols, 4);
+                let n_padded = pad_to(n, 128);
+
+                let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
+                let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
+                let act_scales_swizzled =
+                    Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+
+                let weight_scales_swizzled =
+                    Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
+
+                // GEMM alpha = input_scale * weight_global_scale
+                // input_scale_inv is pre-baked into activation block scales during quantization
+                let input_scale_inv = if input_scale != 0.0 {
+                    1.0 / input_scale
+                } else {
+                    1.0
+                };
+                let alpha = input_scale * weight_global_scale;
+                let alpha_tensor = Tensor::new(&[alpha], dev)?;
+
+                {
+                    let (input_s, _) = input.storage_and_layout();
+                    let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+
+                    let (act_packed_s, _) = act_packed.storage_and_layout();
+                    let act_packed_ptr =
+                        cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (act_scales_s, _) = act_scales.storage_and_layout();
+                    let act_scales_ptr =
+                        cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+                    let act_scales_sw_ptr =
+                        cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (weight_s, _) = weight.storage_and_layout();
+                    let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const std::ffi::c_void;
+
+                    let (scale_s, _) = scale.storage_and_layout();
+                    let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
+
+                    let (wscale_sw_s, _) = weight_scales_swizzled.storage_and_layout();
+                    let wscale_sw_ptr = cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+                    let (output_s, _) = output.storage_and_layout();
+                    let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+                    let (alpha_s, _) = alpha_tensor.storage_and_layout();
+                    let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
+
+                    unsafe {
+                        match dtype {
+                            DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                                input_ptr,
+                                act_packed_ptr,
+                                act_scales_ptr,
+                                act_scales_sw_ptr,
+                                input_scale_inv,
+                                m as i32,
+                                k as i32,
+                                m_padded as i32,
+                                k_scale_padded as i32,
+                                stream,
+                            ),
+                            DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                                input_ptr,
+                                act_packed_ptr,
+                                act_scales_ptr,
+                                act_scales_sw_ptr,
+                                input_scale_inv,
+                                m as i32,
+                                k as i32,
+                                m_padded as i32,
+                                k_scale_padded as i32,
+                                stream,
+                            ),
+                            _ => candle_core::bail!("nvfp4_matmul: unsupported dtype {:?}", dtype),
+                        }
+
+                        ffi::nvfp4_swizzle_weight_scales(
+                            scale_ptr,
+                            wscale_sw_ptr,
+                            n as i32,
+                            k_scale_cols as i32,
+                            n_padded as i32,
+                            k_scale_padded as i32,
+                            stream,
+                        );
+
+                        match dtype {
+                            DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
+                                act_packed_ptr as *const std::ffi::c_void,
+                                weight_ptr,
+                                act_scales_sw_ptr as *const std::ffi::c_void,
+                                wscale_sw_ptr as *const std::ffi::c_void,
+                                alpha_ptr,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                stream,
+                            ),
+                            DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
+                                act_packed_ptr as *const std::ffi::c_void,
+                                weight_ptr,
+                                act_scales_sw_ptr as *const std::ffi::c_void,
+                                wscale_sw_ptr as *const std::ffi::c_void,
+                                alpha_ptr,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                stream,
+                            ),
+                            _ => candle_core::bail!("nvfp4_matmul: unsupported dtype {:?}", dtype),
+                        }
+                    }
+                }
+
+                if let Some(b) = bias {
+                    return Ok(output.broadcast_add(b)?);
+                }
+            } else {
+                // Software dequant path (existing kernels)
                 let (input_s, _) = input.storage_and_layout();
                 let (weight_s, _) = weight.storage_and_layout();
                 let (scale_s, _) = scale.storage_and_layout();
@@ -198,8 +364,16 @@ pub fn nvfp4_matmul(
 /// * `weights` - [num_experts, N, K/2] packed U8
 /// * `weight_scales` - [num_experts, N, K/16] U8 FP8 E4M3 block scales
 /// * `weight_global_scales` - [num_experts] F32 per-expert global scales
+/// * `input_scales` - Optional [num_experts] F32 per-expert activation global scales.
+///   Used by the hardware FP4 path to compute per-expert GEMM alpha.
+///   Ignored by the software path.
 /// * `biases` - Optional [num_experts, N]
 /// * `indices` - [num_tokens, topk] U32 expert indices
+///
+/// On Blackwell (SM100+) with cutlass feature: sorts tokens by expert, quantizes
+/// activations to FP4 on-the-fly, and uses CUTLASS grouped GEMM with per-expert
+/// alpha = input_scale[e] * weight_global_scale[e].
+/// On older GPUs: uses software dequant path (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [num_tokens, topk, N]
 #[allow(unused)]
@@ -208,6 +382,7 @@ pub fn nvfp4_moe_gemm(
     weights: &Tensor,
     weight_scales: &Tensor,
     weight_global_scales: &Tensor,
+    input_scales: Option<&Tensor>,
     biases: Option<&Tensor>,
     indices: &Tensor,
 ) -> Result<Tensor> {
@@ -305,6 +480,30 @@ pub fn nvfp4_moe_gemm(
 
             let has_bias = biases.is_some();
 
+            #[allow(unused)]
+            let use_hardware_fp4 = is_hardware_fp4_available(dev);
+
+            #[cfg(feature = "cutlass")]
+            if use_hardware_fp4 && num_tokens > 0 {
+                return nvfp4_moe_gemm_hardware(
+                    &input,
+                    &weights,
+                    &weight_scales,
+                    &weight_global_scales,
+                    input_scales,
+                    &indices,
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    k,
+                    n,
+                    input_has_topk_dim,
+                    dtype,
+                    dev,
+                    cuda_dev,
+                );
+            }
+
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
@@ -396,4 +595,328 @@ pub fn nvfp4_moe_gemm(
         }
         _ => candle_core::bail!("nvfp4_moe_gemm: unsupported backend (need CUDA)"),
     }
+}
+
+/// Hardware CUTLASS MoE GEMM path for Blackwell (SM100+).
+///
+/// Sorts tokens by expert, quantizes activations to FP4 on-the-fly,
+/// swizzles scales, and runs CUTLASS grouped GEMM with per-expert alpha.
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_moe_gemm_hardware(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    weight_global_scales: &Tensor,
+    input_scales: Option<&Tensor>,
+    indices: &Tensor,
+    num_tokens: usize,
+    topk: usize,
+    num_experts: usize,
+    k: usize,
+    n: usize,
+    _input_has_topk_dim: bool,
+    dtype: DType,
+    dev: &candle_core::Device,
+    cuda_dev: &candle_core::cuda_backend::CudaDevice,
+) -> Result<Tensor> {
+    use candle_core::Storage;
+
+    fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                DType::I64 => Ok(*c.as_cuda_slice::<i64>()?.device_ptr()),
+                DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    let stream = *cuda_dev.cu_stream() as i64;
+    let total_expanded = num_tokens * topk;
+
+    // Step 1: Read indices to CPU and sort tokens by expert
+    let indices_cpu = indices.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+
+    // Build expanded token list: (expert_id, original_expanded_row, source_token)
+    let mut expanded: Vec<(u32, usize, usize)> = Vec::with_capacity(total_expanded);
+    for t in 0..num_tokens {
+        for tk in 0..topk {
+            let expert_id = indices_cpu[t][tk];
+            let expanded_row = t * topk + tk;
+            expanded.push((expert_id, expanded_row, t));
+        }
+    }
+
+    // Sort by expert_id for contiguous expert groups
+    expanded.sort_by_key(|&(eid, _, _)| eid);
+
+    // Build sorted_token_ids (which source token each sorted row comes from)
+    // and scatter_ids (where each sorted row goes back to in the output)
+    // Using u32 since all values are non-negative; cast to i32* at FFI boundary.
+    let sorted_token_ids: Vec<u32> = expanded.iter().map(|&(_, _, src)| src as u32).collect();
+    let scatter_ids: Vec<u32> = expanded.iter().map(|&(_, orig, _)| orig as u32).collect();
+
+    // Build per-expert offsets and problem sizes
+    let mut expert_offsets = vec![0u32; num_experts];
+    let mut expert_counts = vec![0u32; num_experts];
+    for &(eid, _, _) in &expanded {
+        expert_counts[eid as usize] += 1;
+    }
+    let mut offset = 0u32;
+    for e in 0..num_experts {
+        expert_offsets[e] = offset;
+        offset += expert_counts[e];
+    }
+
+    // problem_sizes: [E * 3] = (M_i, N, K) per expert
+    let mut problem_sizes = vec![0u32; num_experts * 3];
+    for e in 0..num_experts {
+        problem_sizes[e * 3] = expert_counts[e];
+        problem_sizes[e * 3 + 1] = n as u32;
+        problem_sizes[e * 3 + 2] = k as u32;
+    }
+
+    // sf_offsets: same as expert_offsets for activation scales (1 scale row per token row)
+    let sf_offsets = expert_offsets.clone();
+
+    // Step 2: Compute per-expert alphas = input_scale[e] * weight_global_scale[e]
+    let wgs_cpu = weight_global_scales.to_vec1::<f32>()?;
+    let iscales_cpu: Vec<f32> = if let Some(is) = input_scales {
+        is.to_vec1::<f32>()?
+    } else {
+        vec![1.0f32; num_experts]
+    };
+    let alphas: Vec<f32> = (0..num_experts)
+        .map(|e| iscales_cpu[e] * wgs_cpu[e])
+        .collect();
+
+    // Step 3: Upload CPU arrays to GPU (u32 tensors, cast to i32* at FFI boundary)
+    let sorted_token_ids_t = Tensor::from_vec(sorted_token_ids, (total_expanded,), dev)?;
+    let scatter_ids_t = Tensor::from_vec(scatter_ids, (total_expanded,), dev)?;
+    let expert_offsets_t = Tensor::from_vec(expert_offsets, (num_experts,), dev)?;
+    let sf_offsets_t = Tensor::from_vec(sf_offsets, (num_experts,), dev)?;
+    let problem_sizes_t = Tensor::from_vec(problem_sizes, (num_experts * 3,), dev)?;
+    let alphas_t = Tensor::from_vec(alphas, (num_experts,), dev)?;
+
+    // Step 4: Gather input tokens sorted by expert
+    let gathered = Tensor::zeros((total_expanded, k), dtype, dev)?;
+    {
+        let (input_s, _) = input.storage_and_layout();
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (stids_s, _) = sorted_token_ids_t.storage_and_layout();
+
+        let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+        let gathered_ptr = cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void;
+        let stids_ptr = cuda_ptr(&stids_s, DType::U32)? as *const i32;
+
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_moe_gather_f16(
+                    input_ptr,
+                    gathered_ptr,
+                    stids_ptr,
+                    total_expanded as i32,
+                    k as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_moe_gather_bf16(
+                    input_ptr,
+                    gathered_ptr,
+                    stids_ptr,
+                    total_expanded as i32,
+                    k as i32,
+                    stream,
+                ),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            }
+        }
+    }
+
+    // Step 5: Quantize gathered activations to FP4
+    // Use input_scale_inv = 1.0 since per-expert scaling is in the alpha
+    let k_scale = k / NVFP4_BLOCK_SIZE;
+    let m_padded = pad_to(total_expanded, 128);
+    let k_scale_padded = pad_to(k_scale, 4);
+
+    let act_packed = Tensor::zeros((total_expanded, k / 2), DType::U8, dev)?;
+    let act_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+    let act_scales_swizzled = Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+
+    {
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (act_scales_s, _) = act_scales.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+
+        let gathered_ptr = cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void;
+        let act_packed_ptr = cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
+        let act_scales_ptr = cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
+        let act_scales_sw_ptr = cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                    gathered_ptr,
+                    act_packed_ptr,
+                    act_scales_ptr,
+                    act_scales_sw_ptr,
+                    1.0f32, // input_scale_inv = 1.0, per-expert scaling via alpha
+                    total_expanded as i32,
+                    k as i32,
+                    m_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                    gathered_ptr,
+                    act_packed_ptr,
+                    act_scales_ptr,
+                    act_scales_sw_ptr,
+                    1.0f32,
+                    total_expanded as i32,
+                    k as i32,
+                    m_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            }
+        }
+    }
+
+    // Step 6: Swizzle weight scales for CUTLASS
+    // Weight scales: [E, N, K/16] -> swizzle each expert's [N, K/16] block
+    let n_padded = pad_to(n, 128);
+    let weight_scales_swizzled =
+        Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
+    {
+        let (ws_s, _) = weight_scales.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let ws_base = cuda_ptr(&ws_s, DType::U8)?;
+        let wss_base = cuda_ptr(&wss_s, DType::U8)?;
+
+        for e in 0..num_experts {
+            let src_offset = (e * n * k_scale) as u64;
+            let dst_offset = (e * n_padded * k_scale_padded) as u64;
+            unsafe {
+                ffi::nvfp4_swizzle_weight_scales(
+                    (ws_base + src_offset) as *const std::ffi::c_void,
+                    (wss_base + dst_offset) as *mut std::ffi::c_void,
+                    n as i32,
+                    k_scale as i32,
+                    n_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                );
+            }
+        }
+    }
+
+    // Step 7: Run CUTLASS grouped GEMM
+    let cutlass_output = Tensor::zeros((total_expanded, n), dtype, dev)?;
+    {
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (weights_s, _) = weights.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let (alphas_s, _) = alphas_t.storage_and_layout();
+        let (eo_s, _) = expert_offsets_t.storage_and_layout();
+        let (sfo_s, _) = sf_offsets_t.storage_and_layout();
+        let (ps_s, _) = problem_sizes_t.storage_and_layout();
+        let (out_s, _) = cutlass_output.storage_and_layout();
+
+        let act_packed_ptr = cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void;
+        let weights_ptr = cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void;
+        let act_scales_sw_ptr = cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void;
+        let wss_ptr = cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void;
+        let alphas_ptr = cuda_ptr(&alphas_s, DType::F32)? as *const f32;
+        let eo_ptr = cuda_ptr(&eo_s, DType::U32)? as *const i32;
+        let sfo_ptr = cuda_ptr(&sfo_s, DType::U32)? as *const i32;
+        let ps_ptr = cuda_ptr(&ps_s, DType::U32)? as *const i32;
+        let out_ptr = cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void;
+
+        unsafe {
+            let ret = match dtype {
+                DType::F16 => ffi::nvfp4_cutlass_moe_gemm_f16(
+                    out_ptr,
+                    act_packed_ptr,
+                    weights_ptr,
+                    act_scales_sw_ptr,
+                    wss_ptr,
+                    alphas_ptr,
+                    eo_ptr,
+                    sfo_ptr,
+                    ps_ptr,
+                    num_experts as i32,
+                    total_expanded as i32,
+                    n as i32,
+                    k as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_cutlass_moe_gemm_bf16(
+                    out_ptr,
+                    act_packed_ptr,
+                    weights_ptr,
+                    act_scales_sw_ptr,
+                    wss_ptr,
+                    alphas_ptr,
+                    eo_ptr,
+                    sfo_ptr,
+                    ps_ptr,
+                    num_experts as i32,
+                    total_expanded as i32,
+                    n as i32,
+                    k as i32,
+                    stream,
+                ),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            };
+            if ret != 0 {
+                candle_core::bail!("nvfp4_cutlass_moe_gemm failed with error code {}", ret);
+            }
+        }
+    }
+
+    // Step 8: Scatter results back to [num_tokens * topk, N] order
+    let output = Tensor::zeros((total_expanded, n), dtype, dev)?;
+    {
+        let (cutlass_out_s, _) = cutlass_output.storage_and_layout();
+        let (output_s, _) = output.storage_and_layout();
+        let (scatter_s, _) = scatter_ids_t.storage_and_layout();
+
+        let cutlass_out_ptr = cuda_ptr(&cutlass_out_s, dtype)? as *const std::ffi::c_void;
+        let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+        let scatter_ptr = cuda_ptr(&scatter_s, DType::U32)? as *const i32;
+
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_moe_scatter_f16(
+                    cutlass_out_ptr,
+                    output_ptr,
+                    scatter_ptr,
+                    total_expanded as i32,
+                    n as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_moe_scatter_bf16(
+                    cutlass_out_ptr,
+                    output_ptr,
+                    scatter_ptr,
+                    total_expanded as i32,
+                    n as i32,
+                    stream,
+                ),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            }
+        }
+    }
+
+    // Reshape to [num_tokens, topk, N]
+    output.reshape((num_tokens, topk, n))
 }

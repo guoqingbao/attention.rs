@@ -171,6 +171,87 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn paged_attention_flash_v1(
+        out: *const c_void,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        num_kv_heads: c_int,
+        scale: f32,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        block_size: c_int,
+        max_context_len: c_int,
+        num_seqs: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        q_stride: c_int,
+        kv_block_stride: c_int,
+        kv_page_stride: c_int,
+        kv_head_stride: c_int,
+        dtype: u32,
+        softcapping: f32,
+        sliding_window: c_int,
+        stream: i64,
+    );
+
+    pub fn paged_attention_flash_v2(
+        out: *const c_void,
+        exp_sums: *const f32,
+        max_logits: *const f32,
+        tmp_out: *const c_void,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        num_kv_heads: c_int,
+        scale: f32,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        block_size: c_int,
+        max_context_len: c_int,
+        num_seqs: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        q_stride: c_int,
+        kv_block_stride: c_int,
+        kv_page_stride: c_int,
+        kv_head_stride: c_int,
+        dtype: u32,
+        softcapping: f32,
+        sliding_window: c_int,
+        stream: i64,
+    );
+
+    pub fn paged_attention_flash_prefill(
+        out: *const c_void,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        num_kv_heads: c_int,
+        scale: f32,
+        block_tables: *const u32,
+        context_lens: *const u32,
+        block_size: c_int,
+        max_context_len: c_int,
+        num_seqs: c_int,
+        num_query_heads: c_int,
+        num_query_tokens: c_int,
+        head_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        q_stride: c_int,
+        softcapping: f32,
+        o_stride_tokens: c_int,
+        query_start_len: *const u32,
+        sliding_window: c_int,
+        kv_block_stride: c_int,
+        kv_page_stride: c_int,
+        kv_head_stride: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
     pub fn update_kv_scales_per_head_f32(
         k: *const c_void,
         v: *const c_void,
@@ -1379,6 +1460,140 @@ extern "C" {
         stream: i64,
     ) -> i32;
 
+    // NVFP4 activation quantization (SM100+ / Blackwell)
+    pub fn nvfp4_quantize_activation_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        swizzled_scales: *mut c_void,
+        input_scale_inv: f32,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_quantize_activation_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        swizzled_scales: *mut c_void,
+        input_scale_inv: f32,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_swizzle_weight_scales(
+        linear_scales: *const c_void,
+        swizzled_scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        rows_padded: i32,
+        cols_padded: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_gather_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        sorted_token_ids: *const i32,
+        total_expanded: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_gather_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        sorted_token_ids: *const i32,
+        total_expanded: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_scatter_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        scatter_ids: *const i32,
+        total_expanded: i32,
+        N: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_scatter_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        scatter_ids: *const i32,
+        total_expanded: i32,
+        N: i32,
+        stream: i64,
+    );
+
+    // CUTLASS hardware FP4 GEMM (SM100+ / Blackwell)
+    pub fn nvfp4_cutlass_gemm_f16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        global_sf: *const f32,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_cutlass_gemm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        global_sf: *const f32,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_cutlass_moe_gemm_f16(
+        output: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_blockscale: *const c_void,
+        b_blockscales: *const c_void,
+        alphas: *const f32,
+        expert_offsets: *const i32,
+        sf_offsets: *const i32,
+        problem_sizes: *const i32,
+        num_experts: i32,
+        total_tokens: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    ) -> i32;
+
+    pub fn nvfp4_cutlass_moe_gemm_bf16(
+        output: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_blockscale: *const c_void,
+        b_blockscales: *const c_void,
+        alphas: *const f32,
+        expert_offsets: *const i32,
+        sf_offsets: *const i32,
+        problem_sizes: *const i32,
+        num_experts: i32,
+        total_tokens: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    ) -> i32;
+
     pub fn causal_conv1d_fwd_f32(
         x: *const f32,
         weight: *const f32,
@@ -1989,6 +2204,69 @@ extern "C" {
         k: c_int,
         has_bias: bool,
         input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // MXFP4 CUTLASS hardware FP4 GEMM (SM100+ / Blackwell)
+    // =========================================================================
+
+    pub fn mxfp4_cutlass_gemm_f16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn mxfp4_cutlass_gemm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    // MXFP4 activation quantization (SM100+ / Blackwell)
+    pub fn mxfp4_quantize_activation_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        swizzled_scales: *mut c_void,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn mxfp4_quantize_activation_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        swizzled_scales: *mut c_void,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn mxfp4_swizzle_weight_scales_e8m0(
+        linear_scales: *const c_void,
+        swizzled_scales: *mut c_void,
+        rows: i32,
+        cols: i32,
+        rows_padded: i32,
+        cols_padded: i32,
         stream: i64,
     );
 

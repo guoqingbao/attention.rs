@@ -40,6 +40,11 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_gemm_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
+    println!("cargo:rerun-if-changed=src/mxfp4_gemm_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/mxfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");
     println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
