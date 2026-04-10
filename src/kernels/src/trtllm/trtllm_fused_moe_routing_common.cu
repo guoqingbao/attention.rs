@@ -19,7 +19,7 @@
 // methods use the same workflow: single-block, single-cluster, coop, or
 // multi-kernel histogram+offsets.
 
-#if defined(USE_FLASHINFER) && __has_include("flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"

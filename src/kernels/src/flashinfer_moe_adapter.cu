@@ -1,7 +1,7 @@
 #include <cstdint>
+#include <cstdio>
 
-#if defined(USE_FLASHINFER) && __has_include("flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h") && \
-    __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -401,16 +400,16 @@ int run_fused_moe_fp8(const void* input, const int32_t* topk_ids, const float* t
   workspace.hidden_states_scale_linear = nullptr;
   workspace.gemm1_output = cache.gemm1_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm1) * 2 * intermediate_size, stream);
-  workspace.gemm1_output_scale = cache.gemm1_output_scale.ensure(
+  workspace.gemm1_output_scale = static_cast<float*>(cache.gemm1_output_scale.ensure(
       static_cast<size_t>(2 * intermediate_size / 128) * max_num_padded_tokens_gemm1 *
           sizeof(float),
-      stream);
+      stream));
   workspace.activation_output = cache.activation_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm1) * intermediate_size, stream);
-  workspace.activation_output_scale = cache.activation_output_scale.ensure(
+  workspace.activation_output_scale = static_cast<float*>(cache.activation_output_scale.ensure(
       static_cast<size_t>(intermediate_size / 128) * max_num_padded_tokens_gemm1 *
           sizeof(float),
-      stream);
+      stream));
   workspace.gemm2_output = cache.gemm2_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm2) * hidden_size * sizeof(__nv_bfloat16),
       stream);
@@ -562,58 +561,28 @@ extern "C" int flashinfer_fused_moe_mxfp4(
 #else
 
 extern "C" int flashinfer_fused_moe_bf16(
-    const void*,
-    const int32_t*,
-    const float*,
-    const void*,
-    const void*,
-    void*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t) {
+    const void*, const int32_t*, const float*, const void*, const void*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_bf16: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ Blackwell cubins)\n");
   return -1;
 }
 
 extern "C" int flashinfer_fused_moe_fp8(
-    const void*,
-    const int32_t*,
-    const float*,
-    const uint8_t*,
-    const float*,
-    const uint8_t*,
-    const float*,
-    void*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t) {
+    const void*, const int32_t*, const float*, const uint8_t*, const float*,
+    const uint8_t*, const float*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_fp8: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ Blackwell cubins)\n");
   return -1;
 }
 
 extern "C" int flashinfer_fused_moe_mxfp4(
-    const void*,
-    const int32_t*,
-    const float*,
-    const uint8_t*,
-    const uint8_t*,
-    const uint8_t*,
-    const uint8_t*,
-    void*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t) {
+    const void*, const int32_t*, const float*, const uint8_t*, const uint8_t*,
+    const uint8_t*, const uint8_t*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_mxfp4: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ headers and cubins)\n");
   return -1;
 }
 

@@ -17,7 +17,7 @@
 // routingLlama4: updated for FlashInfer v0.6.7 API
 // Uses runtime mIsPow2/mUsePdl, mClusterSizeInBatchDim, mDtypeOutput/mDtypeInput
 
-#if defined(USE_FLASHINFER) && __has_include("flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"

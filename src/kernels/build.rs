@@ -36,6 +36,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_renormalize.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_custom_block.cu");
+    println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_custom_cluster.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_deepseek.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_llama4.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_common.cu");
@@ -175,8 +177,16 @@ fn main() -> Result<()> {
             );
         }
 
-        // TRT-LLM backend: download BMM/GEMM/FMHA artifacts from NVIDIA artifactory
-        if trtllm_enabled && compute_cap >= 90 {
+        // TRT-LLM backend: download BMM/GEMM/FMHA artifacts from NVIDIA artifactory.
+        // Cubins are Blackwell-only (SM100+); fail the build on older architectures.
+        if trtllm_enabled && compute_cap < 100 {
+            panic!(
+                "trtllm feature requires SM100+ (Blackwell). Detected compute_cap={compute_cap}. \
+                 TRT-LLM fused MoE cubins are Blackwell-only. \
+                 Remove the trtllm feature to build for this GPU."
+            );
+        }
+        if trtllm_enabled && compute_cap >= 100 {
             let trtllm_cache = build_dir.join("trtllm_artifacts");
             std::fs::create_dir_all(&trtllm_cache)?;
 
@@ -214,10 +224,11 @@ fn main() -> Result<()> {
                         trtllm_artifacts::download_fmha_metainfo(&trtllm_cache, &fmha_include_dir)
                             .unwrap_or_default();
 
-                    // Add compile flags for TRT-LLM export interface
                     builder = builder
+                        .arg("-DUSE_TRTLLM")
                         .arg("-DTLLM_GEN_EXPORT_INTERFACE")
                         .arg("-DTLLM_GEN_EXPORT_FLASHINFER")
+                        .arg("-DTLLM_ENABLE_CUDA")
                         .arg(&format!(
                             "-DTLLM_GEN_GEMM_CUBIN_PATH=\\\"{}\\\"",
                             trtllm_artifacts::TRTLLM_GEN_BMM_PATH
