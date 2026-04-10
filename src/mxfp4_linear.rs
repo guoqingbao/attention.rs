@@ -50,6 +50,9 @@ pub fn flashinfer_mxfp4_fused_moe(
 ) -> Result<Tensor> {
     use candle_core::Storage;
 
+    #[cfg(feature = "trtllm")]
+    crate::trtllm_cubin_loader::init_cubin_loader();
+
     let dev = input.device();
     let dtype = input.dtype();
 

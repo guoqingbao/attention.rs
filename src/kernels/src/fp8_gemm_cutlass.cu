@@ -548,7 +548,7 @@ void launch_sm100_fp8_blockwise_scaled_mm(
 
   cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
   if (status != cutlass::Status::kSuccess) {
-    printf("sm100 fp8 gemm failed: %s\n", cutlassGetStatusString(status));
+    printf("sm100 fp8 gemm failed: %s\n", cutlass::cutlassGetStatusString(status));
   }
 }
 
@@ -697,7 +697,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
 
   cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
   if (status != cutlass::Status::kSuccess) {
-    printf("sm120 fp8 gemm failed: %s\n", cutlassGetStatusString(status));
+    printf("sm120 fp8 gemm failed: %s\n", cutlass::cutlassGetStatusString(status));
   }
 }
 

@@ -10,8 +10,8 @@
  *   - Kernel schedule: Mxf8f6f4Sm100 (not Nvf4Sm100)
  *   - No global scale factor (alpha = 1.0, not a device pointer)
  *
- * Based on FlashInfer MXFP4/MXFP8 CUTLASS templates.
- * Requires CUTLASS 3.x with SM100 block-scaled tensor op support.
+ * Based on FlashInfer MXFP8 CUTLASS templates (SM100 path).
+ * Requires CUTLASS 4.4.2+ with SM100 block-scaled tensor op support.
  */
 
 #ifdef ENABLE_FP4
@@ -44,6 +44,7 @@ using namespace cute;
 
 // ============================================================================
 // SM100 MXFP4 Dense GEMM Kernel Configurations
+// Following FlashInfer mxfp8_gemm_template_sm100.h patterns for CUTLASS 4.4.2
 // ============================================================================
 
 struct _1SM {};
@@ -68,107 +69,60 @@ struct MxSMTypeAdapter<_2SM> {
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
 };
 
-template <typename OutType, typename XSM>
-struct Mxfp4GemmSm100Config {
-  using ElementA = cutlass::float_e2m1_t;
-  using LayoutATag = cutlass::layout::RowMajor;
-  static constexpr int AlignmentA = 32;
-
-  using ElementB = cutlass::float_e2m1_t;
-  using LayoutBTag = cutlass::layout::ColumnMajor;
-  static constexpr int AlignmentB = 32;
-
-  using ElementD = OutType;
-  using ElementC = void;
-  using LayoutCTag = cutlass::layout::RowMajor;
-  using LayoutDTag = cutlass::layout::RowMajor;
-  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-  static constexpr int AlignmentC = AlignmentD;
-
-  using ElementAccumulator = float;
-  using ElementCompute = float;
-  using ArchTag = cutlass::arch::Sm100;
-  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
-  using SFType = cutlass::float_ue8m0_t;
-};
-
-// Small M (M <= 128): 1SM, 128x256x256 tile, 1x4 cluster
-template <typename OutType>
-struct MxKernelConfigSmallM : Mxfp4GemmSm100Config<OutType, _1SM> {
-  using MmaTileShape = Shape<_128, _256, _256>;
-  using ClusterShapeType = Shape<int, int, _1>;
-  using EpilogueTile = Shape<_128, _64>;
-  using EpilogueSchedule = typename MxSMTypeAdapter<_1SM>::EpilogueSchedule;
-  using MainloopSchedule = typename MxSMTypeAdapter<_1SM>::MainloopSchedule;
-  static constexpr int MmaScale = MxSMTypeAdapter<_1SM>::Scale;
-  static dim3 preferred_cluster() { return dim3(1, 4, 1); }
-  static dim3 fallback_cluster() { return dim3(1, 2, 1); }
-};
-
-// Medium M (128 < M <= 1024): 2SM, 256x256x256 tile, 2x4 cluster
-template <typename OutType>
-struct MxKernelConfigMediumM : Mxfp4GemmSm100Config<OutType, _2SM> {
-  using MmaTileShape = Shape<_256, _256, _256>;
-  using ClusterShapeType = Shape<int, int, _1>;
-  using EpilogueTile = Shape<_128, _64>;
-  using EpilogueSchedule = typename MxSMTypeAdapter<_2SM>::EpilogueSchedule;
-  using MainloopSchedule = typename MxSMTypeAdapter<_2SM>::MainloopSchedule;
-  static constexpr int MmaScale = MxSMTypeAdapter<_2SM>::Scale;
-  static dim3 preferred_cluster() { return dim3(2, 4, 1); }
-  static dim3 fallback_cluster() { return dim3(2, 1, 1); }
-};
-
-// Large M (M > 1024): 2SM, 256x256x256 tile, 1x4 cluster
-template <typename OutType>
-struct MxKernelConfigLargeM : Mxfp4GemmSm100Config<OutType, _2SM> {
-  using MmaTileShape = Shape<_256, _256, _256>;
-  using ClusterShapeType = Shape<int, int, _1>;
-  using EpilogueTile = Shape<_128, _64>;
-  using EpilogueSchedule = typename MxSMTypeAdapter<_2SM>::EpilogueSchedule;
-  using MainloopSchedule = typename MxSMTypeAdapter<_2SM>::MainloopSchedule;
-  static constexpr int MmaScale = MxSMTypeAdapter<_2SM>::Scale;
-  static dim3 preferred_cluster() { return dim3(1, 4, 1); }
-  static dim3 fallback_cluster() { return dim3(1, 2, 1); }
-};
-
 // ============================================================================
 // CUTLASS GEMM Instantiation Template
 // ============================================================================
 
-template <typename Config>
+template <typename OutType, int CTA_M, int CTA_N, int CTA_K, typename XSM>
 struct CutlassMxfp4Gemm {
-  using ElementA = typename Config::ElementA;
-  using LayoutA = typename Config::LayoutATag;
-  using ElementB = typename Config::ElementB;
-  using LayoutB = typename Config::LayoutBTag;
-  using ElementD = typename Config::ElementD;
-  using LayoutD = typename Config::LayoutDTag;
-  using ElementC = typename Config::ElementC;
-  using LayoutC = typename Config::LayoutCTag;
-  using ElementAccumulator = typename Config::ElementAccumulator;
-  using ElementCompute = typename Config::ElementCompute;
-  using SFType = typename Config::SFType;
-  using ArchTag = typename Config::ArchTag;
-  using OperatorClass = typename Config::OperatorClass;
+  using OutElementType = OutType;
+  using CTAShape = cute::Shape<cute::Int<CTA_M>, cute::Int<CTA_N>, cute::Int<CTA_K>>;
+  using ClusterShape = cute::Shape<int, int, _1>;
+  using ElementType = cutlass::float_e2m1_t;
+  using Arch = cutlass::arch::Sm100;
 
-  using MmaTileShape = typename Config::MmaTileShape;
-  using ClusterShape = typename Config::ClusterShapeType;
-  using EpilogueTile = typename Config::EpilogueTile;
-  using EpilogueSchedule = typename Config::EpilogueSchedule;
-  using MainloopSchedule = typename Config::MainloopSchedule;
+  using ElementA = ElementType;
+  using LayoutA = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 32;
+
+  using ElementB = ElementType;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  static constexpr int AlignmentB = 32;
+
+  using ElementC = void;
+  using LayoutC = cutlass::layout::RowMajor;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
+
+  using SFType = cutlass::float_ue8m0_t;
+  using ElementCompute = float;
+  using ElementAccumulator = float;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+  using EpilogueTileType = std::conditional_t<
+      CTA_M == 128 && CTA_N == 256 && CTA_K == 256,
+      cute::Shape<cute::_128, cute::_64>,
+      cutlass::epilogue::collective::EpilogueTileAuto>;
+
+  using EpilogueSchedule = typename MxSMTypeAdapter<XSM>::EpilogueSchedule;
+  using MainloopSchedule = typename MxSMTypeAdapter<XSM>::MainloopSchedule;
+
+  using MmaTileShape = cute::Shape<
+      cute::Int<CTA_M * MxSMTypeAdapter<XSM>::Scale>,
+      cute::Int<CTA_N>, cute::Int<CTA_K>>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTile,
+      Arch, OperatorClass, MmaTileShape, ClusterShape, EpilogueTileType,
       ElementAccumulator, ElementCompute,
-      ElementC, LayoutC, Config::AlignmentC,
-      ElementD, LayoutD, Config::AlignmentD,
-      EpilogueSchedule
+      ElementC, LayoutC, AlignmentC,
+      OutElementType, LayoutC, AlignmentC,
+      EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>
   >::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      cute::tuple<ElementA, SFType>, LayoutA, Config::AlignmentA,
-      cute::tuple<ElementB, SFType>, LayoutB, Config::AlignmentB,
+      Arch, cutlass::arch::OpClassBlockScaledTensorOp,
+      cute::tuple<ElementA, SFType>, LayoutA, AlignmentA,
+      cute::tuple<ElementB, SFType>, LayoutB, AlignmentB,
       ElementAccumulator, MmaTileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<
           static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
@@ -176,7 +130,7 @@ struct CutlassMxfp4Gemm {
   >::CollectiveOp;
 
   template <typename Base>
-  struct Sm10xOnly : Base {
+  struct Sm10x11xOnly : Base {
     using typename Base::Params;
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf) {
@@ -191,103 +145,179 @@ struct CutlassMxfp4Gemm {
     }
   };
 
-  using GemmKernel = Sm10xOnly<
+  using GemmKernel = Sm10x11xOnly<
       cutlass::gemm::kernel::GemmUniversal<
-          Shape<int, int, int, int>,
+          cute::Shape<int, int, int, int>,
           CollectiveMainloop, CollectiveEpilogue,
           cutlass::gemm::PersistentScheduler>>;
 
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
 
 // ============================================================================
-// Kernel Launch
+// SM120 (Blackwell) MXFP4 Dense GEMM
+// Uses KernelScheduleAuto, EpilogueScheduleAuto, 1x1x1 cluster, StageCount<2>
 // ============================================================================
 
-template <typename Config>
+template <typename OutType, int CTA_M, int CTA_N, int CTA_K>
+struct CutlassMxfp4GemmSm120 {
+  using OutElementType = OutType;
+  using CTAShape = cute::Shape<cute::Int<CTA_M>, cute::Int<CTA_N>, cute::Int<CTA_K>>;
+  using ClusterShape = cute::Shape<_1, _1, _1>;
+  using ElementType = cutlass::float_e2m1_t;
+  using Arch = cutlass::arch::Sm120;
+
+  using ElementA = ElementType;
+  using LayoutA = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 32;
+
+  using ElementB = ElementType;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  static constexpr int AlignmentB = 32;
+
+  using ElementC = void;
+  using LayoutC = cutlass::layout::RowMajor;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
+
+  using SFType = cutlass::float_ue8m0_t;
+  using ElementCompute = float;
+  using ElementAccumulator = float;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+
+  using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using MainloopSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+
+  using MmaTileShape = cute::Shape<cute::Int<CTA_M>, cute::Int<CTA_N>, cute::Int<CTA_K>>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      Arch, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTileType,
+      ElementAccumulator, ElementCompute,
+      ElementC, LayoutC, AlignmentC,
+      OutElementType, LayoutC, AlignmentC,
+      EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>
+  >::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      Arch, OperatorClass,
+      cute::tuple<ElementA, SFType>, LayoutA, AlignmentA,
+      cute::tuple<ElementB, SFType>, LayoutB, AlignmentB,
+      ElementAccumulator, MmaTileShape, ClusterShape,
+      cutlass::gemm::collective::StageCount<2>,
+      MainloopSchedule
+  >::CollectiveOp;
+
+  template <typename Base>
+  struct Sm12xOnly : Base {
+    using typename Base::Params;
+    CUTLASS_DEVICE
+    void operator()(Params const& params, char* smem_buf) {
+      if constexpr (flashinfer::arch::is_major_v<12>) {
+        this->Base::operator()(params, smem_buf);
+      } else {
+        if (cute::thread0()) {
+          printf("MXFP4 CUTLASS GEMM SM120: requires SM12x\n");
+          __trap();
+        }
+      }
+    }
+  };
+
+  using GemmKernel = Sm12xOnly<
+      cutlass::gemm::kernel::GemmUniversal<
+          cute::Shape<int, int, int, int>,
+          CollectiveMainloop, CollectiveEpilogue,
+          cutlass::gemm::PersistentScheduler>>;
+
+  using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+};
+
+// ============================================================================
+// Kernel Launch (field-based argument construction for CUTLASS 4.4.2)
+// ============================================================================
+
+template <typename GemmOp>
 static void run_mxfp4_gemm(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
     int m, int n, int k,
+    dim3 preferred_cluster, dim3 fallback_cluster,
     cudaStream_t stream)
 {
-  using GemmOp = CutlassMxfp4Gemm<Config>;
   using Gemm = typename GemmOp::Gemm;
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
   using ElementD = typename Gemm::ElementD;
   using ElementSFA = cutlass::float_ue8m0_t;
   using ElementSFB = cutlass::float_ue8m0_t;
-  using ElementCompute = float;
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
   using Sm1xxBlkScaledConfig = typename GemmOp::Sm1xxBlkScaledConfig;
 
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+  typename Gemm::Arguments operator_args;
+  operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
 
-  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
-  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  auto& fusion_args = operator_args.epilogue.thread;
+  fusion_args.alpha_ptr = nullptr;
 
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, 1},
-      {
-          static_cast<ElementA const*>(A),
-          stride_A,
-          static_cast<ElementB const*>(B),
-          stride_B,
-          static_cast<ElementSFA const*>(input_sf),
-          layout_SFA,
-          static_cast<ElementSFB const*>(weight_sf),
-          layout_SFB
-      },
-      {
-          {},
-          nullptr,
-          stride_D,
-          static_cast<ElementD*>(D),
-          stride_D
-      }
-  };
+  operator_args.problem_shape = cute::make_shape(m, n, k, 1);
 
-  // MXFP4 has no global scale factor (unlike NVFP4)
-  // The epilogue uses default alpha=1.0, beta=0.0
+  operator_args.mainloop.ptr_A = static_cast<ElementA const*>(A);
+  operator_args.mainloop.ptr_B = static_cast<ElementB const*>(B);
+  operator_args.mainloop.ptr_SFA = static_cast<ElementSFA const*>(input_sf);
+  operator_args.mainloop.ptr_SFB = static_cast<ElementSFB const*>(weight_sf);
+  operator_args.epilogue.ptr_C = nullptr;
+  operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
-  arguments.hw_info.cluster_shape = Config::preferred_cluster();
-  arguments.hw_info.cluster_shape_fallback = Config::fallback_cluster();
+  operator_args.mainloop.dA =
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
+  operator_args.mainloop.dB =
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
+  operator_args.epilogue.dC =
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
+  operator_args.epilogue.dD = operator_args.epilogue.dC;
+
+  operator_args.mainloop.layout_SFA =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(operator_args.problem_shape);
+  operator_args.mainloop.layout_SFB =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(operator_args.problem_shape);
+
+  if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>) {
+    operator_args.scheduler.max_swizzle_size = 1;
+  }
+
+  operator_args.hw_info.cluster_shape = preferred_cluster;
+  operator_args.hw_info.cluster_shape_fallback = fallback_cluster;
 
   Gemm gemm;
 
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  size_t workspace_size = Gemm::get_workspace_size(operator_args);
   void* workspace = nullptr;
   if (workspace_size > 0) {
     cudaMallocAsync(&workspace, workspace_size, stream);
   }
 
-  auto can_impl = gemm.can_implement(arguments);
+  auto can_impl = gemm.can_implement(operator_args);
   if (can_impl != cutlass::Status::kSuccess) {
     if (workspace) cudaFreeAsync(workspace, stream);
     fprintf(stderr, "[MXFP4 CUTLASS GEMM] can_implement failed: %s\n",
-            cutlassGetStatusString(can_impl));
+            cutlass::cutlassGetStatusString(can_impl));
     return;
   }
 
-  auto init_status = gemm.initialize(arguments, workspace, stream);
+  auto init_status = gemm.initialize(operator_args, workspace, stream);
   if (init_status != cutlass::Status::kSuccess) {
     if (workspace) cudaFreeAsync(workspace, stream);
     fprintf(stderr, "[MXFP4 CUTLASS GEMM] initialize failed: %s\n",
-            cutlassGetStatusString(init_status));
+            cutlass::cutlassGetStatusString(init_status));
     return;
   }
 
-  auto run_status = gemm.run(arguments, workspace, stream, nullptr, true);
+  auto run_status = gemm.run(operator_args, workspace, stream, nullptr, true);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[MXFP4 CUTLASS GEMM] run failed: %s\n",
-            cutlassGetStatusString(run_status));
+            cutlass::cutlassGetStatusString(run_status));
   }
 
   if (workspace) cudaFreeAsync(workspace, stream);
@@ -302,15 +332,45 @@ static void dispatch_mxfp4_gemm_sm100(
     cudaStream_t stream)
 {
   if (m <= 128) {
-    run_mxfp4_gemm<MxKernelConfigSmallM<OutType>>(
-        D, A, B, input_sf, weight_sf, m, n, k, stream);
+    using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _1SM>;
+    run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
+                            dim3(1, 4, 1), dim3(1, 2, 1), stream);
   } else if (m <= 1024) {
-    run_mxfp4_gemm<MxKernelConfigMediumM<OutType>>(
-        D, A, B, input_sf, weight_sf, m, n, k, stream);
+    using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _2SM>;
+    run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
+                            dim3(2, 4, 1), dim3(2, 1, 1), stream);
   } else {
-    run_mxfp4_gemm<MxKernelConfigLargeM<OutType>>(
-        D, A, B, input_sf, weight_sf, m, n, k, stream);
+    using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _2SM>;
+    run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
+                            dim3(1, 4, 1), dim3(1, 2, 1), stream);
   }
+}
+
+// SM120 (Blackwell) launch helper
+template <typename OutType>
+static void run_mxfp4_gemm_sm120(
+    void* D, const void* A, const void* B,
+    const void* input_sf, const void* weight_sf,
+    int m, int n, int k,
+    cudaStream_t stream)
+{
+  using GemmOp = CutlassMxfp4GemmSm120<OutType, 128, 256, 256>;
+  run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
+                          dim3(1, 1, 1), dim3(1, 1, 1), stream);
+}
+
+// Runtime SM version detection
+static int get_mxfp4_sm_version() {
+  static int sm = -1;
+  if (sm < 0) {
+    int device;
+    cudaGetDevice(&device);
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    sm = major * 10 + minor;
+  }
+  return sm;
 }
 
 // ============================================================================
@@ -320,17 +380,22 @@ static void dispatch_mxfp4_gemm_sm100(
 extern "C" {
 
 void mxfp4_cutlass_gemm_f16(
-    const void* input,       // [M, K/2] packed FP4 activations (uint8)
-    const void* weight,      // [N, K/2] packed FP4 weights (uint8)
-    const void* input_sf,    // input block scales (E8M0, swizzled)
-    const void* weight_sf,   // weight block scales (E8M0, swizzled)
-    void* output,            // [M, N] output (FP16)
+    const void* input,
+    const void* weight,
+    const void* input_sf,
+    const void* weight_sf,
+    void* output,
     int M, int N, int K,
     int64_t stream)
 {
-  dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
-      output, input, weight, input_sf, weight_sf,
-      M, N, K, reinterpret_cast<cudaStream_t>(stream));
+  auto s = reinterpret_cast<cudaStream_t>(stream);
+  if (get_mxfp4_sm_version() >= 120) {
+    run_mxfp4_gemm_sm120<cutlass::half_t>(
+        output, input, weight, input_sf, weight_sf, M, N, K, s);
+  } else {
+    dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
+        output, input, weight, input_sf, weight_sf, M, N, K, s);
+  }
 }
 
 void mxfp4_cutlass_gemm_bf16(
@@ -342,9 +407,14 @@ void mxfp4_cutlass_gemm_bf16(
     int M, int N, int K,
     int64_t stream)
 {
-  dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
-      output, input, weight, input_sf, weight_sf,
-      M, N, K, reinterpret_cast<cudaStream_t>(stream));
+  auto s = reinterpret_cast<cudaStream_t>(stream);
+  if (get_mxfp4_sm_version() >= 120) {
+    run_mxfp4_gemm_sm120<cutlass::bfloat16_t>(
+        output, input, weight, input_sf, weight_sf, M, N, K, s);
+  } else {
+    dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
+        output, input, weight, input_sf, weight_sf, M, N, K, s);
+  }
 }
 
 }  // extern "C"

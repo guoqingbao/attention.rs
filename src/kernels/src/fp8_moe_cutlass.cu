@@ -654,7 +654,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_f16 sm120 failed: %s\n", cutlassGetStatusString(status));
+      printf("moe_fp8_grouped_gemm_f16 sm120 failed: %s\n", cutlass::cutlassGetStatusString(status));
     }
     return;
   }
@@ -664,7 +664,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_f16 sm100 failed: %s\n", cutlassGetStatusString(status));
+      printf("moe_fp8_grouped_gemm_f16 sm100 failed: %s\n", cutlass::cutlassGetStatusString(status));
     }
     return;
   }
@@ -674,7 +674,7 @@ extern "C" void moe_fp8_grouped_gemm_f16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status1 != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_f16 sm90 failed: %s\n", cutlassGetStatusString(status1));
+      printf("moe_fp8_grouped_gemm_f16 sm90 failed: %s\n", cutlass::cutlassGetStatusString(status1));
     }
     return;
   }
@@ -711,7 +711,7 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_bf16 sm120 failed: %s\n", cutlassGetStatusString(status));
+      printf("moe_fp8_grouped_gemm_bf16 sm120 failed: %s\n", cutlass::cutlassGetStatusString(status));
     }
     return;
   }
@@ -721,7 +721,7 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_bf16 sm100 failed: %s\n", cutlassGetStatusString(status));
+      printf("moe_fp8_grouped_gemm_bf16 sm100 failed: %s\n", cutlass::cutlassGetStatusString(status));
     }
     return;
   }
@@ -731,7 +731,7 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
         a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out_ptr, stream,
         column_major_a_scales);
     if (status1 != cutlass::Status::kSuccess) {
-      printf("moe_fp8_grouped_gemm_bf16 sm90 failed: %s\n", cutlassGetStatusString(status1));
+      printf("moe_fp8_grouped_gemm_bf16 sm90 failed: %s\n", cutlass::cutlassGetStatusString(status1));
     }
     return;
   }

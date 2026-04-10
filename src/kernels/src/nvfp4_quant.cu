@@ -304,15 +304,17 @@ void nvfp4_swizzle_weight_scales(
       rows_padded, cols_padded);
 }
 
+}  // extern "C"
+
 // ============================================================================
-// MoE helper: gather tokens sorted by expert from [num_tokens, topk] indices
+// MoE helper kernels (C++ templates, outside extern "C")
 // ============================================================================
 
 template <typename T>
 __global__ void nvfp4_moe_gather_kernel(
-    const T* __restrict__ input,          // [num_tokens, K]
-    T* __restrict__ output,               // [total_expanded, K]
-    const int32_t* __restrict__ sorted_token_ids,  // [total_expanded]
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
     int K, int total_expanded)
 {
   int row = blockIdx.x;
@@ -322,6 +324,23 @@ __global__ void nvfp4_moe_gather_kernel(
   int src_token = sorted_token_ids[row];
   output[row * K + col] = input[src_token * K + col];
 }
+
+template <typename T>
+__global__ void nvfp4_moe_scatter_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int32_t* __restrict__ scatter_ids,
+    int N, int total_expanded)
+{
+  int row = blockIdx.x;
+  int col = threadIdx.x + blockIdx.y * blockDim.x;
+  if (row >= total_expanded || col >= N) return;
+
+  int dst_row = scatter_ids[row];
+  output[dst_row * N + col] = input[row * N + col];
+}
+
+extern "C" {
 
 void nvfp4_moe_gather_f16(
     const void* input, void* output,
@@ -347,22 +366,6 @@ void nvfp4_moe_gather_bf16(
       static_cast<const nv_bfloat16*>(input),
       static_cast<nv_bfloat16*>(output),
       sorted_token_ids, K, total_expanded);
-}
-
-// MoE helper: scatter CUTLASS output back to [num_tokens, topk, N] layout
-template <typename T>
-__global__ void nvfp4_moe_scatter_kernel(
-    const T* __restrict__ input,          // [total_expanded, N] sorted by expert
-    T* __restrict__ output,               // [num_tokens * topk, N]
-    const int32_t* __restrict__ scatter_ids,  // [total_expanded] -> original expanded row
-    int N, int total_expanded)
-{
-  int row = blockIdx.x;
-  int col = threadIdx.x + blockIdx.y * blockDim.x;
-  if (row >= total_expanded || col >= N) return;
-
-  int dst_row = scatter_ids[row];
-  output[dst_row * N + col] = input[row * N + col];
 }
 
 void nvfp4_moe_scatter_f16(

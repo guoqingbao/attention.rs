@@ -1,6 +1,6 @@
 #include <cstdint>
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && \
+#if defined(USE_FLASHINFER) && __has_include("flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h") && \
     __has_include("tensorrt_llm/common/logger.h")
 
 #include <cuda_bf16.h>
@@ -255,7 +255,9 @@ void run_routing_from_precomputed_topk(
       /*useRoutingScalesOnInput=*/false,
       /*useDeepSeekFp8=*/false,
       trtllm_moe::Routing::RoutingMethodType::Renormalize,
-      stream);
+      stream,
+      /*dtypeLogits=*/dtype_elt,
+      /*normTopkProb=*/true);
 }
 
 int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* topk_weights,
@@ -277,7 +279,7 @@ int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* 
       cache.bf16_input_dtype != input_dtype || cache.bf16_weight_dtype != weight_dtype) {
     cache.bf16_runner = std::make_unique<trtllm_moe::MoE::Runner>(
         input_dtype, weight_dtype, /*useDeepSeekFp8=*/false, tile_tokens_dim,
-        trtllm_moe::MoE::GatedActType::SwiGlu, /*useShuffledMatrixA=*/false,
+        trtllm_moe::MoE::ActivationType::Swiglu, /*useShuffledMatrix=*/false,
         batchedGemm::gemm::MatrixLayout::MajorK);
     cache.bf16_tile_tokens_dim = tile_tokens_dim;
     cache.bf16_input_dtype = input_dtype;
@@ -355,7 +357,7 @@ int run_fused_moe_fp8(const void* input, const int32_t* topk_ids, const float* t
   if (!cache.fp8_runner || cache.fp8_tile_tokens_dim != tile_tokens_dim) {
     cache.fp8_runner = std::make_unique<trtllm_moe::MoE::Runner>(
         btg::Dtype::E4m3, /*useDeepSeekFp8=*/true, tile_tokens_dim,
-        /*useShuffledMatrixA=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
+        /*useShuffledMatrix=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
     cache.fp8_tile_tokens_dim = tile_tokens_dim;
   }
 
@@ -441,8 +443,8 @@ int run_fused_moe_mxfp4(const void* input, const int32_t* topk_ids, const float*
     cache.fp8_runner = std::make_unique<trtllm_moe::MoE::Runner>(
         input_dtype, btg::Dtype::MxE2m1,
         /*useDeepSeekFp8=*/false, tile_tokens_dim,
-        trtllm_moe::MoE::GatedActType::SwiGlu,
-        /*useShuffledMatrixA=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
+        trtllm_moe::MoE::ActivationType::Swiglu,
+        /*useShuffledMatrix=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
     cache.fp8_tile_tokens_dim = tile_tokens_dim;
   }
 
@@ -616,3 +618,17 @@ extern "C" int flashinfer_fused_moe_mxfp4(
 }
 
 #endif  // USE_FLASHINFER && required TRT-LLM headers
+
+// Cubin loader: provides FlashInferSetCubinCallback / FlashInferSetCurrentCubin
+// and the getCubin() function used by BatchedGemmInterface at runtime.
+// The extern "C" symbols are always needed when trtllm feature is enabled
+// so Rust FFI can register the callback.
+#if defined(USE_FLASHINFER) && __has_include("flashinfer/cubin_loader.h")
+#include <string>
+#include <stdexcept>
+namespace flashinfer {
+namespace trtllm_cubin_loader {
+#include <flashinfer/cubin_loader.h>
+}
+}
+#endif

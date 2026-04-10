@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && __has_include("flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h") && __has_include("tensorrt_llm/common/logger.h")
 
 #include <cstring>
 #include <vector>
@@ -104,7 +104,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrix == mOptions.useShuffledMatrixA &&
+        options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {

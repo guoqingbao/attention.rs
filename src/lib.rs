@@ -36,6 +36,9 @@ pub mod swiglu;
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
+#[cfg(feature = "trtllm")]
+pub mod trtllm_cubin_loader;
+
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
 pub struct FlashInferMetadata {

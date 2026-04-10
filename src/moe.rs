@@ -88,6 +88,9 @@ pub fn flashinfer_fused_moe(
     gate_up_weights: &Tensor,
     down_weights: &Tensor,
 ) -> Result<Tensor> {
+    #[cfg(feature = "trtllm")]
+    crate::trtllm_cubin_loader::init_cubin_loader();
+
     let (num_tokens, hidden_size) = input.dims2()?;
     let (num_experts, gate_up_n, gate_up_k) = gate_up_weights.dims3()?;
     let (down_experts, down_n, down_k) = down_weights.dims3()?;
@@ -156,6 +159,9 @@ pub fn flashinfer_fused_moe_fp8(
     down_weights: &Tensor,
     down_scales: &Tensor,
 ) -> Result<Tensor> {
+    #[cfg(feature = "trtllm")]
+    crate::trtllm_cubin_loader::init_cubin_loader();
+
     let (num_tokens, hidden_size) = input.dims2()?;
     let (num_experts, gate_up_n, gate_up_k) = gate_up_weights.dims3()?;
     let (down_experts, down_n, down_k) = down_weights.dims3()?;

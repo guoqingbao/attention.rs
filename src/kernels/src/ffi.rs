@@ -2574,4 +2574,16 @@ extern "C" {
         dtype: u32,
         stream: i64,
     );
+
+    // =========================================================================
+    // TRT-LLM cubin loader callback (FlashInfer export interface)
+    // =========================================================================
+
+    #[cfg(feature = "trtllm")]
+    pub fn FlashInferSetCubinCallback(
+        callback: Option<unsafe extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char)>,
+    );
+
+    #[cfg(feature = "trtllm")]
+    pub fn FlashInferSetCurrentCubin(binary: *const std::ffi::c_char, size: std::ffi::c_int);
 }
