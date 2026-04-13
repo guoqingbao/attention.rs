@@ -233,13 +233,21 @@ struct CutlassMxfp4GemmSm120 {
     }
   };
 
-  using GemmKernel = Sm12xOnly<
+  using GemmKernelPersistent = Sm12xOnly<
       cutlass::gemm::kernel::GemmUniversal<
           cute::Shape<int, int, int, int>,
           CollectiveMainloop, CollectiveEpilogue,
           cutlass::gemm::PersistentScheduler>>;
 
+  using GemmKernelStreamK = Sm12xOnly<
+      cutlass::gemm::kernel::GemmUniversal<
+          cute::Shape<int, int, int, int>,
+          CollectiveMainloop, CollectiveEpilogue,
+          cutlass::gemm::StreamKScheduler>>;
+
+  using GemmKernel = GemmKernelPersistent;
   using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using GemmStreamK = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelStreamK>;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
 
@@ -249,16 +257,17 @@ struct CutlassMxfp4GemmSm120 {
 // Kernel Launch (field-based argument construction for CUTLASS 4.4.2)
 // ============================================================================
 
-template <typename GemmOp>
+template <typename GemmOp, typename GemmAdapter = typename GemmOp::Gemm>
 static void run_mxfp4_gemm(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
     int m, int n, int k,
     dim3 preferred_cluster, dim3 fallback_cluster,
     void* workspace, size_t workspace_bytes,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const char* sched_name = "DP")
 {
-  using Gemm = typename GemmOp::Gemm;
+  using Gemm = GemmAdapter;
   using ElementD = typename Gemm::ElementD;
   using ElementSFA = cutlass::float_ue8m0_t;
   using ElementSFB = cutlass::float_ue8m0_t;
@@ -301,23 +310,23 @@ static void run_mxfp4_gemm(
 
   size_t workspace_size = Gemm::get_workspace_size(operator_args);
   if (workspace_size > workspace_bytes) {
-    fprintf(stderr, "[MXFP4] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
-            workspace_size, workspace_bytes, m, n, k);
+    fprintf(stderr, "[MXFP4 %s] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
+            sched_name, workspace_size, workspace_bytes, m, n, k);
     return;
   }
   void* ws = (workspace_size > 0) ? workspace : nullptr;
 
   auto can_impl = gemm.can_implement(operator_args);
   if (can_impl != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[MXFP4] can_implement failed: %s (M=%d N=%d K=%d)\n",
-            cutlass::cutlassGetStatusString(can_impl), m, n, k);
+    fprintf(stderr, "[MXFP4 %s] can_implement failed: %s (M=%d N=%d K=%d)\n",
+            sched_name, cutlass::cutlassGetStatusString(can_impl), m, n, k);
     return;
   }
 
   auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[MXFP4] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
-            cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
+    fprintf(stderr, "[MXFP4 %s] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
+            sched_name, cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
   }
 }
 
@@ -356,8 +365,15 @@ static void run_mxfp4_gemm_sm120(
     cudaStream_t stream)
 {
   using GemmOp = CutlassMxfp4GemmSm120<OutType, 128, 256, 256>;
-  run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
-                          dim3(1, 1, 1), dim3(1, 1, 1), workspace, workspace_bytes, stream);
+  if (m < 128) {
+    run_mxfp4_gemm<GemmOp, typename GemmOp::GemmStreamK>(
+        D, A, B, input_sf, weight_sf, m, n, k,
+        dim3(1, 1, 1), dim3(1, 1, 1), workspace, workspace_bytes, stream, "StreamK");
+  } else {
+    run_mxfp4_gemm<GemmOp>(
+        D, A, B, input_sf, weight_sf, m, n, k,
+        dim3(1, 1, 1), dim3(1, 1, 1), workspace, workspace_bytes, stream, "Persistent");
+  }
 }
 #endif // ENABLE_FP4_SM120
 

@@ -404,18 +404,18 @@ static void dispatch_fp4_gemm_sm100(
 
 #if defined(ENABLE_FP4_SM120)
 
-template <typename OutType>
-static void run_fp4_gemm_sm120(
+template <typename Gemm, typename OutType>
+static void run_fp4_gemm_sm120_impl(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
     const float* global_sf,
     int m, int n, int k,
     void* workspace, size_t workspace_bytes,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const char* sched_name)
 {
   using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120Config<OutType>>;
-  using Gemm = typename GemmOp::Gemm;
-  using ElementD = typename Gemm::ElementD;
+  using ElementD = OutType;
   using ElementSFA = cutlass::float_ue4m3_t;
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
@@ -461,23 +461,46 @@ static void run_fp4_gemm_sm120(
 
   size_t workspace_size = Gemm::get_workspace_size(operator_args);
   if (workspace_size > workspace_bytes) {
-    fprintf(stderr, "[NVFP4 SM120] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
-            workspace_size, workspace_bytes, m, n, k);
+    fprintf(stderr, "[NVFP4 SM120 %s] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
+            sched_name, workspace_size, workspace_bytes, m, n, k);
     return;
   }
   void* ws = (workspace_size > 0) ? workspace : nullptr;
 
   auto can_impl = gemm.can_implement(operator_args);
   if (can_impl != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[NVFP4 SM120] can_implement failed: %s (M=%d N=%d K=%d)\n",
-            cutlass::cutlassGetStatusString(can_impl), m, n, k);
+    fprintf(stderr, "[NVFP4 SM120 %s] can_implement failed: %s (M=%d N=%d K=%d)\n",
+            sched_name, cutlass::cutlassGetStatusString(can_impl), m, n, k);
     return;
   }
 
   auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[NVFP4 SM120] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
-            cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
+    fprintf(stderr, "[NVFP4 SM120 %s] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
+            sched_name, cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
+  }
+}
+
+template <typename OutType>
+static void run_fp4_gemm_sm120(
+    void* D, const void* A, const void* B,
+    const void* input_sf, const void* weight_sf,
+    const float* global_sf,
+    int m, int n, int k,
+    void* workspace, size_t workspace_bytes,
+    cudaStream_t stream)
+{
+  using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120Config<OutType>>;
+  if (m < 128) {
+    using GemmStreamK = typename GemmOp::GemmStreamK;
+    run_fp4_gemm_sm120_impl<GemmStreamK, OutType>(
+        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+        workspace, workspace_bytes, stream, "StreamK");
+  } else {
+    using GemmDP = typename GemmOp::Gemm;
+    run_fp4_gemm_sm120_impl<GemmDP, OutType>(
+        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+        workspace, workspace_bytes, stream, "DP");
   }
 }
 

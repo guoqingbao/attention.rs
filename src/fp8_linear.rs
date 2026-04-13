@@ -538,6 +538,9 @@ pub fn fp8_matmul_cutlass(
         );
     }
 
+    let (gemm_ws_ptr, _, _, _) = crate::flashinfer::get_or_init_workspace(cu_dev, false)?;
+    let gemm_ws_bytes = crate::flashinfer::WORKSPACE_FLOAT_SIZE as i64;
+
     match (dev, dtype) {
         (Device::Cuda(_), DType::F16) => {
             let out_ptr = get_cuda_slice::<half::f16>(&output)?;
@@ -555,6 +558,8 @@ pub fn fp8_matmul_cutlass(
                     block_size[0] as i32,
                     block_size[1] as i32,
                     sm_version,
+                    gemm_ws_ptr,
+                    gemm_ws_bytes,
                     stream,
                 )
             }
@@ -575,6 +580,8 @@ pub fn fp8_matmul_cutlass(
                     block_size[0] as i32,
                     block_size[1] as i32,
                     sm_version,
+                    gemm_ws_ptr,
+                    gemm_ws_bytes,
                     stream,
                 )
             }

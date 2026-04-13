@@ -967,6 +967,8 @@ extern "C" {
         block_size_y: c_int,
         block_size_x: c_int,
         sm_version: c_int,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -997,6 +999,8 @@ extern "C" {
         block_size_y: c_int,
         block_size_x: c_int,
         sm_version: c_int,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 

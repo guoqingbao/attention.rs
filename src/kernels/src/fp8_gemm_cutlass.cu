@@ -156,6 +156,7 @@ using namespace cute;
 
 template <typename GemmKernel>
 cutlass::Status cutlass_gemm_caller(typename GemmKernel::Arguments const& args,
+                                    void* workspace, size_t workspace_bytes,
                                     cudaStream_t stream) {
   using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   GemmOp gemm_op;
@@ -166,26 +167,14 @@ cutlass::Status cutlass_gemm_caller(typename GemmKernel::Arguments const& args,
   }
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
-  void* workspace = nullptr;
-  if (workspace_size > 0) {
-    auto err = cudaMallocAsync(&workspace, workspace_size, stream);
-    if (err != cudaSuccess) {
-      return cutlass::Status::kErrorInternal;
-    }
+  if (workspace_size > workspace_bytes) {
+    fprintf(stderr, "[FP8 CUTLASS GEMM] workspace too small: need %zu, have %zu\n",
+            workspace_size, workspace_bytes);
+    return cutlass::Status::kErrorInternal;
   }
+  void* ws = (workspace_size > 0) ? workspace : nullptr;
 
-  auto init_status = gemm_op.initialize(args, workspace, stream);
-  if (init_status != cutlass::Status::kSuccess) {
-    if (workspace != nullptr) {
-      cudaFreeAsync(workspace, stream);
-    }
-    return init_status;
-  }
-  auto run_status = gemm_op.run(stream);
-  if (workspace != nullptr) {
-    cudaFreeAsync(workspace, stream);
-  }
-  return run_status;
+  return gemm_op.run(args, ws, stream, nullptr, /*launch_with_pdl=*/false);
 }
 
 template <
@@ -292,6 +281,7 @@ void cutlass_gemm_caller_blockwise(
                                    int m,
                                    int n,
                                    int k,
+                                   void* workspace, size_t workspace_bytes,
                                    cudaStream_t stream) {
   using GemmKernel = typename Gemm::GemmKernel;
   using ScaleTileShape = Shape<_1, _128, _128>;
@@ -344,7 +334,7 @@ void cutlass_gemm_caller_blockwise(
       hw_info,
       scheduler};
 
-  cutlass_gemm_caller<GemmKernel>(args, stream);
+  cutlass_gemm_caller<GemmKernel>(args, workspace, workspace_bytes, stream);
 }
 
 
@@ -415,6 +405,7 @@ void fp8_gemm_launcher_sm90(
                      const float* b_scales,
                      T_Out* output_ptr,
                      int M, int N, int K,
+                     void* workspace, size_t workspace_bytes,
                      cudaStream_t stream)
 {
     if (K > 3 * N) {
@@ -424,7 +415,7 @@ void fp8_gemm_launcher_sm90(
             reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
             const_cast<float*>(a_scales),
             const_cast<float*>(b_scales),
-            M, N, K, stream);
+            M, N, K, workspace, workspace_bytes, stream);
     } else {
         cutlass_gemm_caller_blockwise<
             cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, T_Out, 1, 128, 128>>(
@@ -433,7 +424,7 @@ void fp8_gemm_launcher_sm90(
             reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
             const_cast<float*>(a_scales),
             const_cast<float*>(b_scales),
-            M, N, K, stream);
+            M, N, K, workspace, workspace_bytes, stream);
     }
 }
 
@@ -454,6 +445,7 @@ void launch_sm100_fp8_blockwise_scaled_mm(
     int m,
     int n,
     int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream) {
   static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
   static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
@@ -546,7 +538,7 @@ void launch_sm100_fp8_blockwise_scaled_mm(
   typename GemmKernel::Arguments args = {
       cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, mainloop_args, epilogue_args};
 
-  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
+  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, workspace, workspace_bytes, stream);
   if (status != cutlass::Status::kSuccess) {
     printf("sm100 fp8 gemm failed: %s\n", cutlass::cutlassGetStatusString(status));
   }
@@ -562,6 +554,7 @@ void sm100_fp8_blockwise_dispatch_shape(
     int m,
     int n,
     int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream) {
   if (m <= 128) {
     using MmaTileShape = Shape<_64, _128, _128>;
@@ -569,14 +562,14 @@ void sm100_fp8_blockwise_dispatch_shape(
     using EpilogueTileShape = Shape<_64, _64>;
     using ScalesPerTile = Shape<_64, _1, _1>;
     launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-        out, a, b, scales_a, scales_b, m, n, k, stream);
+        out, a, b, scales_a, scales_b, m, n, k, workspace, workspace_bytes, stream);
   } else {
     using MmaTileShape = Shape<_128, _128, _128>;
     using PerSmTileShape = Shape<_128, _128, _128>;
     using EpilogueTileShape = Shape<_128, _64>;
     using ScalesPerTile = Shape<_128, _1, _1>;
     launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-        out, a, b, scales_a, scales_b, m, n, k, stream);
+        out, a, b, scales_a, scales_b, m, n, k, workspace, workspace_bytes, stream);
   }
 }
 
@@ -597,6 +590,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     int m,
     int n,
     int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream) {
   using ElementBlockScale = float;
 
@@ -695,7 +689,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       epilogue_args,
   };
 
-  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, stream);
+  cutlass::Status status = cutlass_gemm_caller<GemmKernel>(args, workspace, workspace_bytes, stream);
   if (status != cutlass::Status::kSuccess) {
     printf("sm120 fp8 gemm failed: %s\n", cutlass::cutlassGetStatusString(status));
   }
@@ -711,13 +705,14 @@ void sm120_fp8_blockwise_dispatch_shape(
     int m,
     int n,
     int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream) {
   using MmaTileShape = Shape<_128, _128, _128>;
   using PerSmTileShape = Shape<_128, _128, _128>;
   using EpilogueTileShape = Shape<_128, _64>;
   using ScalesPerTile = Shape<_128, _1, _1>;
   launch_sm120_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-      out, a, b, scales_a, scales_b, m, n, k, stream);
+      out, a, b, scales_a, scales_b, m, n, k, workspace, workspace_bytes, stream);
 }
 
 #endif
@@ -728,10 +723,11 @@ extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
                                        const float* weight_scale,
                                        __half* output,
                                        int M, int N, int K,
-                                       int /*scale_row_stride*/, // Unused args
+                                       int /*scale_row_stride*/,
                                        int /*block_size_y*/,
                                        int /*block_size_x*/,
                                        int sm_version,
+                                       void* workspace, int64_t workspace_bytes,
                                        cudaStream_t stream) {
 #if defined(USE_CUTLASS)
     const auto* a_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(input_q);
@@ -739,22 +735,23 @@ extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
     auto* out_ptr = reinterpret_cast<cutlass::half_t*>(output);
     auto* a_scales = const_cast<float*>(input_scale);
     auto* b_scales = const_cast<float*>(weight_scale);
+    size_t ws_bytes = static_cast<size_t>(workspace_bytes);
 
     if (sm_version >= 120) {
         sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, workspace, ws_bytes, stream);
         return;
     }
 
     if (sm_version >= 100) {
         sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, workspace, ws_bytes, stream);
         return;
     }
 
     if (sm_version >= 90) {
         fp8_gemm_launcher_sm90<cutlass::half_t>(
-            input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);
+            input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, workspace, ws_bytes, stream);
     }
 #endif
 }
@@ -769,6 +766,7 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
                                         int /*block_size_y*/,
                                         int /*block_size_x*/,
                                         int sm_version,
+                                        void* workspace, int64_t workspace_bytes,
                                         cudaStream_t stream) {
 #if defined(USE_CUTLASS)
     const auto* a_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(input_q);
@@ -776,20 +774,21 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
     auto* out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(output);
     auto* a_scales = const_cast<float*>(input_scale);
     auto* b_scales = const_cast<float*>(weight_scale);
+    size_t ws_bytes = static_cast<size_t>(workspace_bytes);
 
     if (sm_version >= 120) {
         sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, workspace, ws_bytes, stream);
         return;
     }
     if (sm_version >= 100) {
         sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, stream);
+            out_ptr, a_ptr, b_ptr, a_scales, b_scales, M, N, K, workspace, ws_bytes, stream);
         return;
     }
     if (sm_version >= 90) {
         fp8_gemm_launcher_sm90<cutlass::bfloat16_t>(
-            input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, stream);
+            input_q, input_scale, weight, weight_scale, out_ptr, M, N, K, workspace, ws_bytes, stream);
     }
 #endif
 }
