@@ -303,6 +303,8 @@ struct CutlassFp4GemmSm120 {
 // Kernel Launch
 // ============================================================================
 
+#if defined(ENABLE_FP4_SM100)
+
 template <typename Config>
 static void run_fp4_gemm(
     void* D, const void* A, const void* B,
@@ -389,7 +391,6 @@ static void run_fp4_gemm(
   if (workspace) cudaFreeAsync(workspace, stream);
 }
 
-#if defined(ENABLE_FP4_SM100)
 template <typename OutType>
 static void dispatch_fp4_gemm_sm100(
     void* D, const void* A, const void* B,
