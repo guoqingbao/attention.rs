@@ -126,14 +126,15 @@ struct KernelConfigLargeM : Fp4GemmSm100Config<OutType, _2SM> {
 #endif // ENABLE_FP4_SM100
 
 // ============================================================================
-// SM120 (Blackwell) NVFP4 Dense GEMM Configuration
+// SM120 (Blackwell) NVFP4 Dense GEMM Configurations
+// Three tile shapes matching FlashInfer's fp4_gemm_cutlass_template_sm120.h:
+//   128x128x128, 128x128x256, 256x128x128
 // Uses KernelScheduleAuto, EpilogueScheduleAuto, 1x1x1 cluster, void/StreamK scheduler
-// Based on FlashInfer's fp4_gemm_template_sm120.h / CUTLASS example 79
 // ============================================================================
 
 #if defined(ENABLE_FP4_SM120)
 
-template <typename OutType, typename TileShape>
+template <typename OutType>
 struct Fp4GemmSm120ConfigBase {
   using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -156,7 +157,6 @@ struct Fp4GemmSm120ConfigBase {
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
   using SFType = cutlass::float_ue4m3_t;
 
-  using MmaTileShape = TileShape;
   using ClusterShapeType = Shape<_1, _1, _1>;
   using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -164,16 +164,19 @@ struct Fp4GemmSm120ConfigBase {
 };
 
 template <typename OutType>
-struct Fp4GemmSm120ConfigSmallM
-    : Fp4GemmSm120ConfigBase<OutType, Shape<_128, _128, _256>> {};
+struct Fp4GemmSm120Config_128x128x128 : Fp4GemmSm120ConfigBase<OutType> {
+  using MmaTileShape = Shape<_128, _128, _128>;
+};
 
 template <typename OutType>
-struct Fp4GemmSm120ConfigM256
-    : Fp4GemmSm120ConfigBase<OutType, Shape<_128, _128, _128>> {};
+struct Fp4GemmSm120Config_128x128x256 : Fp4GemmSm120ConfigBase<OutType> {
+  using MmaTileShape = Shape<_128, _128, _256>;
+};
 
 template <typename OutType>
-struct Fp4GemmSm120ConfigDefault
-    : Fp4GemmSm120ConfigBase<OutType, Shape<_256, _128, _128>> {};
+struct Fp4GemmSm120Config_256x128x128 : Fp4GemmSm120ConfigBase<OutType> {
+  using MmaTileShape = Shape<_256, _128, _128>;
+};
 
 #endif // ENABLE_FP4_SM120
 
@@ -333,10 +336,6 @@ static void run_fp4_gemm(
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
   using Sm1xxBlkScaledConfig = typename GemmOp::Sm1xxBlkScaledConfig;
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideC = typename Gemm::GemmKernel::StrideC;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
 
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
@@ -352,11 +351,11 @@ static void run_fp4_gemm(
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
-      cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
   operator_args.mainloop.dB =
-      cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
   operator_args.epilogue.dC =
-      cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
+      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
   operator_args.epilogue.dD = operator_args.epilogue.dC;
 
   operator_args.mainloop.layout_SFA =
@@ -366,6 +365,10 @@ static void run_fp4_gemm(
 
   if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>) {
     operator_args.scheduler.max_swizzle_size = 1;
+  }
+  if constexpr (!std::is_const_v<decltype(operator_args.scheduler.raster_order)>) {
+    using Enum_t = decltype(operator_args.scheduler.raster_order);
+    operator_args.scheduler.raster_order = Enum_t::Heuristic;
   }
 
   operator_args.hw_info.cluster_shape = Config::preferred_cluster();
@@ -388,12 +391,7 @@ static void run_fp4_gemm(
     return;
   }
 
-  auto status = gemm.initialize(operator_args, ws);
-  if (status != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[NVFP4 GEMM CUTLASS] initialize failed: %s\n",
-            cutlass::cutlassGetStatusString(status));
-  }
-  auto run_status = gemm.run(operator_args, ws, stream);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM100] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
@@ -425,7 +423,7 @@ static void dispatch_fp4_gemm_sm100(
 
 #if defined(ENABLE_FP4_SM120)
 
-template <typename Gemm, typename OutType>
+template <typename GemmAdapter, typename Config>
 static void run_fp4_gemm_sm120_impl(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
@@ -435,17 +433,14 @@ static void run_fp4_gemm_sm120_impl(
     cudaStream_t stream,
     const char* sched_name)
 {
-  using ElementD = OutType;
+  using GemmOp = CutlassFp4GemmSm120<Config>;
+  using ElementD = typename Config::ElementD;
   using ElementSFA = cutlass::float_ue4m3_t;
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
-  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideC = typename Gemm::GemmKernel::StrideC;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
+  using Sm1xxBlkScaledConfig = typename GemmOp::Sm1xxBlkScaledConfig;
 
-  typename Gemm::Arguments operator_args;
+  typename GemmAdapter::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
 
   operator_args.epilogue.thread.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
@@ -459,11 +454,11 @@ static void run_fp4_gemm_sm120_impl(
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
-      cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
+      cute::make_int_tuple_from<typename GemmAdapter::GemmKernel::StrideA>(k, 0);
   operator_args.mainloop.dB =
-      cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+      cute::make_int_tuple_from<typename GemmAdapter::GemmKernel::StrideB>(k, 0);
   operator_args.epilogue.dC =
-      cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
+      cute::make_int_tuple_from<typename GemmAdapter::GemmKernel::StrideC>(n, 0);
   operator_args.epilogue.dD = operator_args.epilogue.dC;
 
   operator_args.mainloop.layout_SFA =
@@ -481,9 +476,9 @@ static void run_fp4_gemm_sm120_impl(
   operator_args.hw_info.cluster_shape = dim3(1, 1, 1);
   operator_args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
 
-  Gemm gemm;
+  GemmAdapter gemm;
 
-  size_t workspace_size = Gemm::get_workspace_size(operator_args);
+  size_t workspace_size = GemmAdapter::get_workspace_size(operator_args);
   if (workspace_size > workspace_bytes) {
     fprintf(stderr, "[NVFP4 SM120 %s] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
             sched_name, workspace_size, workspace_bytes, m, n, k);
@@ -498,17 +493,71 @@ static void run_fp4_gemm_sm120_impl(
     return;
   }
 
-  auto status = gemm.initialize(operator_args, ws, stream);
-  if (status != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[NVFP4 GEMM CUTLASS] initialize failed: %s\n",
-            cutlass::cutlassGetStatusString(status));
-  }
-
-  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*enable_pdl=*/true);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM120 %s] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             sched_name, cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
   }
+}
+
+// Try a specific tile config with DP scheduler, return true on success
+template <typename Config>
+static bool try_fp4_gemm_sm120_dp(
+    void* D, const void* A, const void* B,
+    const void* input_sf, const void* weight_sf,
+    const float* global_sf,
+    int m, int n, int k,
+    void* workspace, size_t workspace_bytes,
+    cudaStream_t stream,
+    const char* tile_name)
+{
+  using GemmOp = CutlassFp4GemmSm120<Config>;
+  using GemmDP = typename GemmOp::Gemm;
+
+  typename GemmDP::Arguments test_args;
+  test_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  test_args.problem_shape = cute::make_shape(m, n, k, 1);
+
+  GemmDP gemm;
+  auto can_impl = gemm.can_implement(test_args);
+  if (can_impl != cutlass::Status::kSuccess) {
+    return false;
+  }
+
+  run_fp4_gemm_sm120_impl<GemmDP, Config>(
+      D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+      workspace, workspace_bytes, stream, tile_name);
+  return true;
+}
+
+// Try a specific tile config with StreamK scheduler, return true on success
+template <typename Config>
+static bool try_fp4_gemm_sm120_streamk(
+    void* D, const void* A, const void* B,
+    const void* input_sf, const void* weight_sf,
+    const float* global_sf,
+    int m, int n, int k,
+    void* workspace, size_t workspace_bytes,
+    cudaStream_t stream,
+    const char* tile_name)
+{
+  using GemmOp = CutlassFp4GemmSm120<Config>;
+  using GemmSK = typename GemmOp::GemmStreamK;
+
+  typename GemmSK::Arguments test_args;
+  test_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  test_args.problem_shape = cute::make_shape(m, n, k, 1);
+
+  GemmSK gemm;
+  auto can_impl = gemm.can_implement(test_args);
+  if (can_impl != cutlass::Status::kSuccess) {
+    return false;
+  }
+
+  run_fp4_gemm_sm120_impl<GemmSK, Config>(
+      D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+      workspace, workspace_bytes, stream, tile_name);
+  return true;
 }
 
 template <typename OutType>
@@ -520,36 +569,58 @@ static void run_fp4_gemm_sm120(
     void* workspace, size_t workspace_bytes,
     cudaStream_t stream)
 {
-  auto next_pow2 = [](int v) {
-    unsigned x = static_cast<unsigned>(v <= 1 ? 1 : v - 1);
-    x |= x >> 1;
-    x |= x >> 2;
-    x |= x >> 4;
-    x |= x >> 8;
-    x |= x >> 16;
-    return static_cast<int>(x + 1);
-  };
+  // FlashInfer's SM120 tile shapes: 128x128x128, 128x128x256, 256x128x128
+  // Heuristic: try the most appropriate tile first based on problem dimensions
+  using Cfg_128x128x128 = Fp4GemmSm120Config_128x128x128<OutType>;
+  using Cfg_128x128x256 = Fp4GemmSm120Config_128x128x256<OutType>;
+  using Cfg_256x128x128 = Fp4GemmSm120Config_256x128x128<OutType>;
 
-  int mp2 = next_pow2(m < 16 ? 16 : m);
-  if (mp2 <= 32) {
-    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigSmallM<OutType>>;
-    using Gemm = typename GemmOp::Gemm;
-    run_fp4_gemm_sm120_impl<Gemm, OutType>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        workspace, workspace_bytes, stream, "SmallM");
-  } else if (mp2 <= 256) {
-    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigM256<OutType>>;
-    using Gemm = typename GemmOp::Gemm;
-    run_fp4_gemm_sm120_impl<Gemm, OutType>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        workspace, workspace_bytes, stream, "M256");
+  if (m < 128) {
+    // Small M: use StreamK with 128x128x128 (most flexible for small M)
+    if (try_fp4_gemm_sm120_streamk<Cfg_128x128x128>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x128-SK"))
+      return;
+    // Fallback: try 128x128x256 with StreamK (better for large K)
+    if (try_fp4_gemm_sm120_streamk<Cfg_128x128x256>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x256-SK"))
+      return;
+  } else if (m >= 256) {
+    // Large M: prefer 256x128x128 DP
+    if (try_fp4_gemm_sm120_dp<Cfg_256x128x128>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "256x128x128-DP"))
+      return;
+    // Fallback: 128x128x256 DP (better for large K)
+    if (try_fp4_gemm_sm120_dp<Cfg_128x128x256>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x256-DP"))
+      return;
+    // Last resort: 128x128x128 DP
+    if (try_fp4_gemm_sm120_dp<Cfg_128x128x128>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x128-DP"))
+      return;
   } else {
-    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigDefault<OutType>>;
-    using Gemm = typename GemmOp::Gemm;
-    run_fp4_gemm_sm120_impl<Gemm, OutType>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        workspace, workspace_bytes, stream, "Default");
+    // Medium M (128..255): try 128x128x256 DP first (good K throughput)
+    if (try_fp4_gemm_sm120_dp<Cfg_128x128x256>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x256-DP"))
+      return;
+    // Fallback: 128x128x128 DP
+    if (try_fp4_gemm_sm120_dp<Cfg_128x128x128>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x128-DP"))
+      return;
+    // StreamK fallback
+    if (try_fp4_gemm_sm120_streamk<Cfg_128x128x128>(
+            D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+            workspace, workspace_bytes, stream, "128x128x128-SK"))
+      return;
   }
+
+  fprintf(stderr, "[NVFP4 SM120] no viable tile config for M=%d N=%d K=%d\n", m, n, k);
 }
 
 #endif // ENABLE_FP4_SM120

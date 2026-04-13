@@ -5,6 +5,10 @@
  *
  * Required for hardware FP4 GEMM path on Blackwell (SM100+).
  * The CUTLASS block-scaled tensor ops expect both A and B in FP4 format.
+ *
+ * On SM100+ (Blackwell): uses hardware PTX cvt.rn.satfinite.e2m1x2.f32 for
+ * precise FP4 conversion and __nv_fp8_e4m3 for scale factor encoding.
+ * On older GPUs: uses software fallback with LUT-based conversion.
  */
 
 #ifdef ENABLE_FP4
@@ -19,10 +23,46 @@
 
 static constexpr int NVFP4_BLOCK_SIZE = 16;
 
-// FP4 E2M1 quantization LUT: maps float values to 4-bit E2M1 codes
-// E2M1 values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives)
+// ============================================================================
+// Hardware FP4 conversion (SM100+ / Blackwell)
+// Uses PTX cvt.rn.satfinite.e2m1x2.f32 for precise round-to-nearest-even
+// ============================================================================
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+__device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&vals)[8]) {
+  uint32_t result;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}\n"
+      : "=r"(result)
+      : "f"(vals[0]), "f"(vals[1]), "f"(vals[2]), "f"(vals[3]),
+        "f"(vals[4]), "f"(vals[5]), "f"(vals[6]), "f"(vals[7]));
+  return result;
+}
+
+__device__ __forceinline__ float fast_rcp_ftz(float x) {
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
+  return r;
+}
+
+#endif // __CUDA_ARCH__ >= 1000
+
+// ============================================================================
+// Software FP4 conversion fallback (pre-SM100)
+// ============================================================================
+
 __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
-  // Clamp to FP4 E2M1 range: [-6.0, 6.0]
   float abs_val = fabsf(val);
   uint8_t sign = (val < 0.0f) ? 0x8 : 0x0;
 
@@ -48,108 +88,21 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
   return sign | code;
 }
 
-// FP4 E2M1 dequantization LUT
-__device__ __constant__ float fp4_e2m1_lut[16] = {
-  0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-};
-
-// Convert float to FP8 E4M3 (for block scales)
-__device__ __forceinline__ uint8_t float_to_fp8_e4m3(float val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-  __nv_fp8_e4m3 fp8_val = __nv_fp8_e4m3(val);
-  return *reinterpret_cast<uint8_t*>(&fp8_val);
-#else
-  // Software fallback
-  if (val == 0.0f) return 0;
-  uint32_t bits = __float_as_uint(val);
-  uint32_t sign = (bits >> 31) & 1;
-  int exp = ((bits >> 23) & 0xFF) - 127;
-  uint32_t mantissa = bits & 0x7FFFFF;
-
-  // Clamp to FP8 E4M3 range
-  if (exp > 8) { exp = 8; mantissa = 0x600000; }
-  if (exp < -9) return 0;
-
-  int biased_exp = exp + 7;
-  if (biased_exp < 0) biased_exp = 0;
-  if (biased_exp > 15) biased_exp = 15;
-
-  uint8_t mant3 = (mantissa >> 20) & 0x7;
-  return (sign << 7) | (biased_exp << 3) | mant3;
-#endif
-}
-
-// Convert FP8 E4M3 to float (for dequant verification)
-__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-  __nv_fp8_e4m3 fp8_val = *reinterpret_cast<__nv_fp8_e4m3*>(&val);
-  return float(fp8_val);
-#else
-  if (val == 0) return 0.0f;
-  uint32_t sign = (val >> 7) & 1;
-  int biased_exp = (val >> 3) & 0xF;
-  uint32_t mantissa = val & 0x7;
-  int exp = biased_exp - 7;
-  float result = (1.0f + mantissa / 8.0f) * powf(2.0f, exp);
-  return sign ? -result : result;
-#endif
-}
-
-// Quantize a block of 16 floats to FP4 E2M1 + compute block scale
-// Returns the block scale as FP8 E4M3
-//
-// input_scale_inv: reciprocal of the per-tensor activation scale from the checkpoint.
-//   The block scale is computed as: sf = input_scale_inv * (amax / 6.0)
-//   This pre-bakes the input scaling into the block scales so that the CUTLASS GEMM
-//   epilogue alpha = (input_scale * weight_global_scale) produces correctly scaled output.
-//   When input_scale = 1.0, this has no effect.
-__device__ __forceinline__ uint8_t quantize_block_fp4(
-    const float* vals, uint8_t* packed_out, int valid_count,
-    float input_scale_inv)
-{
-  float amax = 0.0f;
-  for (int i = 0; i < valid_count; i++) {
-    amax = fmaxf(amax, fabsf(vals[i]));
-  }
-
-  // Block scale = input_scale_inv * (amax / 6.0)
-  // Following SGLang/TRT-LLM convention: SFValue = SFScaleVal * (vecMax / max_fp4)
-  float raw_scale = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
-  float scale = input_scale_inv * raw_scale;
-  uint8_t fp8_scale = float_to_fp8_e4m3(scale);
-
-  // Reconstruct quantized scale for accurate inverse
-  float quant_scale = fp8_e4m3_to_float(fp8_scale);
-  float inv_scale = (quant_scale > 0.0f)
-      ? (1.0f / (quant_scale / input_scale_inv))
-      : 0.0f;
-
-  uint8_t codes[16];
-  for (int i = 0; i < valid_count; i++) {
-    codes[i] = float_to_fp4_e2m1(vals[i] * inv_scale);
-  }
-  for (int i = valid_count; i < 16; i++) {
-    codes[i] = 0;
-  }
-
-  for (int i = 0; i < 8; i++) {
-    packed_out[i] = (codes[2 * i + 1] << 4) | codes[2 * i];
-  }
-
-  return fp8_scale;
-}
-
 // ============================================================================
-// Activation quantization kernel: BF16/F16 -> packed FP4 + FP8 block scales
+// Activation quantization kernel (SM100+ hardware path)
+// Matches TRT-LLM/FlashInfer quantize_with_block_size exactly:
+//   SFValue = SFScaleVal * (vecMax / 6.0)
+//   fp8_scale = fp8_e4m3(SFValue)
+//   outputScale = 1 / (float(fp8_scale) / SFScaleVal)
+//   quantized_val = val * outputScale
 // ============================================================================
 
 template <typename InType>
-__global__ void nvfp4_quantize_activation_kernel(
+__global__ void nvfp4_quantize_activation_hw_kernel(
     const InType* __restrict__ input,   // [M, K]
     uint8_t* __restrict__ output,       // [M, K/2] packed FP4
     uint8_t* __restrict__ scales,       // [M_padded, K/16] FP8 E4M3 block scales
-    float input_scale_inv,              // 1.0 / input_scale (pre-baked into block scales)
+    float SFScaleVal,                   // globalScale = (448*6)/amax or 1/input_scale
     int M, int K, int M_padded)
 {
   int row = blockIdx.x;
@@ -170,57 +123,141 @@ __global__ void nvfp4_quantize_activation_kernel(
     }
   }
 
-  uint8_t packed[8];
-  uint8_t block_scale = quantize_block_fp4(
-      vals, packed, min(NVFP4_BLOCK_SIZE, K - k_start), input_scale_inv);
+  // Find absolute maximum of the block (matching TRT-LLM's warp reduction)
+  float vecMax = 0.0f;
+  for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
+    vecMax = fmaxf(vecMax, fabsf(vals[i]));
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Hardware path: matches TRT-LLM exactly
+  // SFValue = SFScaleVal * (vecMax / 6.0)
+  float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
+
+  __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
+  uint8_t fp8_scale_bits = fp8_sf.__x;
+  SFValue = static_cast<float>(fp8_sf);
+
+  // outputScale = 1 / (float(fp8(SFValue)) / SFScaleVal)
+  float outputScale = vecMax != 0.0f
+      ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal))
+      : 0.0f;
+
+  // Scale values and convert to FP4 using hardware intrinsics
+  float scaled_vals_0[8], scaled_vals_1[8];
+  for (int i = 0; i < 8; i++) {
+    scaled_vals_0[i] = vals[i] * outputScale;
+  }
+  for (int i = 0; i < 8; i++) {
+    scaled_vals_1[i] = vals[8 + i] * outputScale;
+  }
+
+  uint32_t packed_lo = fp32x8_to_e2m1x8(scaled_vals_0);
+  uint32_t packed_hi = fp32x8_to_e2m1x8(scaled_vals_1);
+
+  // Write packed FP4 output (8 bytes = 16 nibbles)
+  int out_offset = row * (K / 2) + k_start / 2;
+  reinterpret_cast<uint32_t*>(output + out_offset)[0] = packed_lo;
+  reinterpret_cast<uint32_t*>(output + out_offset)[1] = packed_hi;
+
+  scales[row * num_blocks + block_idx] = fp8_scale_bits;
+
+#else
+  // Software fallback for pre-SM100
+  float SFValue = SFScaleVal * (vecMax / 6.0f);
+
+  uint8_t fp8_scale_bits = 0;
+  float outputScale = 0.0f;
+
+  if (vecMax > 0.0f && SFValue > 0.0f) {
+    // Software FP8 E4M3 conversion
+    uint32_t bits = __float_as_uint(SFValue);
+    uint32_t sign = (bits >> 31) & 1;
+    int exp = ((bits >> 23) & 0xFF) - 127;
+    uint32_t mantissa = bits & 0x7FFFFF;
+
+    if (exp > 8) { exp = 8; mantissa = 0x600000; }
+    if (exp >= -9) {
+      int biased_exp = exp + 7;
+      if (biased_exp < 0) biased_exp = 0;
+      if (biased_exp > 15) biased_exp = 15;
+
+      uint8_t mant3 = (mantissa >> 20) & 0x7;
+      fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
+
+      float recon_mantissa = 1.0f + mant3 / 8.0f;
+      float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
+      if (sign) quant_scale = -quant_scale;
+
+      outputScale = (quant_scale != 0.0f && SFScaleVal != 0.0f)
+          ? (1.0f / (quant_scale / SFScaleVal))
+          : 0.0f;
+    }
+  }
+
+  uint8_t codes[16];
+  for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
+    codes[i] = float_to_fp4_e2m1(vals[i] * outputScale);
+  }
 
   int out_offset = row * (K / 2) + k_start / 2;
   for (int i = 0; i < 8; i++) {
-    output[out_offset + i] = packed[i];
+    output[out_offset + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
   }
 
-  scales[row * num_blocks + block_idx] = block_scale;
+  scales[row * num_blocks + block_idx] = fp8_scale_bits;
+#endif
 }
 
 // ============================================================================
-// Scale factor swizzling kernel for CUTLASS block-scaled layout
-// Converts linear scale layout to the swizzled 128x4 layout expected by CUTLASS
+// Scale factor swizzling kernel for CUTLASS block-scaled 128x4 layout
+// Matches TRT-LLM's get_sf_out_offset_128x4 exactly:
+//   SF layout [numMTiles, numKTiles, 32 (outerM), 4 (innerM), 4 (innerK)]
+//   Total tile size = 32 * 4 * 4 = 512
+// Input:  linear_scales[rows, cols] in row-major
+// Output: swizzled_scales[total_swizzled_size] in CUTLASS 128x4 layout
 // ============================================================================
 
 __global__ void nvfp4_swizzle_scales_kernel(
     const uint8_t* __restrict__ linear_scales,  // [rows, cols] linear layout
-    uint8_t* __restrict__ swizzled_scales,       // [rows_padded, cols_padded] swizzled
+    uint8_t* __restrict__ swizzled_scales,       // flat swizzled output
     int rows, int cols,
     int rows_padded, int cols_padded)
 {
+  // Each thread processes one (mIdx, kIdx) pair from the linear layout
+  // and writes to the swizzled destination
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = rows_padded * cols_padded;
   if (idx >= total) return;
 
-  // CUTLASS/FlashInfer NVFP4 stores scale factors in 128x4 tiles laid out as:
-  //   [num_m_tiles, num_k_tiles, 32 (outer_m), 4 (inner_m), 4 (inner_k)]
-  // The destination buffer is still a flat byte array of length rows_padded * cols_padded,
-  // so recover the swizzled tile coordinates from the flat destination index and then map
-  // them back to the source linear [row, col] coordinates.
-  int num_k_tiles = cols_padded / 4;
-  int rem = idx;
-  int inner_k = rem % 4;
-  rem /= 4;
-  int inner_m = rem % 4;
-  rem /= 4;
-  int outer_m = rem % 32;
-  rem /= 32;
-  int k_tile = rem % num_k_tiles;
-  int m_tile = rem / num_k_tiles;
+  int mIdx = idx / cols_padded;
+  int kIdx = idx % cols_padded;
 
-  int src_row = m_tile * 128 + inner_m * 32 + outer_m;
-  int src_col = k_tile * 4 + inner_k;
-
+  // Read from linear layout (zero for padding)
   uint8_t val = 0;
-  if (src_row < rows && src_col < cols) {
-    val = linear_scales[src_row * cols + src_col];
+  if (mIdx < rows && kIdx < cols) {
+    val = linear_scales[mIdx * cols + kIdx];
   }
-  swizzled_scales[idx] = val;
+
+  // Compute swizzled destination offset matching TRT-LLM's get_sf_out_offset_128x4
+  int innerKIdx = kIdx % 4;
+  int innerMIdx = (mIdx % 128) / 32;
+  int outerMIdx = mIdx % 32;
+  int kTileIdx = kIdx / 4;
+  int mTileIdx = mIdx / 128;
+
+  int numKTiles = (cols_padded + 3) / 4;
+
+  int64_t kTileStride = 512;  // 32 * 4 * 4
+  int64_t mTileStride = (int64_t)numKTiles * kTileStride;
+
+  int64_t dstOffset = (int64_t)mTileIdx * mTileStride
+                    + (int64_t)kTileIdx * kTileStride
+                    + outerMIdx * 16
+                    + innerMIdx * 4
+                    + innerKIdx;
+
+  swizzled_scales[dstOffset] = val;
 }
 
 // ============================================================================
@@ -234,7 +271,7 @@ void nvfp4_quantize_activation_f16(
     void* output,           // [M, K/2] packed FP4 uint8
     void* scales,           // [M_padded, K/16] FP8 block scales
     void* swizzled_scales,  // [M_padded, K_scale_padded] swizzled scales for CUTLASS
-    float input_scale_inv,  // 1.0 / input_scale (from checkpoint, default 1.0)
+    float input_scale_inv,  // SFScaleVal = 1.0 / input_scale (from checkpoint, default 1.0)
     int M, int K,
     int M_padded, int K_scale_padded,
     int64_t stream)
@@ -243,7 +280,7 @@ void nvfp4_quantize_activation_f16(
   dim3 grid(M);
   dim3 block(num_blocks_k);
 
-  nvfp4_quantize_activation_kernel<half><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+  nvfp4_quantize_activation_hw_kernel<half><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const half*>(input),
       static_cast<uint8_t*>(output),
       static_cast<uint8_t*>(scales),
@@ -274,7 +311,7 @@ void nvfp4_quantize_activation_bf16(
   dim3 grid(M);
   dim3 block(num_blocks_k);
 
-  nvfp4_quantize_activation_kernel<nv_bfloat16><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+  nvfp4_quantize_activation_hw_kernel<nv_bfloat16><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const nv_bfloat16*>(input),
       static_cast<uint8_t*>(output),
       static_cast<uint8_t*>(scales),
