@@ -109,12 +109,20 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
-            if compute_cap >= 90 {
+            if compute_cap >= 89 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
+            }
+            if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
             }
             if compute_cap >= 100 {
                 builder = builder.arg("-DENABLE_FP4");
+            }
+            if (100..120).contains(&compute_cap) {
+                builder = builder.arg("-DENABLE_FP4_SM100");
+            }
+            if compute_cap >= 120 {
+                builder = builder.arg("-DENABLE_FP4_SM120");
             }
         }
     }

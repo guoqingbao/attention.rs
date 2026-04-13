@@ -45,7 +45,10 @@ using namespace cute;
 // ============================================================================
 // SM100 MXFP4 Dense GEMM Kernel Configurations
 // Following FlashInfer mxfp8_gemm_template_sm100.h patterns for CUTLASS 4.4.2
+// Only compiled when targeting SM100-SM119 (datacenter Blackwell)
 // ============================================================================
+
+#if defined(ENABLE_FP4_SM100)
 
 struct _1SM {};
 struct _2SM {};
@@ -155,10 +158,15 @@ struct CutlassMxfp4Gemm {
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
 
+#endif // ENABLE_FP4_SM100
+
 // ============================================================================
-// SM120 (Blackwell) MXFP4 Dense GEMM
+// SM120 (Blackwell consumer) MXFP4 Dense GEMM
 // Uses KernelScheduleAuto, EpilogueScheduleAuto, 1x1x1 cluster, StageCount<2>
+// Only compiled when targeting SM120+ (RTX 5090 etc.)
 // ============================================================================
+
+#if defined(ENABLE_FP4_SM120)
 
 template <typename OutType, int CTA_M, int CTA_N, int CTA_K>
 struct CutlassMxfp4GemmSm120 {
@@ -234,6 +242,8 @@ struct CutlassMxfp4GemmSm120 {
   using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
+
+#endif // ENABLE_FP4_SM120
 
 // ============================================================================
 // Kernel Launch (field-based argument construction for CUTLASS 4.4.2)
@@ -323,7 +333,7 @@ static void run_mxfp4_gemm(
   if (workspace) cudaFreeAsync(workspace, stream);
 }
 
-// M-bucketed dispatch
+#if defined(ENABLE_FP4_SM100)
 template <typename OutType>
 static void dispatch_mxfp4_gemm_sm100(
     void* D, const void* A, const void* B,
@@ -345,8 +355,9 @@ static void dispatch_mxfp4_gemm_sm100(
                             dim3(1, 4, 1), dim3(1, 2, 1), stream);
   }
 }
+#endif // ENABLE_FP4_SM100
 
-// SM120 (Blackwell) launch helper
+#if defined(ENABLE_FP4_SM120)
 template <typename OutType>
 static void run_mxfp4_gemm_sm120(
     void* D, const void* A, const void* B,
@@ -358,20 +369,7 @@ static void run_mxfp4_gemm_sm120(
   run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
                           dim3(1, 1, 1), dim3(1, 1, 1), stream);
 }
-
-// Runtime SM version detection
-static int get_mxfp4_sm_version() {
-  static int sm = -1;
-  if (sm < 0) {
-    int device;
-    cudaGetDevice(&device);
-    int major, minor;
-    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-    sm = major * 10 + minor;
-  }
-  return sm;
-}
+#endif // ENABLE_FP4_SM120
 
 // ============================================================================
 // C API Entry Points
@@ -389,13 +387,13 @@ void mxfp4_cutlass_gemm_f16(
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
-  if (get_mxfp4_sm_version() >= 120) {
-    run_mxfp4_gemm_sm120<cutlass::half_t>(
-        output, input, weight, input_sf, weight_sf, M, N, K, s);
-  } else {
-    dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
-        output, input, weight, input_sf, weight_sf, M, N, K, s);
-  }
+#if defined(ENABLE_FP4_SM120)
+  run_mxfp4_gemm_sm120<cutlass::half_t>(
+      output, input, weight, input_sf, weight_sf, M, N, K, s);
+#elif defined(ENABLE_FP4_SM100)
+  dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
+      output, input, weight, input_sf, weight_sf, M, N, K, s);
+#endif
 }
 
 void mxfp4_cutlass_gemm_bf16(
@@ -408,13 +406,13 @@ void mxfp4_cutlass_gemm_bf16(
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
-  if (get_mxfp4_sm_version() >= 120) {
-    run_mxfp4_gemm_sm120<cutlass::bfloat16_t>(
-        output, input, weight, input_sf, weight_sf, M, N, K, s);
-  } else {
-    dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
-        output, input, weight, input_sf, weight_sf, M, N, K, s);
-  }
+#if defined(ENABLE_FP4_SM120)
+  run_mxfp4_gemm_sm120<cutlass::bfloat16_t>(
+      output, input, weight, input_sf, weight_sf, M, N, K, s);
+#elif defined(ENABLE_FP4_SM100)
+  dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
+      output, input, weight, input_sf, weight_sf, M, N, K, s);
+#endif
 }
 
 }  // extern "C"

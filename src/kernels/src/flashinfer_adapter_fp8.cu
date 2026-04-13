@@ -14,6 +14,10 @@ using namespace flashinfer;
 extern "C" void flashinfer_fp8_quantize_q_scalar(const void* input, void* output_q, int64_t numel,
                                                  const float* q_scale, bool is_input_f16,
                                                  int64_t stream_);
+extern "C" void flashinfer_fp8_quantize_q_per_head(const void* input, void* output_q,
+                                                   float* output_scale, int64_t numel,
+                                                   int num_heads, int head_dim,
+                                                   bool is_input_f16, int64_t stream_);
 extern "C" void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* v_in,
                                                   void* k_out, void* v_out, int64_t numel,
                                                   const float* k_scale, const float* v_scale,
@@ -485,68 +489,56 @@ void flashinfer_decode_run_wrapper_fp8(
     (void)ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream);
     (void)ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream);
 
-    void* q_scale_ptr = nullptr;
     void* q_fp8_ptr = nullptr;
+    float* q_scale_arr = nullptr;
     double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
     cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
-    cudaMallocAsync(&q_scale_ptr, sizeof(float), stream);
+    cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
 
     bool is_input_f16 = (out_data_type == 0);
-    flashinfer_fp8_quantize_q_scalar(
-        q_ptr, q_fp8_ptr, numel, static_cast<float*>(q_scale_ptr), is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(static_cast<float*>(q_scale_ptr), q_scale_scalar, stream);
+    flashinfer_fp8_quantize_q_per_head(
+        q_ptr, q_fp8_ptr, q_scale_arr, numel,
+        num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
+    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     using DTypeQ = cutlass::float_e4m3_t;
     using DTypeKV = cutlass::float_e4m3_t;
     using AttentionType = DefaultFP8Attention;
+
+    auto launch_fp8_prefill = [&](auto dtype_out_val) {
+        using DTypeOut = decltype(dtype_out_val);
+        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+            params, q_fp8_ptr, k_data, v_data, out_ptr,
+            num_qo_heads, num_kv_heads, head_dim, page_size,
+            batch_size, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
+            k_scale_scalar, v_scale_scalar, true,
+            indices, workspace_int, plan_info);
+        params.additional_params.maybe_scale_q = q_scale_arr;
+        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            if (plan_info.same_schedule_for_all_heads) {
+                BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                    params, false, stream);
+            } else {
+                BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                    params, false, stream);
+            }
+        });
+    };
     if (out_data_type == 1) {
-        using DTypeOut = cutlass::bfloat16_t;
-        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_data, v_data, out_ptr,
-            num_qo_heads, num_kv_heads, head_dim, page_size,
-            batch_size, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
-            k_scale_scalar, v_scale_scalar, false,
-            indices, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                    params, false, stream);
-            } else {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                    params, false, stream);
-            }
-        });
+        launch_fp8_prefill(cutlass::bfloat16_t{});
     } else {
-        using DTypeOut = cutlass::half_t;
-        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_data, v_data, out_ptr,
-            num_qo_heads, num_kv_heads, head_dim, page_size,
-            batch_size, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
-            k_scale_scalar, v_scale_scalar, false,
-            indices, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                    params, false, stream);
-            } else {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                    params, false, stream);
-            }
-        });
+        launch_fp8_prefill(cutlass::half_t{});
     }
 
     if (q_fp8_ptr) {
         cudaFreeAsync(q_fp8_ptr, stream);
     }
-    if (q_scale_ptr) {
-        cudaFreeAsync(q_scale_ptr, stream);
+    if (q_scale_arr) {
+        cudaFreeAsync(q_scale_arr, stream);
     }
 }
 
@@ -612,67 +604,183 @@ void flashinfer_prefill_wrapper_fp8(
         stream
     );
 
-    void* q_scale_ptr = nullptr;
     void* q_fp8_ptr = nullptr;
+    float* q_scale_arr = nullptr;
     double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
     cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
-    cudaMallocAsync(&q_scale_ptr, sizeof(float), stream);
+    cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
     bool is_input_f16 = (out_data_type == 0);
-    flashinfer_fp8_quantize_q_scalar(
-        q_ptr, q_fp8_ptr, numel, static_cast<float*>(q_scale_ptr), is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(static_cast<float*>(q_scale_ptr), q_scale_scalar, stream);
+    flashinfer_fp8_quantize_q_per_head(
+        q_ptr, q_fp8_ptr, q_scale_arr, numel,
+        num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
+    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     using DTypeQ = cutlass::float_e4m3_t;
     using DTypeKV = cutlass::float_e4m3_t;
     using AttentionType = DefaultFP8Attention;
+
+    auto launch_fp8_prefill = [&](auto dtype_out_val) {
+        using DTypeOut = decltype(dtype_out_val);
+        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+            params, q_fp8_ptr, k_data, v_data, out_ptr,
+            num_qo_heads, num_kv_heads, head_dim, page_size,
+            total_num_rows, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
+            k_scale_scalar, v_scale_scalar, true,
+            indices, workspace_int, plan_info);
+        params.additional_params.maybe_scale_q = q_scale_arr;
+        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            if (plan_info.same_schedule_for_all_heads) {
+                BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                    params, false, stream);
+            } else {
+                BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                    params, false, stream);
+            }
+        });
+    };
     if (out_data_type == 1) {
-        using DTypeOut = cutlass::bfloat16_t;
-        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_data, v_data, out_ptr,
-            num_qo_heads, num_kv_heads, head_dim, page_size,
-            total_num_rows, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
-            k_scale_scalar, v_scale_scalar, false,
-            indices, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                    params, false, stream);
-            } else {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                    params, false, stream);
-            }
-        });
+        launch_fp8_prefill(cutlass::bfloat16_t{});
     } else {
-        using DTypeOut = cutlass::half_t;
-        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_data, v_data, out_ptr,
-            num_qo_heads, num_kv_heads, head_dim, page_size,
-            total_num_rows, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
-            k_scale_scalar, v_scale_scalar, false,
-            indices, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                    params, false, stream);
-            } else {
-                BatchFP8PrefillWithPagedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                    params, false, stream);
-            }
-        });
+        launch_fp8_prefill(cutlass::half_t{});
     }
 
     if (q_fp8_ptr) {
         cudaFreeAsync(q_fp8_ptr, stream);
     }
-    if (q_scale_ptr) {
-        cudaFreeAsync(q_scale_ptr, stream);
+    if (q_scale_arr) {
+        cudaFreeAsync(q_scale_arr, stream);
+    }
+}
+
+void flashinfer_prefill_run_fp8(
+    void* out_ptr,
+    void* q_ptr,
+    int32_t total_num_rows,
+    void* k_data, void* v_data,
+    int32_t* indices,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    float sm_scale,
+    const float* k_scale_ptr,
+    const float* v_scale_ptr,
+    void* workspace_int,
+    int32_t out_data_type,
+    const int64_t* plan_info_vec,
+    cudaStream_t stream
+) {
+    if (!k_scale_ptr || !v_scale_ptr) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] k_scale or v_scale is null\n");
+        return;
+    }
+    if (plan_info_vec == nullptr) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] plan_info is null\n");
+        return;
+    }
+
+    int64_t tag = plan_info_vec[0];
+    if (tag != 1) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] requires SM90 plan (tag=1), got tag=%lld\n",
+                (long long)tag);
+        return;
+    }
+    const int64_t* plan_data = plan_info_vec + 1;
+    PrefillPlanSM90Info plan_info;
+    std::vector<int64_t> vec(plan_data, plan_data + 9);
+    plan_info.FromVector(vec);
+
+    using IdType = int32_t;
+    double k_scale_scalar = 1.0;
+    double v_scale_scalar = 1.0;
+    if (!ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream)) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read k_scale\n");
+        return;
+    }
+    if (!ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream)) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read v_scale\n");
+        return;
+    }
+
+    void* q_fp8_ptr = nullptr;
+    float* q_scale_arr = nullptr;
+    double q_scale_scalar = 1.0;
+    int64_t numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
+    if (cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream) != cudaSuccess) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] cudaMallocAsync q_fp8 failed\n");
+        return;
+    }
+    if (cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream) != cudaSuccess) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] cudaMallocAsync q_scale failed\n");
+        if (q_fp8_ptr) cudaFreeAsync(q_fp8_ptr, stream);
+        return;
+    }
+    bool is_input_f16 = (out_data_type == 0);
+    flashinfer_fp8_quantize_q_per_head(
+        q_ptr, q_fp8_ptr, q_scale_arr, numel,
+        num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
+
+    cudaError_t qquant_err = cudaStreamSynchronize(stream);
+    if (qquant_err != cudaSuccess) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] Q quantize failed: %s\n",
+                cudaGetErrorString(qquant_err));
+        cudaFreeAsync(q_fp8_ptr, stream);
+        cudaFreeAsync(q_scale_arr, stream);
+        return;
+    }
+    if (!ReadScaleScalar(q_scale_arr, q_scale_scalar, stream)) {
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read q_scale\n");
+        cudaFreeAsync(q_fp8_ptr, stream);
+        cudaFreeAsync(q_scale_arr, stream);
+        return;
+    }
+
+    using DTypeQ = cutlass::float_e4m3_t;
+    using DTypeKV = cutlass::float_e4m3_t;
+    using AttentionType = DefaultFP8Attention;
+
+    auto launch_fp8_prefill = [&](auto dtype_out_val) {
+        using DTypeOut = decltype(dtype_out_val);
+        FP8BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+        FillFP8PagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+            params, q_fp8_ptr, k_data, v_data, out_ptr,
+            num_qo_heads, num_kv_heads, head_dim, page_size,
+            total_num_rows, sm_scale, q_scale_scalar, k_scale_ptr, v_scale_ptr,
+            k_scale_scalar, v_scale_scalar, true,
+            indices, workspace_int, plan_info);
+        params.additional_params.maybe_scale_q = q_scale_arr;
+        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            cudaError_t kernel_err;
+            if (plan_info.same_schedule_for_all_heads) {
+                kernel_err = BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
+                    params, false, stream);
+            } else {
+                kernel_err = BatchFP8PrefillWithPagedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
+                    params, false, stream);
+            }
+            if (kernel_err != cudaSuccess) {
+                fprintf(stderr, "[flashinfer][prefill_run_fp8] FP8 prefill kernel launch failed: %s\n",
+                        cudaGetErrorString(kernel_err));
+            }
+        });
+    };
+    if (out_data_type == 1) {
+        launch_fp8_prefill(cutlass::bfloat16_t{});
+    } else {
+        launch_fp8_prefill(cutlass::half_t{});
+    }
+
+    if (q_fp8_ptr) {
+        cudaFreeAsync(q_fp8_ptr, stream);
+    }
+    if (q_scale_arr) {
+        cudaFreeAsync(q_scale_arr, stream);
     }
 }
 
@@ -743,24 +851,28 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     double k_scale_scalar = 1.0;
     double v_scale_scalar = 1.0;
     void* q_fp8_ptr = nullptr;
-    void* q_scale_ptr = nullptr;
+    float* q_scale_arr = nullptr;
     const int64_t q_numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
     cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(q_numel) * sizeof(uint8_t), stream);
-    cudaMallocAsync(&q_scale_ptr, sizeof(float), stream);
+    cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
 
     bool is_input_f16 = (out_data_type == 0);
-    flashinfer_fp8_quantize_q_scalar(
-        q_ptr, q_fp8_ptr, q_numel, static_cast<float*>(q_scale_ptr), is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(static_cast<float*>(q_scale_ptr), q_scale_scalar, stream);
+    flashinfer_fp8_quantize_q_per_head(
+        q_ptr, q_fp8_ptr, q_scale_arr, q_numel,
+        num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
+    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     void* k_fp8_ptr = nullptr;
     void* v_fp8_ptr = nullptr;
     const int64_t kv_numel = static_cast<int64_t>(total_kv_rows) * num_kv_heads * head_dim;
     cudaMallocAsync(&k_fp8_ptr, static_cast<size_t>(kv_numel) * sizeof(uint8_t), stream);
     cudaMallocAsync(&v_fp8_ptr, static_cast<size_t>(kv_numel) * sizeof(uint8_t), stream);
-    flashinfer_fp8_quantize_kv_scalar(
+    extern void flashinfer_fp8_quantize_kv_per_head(
+        const void*, const void*, void*, void*, int64_t,
+        int, int, const float*, const float*, bool, int64_t);
+    flashinfer_fp8_quantize_kv_per_head(
         k_ptr, v_ptr, k_fp8_ptr, v_fp8_ptr, kv_numel,
-        k_scale_ptr, v_scale_ptr, is_input_f16, (int64_t)stream);
+        num_kv_heads, head_dim, k_scale_ptr, v_scale_ptr, is_input_f16, (int64_t)stream);
     (void)ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream);
     (void)ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream);
 
@@ -768,41 +880,32 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     using DTypeQ = cutlass::float_e4m3_t;
     using DTypeKV = cutlass::float_e4m3_t;
     using AttentionType = DefaultFP8Attention;
+
+    auto launch_ragged = [&](auto dtype_out_val) {
+        using DTypeOut = decltype(dtype_out_val);
+        FP8BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
+        FillFP8RaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
+            params, q_fp8_ptr, k_fp8_ptr, v_fp8_ptr, out_ptr, num_qo_heads, num_kv_heads,
+            head_dim, total_num_rows, total_kv_rows, sm_scale, q_scale_scalar,
+            k_scale_ptr, v_scale_ptr, k_scale_scalar, v_scale_scalar, true, workspace_int, plan_info);
+        params.additional_params.maybe_scale_q = q_scale_arr;
+        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            if (plan_info.same_schedule_for_all_heads) {
+                BatchFP8PrefillWithRaggedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(params, true, stream);
+            } else {
+                BatchFP8PrefillWithRaggedKVCacheDispatched<
+                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(params, true, stream);
+            }
+        });
+    };
     if (out_data_type == 1) {
-        using DTypeOut = cutlass::bfloat16_t;
-        FP8BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8RaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_fp8_ptr, v_fp8_ptr, out_ptr, num_qo_heads, num_kv_heads,
-            head_dim, total_num_rows, total_kv_rows, sm_scale, q_scale_scalar,
-            k_scale_ptr, v_scale_ptr, k_scale_scalar, v_scale_scalar, false, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(params, true, stream);
-            } else {
-                BatchFP8PrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(params, true, stream);
-            }
-        });
+        launch_ragged(cutlass::bfloat16_t{});
     } else {
-        using DTypeOut = cutlass::half_t;
-        FP8BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType> params;
-        FillFP8RaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>(
-            params, q_fp8_ptr, k_fp8_ptr, v_fp8_ptr, out_ptr, num_qo_heads, num_kv_heads,
-            head_dim, total_num_rows, total_kv_rows, sm_scale, q_scale_scalar,
-            k_scale_ptr, v_scale_ptr, k_scale_scalar, v_scale_scalar, false, workspace_int, plan_info);
-        DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-            if (plan_info.same_schedule_for_all_heads) {
-                BatchFP8PrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(params, true, stream);
-            } else {
-                BatchFP8PrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(params, true, stream);
-            }
-        });
+        launch_ragged(cutlass::half_t{});
     }
     if (q_fp8_ptr) cudaFreeAsync(q_fp8_ptr, stream);
-    if (q_scale_ptr) cudaFreeAsync(q_scale_ptr, stream);
+    if (q_scale_arr) cudaFreeAsync(q_scale_arr, stream);
     if (k_fp8_ptr) cudaFreeAsync(k_fp8_ptr, stream);
     if (v_fp8_ptr) cudaFreeAsync(v_fp8_ptr, stream);
 #endif

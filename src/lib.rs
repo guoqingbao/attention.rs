@@ -519,14 +519,6 @@ impl PagedAttention {
                 };
 
                 if flashinfer_group_supported {
-                    if let Some(kc) = key_cache.as_ref() {
-                        if kc.dtype() == candle_core::DType::U8 {
-                            candle_core::bail!(
-                                "flashinfer in the current build does not support fp8 kvcache!",
-                            );
-                        }
-                    }
-
                     self.maybe_update_kv_scales(&key, &value)?;
 
                     if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
@@ -551,13 +543,13 @@ impl PagedAttention {
                         16
                     };
 
-                    return if input_metadata.is_prefill {
+                    if input_metadata.is_prefill {
                         let plan_info = fm.prefill_plan_info.as_ref().ok_or_else(|| {
                             candle_core::Error::msg(
                                 "flashinfer prefill requires prefill_plan_info (plan+run path)",
                             )
                         })?;
-                        crate::flashinfer::prefill_with_plan(
+                        return crate::flashinfer::prefill_with_plan(
                             &query,
                             key_cache.as_ref().unwrap(),
                             value_cache.as_ref().unwrap(),
@@ -576,14 +568,14 @@ impl PagedAttention {
                             Some(self.sliding_window.unwrap_or(0) as i32),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
                             plan_info,
-                        )
+                        );
                     } else {
                         let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
                             candle_core::Error::msg(
                                 "flashinfer decode requires decode_plan_info (plan+run path)",
                             )
                         })?;
-                        crate::flashinfer::decode_with_plan(
+                        return crate::flashinfer::decode_with_plan(
                             &query,
                             key_cache.as_ref().unwrap(),
                             value_cache.as_ref().unwrap(),
@@ -601,8 +593,8 @@ impl PagedAttention {
                             fm.use_cuda_graph,
                             Some(self.sliding_window.unwrap_or(0) as i32),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
-                        )
-                    };
+                        );
+                    }
                 }
 
                 if !flashinfer_group_supported {

@@ -522,21 +522,8 @@ impl FlashInferDecodeWithPlan {
             if sm < 90 {
                 candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
             }
-            if sm == 90 {
-                if self.plan_info.len() != 9 {
-                    candle::bail!(
-                        "flashinfer fp8 decode plan_info must have length 9 on sm90, got {}",
-                        self.plan_info.len()
-                    );
-                }
-            } else if self.plan_info.len() != 10 {
-                candle::bail!(
-                    "flashinfer fp8 decode plan_info must have length 10 on sm{}, got {}",
-                    sm,
-                    self.plan_info.len()
-                );
-            }
-        } else if self.plan_info.len() != 10 {
+        }
+        if self.plan_info.len() != 10 {
             candle::bail!(
                 "flashinfer decode plan_info must have length 10, got {}",
                 self.plan_info.len()
@@ -755,12 +742,7 @@ pub fn decode_plan(
         );
     }
 
-    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-    if data_type == 2 && sm == 90 {
-        Ok(plan_info[..9].to_vec())
-    } else {
-        Ok(plan_info.to_vec())
-    }
+    Ok(plan_info.to_vec())
 }
 
 /// Compute the prefill plan once per model forward. Returns a tagged i64 vector (16 elements).
@@ -996,6 +978,199 @@ impl FlashInferPrefillWithPlan {
                 data_type,
                 out_data_type,
                 self.plan_info.as_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        }
+
+        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        Ok((out, q_l.shape().clone()))
+    }
+}
+
+/// FP8 paged prefill using FlashInfer's SM90 FP8 attention kernels.
+/// This is a self-contained operation that does both plan and run internally.
+/// It quantizes Q to FP8 on-the-fly and uses the FP8 KV cache directly.
+/// Requires SM90+ (Hopper or later).
+///
+/// Note: The primary FP8 prefill path now goes through the standard
+/// `prefill_with_plan` which dispatches to `flashinfer_prefill_run_fp8`
+/// in the C++ adapter. This standalone function is kept for direct use.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn prefill_fp8_paged(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    indptr_host: &[u32],
+    last_len: &Tensor,
+    q_cu_seqlens: &Tensor,
+    q_cu_seqlens_host: &[u32],
+    kv_len_arr_host: &[u32],
+    total_num_rows: u32,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+) -> Result<Tensor> {
+    let op = FlashInferFP8PagedPrefill {
+        key_cache: key_cache.clone(),
+        value_cache: value_cache.clone(),
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
+        indices: indices.clone(),
+        indptr: indptr.clone(),
+        indptr_host: indptr_host.to_vec(),
+        last_len: last_len.clone(),
+        q_cu_seqlens: q_cu_seqlens.clone(),
+        q_cu_seqlens_host: q_cu_seqlens_host.to_vec(),
+        kv_len_arr_host: kv_len_arr_host.to_vec(),
+        total_num_rows,
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+    };
+    q.apply_op1(op)
+}
+
+struct FlashInferFP8PagedPrefill {
+    key_cache: Tensor,
+    value_cache: Tensor,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
+    indices: Tensor,
+    indptr: Tensor,
+    indptr_host: Vec<u32>,
+    last_len: Tensor,
+    q_cu_seqlens: Tensor,
+    q_cu_seqlens_host: Vec<u32>,
+    kv_len_arr_host: Vec<u32>,
+    total_num_rows: u32,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+}
+
+impl candle::CustomOp1 for FlashInferFP8PagedPrefill {
+    fn name(&self) -> &'static str {
+        "flashinfer-fp8-paged-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &candle::CpuStorage,
+        _: &Layout,
+    ) -> Result<(candle::CpuStorage, candle::Shape)> {
+        candle::bail!("no cpu support for fp8 paged prefill")
+    }
+
+    fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            _ => candle::bail!("fp8 paged prefill: unsupported q dtype {:?}", q.dtype()),
+        }
+    }
+}
+
+impl FlashInferFP8PagedPrefill {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
+        let dev = q.device();
+        let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+        if sm < 90 {
+            candle::bail!("flashinfer fp8 paged prefill requires sm90+, got sm{}", sm);
+        }
+
+        let kc_ptr = get_cuda_ptr(&self.key_cache)?;
+        let vc_ptr = get_cuda_ptr(&self.value_cache)?;
+
+        let (indices, indices_l) = self.indices.storage_and_layout();
+        let indices_ptr = match &*indices {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indices_l.start_offset()..),
+            _ => candle::bail!("indices must be cuda"),
+        };
+        let (indptr, indptr_l) = self.indptr.storage_and_layout();
+        let indptr_ptr = match &*indptr {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indptr_l.start_offset()..),
+            _ => candle::bail!("indptr must be cuda"),
+        };
+        let (last_len, last_len_l) = self.last_len.storage_and_layout();
+        let last_len_ptr = match &*last_len {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(last_len_l.start_offset()..),
+            _ => candle::bail!("last_len must be cuda"),
+        };
+        let (q_lens, q_lens_l) = self.q_cu_seqlens.storage_and_layout();
+        let q_lens_ptr = match &*q_lens {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(q_lens_l.start_offset()..),
+            _ => candle::bail!("q_cu_seqlens must be cuda"),
+        };
+
+        let k_scale_ptr = self
+            .k_scale
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("fp8 paged prefill requires k_scale"))?;
+        let v_scale_ptr = self
+            .v_scale
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("fp8 paged prefill requires v_scale"))?;
+        let k_scale = get_cuda_f32_ptr(k_scale_ptr)?;
+        let v_scale = get_cuda_f32_ptr(v_scale_ptr)?;
+
+        let out_data_type: i32 = if q.dtype() == DType::BF16 { 1 } else { 0 };
+        let batch_size = self.q_cu_seqlens_host.len().saturating_sub(1);
+
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
+
+        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
+            get_or_init_workspace(dev, false)?;
+
+        unsafe {
+            kernels::ffi::flashinfer_prefill_wrapper_fp8(
+                out_ptr,
+                q_ptr,
+                *q_lens_ptr.device_ptr() as *const i32,
+                self.q_cu_seqlens_host.as_ptr() as *const i32,
+                self.kv_len_arr_host.as_ptr() as *const i32,
+                self.total_num_rows as i32,
+                kc_ptr,
+                vc_ptr,
+                *indices_ptr.device_ptr() as *const i32,
+                *indptr_ptr.device_ptr() as *const i32,
+                self.indptr_host.as_ptr() as *const i32,
+                *last_len_ptr.device_ptr() as *const i32,
+                batch_size as i32,
+                self.num_qo_heads as i32,
+                self.num_kv_heads as i32,
+                self.head_dim as i32,
+                self.block_size as i32,
+                self.sm_scale,
+                k_scale,
+                v_scale,
+                ws_float_ptr,
+                WORKSPACE_FLOAT_SIZE,
+                ws_int_ptr,
+                WORKSPACE_INT_SIZE,
+                page_locked_ptr,
+                page_locked_size,
+                false,
+                2, // data_type = FP8
+                out_data_type,
                 *dev.cu_stream() as i64,
             );
         }

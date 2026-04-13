@@ -39,6 +39,8 @@ using namespace cute;
 // Grouped GEMM for MoE with NVFP4 block-scaled weights
 // ============================================================================
 
+#if defined(ENABLE_FP4_SM100)
+
 template <typename OutType>
 struct Fp4MoeGemmSm100 {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -104,9 +106,13 @@ struct Fp4MoeGemmSm100 {
   using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 };
 
+#endif // ENABLE_FP4_SM100
+
 // ============================================================================
 // SM120 (Blackwell) Grouped GEMM for MoE with NVFP4 block-scaled weights
 // ============================================================================
+
+#if defined(ENABLE_FP4_SM120)
 
 template <typename OutType>
 struct Fp4MoeGemmSm120 {
@@ -137,8 +143,8 @@ struct Fp4MoeGemmSm120 {
   using ClusterShape = Shape<_1, _1, _1>;
 
   using MmaTileShape = Shape<_128, _256, _256>;
-  using KernelSchedule = cutlass::gemm::KernelScheduleAuto;
-  using EpilogueSchedule = cutlass::epilogue::EpilogueScheduleAuto;
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, EpilogueOperatorClass, MmaTileShape, ClusterShape,
@@ -171,6 +177,8 @@ struct Fp4MoeGemmSm120 {
   using ScaleConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 };
+
+#endif // ENABLE_FP4_SM120
 
 // ============================================================================
 // Device kernel to set up per-expert pointer arrays for grouped GEMM
@@ -247,6 +255,8 @@ __global__ void setup_moe_group_gemm_args(
 // ============================================================================
 // MoE Grouped GEMM Launch
 // ============================================================================
+
+#if defined(ENABLE_FP4_SM100)
 
 template <typename OutType>
 static int run_fp4_moe_grouped_gemm_sm100(
@@ -414,9 +424,13 @@ static int run_fp4_moe_grouped_gemm_sm100(
   return 0;
 }
 
+#endif // ENABLE_FP4_SM100
+
 // ============================================================================
 // SM120 MoE Grouped GEMM Launch
 // ============================================================================
+
+#if defined(ENABLE_FP4_SM120)
 
 template <typename OutType>
 static int run_fp4_moe_grouped_gemm_sm120(
@@ -579,18 +593,7 @@ static int run_fp4_moe_grouped_gemm_sm120(
   return 0;
 }
 
-// ============================================================================
-// Runtime SM version detection
-// ============================================================================
-
-static int get_moe_sm_version() {
-  int device = 0;
-  cudaGetDevice(&device);
-  int major = 0, minor = 0;
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  return major * 10 + minor;
-}
+#endif // ENABLE_FP4_SM120
 
 // ============================================================================
 // C API Entry Points (with SM dispatch)
@@ -614,16 +617,19 @@ int nvfp4_cutlass_moe_gemm_f16(
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
-  if (get_moe_sm_version() >= 120) {
-    return run_fp4_moe_grouped_gemm_sm120<cutlass::half_t>(
-        output, a, b, a_blockscale, b_blockscales, alphas,
-        expert_offsets, sf_offsets, problem_sizes,
-        num_experts, total_tokens, N, K, s);
-  }
+#if defined(ENABLE_FP4_SM120)
+  return run_fp4_moe_grouped_gemm_sm120<cutlass::half_t>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, s);
+#elif defined(ENABLE_FP4_SM100)
   return run_fp4_moe_grouped_gemm_sm100<cutlass::half_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
       num_experts, total_tokens, N, K, s);
+#else
+  return -1;
+#endif
 }
 
 int nvfp4_cutlass_moe_gemm_bf16(
@@ -642,16 +648,19 @@ int nvfp4_cutlass_moe_gemm_bf16(
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
-  if (get_moe_sm_version() >= 120) {
-    return run_fp4_moe_grouped_gemm_sm120<cutlass::bfloat16_t>(
-        output, a, b, a_blockscale, b_blockscales, alphas,
-        expert_offsets, sf_offsets, problem_sizes,
-        num_experts, total_tokens, N, K, s);
-  }
+#if defined(ENABLE_FP4_SM120)
+  return run_fp4_moe_grouped_gemm_sm120<cutlass::bfloat16_t>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, s);
+#elif defined(ENABLE_FP4_SM100)
   return run_fp4_moe_grouped_gemm_sm100<cutlass::bfloat16_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
       num_experts, total_tokens, N, K, s);
+#else
+  return -1;
+#endif
 }
 
 }  // extern "C"
