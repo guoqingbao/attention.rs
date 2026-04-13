@@ -333,6 +333,10 @@ static void run_fp4_gemm(
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
   using Sm1xxBlkScaledConfig = typename GemmOp::Sm1xxBlkScaledConfig;
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
 
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
@@ -348,11 +352,11 @@ static void run_fp4_gemm(
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
+      cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   operator_args.mainloop.dB =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
+      cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   operator_args.epilogue.dC =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
+      cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
   operator_args.epilogue.dD = operator_args.epilogue.dC;
 
   operator_args.mainloop.layout_SFA =
@@ -436,6 +440,10 @@ static void run_fp4_gemm_sm120_impl(
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
 
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
@@ -451,11 +459,11 @@ static void run_fp4_gemm_sm120_impl(
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
+      cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   operator_args.mainloop.dB =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
+      cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   operator_args.epilogue.dC =
-      cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
+      cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
   operator_args.epilogue.dD = operator_args.epilogue.dC;
 
   operator_args.mainloop.layout_SFA =
