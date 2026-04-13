@@ -749,87 +749,87 @@ fn nvfp4_moe_gemm_hardware(
         }
     }
 
-    // Step 5: Quantize gathered activations to FP4
-    // Use input_scale_inv = 1.0 since per-expert scaling is in the alpha
+    // Step 5: Quantize gathered activations to FP4.
+    // Each expert slice must be quantized with its own activation global scale.
+    // Folding all per-expert input scales into the GEMM alpha is incorrect because
+    // the block scales themselves must already include the activation-side global
+    // scale used during FP4 quantization.
     let k_scale = k / NVFP4_BLOCK_SIZE;
-    let total_m_padded = pad_to(total_expanded, 128);
     let k_scale_padded = pad_to(k_scale, 4);
 
     let act_packed = Tensor::zeros((total_expanded, k / 2), DType::U8, dev)?;
     let act_scales = Tensor::zeros((total_expanded, k_scale), DType::U8, dev)?;
-    let act_scales_swizzled_tmp = Tensor::zeros((total_m_padded, k_scale_padded), DType::U8, dev)?;
     let act_scales_swizzled = Tensor::zeros((total_sf_rows, k_scale_padded), DType::U8, dev)?;
 
     {
         let (gathered_s, _) = gathered.storage_and_layout();
         let (act_packed_s, _) = act_packed.storage_and_layout();
         let (act_scales_s, _) = act_scales.storage_and_layout();
-        let (act_scales_sw_s, _) = act_scales_swizzled_tmp.storage_and_layout();
-
-        let gathered_ptr = cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void;
-        let act_packed_ptr = cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
-        let act_scales_ptr = cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
-        let act_scales_sw_ptr = cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
-
-        unsafe {
-            match dtype {
-                DType::F16 => ffi::nvfp4_quantize_activation_f16(
-                    gathered_ptr,
-                    act_packed_ptr,
-                    act_scales_ptr,
-                    act_scales_sw_ptr,
-                    1.0f32, // input_scale_inv = 1.0, per-expert scaling via alpha
-                    total_expanded as i32,
-                    k as i32,
-                    total_m_padded as i32,
-                    k_scale_padded as i32,
-                    stream,
-                ),
-                DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
-                    gathered_ptr,
-                    act_packed_ptr,
-                    act_scales_ptr,
-                    act_scales_sw_ptr,
-                    1.0f32,
-                    total_expanded as i32,
-                    k as i32,
-                    total_m_padded as i32,
-                    k_scale_padded as i32,
-                    stream,
-                ),
-                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
-            }
-        }
-    }
-
-    // Re-swizzle each expert's activation scales into a tensor whose rows are padded
-    // independently per expert. Using expert_offsets here is incorrect because the
-    // grouped CUTLASS path expects scale-factor pointers to advance by padded row
-    // counts, not by the packed-token counts.
-    {
-        let (act_scales_s, _) = act_scales.storage_and_layout();
         let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+
+        let gathered_base = cuda_ptr(&gathered_s, dtype)?;
+        let act_packed_base = cuda_ptr(&act_packed_s, DType::U8)?;
         let act_scales_base = cuda_ptr(&act_scales_s, DType::U8)?;
         let act_scales_sw_base = cuda_ptr(&act_scales_sw_s, DType::U8)?;
+
+        let gathered_row_bytes = match dtype {
+            DType::F16 => k * std::mem::size_of::<half::f16>(),
+            DType::BF16 => k * std::mem::size_of::<half::bf16>(),
+            _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+        } as u64;
 
         for e in 0..num_experts {
             let rows = expert_counts[e] as usize;
             if rows == 0 {
                 continue;
             }
-            let src_offset = expert_offsets[e] as u64 * k_scale as u64;
-            let dst_offset = sf_offsets[e] as u64 * k_scale_padded as u64;
+
+            let input_scale_inv = if iscales_cpu[e] != 0.0 {
+                1.0 / iscales_cpu[e]
+            } else {
+                1.0
+            };
+            let row_offset = expert_offsets[e] as u64;
+            let sf_row_offset = sf_offsets[e] as u64;
             let rows_padded = pad_to(rows, 128);
+
+            let gathered_ptr =
+                (gathered_base + row_offset * gathered_row_bytes) as *const std::ffi::c_void;
+            let act_packed_ptr =
+                (act_packed_base + row_offset * (k as u64 / 2)) as *mut std::ffi::c_void;
+            let act_scales_ptr =
+                (act_scales_base + row_offset * k_scale as u64) as *mut std::ffi::c_void;
+            let act_scales_sw_ptr = (act_scales_sw_base + sf_row_offset * k_scale_padded as u64)
+                as *mut std::ffi::c_void;
+
             unsafe {
-                ffi::nvfp4_swizzle_weight_scales(
-                    (act_scales_base + src_offset) as *const std::ffi::c_void,
-                    (act_scales_sw_base + dst_offset) as *mut std::ffi::c_void,
-                    rows as i32,
-                    k_scale as i32,
-                    rows_padded as i32,
-                    k_scale_padded as i32,
-                    stream,
-                );
+                match dtype {
+                    DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                        gathered_ptr,
+                        act_packed_ptr,
+                        act_scales_ptr,
+                        act_scales_sw_ptr,
+                        input_scale_inv,
+                        rows as i32,
+                        k as i32,
+                        rows_padded as i32,
+                        k_scale_padded as i32,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                        gathered_ptr,
+                        act_packed_ptr,
+                        act_scales_ptr,
+                        act_scales_sw_ptr,
+                        input_scale_inv,
+                        rows as i32,
+                        k as i32,
+                        rows_padded as i32,
+                        k_scale_padded as i32,
+                        stream,
+                    ),
+                    _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+                }
             }
         }
     }
