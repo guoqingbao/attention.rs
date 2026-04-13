@@ -372,7 +372,12 @@ static void run_fp4_gemm(
     return;
   }
 
-  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
+  auto status = gemm.initialize(operator_args, ws);
+  if (status != cutlass::Status::kSuccess) {
+    fprintf(stderr, "[NVFP4 GEMM CUTLASS] initialize failed: %s\n",
+            cutlass::cutlassGetStatusString(status));
+  }
+  auto run_status = gemm.run(operator_args, ws, stream);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM100] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
