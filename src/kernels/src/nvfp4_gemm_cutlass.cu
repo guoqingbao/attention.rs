@@ -347,7 +347,7 @@ static void run_fp4_gemm(
   operator_args.mainloop.ptr_B = static_cast<cutlass::float_e2m1_t const*>(B);
   operator_args.mainloop.ptr_SFA = static_cast<ElementSFA const*>(input_sf);
   operator_args.mainloop.ptr_SFB = static_cast<ElementSFB const*>(weight_sf);
-  operator_args.epilogue.ptr_C = nullptr;
+  operator_args.epilogue.ptr_C = static_cast<typename Gemm::ElementC const*>(D);
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
@@ -388,6 +388,13 @@ static void run_fp4_gemm(
   if (can_impl != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM100] can_implement failed: %s (M=%d N=%d K=%d)\n",
             cutlass::cutlassGetStatusString(can_impl), m, n, k);
+    return;
+  }
+
+  auto init_status = gemm.initialize(operator_args, ws, stream);
+  if (init_status != cutlass::Status::kSuccess) {
+    fprintf(stderr, "[NVFP4 SM100] initialize failed: %s (M=%d N=%d K=%d)\n",
+            cutlass::cutlassGetStatusString(init_status), m, n, k);
     return;
   }
 
@@ -450,7 +457,7 @@ static void run_fp4_gemm_sm120_impl(
   operator_args.mainloop.ptr_B = static_cast<cutlass::float_e2m1_t const*>(B);
   operator_args.mainloop.ptr_SFA = static_cast<ElementSFA const*>(input_sf);
   operator_args.mainloop.ptr_SFB = static_cast<ElementSFB const*>(weight_sf);
-  operator_args.epilogue.ptr_C = nullptr;
+  operator_args.epilogue.ptr_C = static_cast<typename GemmAdapter::ElementC const*>(D);
   operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
 
   operator_args.mainloop.dA =
@@ -490,6 +497,13 @@ static void run_fp4_gemm_sm120_impl(
   if (can_impl != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM120 %s] can_implement failed: %s (M=%d N=%d K=%d)\n",
             sched_name, cutlass::cutlassGetStatusString(can_impl), m, n, k);
+    return;
+  }
+
+  auto init_status = gemm.initialize(operator_args, ws, stream);
+  if (init_status != cutlass::Status::kSuccess) {
+    fprintf(stderr, "[NVFP4 SM120 %s] initialize failed: %s (M=%d N=%d K=%d)\n",
+            sched_name, cutlass::cutlassGetStatusString(init_status), m, n, k);
     return;
   }
 
