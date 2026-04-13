@@ -197,23 +197,28 @@ __global__ void nvfp4_swizzle_scales_kernel(
   int total = rows_padded * cols_padded;
   if (idx >= total) return;
 
-  int dst_row = idx / cols_padded;
-  int dst_col = idx % cols_padded;
+  // CUTLASS/FlashInfer NVFP4 stores scale factors in 128x4 tiles laid out as:
+  //   [num_m_tiles, num_k_tiles, 32 (outer_m), 4 (inner_m), 4 (inner_k)]
+  // The destination buffer is still a flat byte array of length rows_padded * cols_padded,
+  // so recover the swizzled tile coordinates from the flat destination index and then map
+  // them back to the source linear [row, col] coordinates.
+  int num_k_tiles = cols_padded / 4;
+  int rem = idx;
+  int inner_k = rem % 4;
+  rem /= 4;
+  int inner_m = rem % 4;
+  rem /= 4;
+  int outer_m = rem % 32;
+  rem /= 32;
+  int k_tile = rem % num_k_tiles;
+  int m_tile = rem / num_k_tiles;
 
-  // Swizzle mapping: for scale factor row 'i', it maps to data block row:
-  // (i % 4) * 32 + (i / 4)
-  // Inverse: given dst_row, find src_row such that (src_row % 4) * 32 + (src_row / 4) == dst_row
-  // This is the CUTLASS 128x4 swizzled layout
-
-  // For the 128x4 block: rows are interleaved in groups of 4
-  int block_128 = dst_row / 128;
-  int within_128 = dst_row % 128;
-  int src_within = (within_128 % 32) * 4 + (within_128 / 32);
-  int src_row = block_128 * 128 + src_within;
+  int src_row = m_tile * 128 + inner_m * 32 + outer_m;
+  int src_col = k_tile * 4 + inner_k;
 
   uint8_t val = 0;
-  if (src_row < rows && dst_col < cols) {
-    val = linear_scales[src_row * cols + dst_col];
+  if (src_row < rows && src_col < cols) {
+    val = linear_scales[src_row * cols + src_col];
   }
   swizzled_scales[idx] = val;
 }
