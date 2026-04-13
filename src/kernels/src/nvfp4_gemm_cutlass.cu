@@ -133,8 +133,8 @@ struct KernelConfigLargeM : Fp4GemmSm100Config<OutType, _2SM> {
 
 #if defined(ENABLE_FP4_SM120)
 
-template <typename OutType>
-struct Fp4GemmSm120Config {
+template <typename OutType, typename TileShape>
+struct Fp4GemmSm120ConfigBase {
   using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
   static constexpr int AlignmentA = 32;
@@ -156,12 +156,24 @@ struct Fp4GemmSm120Config {
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
   using SFType = cutlass::float_ue4m3_t;
 
-  using MmaTileShape = Shape<_128, _256, _256>;
+  using MmaTileShape = TileShape;
   using ClusterShapeType = Shape<_1, _1, _1>;
   using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using MainloopSchedule = cutlass::gemm::collective::KernelScheduleAuto;
 };
+
+template <typename OutType>
+struct Fp4GemmSm120ConfigSmallM
+    : Fp4GemmSm120ConfigBase<OutType, Shape<_128, _128, _256>> {};
+
+template <typename OutType>
+struct Fp4GemmSm120ConfigM256
+    : Fp4GemmSm120ConfigBase<OutType, Shape<_128, _128, _128>> {};
+
+template <typename OutType>
+struct Fp4GemmSm120ConfigDefault
+    : Fp4GemmSm120ConfigBase<OutType, Shape<_256, _128, _128>> {};
 
 #endif // ENABLE_FP4_SM120
 
@@ -419,12 +431,11 @@ static void run_fp4_gemm_sm120_impl(
     cudaStream_t stream,
     const char* sched_name)
 {
-  using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120Config<OutType>>;
   using ElementD = OutType;
   using ElementSFA = cutlass::float_ue4m3_t;
   using ElementSFB = cutlass::float_ue4m3_t;
   using ElementCompute = float;
-  using Sm1xxBlkScaledConfig = typename GemmOp::Sm1xxBlkScaledConfig;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
@@ -479,13 +490,13 @@ static void run_fp4_gemm_sm120_impl(
     return;
   }
 
-  auto status = gemm.initialize(operator_args, ws);
+  auto status = gemm.initialize(operator_args, ws, stream);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 GEMM CUTLASS] initialize failed: %s\n",
             cutlass::cutlassGetStatusString(status));
   }
 
-  auto run_status = gemm.run(operator_args, ws, stream);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*enable_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM120 %s] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             sched_name, cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
@@ -501,17 +512,35 @@ static void run_fp4_gemm_sm120(
     void* workspace, size_t workspace_bytes,
     cudaStream_t stream)
 {
-  using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120Config<OutType>>;
-  if (m < 128) {
-    using GemmStreamK = typename GemmOp::GemmStreamK;
-    run_fp4_gemm_sm120_impl<GemmStreamK, OutType>(
+  auto next_pow2 = [](int v) {
+    unsigned x = static_cast<unsigned>(v <= 1 ? 1 : v - 1);
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return static_cast<int>(x + 1);
+  };
+
+  int mp2 = next_pow2(m < 16 ? 16 : m);
+  if (mp2 <= 32) {
+    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigSmallM<OutType>>;
+    using Gemm = typename GemmOp::Gemm;
+    run_fp4_gemm_sm120_impl<Gemm, OutType>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        workspace, workspace_bytes, stream, "StreamK");
+        workspace, workspace_bytes, stream, "SmallM");
+  } else if (mp2 <= 256) {
+    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigM256<OutType>>;
+    using Gemm = typename GemmOp::Gemm;
+    run_fp4_gemm_sm120_impl<Gemm, OutType>(
+        D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+        workspace, workspace_bytes, stream, "M256");
   } else {
-    using GemmDP = typename GemmOp::Gemm;
-    run_fp4_gemm_sm120_impl<GemmDP, OutType>(
+    using GemmOp = CutlassFp4GemmSm120<Fp4GemmSm120ConfigDefault<OutType>>;
+    using Gemm = typename GemmOp::Gemm;
+    run_fp4_gemm_sm120_impl<Gemm, OutType>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        workspace, workspace_bytes, stream, "DP");
+        workspace, workspace_bytes, stream, "Default");
   }
 }
 

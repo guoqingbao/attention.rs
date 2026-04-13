@@ -117,7 +117,8 @@ pub fn nvfp4_matmul(
                 }
             }
 
-            let use_hardware_fp4 = is_hardware_fp4_available(dev) && m >= 32;
+            let use_hardware_fp4 =
+                is_hardware_fp4_available(dev) && m >= 32 && n % 32 == 0 && k % 32 == 0;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
@@ -489,7 +490,7 @@ pub fn nvfp4_moe_gemm(
             let has_bias = biases.is_some();
 
             #[allow(unused)]
-            let use_hardware_fp4 = is_hardware_fp4_available(dev);
+            let use_hardware_fp4 = is_hardware_fp4_available(dev) && n % 32 == 0 && k % 32 == 0;
 
             #[cfg(feature = "cutlass")]
             if use_hardware_fp4 && num_tokens > 0 {
@@ -690,8 +691,15 @@ fn nvfp4_moe_gemm_hardware(
         problem_sizes[e * 3 + 2] = k as u32;
     }
 
-    // sf_offsets: same as expert_offsets for activation scales (1 scale row per token row)
-    let sf_offsets = expert_offsets.clone();
+    // CUTLASS block-scaled grouped GEMM requires each expert's activation-scale rows
+    // to start on a 128-row boundary, even though the packed activations themselves
+    // remain tightly packed.
+    let mut sf_offsets = vec![0u32; num_experts];
+    let mut total_sf_rows = 0usize;
+    for e in 0..num_experts {
+        sf_offsets[e] = total_sf_rows as u32;
+        total_sf_rows += pad_to(expert_counts[e] as usize, 128);
+    }
 
     // Step 2: Compute per-expert alphas = input_scale[e] * weight_global_scale[e]
     let wgs_cpu = weight_global_scales.to_vec1::<f32>()?;
@@ -749,18 +757,19 @@ fn nvfp4_moe_gemm_hardware(
     // Step 5: Quantize gathered activations to FP4
     // Use input_scale_inv = 1.0 since per-expert scaling is in the alpha
     let k_scale = k / NVFP4_BLOCK_SIZE;
-    let m_padded = pad_to(total_expanded, 128);
+    let total_m_padded = pad_to(total_expanded, 128);
     let k_scale_padded = pad_to(k_scale, 4);
 
     let act_packed = Tensor::zeros((total_expanded, k / 2), DType::U8, dev)?;
-    let act_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
-    let act_scales_swizzled = Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+    let act_scales = Tensor::zeros((total_expanded, k_scale), DType::U8, dev)?;
+    let act_scales_swizzled_tmp = Tensor::zeros((total_m_padded, k_scale_padded), DType::U8, dev)?;
+    let act_scales_swizzled = Tensor::zeros((total_sf_rows, k_scale_padded), DType::U8, dev)?;
 
     {
         let (gathered_s, _) = gathered.storage_and_layout();
         let (act_packed_s, _) = act_packed.storage_and_layout();
         let (act_scales_s, _) = act_scales.storage_and_layout();
-        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled_tmp.storage_and_layout();
 
         let gathered_ptr = cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void;
         let act_packed_ptr = cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
@@ -777,7 +786,7 @@ fn nvfp4_moe_gemm_hardware(
                     1.0f32, // input_scale_inv = 1.0, per-expert scaling via alpha
                     total_expanded as i32,
                     k as i32,
-                    m_padded as i32,
+                    total_m_padded as i32,
                     k_scale_padded as i32,
                     stream,
                 ),
@@ -789,11 +798,43 @@ fn nvfp4_moe_gemm_hardware(
                     1.0f32,
                     total_expanded as i32,
                     k as i32,
-                    m_padded as i32,
+                    total_m_padded as i32,
                     k_scale_padded as i32,
                     stream,
                 ),
                 _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            }
+        }
+    }
+
+    // Re-swizzle each expert's activation scales into a tensor whose rows are padded
+    // independently per expert. Using expert_offsets here is incorrect because the
+    // grouped CUTLASS path expects scale-factor pointers to advance by padded row
+    // counts, not by the packed-token counts.
+    {
+        let (act_scales_s, _) = act_scales.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let act_scales_base = cuda_ptr(&act_scales_s, DType::U8)?;
+        let act_scales_sw_base = cuda_ptr(&act_scales_sw_s, DType::U8)?;
+
+        for e in 0..num_experts {
+            let rows = expert_counts[e] as usize;
+            if rows == 0 {
+                continue;
+            }
+            let src_offset = expert_offsets[e] as u64 * k_scale as u64;
+            let dst_offset = sf_offsets[e] as u64 * k_scale_padded as u64;
+            let rows_padded = pad_to(rows, 128);
+            unsafe {
+                ffi::nvfp4_swizzle_weight_scales(
+                    (act_scales_base + src_offset) as *const std::ffi::c_void,
+                    (act_scales_sw_base + dst_offset) as *mut std::ffi::c_void,
+                    rows as i32,
+                    k_scale as i32,
+                    rows_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                );
             }
         }
     }

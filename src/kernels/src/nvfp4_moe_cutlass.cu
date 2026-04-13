@@ -225,6 +225,7 @@ __global__ void setup_moe_group_gemm_args(
   int64_t expert_offset = static_cast<int64_t>(expert_offsets[expert_id]);
   int64_t sf_offset = static_cast<int64_t>(sf_offsets[expert_id]);
   int64_t group_size = 16;
+  int64_t row_align = 128;
 
   int64_t m = static_cast<int64_t>(problem_sizes[expert_id * 3]);
   int64_t n = static_cast<int64_t>(problem_sizes[expert_id * 3 + 1]);
@@ -232,13 +233,20 @@ __global__ void setup_moe_group_gemm_args(
 
   int64_t half_k = k / 2;
   int64_t group_k = k / group_size;
+  int64_t group_k_padded = ((group_k + 3) / 4) * 4;
+  int64_t n_padded = ((n + row_align - 1) / row_align) * row_align;
 
   a_offsets[expert_id] = a_base + expert_offset * half_k;
   b_offsets[expert_id] = b_base + expert_id * n * half_k;
   out_offsets[expert_id] = out_base + expert_offset * n;
-  a_scales_offsets[expert_id] = a_scales_base + sf_offset * group_k;
-  b_scales_offsets[expert_id] = b_scales_base + expert_id * n * group_k;
+  a_scales_offsets[expert_id] = a_scales_base + sf_offset * group_k_padded;
+  b_scales_offsets[expert_id] = b_scales_base + expert_id * n_padded * group_k_padded;
   alpha_offsets[expert_id] = alphas_base + expert_id;
+
+  assert((reinterpret_cast<uintptr_t>(a_scales_offsets[expert_id]) % 128) == 0 &&
+         "NVFP4 activation scales must be 128-byte aligned");
+  assert((reinterpret_cast<uintptr_t>(b_scales_offsets[expert_id]) % 128) == 0 &&
+         "NVFP4 weight scales must be 128-byte aligned");
 
   stride_a[expert_id] = cutlass::make_cute_packed_stride(StrideA{}, {static_cast<int>(m), static_cast<int>(k), 1});
   stride_b[expert_id] = cutlass::make_cute_packed_stride(StrideB{}, {static_cast<int>(n), static_cast<int>(k), 1});
