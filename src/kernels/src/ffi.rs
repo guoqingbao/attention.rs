@@ -1497,6 +1497,8 @@ extern "C" {
         M: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -1510,6 +1512,8 @@ extern "C" {
         M: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -2173,6 +2177,8 @@ extern "C" {
         M: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -2185,6 +2191,8 @@ extern "C" {
         M: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 

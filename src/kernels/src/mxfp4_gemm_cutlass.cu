@@ -255,11 +255,10 @@ static void run_mxfp4_gemm(
     const void* input_sf, const void* weight_sf,
     int m, int n, int k,
     dim3 preferred_cluster, dim3 fallback_cluster,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream)
 {
   using Gemm = typename GemmOp::Gemm;
-  using ElementA = typename Gemm::ElementA;
-  using ElementB = typename Gemm::ElementB;
   using ElementD = typename Gemm::ElementD;
   using ElementSFA = cutlass::float_ue8m0_t;
   using ElementSFB = cutlass::float_ue8m0_t;
@@ -268,13 +267,11 @@ static void run_mxfp4_gemm(
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
 
-  auto& fusion_args = operator_args.epilogue.thread;
-  fusion_args.alpha_ptr = nullptr;
-
+  operator_args.epilogue.thread.alpha_ptr = nullptr;
   operator_args.problem_shape = cute::make_shape(m, n, k, 1);
 
-  operator_args.mainloop.ptr_A = static_cast<ElementA const*>(A);
-  operator_args.mainloop.ptr_B = static_cast<ElementB const*>(B);
+  operator_args.mainloop.ptr_A = static_cast<cutlass::float_e2m1_t const*>(A);
+  operator_args.mainloop.ptr_B = static_cast<cutlass::float_e2m1_t const*>(B);
   operator_args.mainloop.ptr_SFA = static_cast<ElementSFA const*>(input_sf);
   operator_args.mainloop.ptr_SFB = static_cast<ElementSFB const*>(weight_sf);
   operator_args.epilogue.ptr_C = nullptr;
@@ -303,34 +300,25 @@ static void run_mxfp4_gemm(
   Gemm gemm;
 
   size_t workspace_size = Gemm::get_workspace_size(operator_args);
-  void* workspace = nullptr;
-  if (workspace_size > 0) {
-    cudaMallocAsync(&workspace, workspace_size, stream);
+  if (workspace_size > workspace_bytes) {
+    fprintf(stderr, "[MXFP4] workspace too small: need %zu, have %zu (M=%d N=%d K=%d)\n",
+            workspace_size, workspace_bytes, m, n, k);
+    return;
   }
+  void* ws = (workspace_size > 0) ? workspace : nullptr;
 
   auto can_impl = gemm.can_implement(operator_args);
   if (can_impl != cutlass::Status::kSuccess) {
-    if (workspace) cudaFreeAsync(workspace, stream);
-    fprintf(stderr, "[MXFP4 CUTLASS GEMM] can_implement failed: %s\n",
-            cutlass::cutlassGetStatusString(can_impl));
+    fprintf(stderr, "[MXFP4] can_implement failed: %s (M=%d N=%d K=%d)\n",
+            cutlass::cutlassGetStatusString(can_impl), m, n, k);
     return;
   }
 
-  auto init_status = gemm.initialize(operator_args, workspace, stream);
-  if (init_status != cutlass::Status::kSuccess) {
-    if (workspace) cudaFreeAsync(workspace, stream);
-    fprintf(stderr, "[MXFP4 CUTLASS GEMM] initialize failed: %s\n",
-            cutlass::cutlassGetStatusString(init_status));
-    return;
-  }
-
-  auto run_status = gemm.run(operator_args, workspace, stream, nullptr, true);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
-    fprintf(stderr, "[MXFP4 CUTLASS GEMM] run failed: %s\n",
-            cutlass::cutlassGetStatusString(run_status));
+    fprintf(stderr, "[MXFP4] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
+            cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
   }
-
-  if (workspace) cudaFreeAsync(workspace, stream);
 }
 
 #if defined(ENABLE_FP4_SM100)
@@ -339,20 +327,21 @@ static void dispatch_mxfp4_gemm_sm100(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
     int m, int n, int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream)
 {
   if (m <= 128) {
     using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _1SM>;
     run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
-                            dim3(1, 4, 1), dim3(1, 2, 1), stream);
+                            dim3(1, 4, 1), dim3(1, 2, 1), workspace, workspace_bytes, stream);
   } else if (m <= 1024) {
     using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _2SM>;
     run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
-                            dim3(2, 4, 1), dim3(2, 1, 1), stream);
+                            dim3(2, 4, 1), dim3(2, 1, 1), workspace, workspace_bytes, stream);
   } else {
     using GemmOp = CutlassMxfp4Gemm<OutType, 128, 256, 256, _2SM>;
     run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
-                            dim3(1, 4, 1), dim3(1, 2, 1), stream);
+                            dim3(1, 4, 1), dim3(1, 2, 1), workspace, workspace_bytes, stream);
   }
 }
 #endif // ENABLE_FP4_SM100
@@ -363,11 +352,12 @@ static void run_mxfp4_gemm_sm120(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
     int m, int n, int k,
+    void* workspace, size_t workspace_bytes,
     cudaStream_t stream)
 {
   using GemmOp = CutlassMxfp4GemmSm120<OutType, 128, 256, 256>;
   run_mxfp4_gemm<GemmOp>(D, A, B, input_sf, weight_sf, m, n, k,
-                          dim3(1, 1, 1), dim3(1, 1, 1), stream);
+                          dim3(1, 1, 1), dim3(1, 1, 1), workspace, workspace_bytes, stream);
 }
 #endif // ENABLE_FP4_SM120
 
@@ -384,15 +374,18 @@ void mxfp4_cutlass_gemm_f16(
     const void* weight_sf,
     void* output,
     int M, int N, int K,
+    void* workspace, int64_t workspace_bytes,
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
 #if defined(ENABLE_FP4_SM120)
   run_mxfp4_gemm_sm120<cutlass::half_t>(
-      output, input, weight, input_sf, weight_sf, M, N, K, s);
+      output, input, weight, input_sf, weight_sf, M, N, K,
+      workspace, static_cast<size_t>(workspace_bytes), s);
 #elif defined(ENABLE_FP4_SM100)
   dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
-      output, input, weight, input_sf, weight_sf, M, N, K, s);
+      output, input, weight, input_sf, weight_sf, M, N, K,
+      workspace, static_cast<size_t>(workspace_bytes), s);
 #endif
 }
 
@@ -403,15 +396,18 @@ void mxfp4_cutlass_gemm_bf16(
     const void* weight_sf,
     void* output,
     int M, int N, int K,
+    void* workspace, int64_t workspace_bytes,
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
 #if defined(ENABLE_FP4_SM120)
   run_mxfp4_gemm_sm120<cutlass::bfloat16_t>(
-      output, input, weight, input_sf, weight_sf, M, N, K, s);
+      output, input, weight, input_sf, weight_sf, M, N, K,
+      workspace, static_cast<size_t>(workspace_bytes), s);
 #elif defined(ENABLE_FP4_SM100)
   dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
-      output, input, weight, input_sf, weight_sf, M, N, K, s);
+      output, input, weight, input_sf, weight_sf, M, N, K,
+      workspace, static_cast<size_t>(workspace_bytes), s);
 #endif
 }
 
@@ -423,13 +419,15 @@ extern "C" {
 
 void mxfp4_cutlass_gemm_f16(
     const void*, const void*, const void*, const void*,
-    void*, int, int, int, int64_t)
+    void*, int, int, int,
+    void*, int64_t, int64_t)
 {
 }
 
 void mxfp4_cutlass_gemm_bf16(
     const void*, const void*, const void*, const void*,
-    void*, int, int, int, int64_t)
+    void*, int, int, int,
+    void*, int64_t, int64_t)
 {
 }
 

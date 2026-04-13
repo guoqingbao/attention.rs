@@ -219,6 +219,10 @@ pub fn nvfp4_matmul(
                             stream,
                         );
 
+                        let (ws_ptr, _, _, _) =
+                            crate::flashinfer::get_or_init_workspace(cuda_dev, false)?;
+                        let ws_bytes = crate::flashinfer::WORKSPACE_FLOAT_SIZE as i64;
+
                         match dtype {
                             DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
                                 act_packed_ptr as *const std::ffi::c_void,
@@ -230,6 +234,8 @@ pub fn nvfp4_matmul(
                                 m as i32,
                                 n as i32,
                                 k as i32,
+                                ws_ptr,
+                                ws_bytes,
                                 stream,
                             ),
                             DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
@@ -242,6 +248,8 @@ pub fn nvfp4_matmul(
                                 m as i32,
                                 n as i32,
                                 k as i32,
+                                ws_ptr,
+                                ws_bytes,
                                 stream,
                             ),
                             _ => candle_core::bail!("nvfp4_matmul: unsupported dtype {:?}", dtype),
