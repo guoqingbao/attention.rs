@@ -715,11 +715,6 @@ fn nvfp4_moe_gemm_hardware(
     // Step 3: Upload CPU arrays to GPU (u32 tensors, cast to i32* at FFI boundary)
     let sorted_token_ids_t = Tensor::from_vec(sorted_token_ids, (total_expanded,), dev)?;
     let scatter_ids_t = Tensor::from_vec(scatter_ids, (total_expanded,), dev)?;
-    let expert_offsets_t = Tensor::from_vec(expert_offsets, (num_experts,), dev)?;
-    let sf_offsets_t = Tensor::from_vec(sf_offsets, (num_experts,), dev)?;
-    let problem_sizes_t = Tensor::from_vec(problem_sizes, (num_experts * 3,), dev)?;
-    let alphas_t = Tensor::from_vec(alphas, (num_experts,), dev)?;
-
     // Step 4: Gather input tokens sorted by expert
     let gathered = Tensor::zeros((total_expanded, k), dtype, dev)?;
     {
@@ -838,6 +833,11 @@ fn nvfp4_moe_gemm_hardware(
             }
         }
     }
+
+    let expert_offsets_t = Tensor::from_vec(expert_offsets, (num_experts,), dev)?;
+    let sf_offsets_t = Tensor::from_vec(sf_offsets, (num_experts,), dev)?;
+    let problem_sizes_t = Tensor::from_vec(problem_sizes, (num_experts * 3,), dev)?;
+    let alphas_t = Tensor::from_vec(alphas, (num_experts,), dev)?;
 
     // Step 6: Swizzle weight scales for CUTLASS
     // Weight scales: [E, N, K/16] -> swizzle each expert's [N, K/16] block
