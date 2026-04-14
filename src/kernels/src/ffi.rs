@@ -1213,6 +1213,29 @@ extern "C" {
     );
 
     #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_decode_plan_wrapper_fp8(
+        indptr_host: *mut i32,
+        qo_indptr_host: *mut i32,
+        kv_len_arr_host: *mut i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
+        enable_cuda_graph: bool,
+        data_type: i32,
+        out_data_type: i32,
+        plan_info_out: *mut i64, // length 9
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
     pub fn flashinfer_decode_run_wrapper(
         out_ptr: *mut c_void,
         q_ptr: *const c_void,
@@ -1236,6 +1259,33 @@ extern "C" {
         plan_info_vec: *const i64, // length 10
         window_left: i32,
         logits_soft_cap: f32,
+        data_type: i32,
+        out_data_type: i32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_decode_run_wrapper_fp8(
+        out_ptr: *mut c_void,
+        q_ptr: *mut c_void,
+        k_data: *mut c_void,
+        v_data: *mut c_void,
+        indices: *const i32,
+        indptr: *const i32,
+        last_len: *const i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        sm_scale: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        plan_info_vec: *const i64, // length 9
         data_type: i32,
         out_data_type: i32,
         stream: i64,
@@ -1535,6 +1585,8 @@ extern "C" {
         total_tokens: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     ) -> i32;
 
@@ -1552,6 +1604,8 @@ extern "C" {
         total_tokens: i32,
         N: i32,
         K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     ) -> i32;
 

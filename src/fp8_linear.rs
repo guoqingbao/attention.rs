@@ -4,15 +4,18 @@ use crate::cuda_utils;
 use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Device, Result, Tensor};
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+#[cfg(feature = "cuda")]
 use std::cell::RefCell;
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 384 * 1024 * 1024;
 
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 struct FlashInferFp8Workspace {
@@ -53,6 +56,62 @@ fn get_or_init_flashinfer_fp8_workspace(
         let ws = slot.as_ref().unwrap();
         Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
     })
+}
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+struct CutlassWorkspace {
+    buffer: CudaSlice<u8>,
+    size: usize,
+    device_ordinal: usize,
+}
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+thread_local! {
+    static CUTLASS_WORKSPACE: RefCell<Option<CutlassWorkspace>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+fn get_cutlass_workspace(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    required_size: usize,
+) -> Result<(*mut std::ffi::c_void, usize)> {
+    #[cfg(feature = "flashinfer")]
+    {
+        let (ptr, size) = crate::flashinfer::get_gemm_scratch_workspace(dev)?;
+        if required_size > size {
+            candle_core::bail!(
+                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
+                required_size,
+                size
+            );
+        }
+        return Ok((ptr, size));
+    }
+
+    #[cfg(not(feature = "flashinfer"))]
+    {
+        CUTLASS_WORKSPACE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+            let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
+            let needs_init = match slot.as_ref() {
+                None => true,
+                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
+            };
+
+            if needs_init {
+                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
+                *slot = Some(CutlassWorkspace {
+                    buffer,
+                    size: alloc_size,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let ws = slot.as_ref().unwrap();
+            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -538,8 +597,8 @@ pub fn fp8_matmul_cutlass(
         );
     }
 
-    let (gemm_ws_ptr, _, _, _) = crate::flashinfer::get_or_init_workspace(cu_dev, false)?;
-    let gemm_ws_bytes = crate::flashinfer::WORKSPACE_FLOAT_SIZE as i64;
+    let (gemm_ws_ptr, gemm_ws_bytes) = get_cutlass_workspace(cu_dev, 0)?;
+    let gemm_ws_bytes = gemm_ws_bytes as i64;
 
     match (dev, dtype) {
         (Device::Cuda(_), DType::F16) => {

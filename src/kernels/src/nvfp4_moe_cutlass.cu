@@ -35,6 +35,29 @@
 
 using namespace cute;
 
+namespace {
+
+size_t align_up(size_t value, size_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+void* suballocate_workspace(
+    char* workspace_base,
+    size_t workspace_bytes,
+    size_t& workspace_offset,
+    size_t allocation_bytes,
+    size_t alignment = 256) {
+  size_t aligned_offset = align_up(workspace_offset, alignment);
+  if (aligned_offset > workspace_bytes || allocation_bytes > workspace_bytes - aligned_offset) {
+    return nullptr;
+  }
+  void* result = workspace_base + aligned_offset;
+  workspace_offset = aligned_offset + allocation_bytes;
+  return result;
+}
+
+}  // namespace
+
 // ============================================================================
 // Grouped GEMM for MoE with NVFP4 block-scaled weights
 // ============================================================================
@@ -273,13 +296,15 @@ static int run_fp4_moe_grouped_gemm_sm100(
     const void* b,              // [E, N, K/2] packed FP4 weights
     const void* a_blockscale,   // [total_sf_rows, K/16] FP8 E4M3 activation scales
     const void* b_blockscales,  // [E, N, K/16] FP8 E4M3 weight scales
-    const float* alphas,        // [E] per-expert alpha = 1/(input_gs * weight_gs)
+    const float* alphas,        // [E] per-expert alpha = input_scale * weight_global_scale
     const int32_t* expert_offsets,  // [E] token offsets per expert
     const int32_t* sf_offsets,      // [E] scale factor row offsets per expert
     const int32_t* problem_sizes,   // [E, 3] (M_i, N, K) per expert
     int num_experts,
     int total_tokens,
     int N, int K,
+    void* workspace,
+    size_t workspace_bytes,
     cudaStream_t stream)
 {
   using GemmConfig = Fp4MoeGemmSm100<OutType>;
@@ -311,15 +336,16 @@ static int run_fp4_moe_grouped_gemm_sm100(
                            stride_c_bytes + layout_sfa_bytes + layout_sfb_bytes +
                            16 * 12;  // alignment padding
 
-  char* workspace_buf = nullptr;
-  cudaMallocAsync(&workspace_buf, total_workspace, stream);
-  if (!workspace_buf) return -1;
+  if (workspace == nullptr) {
+    fprintf(stderr, "[NVFP4 MoE CUTLASS] workspace pointer is null\n");
+    return -1;
+  }
 
-  char* ptr = workspace_buf;
-  auto alloc = [&](size_t bytes) -> void* {
-    void* p = ptr;
-    ptr += (bytes + 15) & ~15;  // 16-byte aligned
-    return p;
+  char* workspace_buf = static_cast<char*>(workspace);
+  size_t workspace_offset = 0;
+  auto alloc = [&](size_t bytes, size_t alignment = 256) -> void* {
+    return suballocate_workspace(
+        workspace_buf, workspace_bytes, workspace_offset, bytes, alignment);
   };
 
   auto a_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
@@ -335,6 +361,13 @@ static int run_fp4_moe_grouped_gemm_sm100(
   auto a_strides = static_cast<StrideA*>(alloc(stride_bytes));
   auto b_strides = static_cast<StrideB*>(alloc(num_experts * sizeof(StrideB)));
   auto c_strides = static_cast<StrideC*>(alloc(num_experts * sizeof(StrideC)));
+  if (!a_ptrs || !b_ptrs || !out_ptrs || !a_sf_ptrs || !b_sf_ptrs || !alpha_ptrs ||
+      !layout_sfa_arr || !layout_sfb_arr || !a_strides || !b_strides || !c_strides) {
+    fprintf(stderr,
+            "[NVFP4 MoE CUTLASS] insufficient workspace for metadata: need at least %zu bytes, got %zu\n",
+            total_workspace, workspace_bytes);
+    return -1;
+  }
 
   setup_moe_group_gemm_args<
       ElementType, ElementD, ElementSFType, float,
@@ -397,15 +430,19 @@ static int run_fp4_moe_grouped_gemm_sm100(
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
   if (gemm_workspace_size > 0) {
-    cudaMallocAsync(&gemm_workspace, gemm_workspace_size, stream);
+    gemm_workspace = alloc(gemm_workspace_size);
+    if (gemm_workspace == nullptr) {
+      fprintf(stderr,
+              "[NVFP4 MoE CUTLASS] insufficient workspace for CUTLASS GEMM: need %zu additional bytes, got %zu total\n",
+              gemm_workspace_size, workspace_bytes);
+      return -1;
+    }
   }
 
   auto can_impl = gemm_op.can_implement(args);
   if (can_impl != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] can_implement failed: %s\n",
             cutlass::cutlassGetStatusString(can_impl));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
@@ -413,8 +450,6 @@ static int run_fp4_moe_grouped_gemm_sm100(
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] initialize failed: %s\n",
             cutlass::cutlassGetStatusString(status));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
@@ -422,13 +457,9 @@ static int run_fp4_moe_grouped_gemm_sm100(
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
-  cudaFreeAsync(workspace_buf, stream);
-  if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
   return 0;
 }
 
@@ -454,6 +485,8 @@ static int run_fp4_moe_grouped_gemm_sm120(
     int num_experts,
     int total_tokens,
     int N, int K,
+    void* workspace,
+    size_t workspace_bytes,
     cudaStream_t stream)
 {
   using GemmConfig = Fp4MoeGemmSm120<OutType>;
@@ -482,15 +515,16 @@ static int run_fp4_moe_grouped_gemm_sm120(
                            stride_c_bytes + layout_sfa_bytes + layout_sfb_bytes +
                            16 * 12;
 
-  char* workspace_buf = nullptr;
-  cudaMallocAsync(&workspace_buf, total_workspace, stream);
-  if (!workspace_buf) return -1;
+  if (workspace == nullptr) {
+    fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] workspace pointer is null\n");
+    return -1;
+  }
 
-  char* ptr = workspace_buf;
-  auto alloc = [&](size_t bytes) -> void* {
-    void* p = ptr;
-    ptr += (bytes + 15) & ~15;
-    return p;
+  char* workspace_buf = static_cast<char*>(workspace);
+  size_t workspace_offset = 0;
+  auto alloc = [&](size_t bytes, size_t alignment = 256) -> void* {
+    return suballocate_workspace(
+        workspace_buf, workspace_bytes, workspace_offset, bytes, alignment);
   };
 
   auto a_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
@@ -504,6 +538,13 @@ static int run_fp4_moe_grouped_gemm_sm120(
   auto a_strides = static_cast<StrideA*>(alloc(stride_a_bytes));
   auto b_strides = static_cast<StrideB*>(alloc(stride_b_bytes));
   auto c_strides = static_cast<StrideC*>(alloc(stride_c_bytes));
+  if (!a_ptrs || !b_ptrs || !out_ptrs || !a_sf_ptrs || !b_sf_ptrs || !alpha_ptrs ||
+      !layout_sfa_arr || !layout_sfb_arr || !a_strides || !b_strides || !c_strides) {
+    fprintf(stderr,
+            "[NVFP4 MoE CUTLASS SM120] insufficient workspace for metadata: need at least %zu bytes, got %zu\n",
+            total_workspace, workspace_bytes);
+    return -1;
+  }
 
   setup_moe_group_gemm_args<
       ElementType, ElementD, ElementSFType, float,
@@ -566,15 +607,19 @@ static int run_fp4_moe_grouped_gemm_sm120(
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
   if (gemm_workspace_size > 0) {
-    cudaMallocAsync(&gemm_workspace, gemm_workspace_size, stream);
+    gemm_workspace = alloc(gemm_workspace_size);
+    if (gemm_workspace == nullptr) {
+      fprintf(stderr,
+              "[NVFP4 MoE CUTLASS SM120] insufficient workspace for CUTLASS GEMM: need %zu additional bytes, got %zu total\n",
+              gemm_workspace_size, workspace_bytes);
+      return -1;
+    }
   }
 
   auto can_impl = gemm_op.can_implement(args);
   if (can_impl != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] can_implement failed: %s\n",
             cutlass::cutlassGetStatusString(can_impl));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
@@ -582,8 +627,6 @@ static int run_fp4_moe_grouped_gemm_sm120(
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] initialize failed: %s\n",
             cutlass::cutlassGetStatusString(status));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
@@ -591,13 +634,9 @@ static int run_fp4_moe_grouped_gemm_sm120(
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
-    cudaFreeAsync(workspace_buf, stream);
-    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
     return -1;
   }
 
-  cudaFreeAsync(workspace_buf, stream);
-  if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
   return 0;
 }
 
@@ -622,6 +661,8 @@ int nvfp4_cutlass_moe_gemm_f16(
     int num_experts,
     int total_tokens,
     int N, int K,
+    void* workspace,
+    int64_t workspace_bytes,
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
@@ -629,12 +670,12 @@ int nvfp4_cutlass_moe_gemm_f16(
   return run_fp4_moe_grouped_gemm_sm120<cutlass::half_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
-      num_experts, total_tokens, N, K, s);
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
 #elif defined(ENABLE_FP4_SM100)
   return run_fp4_moe_grouped_gemm_sm100<cutlass::half_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
-      num_experts, total_tokens, N, K, s);
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
 #else
   return -1;
 #endif
@@ -653,6 +694,8 @@ int nvfp4_cutlass_moe_gemm_bf16(
     int num_experts,
     int total_tokens,
     int N, int K,
+    void* workspace,
+    int64_t workspace_bytes,
     int64_t stream)
 {
   auto s = reinterpret_cast<cudaStream_t>(stream);
@@ -660,12 +703,12 @@ int nvfp4_cutlass_moe_gemm_bf16(
   return run_fp4_moe_grouped_gemm_sm120<cutlass::bfloat16_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
-      num_experts, total_tokens, N, K, s);
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
 #elif defined(ENABLE_FP4_SM100)
   return run_fp4_moe_grouped_gemm_sm100<cutlass::bfloat16_t>(
       output, a, b, a_blockscale, b_blockscales, alphas,
       expert_offsets, sf_offsets, problem_sizes,
-      num_experts, total_tokens, N, K, s);
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
 #else
   return -1;
 #endif
@@ -680,7 +723,7 @@ extern "C" {
 int nvfp4_cutlass_moe_gemm_f16(
     void*, const void*, const void*, const void*, const void*,
     const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int64_t)
+    int, int, int, int, void*, int64_t, int64_t)
 {
   return -1;
 }
@@ -688,7 +731,7 @@ int nvfp4_cutlass_moe_gemm_f16(
 int nvfp4_cutlass_moe_gemm_bf16(
     void*, const void*, const void*, const void*, const void*,
     const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int64_t)
+    int, int, int, int, void*, int64_t, int64_t)
 {
   return -1;
 }

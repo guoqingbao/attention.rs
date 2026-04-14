@@ -1,12 +1,77 @@
 #[cfg(feature = "cuda")]
 use crate::kernels::ffi;
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use candle_core::cuda_backend::WrapErr;
 #[cfg(feature = "cuda")]
 use candle_core::DType;
 use candle_core::{Result, Tensor};
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use std::cell::RefCell;
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 384 * 1024 * 1024;
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+struct CutlassWorkspace {
+    buffer: CudaSlice<u8>,
+    size: usize,
+    device_ordinal: usize,
+}
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+thread_local! {
+    static CUTLASS_WORKSPACE: RefCell<Option<CutlassWorkspace>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+fn get_cutlass_workspace(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    required_size: usize,
+) -> Result<(*mut std::ffi::c_void, usize)> {
+    #[cfg(feature = "flashinfer")]
+    {
+        let (ptr, size) = crate::flashinfer::get_gemm_scratch_workspace(dev)?;
+        if required_size > size {
+            candle_core::bail!(
+                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
+                required_size,
+                size
+            );
+        }
+        return Ok((ptr, size));
+    }
+
+    #[cfg(not(feature = "flashinfer"))]
+    {
+        CUTLASS_WORKSPACE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+            let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
+            let needs_init = match slot.as_ref() {
+                None => true,
+                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
+            };
+
+            if needs_init {
+                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
+                *slot = Some(CutlassWorkspace {
+                    buffer,
+                    size: alloc_size,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let ws = slot.as_ref().unwrap();
+            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
+        })
+    }
+}
 
 /// Check if hardware FP4 (CUTLASS block-scaled tensor ops) is available.
 /// Requires Blackwell SM100+ and the cutlass feature.
@@ -27,6 +92,99 @@ fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
 #[cfg(feature = "cuda")]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedRowsMetadata {
+    sorted_token_ids: Vec<u32>,
+    scatter_ids: Vec<u32>,
+    expert_offsets: Vec<u32>,
+    expert_counts: Vec<u32>,
+    sf_offsets: Vec<u32>,
+    problem_sizes: Vec<u32>,
+    total_sf_rows: usize,
+    total_expanded: usize,
+}
+
+fn build_routed_rows_metadata(
+    indices_cpu: &[Vec<u32>],
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    input_has_topk_dim: bool,
+) -> Result<RoutedRowsMetadata> {
+    let num_tokens = indices_cpu.len();
+    let topk = indices_cpu.first().map_or(0, Vec::len);
+    for (token_idx, row) in indices_cpu.iter().enumerate() {
+        if row.len() != topk {
+            candle_core::bail!(
+                "nvfp4_moe_gemm: inconsistent topk width at token {}: expected {}, got {}",
+                token_idx,
+                topk,
+                row.len()
+            );
+        }
+    }
+
+    let total_expanded = num_tokens * topk;
+    let mut expanded: Vec<(u32, usize, u32)> = Vec::with_capacity(total_expanded);
+    for (token_idx, row) in indices_cpu.iter().enumerate() {
+        for (slot_idx, &expert_id) in row.iter().enumerate() {
+            if expert_id as usize >= num_experts {
+                candle_core::bail!(
+                    "nvfp4_moe_gemm: expert index {} out of range for {} experts",
+                    expert_id,
+                    num_experts
+                );
+            }
+            let expanded_row = token_idx * topk + slot_idx;
+            let source_row = if input_has_topk_dim {
+                expanded_row as u32
+            } else {
+                token_idx as u32
+            };
+            expanded.push((expert_id, expanded_row, source_row));
+        }
+    }
+
+    // Preserve original routed-slot order within each expert bucket.
+    expanded.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)));
+
+    let sorted_token_ids: Vec<u32> = expanded.iter().map(|&(_, _, src)| src).collect();
+    let scatter_ids: Vec<u32> = expanded.iter().map(|&(_, orig, _)| orig as u32).collect();
+
+    let mut expert_offsets = vec![0u32; num_experts];
+    let mut expert_counts = vec![0u32; num_experts];
+    for &(expert_id, _, _) in &expanded {
+        expert_counts[expert_id as usize] += 1;
+    }
+    let mut offset = 0u32;
+    for expert_idx in 0..num_experts {
+        expert_offsets[expert_idx] = offset;
+        offset += expert_counts[expert_idx];
+    }
+
+    let mut problem_sizes = vec![0u32; num_experts * 3];
+    let mut sf_offsets = vec![0u32; num_experts];
+    let mut total_sf_rows = 0usize;
+    for expert_idx in 0..num_experts {
+        problem_sizes[expert_idx * 3] = expert_counts[expert_idx];
+        problem_sizes[expert_idx * 3 + 1] = n as u32;
+        problem_sizes[expert_idx * 3 + 2] = k as u32;
+        sf_offsets[expert_idx] = total_sf_rows as u32;
+        total_sf_rows += pad_to(expert_counts[expert_idx] as usize, 128);
+    }
+
+    Ok(RoutedRowsMetadata {
+        sorted_token_ids,
+        scatter_ids,
+        expert_offsets,
+        expert_counts,
+        sf_offsets,
+        problem_sizes,
+        total_sf_rows,
+        total_expanded,
+    })
 }
 
 /// NVFP4 linear: output = input @ weight^T [+ bias]
@@ -220,9 +378,8 @@ pub fn nvfp4_matmul(
                             stream,
                         );
 
-                        let (ws_ptr, _, _, _) =
-                            crate::flashinfer::get_or_init_workspace(cuda_dev, false)?;
-                        let ws_bytes = crate::flashinfer::WORKSPACE_FLOAT_SIZE as i64;
+                        let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
+                        let ws_bytes = ws_bytes as i64;
 
                         match dtype {
                             DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
@@ -624,7 +781,7 @@ fn nvfp4_moe_gemm_hardware(
     num_experts: usize,
     k: usize,
     n: usize,
-    _input_has_topk_dim: bool,
+    input_has_topk_dim: bool,
     dtype: DType,
     dev: &candle_core::Device,
     cuda_dev: &candle_core::cuda_backend::CudaDevice,
@@ -647,64 +804,31 @@ fn nvfp4_moe_gemm_hardware(
     }
 
     let stream = *cuda_dev.cu_stream() as i64;
-    let total_expanded = num_tokens * topk;
 
     // Step 1: Read indices to CPU and sort tokens by expert
     let indices_cpu = indices.to_dtype(DType::U32)?.to_vec2::<u32>()?;
-
-    // Build expanded token list: (expert_id, original_expanded_row, source_token)
-    let mut expanded: Vec<(u32, usize, usize)> = Vec::with_capacity(total_expanded);
-    for t in 0..num_tokens {
-        for tk in 0..topk {
-            let expert_id = indices_cpu[t][tk];
-            let expanded_row = t * topk + tk;
-            expanded.push((expert_id, expanded_row, t));
-        }
-    }
-
-    // Sort by expert_id for contiguous expert groups
-    expanded.sort_by_key(|&(eid, _, _)| eid);
-
-    // Build sorted_token_ids (which source token each sorted row comes from)
-    // and scatter_ids (where each sorted row goes back to in the output)
-    // Using u32 since all values are non-negative; cast to i32* at FFI boundary.
-    let sorted_token_ids: Vec<u32> = expanded.iter().map(|&(_, _, src)| src as u32).collect();
-    let scatter_ids: Vec<u32> = expanded.iter().map(|&(_, orig, _)| orig as u32).collect();
-
-    // Build per-expert offsets and problem sizes
-    let mut expert_offsets = vec![0u32; num_experts];
-    let mut expert_counts = vec![0u32; num_experts];
-    for &(eid, _, _) in &expanded {
-        expert_counts[eid as usize] += 1;
-    }
-    let mut offset = 0u32;
-    for e in 0..num_experts {
-        expert_offsets[e] = offset;
-        offset += expert_counts[e];
-    }
-
-    // problem_sizes: [E * 3] = (M_i, N, K) per expert
-    let mut problem_sizes = vec![0u32; num_experts * 3];
-    for e in 0..num_experts {
-        problem_sizes[e * 3] = expert_counts[e];
-        problem_sizes[e * 3 + 1] = n as u32;
-        problem_sizes[e * 3 + 2] = k as u32;
-    }
-
-    // CUTLASS block-scaled grouped GEMM requires each expert's activation-scale rows
-    // to start on a 128-row boundary, even though the packed activations themselves
-    // remain tightly packed.
-    let mut sf_offsets = vec![0u32; num_experts];
-    let mut total_sf_rows = 0usize;
-    for e in 0..num_experts {
-        sf_offsets[e] = total_sf_rows as u32;
-        total_sf_rows += pad_to(expert_counts[e] as usize, 128);
-    }
+    let routed = build_routed_rows_metadata(&indices_cpu, num_experts, n, k, input_has_topk_dim)?;
+    let total_expanded = routed.total_expanded;
 
     // Step 2: Compute per-expert alphas = input_scale[e] * weight_global_scale[e]
     let wgs_cpu = weight_global_scales.to_vec1::<f32>()?;
+    if wgs_cpu.len() != num_experts {
+        candle_core::bail!(
+            "nvfp4_moe_gemm: weight_global_scales length must be {}, got {}",
+            num_experts,
+            wgs_cpu.len()
+        );
+    }
     let iscales_cpu: Vec<f32> = if let Some(is) = input_scales {
-        is.to_vec1::<f32>()?
+        let values = is.to_vec1::<f32>()?;
+        if values.len() != num_experts {
+            candle_core::bail!(
+                "nvfp4_moe_gemm: input_scales length must be {}, got {}",
+                num_experts,
+                values.len()
+            );
+        }
+        values
     } else {
         vec![1.0f32; num_experts]
     };
@@ -713,12 +837,17 @@ fn nvfp4_moe_gemm_hardware(
         .collect();
 
     // Step 3: Upload CPU arrays to GPU (u32 tensors, cast to i32* at FFI boundary)
-    let sorted_token_ids_t = Tensor::from_vec(sorted_token_ids, (total_expanded,), dev)?;
-    let scatter_ids_t = Tensor::from_vec(scatter_ids, (total_expanded,), dev)?;
+    let sorted_token_ids_t = Tensor::from_vec(routed.sorted_token_ids, (total_expanded,), dev)?;
+    let scatter_ids_t = Tensor::from_vec(routed.scatter_ids, (total_expanded,), dev)?;
+    let gather_input = if input_has_topk_dim {
+        input.reshape((total_expanded, k))?
+    } else {
+        input.clone()
+    };
     // Step 4: Gather input tokens sorted by expert
     let gathered = Tensor::zeros((total_expanded, k), dtype, dev)?;
     {
-        let (input_s, _) = input.storage_and_layout();
+        let (input_s, _) = gather_input.storage_and_layout();
         let (gathered_s, _) = gathered.storage_and_layout();
         let (stids_s, _) = sorted_token_ids_t.storage_and_layout();
 
@@ -759,7 +888,8 @@ fn nvfp4_moe_gemm_hardware(
 
     let act_packed = Tensor::zeros((total_expanded, k / 2), DType::U8, dev)?;
     let act_scales = Tensor::zeros((total_expanded, k_scale), DType::U8, dev)?;
-    let act_scales_swizzled = Tensor::zeros((total_sf_rows, k_scale_padded), DType::U8, dev)?;
+    let act_scales_swizzled =
+        Tensor::zeros((routed.total_sf_rows, k_scale_padded), DType::U8, dev)?;
 
     {
         let (gathered_s, _) = gathered.storage_and_layout();
@@ -779,7 +909,7 @@ fn nvfp4_moe_gemm_hardware(
         } as u64;
 
         for e in 0..num_experts {
-            let rows = expert_counts[e] as usize;
+            let rows = routed.expert_counts[e] as usize;
             if rows == 0 {
                 continue;
             }
@@ -789,8 +919,8 @@ fn nvfp4_moe_gemm_hardware(
             } else {
                 1.0
             };
-            let row_offset = expert_offsets[e] as u64;
-            let sf_row_offset = sf_offsets[e] as u64;
+            let row_offset = routed.expert_offsets[e] as u64;
+            let sf_row_offset = routed.sf_offsets[e] as u64;
             let rows_padded = pad_to(rows, 128);
 
             let gathered_ptr =
@@ -834,9 +964,9 @@ fn nvfp4_moe_gemm_hardware(
         }
     }
 
-    let expert_offsets_t = Tensor::from_vec(expert_offsets, (num_experts,), dev)?;
-    let sf_offsets_t = Tensor::from_vec(sf_offsets, (num_experts,), dev)?;
-    let problem_sizes_t = Tensor::from_vec(problem_sizes, (num_experts * 3,), dev)?;
+    let expert_offsets_t = Tensor::from_vec(routed.expert_offsets, (num_experts,), dev)?;
+    let sf_offsets_t = Tensor::from_vec(routed.sf_offsets, (num_experts,), dev)?;
+    let problem_sizes_t = Tensor::from_vec(routed.problem_sizes, (num_experts * 3,), dev)?;
     let alphas_t = Tensor::from_vec(alphas, (num_experts,), dev)?;
 
     // Step 6: Swizzle weight scales for CUTLASS
@@ -889,6 +1019,8 @@ fn nvfp4_moe_gemm_hardware(
         let sfo_ptr = cuda_ptr(&sfo_s, DType::U32)? as *const i32;
         let ps_ptr = cuda_ptr(&ps_s, DType::U32)? as *const i32;
         let out_ptr = cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void;
+        let (workspace_ptr, workspace_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
+        let workspace_bytes = workspace_bytes as i64;
 
         unsafe {
             let ret = match dtype {
@@ -906,6 +1038,8 @@ fn nvfp4_moe_gemm_hardware(
                     total_expanded as i32,
                     n as i32,
                     k as i32,
+                    workspace_ptr,
+                    workspace_bytes,
                     stream,
                 ),
                 DType::BF16 => ffi::nvfp4_cutlass_moe_gemm_bf16(
@@ -922,6 +1056,8 @@ fn nvfp4_moe_gemm_hardware(
                     total_expanded as i32,
                     n as i32,
                     k as i32,
+                    workspace_ptr,
+                    workspace_bytes,
                     stream,
                 ),
                 _ => candle_core::bail!("unsupported dtype {:?}", dtype),
@@ -968,4 +1104,54 @@ fn nvfp4_moe_gemm_hardware(
 
     // Reshape to [num_tokens, topk, N]
     output.reshape((num_tokens, topk, n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_routed_rows_metadata, RoutedRowsMetadata};
+
+    fn assert_metadata_eq(actual: RoutedRowsMetadata, expected: RoutedRowsMetadata) {
+        assert_eq!(actual.sorted_token_ids, expected.sorted_token_ids);
+        assert_eq!(actual.scatter_ids, expected.scatter_ids);
+        assert_eq!(actual.expert_offsets, expected.expert_offsets);
+        assert_eq!(actual.expert_counts, expected.expert_counts);
+        assert_eq!(actual.sf_offsets, expected.sf_offsets);
+        assert_eq!(actual.problem_sizes, expected.problem_sizes);
+        assert_eq!(actual.total_sf_rows, expected.total_sf_rows);
+        assert_eq!(actual.total_expanded, expected.total_expanded);
+    }
+
+    #[test]
+    fn routed_rows_metadata_for_gate_up_input_uses_token_rows() {
+        let actual =
+            build_routed_rows_metadata(&[vec![2, 0], vec![1, 2]], 3, 64, 32, false).unwrap();
+        let expected = RoutedRowsMetadata {
+            sorted_token_ids: vec![0, 1, 0, 1],
+            scatter_ids: vec![1, 2, 0, 3],
+            expert_offsets: vec![0, 1, 2],
+            expert_counts: vec![1, 1, 2],
+            sf_offsets: vec![0, 128, 256],
+            problem_sizes: vec![1, 64, 32, 1, 64, 32, 2, 64, 32],
+            total_sf_rows: 384,
+            total_expanded: 4,
+        };
+        assert_metadata_eq(actual, expected);
+    }
+
+    #[test]
+    fn routed_rows_metadata_for_down_proj_input_uses_routed_rows() {
+        let actual =
+            build_routed_rows_metadata(&[vec![2, 0], vec![1, 2]], 3, 64, 32, true).unwrap();
+        let expected = RoutedRowsMetadata {
+            sorted_token_ids: vec![1, 2, 0, 3],
+            scatter_ids: vec![1, 2, 0, 3],
+            expert_offsets: vec![0, 1, 2],
+            expert_counts: vec![1, 1, 2],
+            sf_offsets: vec![0, 128, 256],
+            problem_sizes: vec![1, 64, 32, 1, 64, 32, 2, 64, 32],
+            total_sf_rows: 384,
+            total_expanded: 4,
+        };
+        assert_metadata_eq(actual, expected);
+    }
 }

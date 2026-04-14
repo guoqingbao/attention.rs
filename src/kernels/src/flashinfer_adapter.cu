@@ -28,6 +28,51 @@
 using namespace flashinfer;
 
 #if !defined(SM_90_PASS)
+static inline bool ValidateWorkspaceOffset(
+    const char* name,
+    int64_t offset,
+    size_t workspace_size,
+    const char* workspace_kind) {
+    if (offset < 0 || static_cast<size_t>(offset) >= workspace_size) {
+        fprintf(stderr,
+                "[flashinfer][prefill_plan] %s offset=%lld exceeds %s workspace size=%zu\n",
+                name,
+                static_cast<long long>(offset),
+                workspace_kind,
+                workspace_size);
+        return false;
+    }
+    return true;
+}
+
+static inline bool ValidatePrefillPlanInfoBounds(
+    const PrefillPlanInfo& plan_info,
+    size_t float_workspace_size,
+    size_t int_workspace_size) {
+    return ValidateWorkspaceOffset(
+               "total_num_rows", plan_info.total_num_rows_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "request_indices", plan_info.request_indices_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "qo_tile_indices", plan_info.qo_tile_indices_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "kv_tile_indices", plan_info.kv_tile_indices_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "merge_indptr", plan_info.merge_indptr_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "o_indptr", plan_info.o_indptr_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "kv_chunk_size_ptr", plan_info.kv_chunk_size_ptr_offset, int_workspace_size, "int") &&
+           ValidateWorkspaceOffset(
+               "v", plan_info.v_offset, float_workspace_size, "float") &&
+           ValidateWorkspaceOffset(
+               "s", plan_info.s_offset, float_workspace_size, "float") &&
+           ValidateWorkspaceOffset(
+               "block_valid_mask", plan_info.block_valid_mask_offset, int_workspace_size, "int");
+}
+#endif
+
+#if !defined(SM_90_PASS)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias =
     DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap, use_alibi>;
@@ -1005,6 +1050,10 @@ void flashinfer_prefill_plan_wrapper(
             window_left > 0 ? window_left : -1, 0, false, 0,
             stream
         );
+        if (!ValidatePrefillPlanInfoBounds(
+                plan_info, workspace_float_size, workspace_int_size)) {
+            return;
+        }
         if (plan_info_out != nullptr) {
             plan_info_out[0] = 0; // tag: non-SM90
             auto vec = plan_info.ToVector();
@@ -1211,6 +1260,10 @@ void flashinfer_prefill_run_wrapper(
         PrefillPlanInfo plan_info;
         std::vector<int64_t> vec(plan_data, plan_data + 15);
         plan_info.FromVector(vec);
+        if (!ValidatePrefillPlanInfoBounds(
+                plan_info, workspace_float_size, workspace_int_size)) {
+            return;
+        }
 
         auto run_prefill = [&](auto dtype_kv_val) {
             using DTypeKV = decltype(dtype_kv_val);
