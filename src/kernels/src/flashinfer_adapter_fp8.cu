@@ -249,8 +249,10 @@ static inline void FillFP8RaggedParams(
     params.causal = true;
     params.additional_params.sm_scale = static_cast<double>(sm_scale);
     params.additional_params.maybe_scale_q = nullptr;
-    params.additional_params.maybe_scale_k = nullptr;
-    params.additional_params.maybe_scale_v = nullptr;
+    params.additional_params.maybe_scale_k =
+        use_per_head_kv_scales ? const_cast<float*>(k_scale_ptr) : nullptr;
+    params.additional_params.maybe_scale_v =
+        use_per_head_kv_scales ? const_cast<float*>(v_scale_ptr) : nullptr;
     params.additional_params.scale_q_scalar = q_scale_scalar;
     params.additional_params.scale_k_scalar = k_scale_scalar;
     params.additional_params.scale_v_scalar = v_scale_scalar;
@@ -272,48 +274,6 @@ static inline void FillFP8RaggedParams(
         GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.work_indptr_offset);
     params.batch_indices =
         GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.batch_indices_offset);
-}
-
-static inline bool ReadScaleScalar(const float* dev_ptr, double& out, cudaStream_t stream) {
-    if (dev_ptr == nullptr) {
-        return false;
-    }
-    float tmp = 1.0f;
-    if (cudaMemcpyAsync(&tmp, dev_ptr, sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
-        return false;
-    }
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        return false;
-    }
-    out = static_cast<double>(tmp);
-    return true;
-}
-
-static inline bool CheckCudaLaunch(const char* tag) {
-    cudaError_t st = cudaPeekAtLastError();
-    if (st != cudaSuccess) {
-        fprintf(stderr, "[flashinfer][fp8-ragged] %s launch failed: %s\n", tag, cudaGetErrorString(st));
-        return false;
-    }
-    return true;
-}
-
-static inline bool CheckCudaSync(const char* tag, cudaStream_t stream) {
-    cudaError_t st = cudaStreamSynchronize(stream);
-    if (st != cudaSuccess) {
-        fprintf(stderr, "[flashinfer][fp8-ragged] %s stream sync failed: %s\n", tag,
-                cudaGetErrorString(st));
-        return false;
-    }
-    return true;
-}
-
-static inline bool CheckCudaStatus(const char* tag, cudaError_t st) {
-    if (st != cudaSuccess) {
-        fprintf(stderr, "[flashinfer][fp8-ragged] %s failed: %s\n", tag, cudaGetErrorString(st));
-        return false;
-    }
-    return true;
 }
 
 #define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, ...) \
@@ -484,14 +444,12 @@ void flashinfer_decode_run_wrapper_fp8(
     std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 9);
     PrefillPlanSM90Info plan_info;
     plan_info.FromVector(vec);
-    double k_scale_scalar = 1.0;
-    double v_scale_scalar = 1.0;
-    (void)ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream);
-    (void)ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream);
+    constexpr double k_scale_scalar = 1.0;
+    constexpr double v_scale_scalar = 1.0;
 
     void* q_fp8_ptr = nullptr;
     float* q_scale_arr = nullptr;
-    double q_scale_scalar = 1.0;
+    constexpr double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
     cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
     cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
@@ -500,7 +458,6 @@ void flashinfer_decode_run_wrapper_fp8(
     flashinfer_fp8_quantize_q_per_head(
         q_ptr, q_fp8_ptr, q_scale_arr, numel,
         num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     using DTypeQ = cutlass::float_e4m3_t;
     using DTypeKV = cutlass::float_e4m3_t;
@@ -587,10 +544,8 @@ void flashinfer_prefill_wrapper_fp8(
     }
 
     using IdType = int32_t;
-    double k_scale_scalar = 1.0;
-    double v_scale_scalar = 1.0;
-    (void)ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream);
-    (void)ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream);
+    constexpr double k_scale_scalar = 1.0;
+    constexpr double v_scale_scalar = 1.0;
     PrefillPlanSM90Info plan_info;
     PrefillSM90Plan<int32_t>(
         workspace_float, workspace_float_size,
@@ -606,7 +561,7 @@ void flashinfer_prefill_wrapper_fp8(
 
     void* q_fp8_ptr = nullptr;
     float* q_scale_arr = nullptr;
-    double q_scale_scalar = 1.0;
+    constexpr double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
     cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
     cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
@@ -614,7 +569,6 @@ void flashinfer_prefill_wrapper_fp8(
     flashinfer_fp8_quantize_q_per_head(
         q_ptr, q_fp8_ptr, q_scale_arr, numel,
         num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     using DTypeQ = cutlass::float_e4m3_t;
     using DTypeKV = cutlass::float_e4m3_t;
@@ -695,20 +649,12 @@ void flashinfer_prefill_run_fp8(
     plan_info.FromVector(vec);
 
     using IdType = int32_t;
-    double k_scale_scalar = 1.0;
-    double v_scale_scalar = 1.0;
-    if (!ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream)) {
-        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read k_scale\n");
-        return;
-    }
-    if (!ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream)) {
-        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read v_scale\n");
-        return;
-    }
+    constexpr double k_scale_scalar = 1.0;
+    constexpr double v_scale_scalar = 1.0;
 
     void* q_fp8_ptr = nullptr;
     float* q_scale_arr = nullptr;
-    double q_scale_scalar = 1.0;
+    constexpr double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
     if (cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream) != cudaSuccess) {
         fprintf(stderr, "[flashinfer][prefill_run_fp8] cudaMallocAsync q_fp8 failed\n");
@@ -723,19 +669,12 @@ void flashinfer_prefill_run_fp8(
     flashinfer_fp8_quantize_q_per_head(
         q_ptr, q_fp8_ptr, q_scale_arr, numel,
         num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
-
-    cudaError_t qquant_err = cudaStreamSynchronize(stream);
+    cudaError_t qquant_err = cudaPeekAtLastError();
     if (qquant_err != cudaSuccess) {
-        fprintf(stderr, "[flashinfer][prefill_run_fp8] Q quantize failed: %s\n",
+        fprintf(stderr, "[flashinfer][prefill_run_fp8] Q quantize launch failed: %s\n",
                 cudaGetErrorString(qquant_err));
-        cudaFreeAsync(q_fp8_ptr, stream);
-        cudaFreeAsync(q_scale_arr, stream);
-        return;
-    }
-    if (!ReadScaleScalar(q_scale_arr, q_scale_scalar, stream)) {
-        fprintf(stderr, "[flashinfer][prefill_run_fp8] failed to read q_scale\n");
-        cudaFreeAsync(q_fp8_ptr, stream);
-        cudaFreeAsync(q_scale_arr, stream);
+        if (q_fp8_ptr) cudaFreeAsync(q_fp8_ptr, stream);
+        if (q_scale_arr) cudaFreeAsync(q_scale_arr, stream);
         return;
     }
 
@@ -835,7 +774,7 @@ void flashinfer_prefill_ragged_wrapper_fp8(
         kv_len_host[i] = kv_cu_seqlens_host[i + 1] - kv_cu_seqlens_host[i];
     }
     PrefillPlanSM90Info plan_info;
-    cudaError_t plan_st = PrefillSM90Plan<int32_t>(
+    PrefillSM90Plan<int32_t>(
         workspace_float, workspace_float_size,
         workspace_int, page_locked_int_buffer, workspace_int_size,
         plan_info,
@@ -847,9 +786,9 @@ void flashinfer_prefill_ragged_wrapper_fp8(
         stream
     );
 
-    double q_scale_scalar = 1.0;
-    double k_scale_scalar = 1.0;
-    double v_scale_scalar = 1.0;
+    constexpr double q_scale_scalar = 1.0;
+    constexpr double k_scale_scalar = 1.0;
+    constexpr double v_scale_scalar = 1.0;
     void* q_fp8_ptr = nullptr;
     float* q_scale_arr = nullptr;
     const int64_t q_numel = static_cast<int64_t>(total_num_rows) * num_qo_heads * head_dim;
@@ -860,7 +799,6 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     flashinfer_fp8_quantize_q_per_head(
         q_ptr, q_fp8_ptr, q_scale_arr, q_numel,
         num_qo_heads, head_dim, is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(q_scale_arr, q_scale_scalar, stream);
 
     void* k_fp8_ptr = nullptr;
     void* v_fp8_ptr = nullptr;
@@ -873,8 +811,6 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     flashinfer_fp8_quantize_kv_per_head(
         k_ptr, v_ptr, k_fp8_ptr, v_fp8_ptr, kv_numel,
         num_kv_heads, head_dim, k_scale_ptr, v_scale_ptr, is_input_f16, (int64_t)stream);
-    (void)ReadScaleScalar(k_scale_ptr, k_scale_scalar, stream);
-    (void)ReadScaleScalar(v_scale_ptr, v_scale_scalar, stream);
 
     using IdType = int32_t;
     using DTypeQ = cutlass::float_e4m3_t;
