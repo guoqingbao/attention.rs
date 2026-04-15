@@ -330,7 +330,7 @@ int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* 
   workspace.gemm2_output = cache.gemm2_output.ensure(
       static_cast<size_t>(max_num_padded_tokens) * hidden_size * gemm2_elem_size, stream);
   workspace.gemm2_output_scale = nullptr;
-  cache.bf16_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/true);
+  cache.bf16_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
   return 0;
 }
 
@@ -414,7 +414,7 @@ int run_fused_moe_fp8(const void* input, const int32_t* topk_ids, const float* t
       static_cast<size_t>(max_num_padded_tokens_gemm2) * hidden_size * sizeof(__nv_bfloat16),
       stream);
   workspace.gemm2_output_scale = nullptr;
-  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/true);
+  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
   return 0;
 }
 
@@ -494,7 +494,7 @@ int run_fused_moe_mxfp4(const void* input, const int32_t* topk_ids, const float*
   workspace.gemm2_output = cache.gemm2_output.ensure(
       static_cast<size_t>(max_num_padded_tokens) * hidden_size * elt_size, stream);
   workspace.gemm2_output_scale = nullptr;
-  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/true);
+  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
   return 0;
 }
 #endif  // ENABLE_FP4 && FLASHINFER_ENABLE_FP4_E2M1

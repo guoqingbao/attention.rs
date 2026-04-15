@@ -1,9 +1,177 @@
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+#[cfg(feature = "metal")]
+use crate::metal_kernels;
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use candle_core::cuda_backend::WrapErr;
 use candle_core::quantized::QTensor;
 use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+use std::cell::RefCell;
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+const MOE_CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 384 * 1024 * 1024;
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+struct MoeCutlassWorkspace {
+    buffer: CudaSlice<u8>,
+    size: usize,
+    device_ordinal: usize,
+}
+
+#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
+thread_local! {
+    static MOE_CUTLASS_WORKSPACE: RefCell<Option<MoeCutlassWorkspace>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+fn get_moe_cutlass_workspace(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    required_size: usize,
+) -> Result<(*mut std::ffi::c_void, usize)> {
+    #[cfg(feature = "flashinfer")]
+    {
+        let (ptr, size) = crate::flashinfer::get_gemm_scratch_workspace(dev)?;
+        if required_size > size {
+            candle_core::bail!(
+                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
+                required_size,
+                size
+            );
+        }
+        return Ok((ptr, size));
+    }
+
+    #[cfg(not(feature = "flashinfer"))]
+    {
+        MOE_CUTLASS_WORKSPACE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+            let alloc_size = required_size
+                .max(MOE_CUTLASS_WORKSPACE_FALLBACK_SIZE)
+                .max(1);
+            let needs_init = match slot.as_ref() {
+                None => true,
+                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
+            };
+
+            if needs_init {
+                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
+                *slot = Some(MoeCutlassWorkspace {
+                    buffer,
+                    size: alloc_size,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let ws = slot.as_ref().unwrap();
+            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn pad_to(val: usize, align: usize) -> usize {
+    (val + align - 1) / align * align
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedRowsMetadata {
+    sorted_token_ids: Vec<u32>,
+    scatter_ids: Vec<u32>,
+    expert_offsets: Vec<u32>,
+    expert_counts: Vec<u32>,
+    sf_offsets: Vec<u32>,
+    problem_sizes: Vec<u32>,
+    total_sf_rows: usize,
+    total_expanded: usize,
+}
+
+#[cfg(test)]
+fn build_routed_rows_metadata(
+    indices_cpu: &[Vec<u32>],
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    input_has_topk_dim: bool,
+) -> Result<RoutedRowsMetadata> {
+    let num_tokens = indices_cpu.len();
+    let topk = indices_cpu.first().map_or(0, Vec::len);
+    for (token_idx, row) in indices_cpu.iter().enumerate() {
+        if row.len() != topk {
+            candle_core::bail!(
+                "moe_gemm_nvfp4: inconsistent topk width at token {}: expected {}, got {}",
+                token_idx,
+                topk,
+                row.len()
+            );
+        }
+    }
+
+    let total_expanded = num_tokens * topk;
+    let mut expanded: Vec<(u32, usize, u32)> = Vec::with_capacity(total_expanded);
+    for (token_idx, row) in indices_cpu.iter().enumerate() {
+        for (slot_idx, &expert_id) in row.iter().enumerate() {
+            if expert_id as usize >= num_experts {
+                candle_core::bail!(
+                    "moe_gemm_nvfp4: expert index {} out of range for {} experts",
+                    expert_id,
+                    num_experts
+                );
+            }
+            let expanded_row = token_idx * topk + slot_idx;
+            let source_row = if input_has_topk_dim {
+                expanded_row as u32
+            } else {
+                token_idx as u32
+            };
+            expanded.push((expert_id, expanded_row, source_row));
+        }
+    }
+
+    expanded.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)));
+
+    let sorted_token_ids: Vec<u32> = expanded.iter().map(|&(_, _, src)| src).collect();
+    let scatter_ids: Vec<u32> = expanded.iter().map(|&(_, orig, _)| orig as u32).collect();
+
+    let mut expert_offsets = vec![0u32; num_experts];
+    let mut expert_counts = vec![0u32; num_experts];
+    for &(expert_id, _, _) in &expanded {
+        expert_counts[expert_id as usize] += 1;
+    }
+    let mut offset = 0u32;
+    for expert_idx in 0..num_experts {
+        expert_offsets[expert_idx] = offset;
+        offset += expert_counts[expert_idx];
+    }
+
+    let mut problem_sizes = vec![0u32; num_experts * 3];
+    let mut sf_offsets = vec![0u32; num_experts];
+    let mut total_sf_rows = 0usize;
+    for expert_idx in 0..num_experts {
+        problem_sizes[expert_idx * 3] = expert_counts[expert_idx];
+        problem_sizes[expert_idx * 3 + 1] = n as u32;
+        problem_sizes[expert_idx * 3 + 2] = k as u32;
+        sf_offsets[expert_idx] = total_sf_rows as u32;
+        total_sf_rows += pad_to(expert_counts[expert_idx] as usize, 128);
+    }
+
+    Ok(RoutedRowsMetadata {
+        sorted_token_ids,
+        scatter_ids,
+        expert_offsets,
+        expert_counts,
+        sf_offsets,
+        problem_sizes,
+        total_sf_rows,
+        total_expanded,
+    })
+}
 
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 fn cuda_dtype_code(dtype: candle_core::DType) -> Result<i32> {
@@ -247,6 +415,100 @@ pub fn flashinfer_fused_moe_fp8(
     if status != 0 {
         candle_core::bail!("flashinfer fused moe fp8 kernel failed with status {status}");
     }
+    Ok(output)
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+pub fn flashinfer_mxfp4_fused_moe(
+    input: &Tensor,
+    topk_ids: &Tensor,
+    topk_weights: &Tensor,
+    gate_up_weights: &Tensor,
+    gate_up_scales: &Tensor,
+    down_weights: &Tensor,
+    down_scales: &Tensor,
+    num_tokens: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_experts: usize,
+    top_k: usize,
+) -> Result<Tensor> {
+    use candle_core::Storage;
+
+    #[cfg(feature = "trtllm")]
+    crate::trtllm_cubin_loader::init_cubin_loader();
+
+    let dev = input.device();
+    let dtype = input.dtype();
+
+    let sm_version = crate::cuda_utils::sm_version(dev.as_cuda_device()?).unwrap_or(0) as usize;
+    if sm_version < 100 {
+        candle_core::bail!("flashinfer_mxfp4_fused_moe requires Blackwell (sm100+)");
+    }
+
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let input_dtype_code: i32 = match dtype {
+        candle_core::DType::F16 => 0,
+        candle_core::DType::BF16 => 1,
+        _ => candle_core::bail!(
+            "flashinfer_mxfp4_fused_moe: unsupported input dtype {:?}",
+            dtype
+        ),
+    };
+
+    let output = Tensor::zeros((num_tokens, hidden_size), dtype, dev)?;
+
+    fn cuda_ptr(s: &Storage, dtype: candle_core::DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                candle_core::DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                candle_core::DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                candle_core::DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                candle_core::DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                candle_core::DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    {
+        let (input_s, _) = input.storage_and_layout();
+        let (topk_ids_s, _) = topk_ids.storage_and_layout();
+        let (topk_weights_s, _) = topk_weights.storage_and_layout();
+        let (gate_up_w_s, _) = gate_up_weights.storage_and_layout();
+        let (gate_up_s_s, _) = gate_up_scales.storage_and_layout();
+        let (down_w_s, _) = down_weights.storage_and_layout();
+        let (down_s_s, _) = down_scales.storage_and_layout();
+        let (output_s, _) = output.storage_and_layout();
+
+        let status = unsafe {
+            ffi::flashinfer_fused_moe_mxfp4(
+                cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                cuda_ptr(&topk_ids_s, candle_core::DType::U32)? as *const i32,
+                cuda_ptr(&topk_weights_s, candle_core::DType::F32)? as *const f32,
+                cuda_ptr(&gate_up_w_s, candle_core::DType::U8)? as *const u8,
+                cuda_ptr(&gate_up_s_s, candle_core::DType::U8)? as *const u8,
+                cuda_ptr(&down_w_s, candle_core::DType::U8)? as *const u8,
+                cuda_ptr(&down_s_s, candle_core::DType::U8)? as *const u8,
+                cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                num_tokens as i32,
+                hidden_size as i32,
+                intermediate_size as i32,
+                num_experts as i32,
+                top_k as i32,
+                input_dtype_code,
+                stream,
+            )
+        };
+
+        if status != 0 {
+            candle_core::bail!("flashinfer_fused_moe_mxfp4 returned error code {}", status);
+        }
+    }
+
     Ok(output)
 }
 
@@ -851,6 +1113,981 @@ pub fn moe_gemm_fp8(
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+/// Indexed NVFP4 MoE GEMM.
+///
+/// This preserves the original software path contract: callers pass raw
+/// `indices` and receive `[num_tokens, topk, n]`.
+///
+/// On Blackwell (`sm100+`) with compatible shapes, it dispatches internally to
+/// the routed hardware FP4 helper.
+pub fn moe_gemm_nvfp4(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    weight_global_scales: &Tensor,
+    input_scales: Option<&Tensor>,
+    biases: Option<&Tensor>,
+    indices: &Tensor,
+) -> Result<Tensor> {
+    use candle_core::{DType, Storage};
+
+    fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let weights = if weights.is_contiguous() {
+        weights.clone()
+    } else {
+        weights.contiguous()?
+    };
+    let weight_scales = if weight_scales.is_contiguous() {
+        weight_scales.clone()
+    } else {
+        weight_scales.contiguous()?
+    };
+    let weight_global_scales = if weight_global_scales.is_contiguous() {
+        weight_global_scales.clone()
+    } else {
+        weight_global_scales.contiguous()?
+    };
+    let indices = if indices.is_contiguous() {
+        indices.clone()
+    } else {
+        indices.contiguous()?
+    };
+
+    let indices_dims = indices.dims();
+    if indices_dims.len() != 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: expected indices rank 2 [num_tokens, topk], got {:?}",
+            indices_dims
+        );
+    }
+    let num_tokens = indices_dims[0];
+    let topk = indices_dims[1];
+
+    let input_dims = input.dims();
+    let (k, input_has_topk_dim) = match input_dims {
+        [t, kk] => {
+            if *t != num_tokens {
+                candle_core::bail!(
+                    "moe_gemm_nvfp4: input/indices mismatch: input tokens={t}, indices tokens={num_tokens}"
+                );
+            }
+            (*kk, false)
+        }
+        [t, tk, kk] => {
+            if *t != num_tokens || *tk != topk {
+                candle_core::bail!(
+                    "moe_gemm_nvfp4: input/indices mismatch: input={input_dims:?}, indices={indices_dims:?}"
+                );
+            }
+            (*kk, true)
+        }
+        _ => candle_core::bail!(
+            "moe_gemm_nvfp4: expected input rank 2 or 3, got {:?}",
+            input_dims
+        ),
+    };
+
+    if k % crate::nvfp4_linear::NVFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: K must be divisible by {}, got K={k}",
+            crate::nvfp4_linear::NVFP4_BLOCK_SIZE
+        );
+    }
+
+    let w_dims = weights.dims();
+    if w_dims.len() != 3 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: expected weights rank 3 [E, N, K/2], got {:?}",
+            w_dims
+        );
+    }
+    let num_experts = w_dims[0];
+    let n = w_dims[1];
+    if w_dims[2] != k / 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: weights shape mismatch, expected [E, N, K/2]=[{}, {}, {}], got {:?}",
+            num_experts,
+            n,
+            k / 2,
+            w_dims
+        );
+    }
+
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        candle_core::bail!("moe_gemm_nvfp4 only accepts f16/bf16 inputs");
+    }
+
+    let dev = input.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    #[cfg(feature = "cutlass")]
+    {
+        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        let use_hardware_fp4 = sm >= 100 && n % 32 == 0 && k % 32 == 0;
+        if use_hardware_fp4 && num_tokens > 32 {
+            use crate::sort::ArgSortOp;
+            let flat_indices = indices.flatten_all()?.contiguous()?;
+            let (experts_ids, sorted_token_ids) = flat_indices.sort(true)?;
+            let routed_input = if input_has_topk_dim {
+                input.reshape((num_tokens * topk, k))?
+            } else {
+                input.clone()
+            };
+            let output = moe_gemm_nvfp4_hardware(
+                &routed_input,
+                &weights,
+                &weight_scales,
+                &weight_global_scales,
+                input_scales,
+                &None,
+                &sorted_token_ids,
+                &experts_ids,
+                topk,
+                true,
+            )?;
+            return output.reshape((num_tokens, topk, n));
+        }
+    }
+    let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
+    {
+        let stream = *cuda_dev.cu_stream() as i64;
+
+        let (input_s, _) = input.storage_and_layout();
+        let (weights_s, _) = weights.storage_and_layout();
+        let (scales_s, _) = weight_scales.storage_and_layout();
+        let (gscales_s, _) = weight_global_scales.storage_and_layout();
+        let (indices_s, _) = indices.storage_and_layout();
+        let (output_s, _) = output.storage_and_layout();
+
+        let biases_ptr = if let Some(b) = biases {
+            let (b_s, _) = b.storage_and_layout();
+            cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        };
+
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_indexed_moe_gemm_f16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const u8,
+                    cuda_ptr(&scales_s, DType::U8)? as *const u8,
+                    cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                    biases_ptr,
+                    cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    num_tokens as i32,
+                    topk as i32,
+                    num_experts as i32,
+                    n as i32,
+                    k as i32,
+                    biases.is_some(),
+                    input_has_topk_dim,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_indexed_moe_gemm_bf16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const u8,
+                    cuda_ptr(&scales_s, DType::U8)? as *const u8,
+                    cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                    biases_ptr,
+                    cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    num_tokens as i32,
+                    topk as i32,
+                    num_experts as i32,
+                    n as i32,
+                    k as i32,
+                    biases.is_some(),
+                    input_has_topk_dim,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_nvfp4(
+    _: &Tensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: Option<&Tensor>,
+    _: Option<&Tensor>,
+    _: &Tensor,
+) -> Result<Tensor> {
+    candle_core::bail!("moe_gemm_nvfp4 is not implemented on this platform!")
+}
+
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+#[allow(clippy::too_many_arguments)]
+/// Routed NVFP4 MoE GEMM.
+///
+/// This mirrors the FP8 MoE contract: the caller provides expert-grouped
+/// `sorted_token_ids` and `experts_ids` so the kernel wrapper does not need to
+/// rebuild routing from raw `topk_ids`.
+pub fn moe_gemm_nvfp4_hardware(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    weight_global_scales: &Tensor,
+    input_scales: Option<&Tensor>,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    use candle_core::{DType, Storage};
+
+    fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let weights = if weights.is_contiguous() {
+        weights.clone()
+    } else {
+        weights.contiguous()?
+    };
+    let weight_scales = if weight_scales.is_contiguous() {
+        weight_scales.clone()
+    } else {
+        weight_scales.contiguous()?
+    };
+    let weight_global_scales = if weight_global_scales.is_contiguous() {
+        weight_global_scales.clone()
+    } else {
+        weight_global_scales.contiguous()?
+    };
+    let sorted_token_ids = if sorted_token_ids.is_contiguous() {
+        sorted_token_ids.clone()
+    } else {
+        sorted_token_ids.contiguous()?
+    };
+    let experts_ids = if experts_ids.is_contiguous() {
+        experts_ids.clone()
+    } else {
+        experts_ids.contiguous()?
+    };
+
+    let (input_rows, k) = input.dims2()?;
+    let (num_experts, n, packed_k) = weights.dims3()?;
+    if packed_k != k / 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: weights shape mismatch, expected [E, N, K/2]=[{}, {}, {}], got {:?}",
+            num_experts,
+            n,
+            k / 2,
+            weights.dims()
+        );
+    }
+    if k % crate::nvfp4_linear::NVFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: K must be divisible by {}, got K={k}",
+            crate::nvfp4_linear::NVFP4_BLOCK_SIZE
+        );
+    }
+
+    let size_m = sorted_token_ids.elem_count();
+    if sorted_token_ids.elem_count() != size_m || experts_ids.elem_count() != size_m {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: routed tensors must have {} elements, got sorted={} experts={}",
+            size_m,
+            sorted_token_ids.elem_count(),
+            experts_ids.elem_count()
+        );
+    }
+    let map_divisor = if input_rows == size_m {
+        1
+    } else if input_rows * topk == size_m {
+        topk as i32
+    } else {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_hardware: input rows {} are incompatible with routed size {} and topk {}",
+            input_rows,
+            size_m,
+            topk
+        );
+    };
+
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        candle_core::bail!("moe_gemm_nvfp4_hardware only accepts f16/bf16 inputs");
+    }
+
+    let dev = input.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+    if sm < 100 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_hardware requires Blackwell (sm100+), got sm{}",
+            sm
+        );
+    }
+
+    let stream = *cuda_dev.cu_stream() as i64;
+    let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
+    let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
+    let sf_offsets_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
+    let problem_sizes_t = Tensor::zeros((num_experts * 3,), DType::U32, dev)?;
+    let alphas_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
+    let input_scale_invs_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
+
+    {
+        let (experts_ids_s, _) = experts_ids.storage_and_layout();
+        let (expert_counts_s, _) = expert_counts_t.storage_and_layout();
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        unsafe {
+            ffi::moe_fp8_calculate_expert_offsets(
+                cuda_ptr(&experts_ids_s, DType::U32)? as *const i32,
+                cuda_ptr(&expert_counts_s, DType::U32)? as *mut i32,
+                cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
+                num_experts as i32,
+                size_m as i32,
+                is_prefill,
+                stream,
+            );
+        }
+    }
+
+    {
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        let (weight_global_scales_s, _) = weight_global_scales.storage_and_layout();
+        let (sf_offsets_s, _) = sf_offsets_t.storage_and_layout();
+        let (problem_sizes_s, _) = problem_sizes_t.storage_and_layout();
+        let (alphas_s, _) = alphas_t.storage_and_layout();
+        let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
+        let input_scales_ptr = if let Some(scales) = input_scales {
+            let (scales_s, _) = scales.storage_and_layout();
+            cuda_ptr(&scales_s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
+        unsafe {
+            ffi::nvfp4_moe_build_metadata(
+                cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                cuda_ptr(&weight_global_scales_s, DType::F32)? as *const f32,
+                input_scales_ptr,
+                cuda_ptr(&sf_offsets_s, DType::U32)? as *mut i32,
+                cuda_ptr(&problem_sizes_s, DType::U32)? as *mut i32,
+                cuda_ptr(&alphas_s, DType::F32)? as *mut f32,
+                cuda_ptr(&input_scale_invs_s, DType::F32)? as *mut f32,
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                stream,
+            );
+        }
+    }
+
+    let gathered = Tensor::zeros((size_m, k), dtype, dev)?;
+    {
+        let (input_s, _) = input.storage_and_layout();
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (sorted_s, _) = sorted_token_ids.storage_and_layout();
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_moe_gather_f16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    k as i32,
+                    map_divisor,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_moe_gather_bf16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    k as i32,
+                    map_divisor,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    let k_scale = k / crate::nvfp4_linear::NVFP4_BLOCK_SIZE;
+    let k_scale_padded = pad_to(k_scale, 4);
+    let act_packed = Tensor::zeros((size_m, k / 2), DType::U8, dev)?;
+    let total_sf_rows_capacity = size_m + 127 * num_experts;
+    let act_scales_swizzled =
+        Tensor::zeros((total_sf_rows_capacity, k_scale_padded), DType::U8, dev)?;
+    {
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        let (sf_offsets_s, _) = sf_offsets_t.storage_and_layout();
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_quantize_activation_grouped_f16(
+                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
+                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    num_experts as i32,
+                    k as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_quantize_activation_grouped_bf16(
+                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
+                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    num_experts as i32,
+                    k as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    let n_padded = pad_to(n, 128);
+    let weight_scales_swizzled =
+        Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
+    {
+        let (ws_s, _) = weight_scales.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let ws_base = cuda_ptr(&ws_s, DType::U8)?;
+        let wss_base = cuda_ptr(&wss_s, DType::U8)?;
+        for e in 0..num_experts {
+            let src_offset = (e * n * k_scale) as u64;
+            let dst_offset = (e * n_padded * k_scale_padded) as u64;
+            unsafe {
+                ffi::nvfp4_swizzle_weight_scales(
+                    (ws_base + src_offset) as *const std::ffi::c_void,
+                    (wss_base + dst_offset) as *mut std::ffi::c_void,
+                    n as i32,
+                    k_scale as i32,
+                    n_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                );
+            }
+        }
+    }
+
+    let rep_out = Tensor::zeros((size_m, n), dtype, dev)?;
+    {
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (weights_s, _) = weights.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let (alphas_s, _) = alphas_t.storage_and_layout();
+        let (eo_s, _) = expert_offsets_t.storage_and_layout();
+        let (sfo_s, _) = sf_offsets_t.storage_and_layout();
+        let (ps_s, _) = problem_sizes_t.storage_and_layout();
+        let (out_s, _) = rep_out.storage_and_layout();
+        let (workspace_ptr, workspace_bytes) = get_moe_cutlass_workspace(cuda_dev, 0)?;
+        unsafe {
+            let ret = match dtype {
+                DType::F16 => ffi::nvfp4_cutlass_moe_gemm_f16(
+                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
+                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sfo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&ps_s, DType::U32)? as *const i32,
+                    num_experts as i32,
+                    size_m as i32,
+                    n as i32,
+                    k as i32,
+                    workspace_ptr,
+                    workspace_bytes as i64,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_cutlass_moe_gemm_bf16(
+                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
+                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sfo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&ps_s, DType::U32)? as *const i32,
+                    num_experts as i32,
+                    size_m as i32,
+                    n as i32,
+                    k as i32,
+                    workspace_ptr,
+                    workspace_bytes as i64,
+                    stream,
+                ),
+                _ => unreachable!(),
+            };
+            if ret != 0 {
+                candle_core::bail!("nvfp4_cutlass_moe_gemm failed with error code {}", ret);
+            }
+        }
+    }
+
+    let output = Tensor::zeros((size_m, n), dtype, dev)?;
+    {
+        let (rep_out_s, _) = rep_out.storage_and_layout();
+        let (sorted_s, _) = sorted_token_ids.storage_and_layout();
+        let (output_s, _) = output.storage_and_layout();
+        let weights_ptr = if let Some(t) = topk_weights {
+            let (s, _) = t.storage_and_layout();
+            cuda_ptr(&s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::moe_fp8_scatter_rows_f16(
+                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    size_m as i64,
+                    size_m as i64,
+                    n as i64,
+                    weights_ptr,
+                    stream,
+                ),
+                DType::BF16 => ffi::moe_fp8_scatter_rows_bf16(
+                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    size_m as i64,
+                    size_m as i64,
+                    n as i64,
+                    weights_ptr,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+#[cfg(not(all(feature = "cuda", feature = "cutlass")))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_nvfp4_hardware(
+    _: &Tensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: Option<&Tensor>,
+    _: &Option<Tensor>,
+    _: &Tensor,
+    _: &Tensor,
+    _: usize,
+    _: bool,
+) -> Result<Tensor> {
+    candle_core::bail!("moe_gemm_nvfp4_hardware is not implemented on this platform!")
+}
+
+#[allow(clippy::too_many_arguments)]
+/// MXFP4 MoE GEMM.
+///
+/// Unlike the NVFP4 Blackwell path, the current MXFP4 kernels still consume the
+/// routed expert indices directly and do not need a separate
+/// `sorted_token_ids`/`experts_ids` API for correctness or graph-capture
+/// safety. This wrapper exists so higher-level code can call quantized MoE
+/// helpers from `moe.rs` consistently.
+pub fn moe_gemm_mxfp4(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    biases: Option<&Tensor>,
+    indices: &Tensor,
+) -> Result<Tensor> {
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let weights = if weights.is_contiguous() {
+        weights.clone()
+    } else {
+        weights.contiguous()?
+    };
+    let weight_scales = if weight_scales.is_contiguous() {
+        weight_scales.clone()
+    } else {
+        weight_scales.contiguous()?
+    };
+    let indices = if indices.is_contiguous() {
+        indices.clone()
+    } else {
+        indices.contiguous()?
+    };
+
+    let indices_dims = indices.dims();
+    if indices_dims.len() != 2 {
+        candle_core::bail!(
+            "moe_gemm_mxfp4: expected indices rank 2 [num_tokens, topk], got {:?}",
+            indices_dims
+        );
+    }
+    let num_tokens = indices_dims[0];
+    let topk = indices_dims[1];
+
+    let input_dims = input.dims();
+    let (k, input_has_topk_dim) = match input_dims {
+        [t, kk] => {
+            if *t != num_tokens {
+                candle_core::bail!(
+                    "moe_gemm_mxfp4: input/indices mismatch: input tokens={t}, indices tokens={num_tokens}"
+                );
+            }
+            (*kk, false)
+        }
+        [t, tk, kk] => {
+            if *t != num_tokens || *tk != topk {
+                candle_core::bail!(
+                    "moe_gemm_mxfp4: input/indices mismatch: input={input_dims:?}, indices={indices_dims:?}"
+                );
+            }
+            (*kk, true)
+        }
+        _ => candle_core::bail!(
+            "moe_gemm_mxfp4: expected input rank 2 or 3, got {:?}",
+            input_dims
+        ),
+    };
+
+    if k % crate::mxfp4_linear::MXFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "moe_gemm_mxfp4: K must be divisible by {}, got K={k}",
+            crate::mxfp4_linear::MXFP4_BLOCK_SIZE
+        );
+    }
+
+    let w_dims = weights.dims();
+    if w_dims.len() != 3 {
+        candle_core::bail!(
+            "moe_gemm_mxfp4: expected weights rank 3 [E, N, K/2], got {:?}",
+            w_dims
+        );
+    }
+    let num_experts = w_dims[0];
+    let n = w_dims[1];
+
+    if w_dims[2] != k / 2 {
+        candle_core::bail!(
+            "moe_gemm_mxfp4: weights shape mismatch, expected [E, N, K/2]=[{}, {}, {}], got {:?}",
+            num_experts,
+            n,
+            k / 2,
+            w_dims
+        );
+    }
+
+    let dev = input.device();
+    let dtype = input.dtype();
+
+    match dev {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_dev) => {
+            use candle_core::{DType, Storage};
+
+            fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+                match s {
+                    Storage::Cuda(c) => match dtype {
+                        DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                        DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                        DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                        DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                        _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+                    },
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                }
+            }
+
+            let has_bias = biases.is_some();
+            let use_fused = num_tokens >= 32;
+            let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
+
+            {
+                let (input_s, _) = input.storage_and_layout();
+                let (weights_s, _) = weights.storage_and_layout();
+                let (scales_s, _) = weight_scales.storage_and_layout();
+                let (indices_s, _) = indices.storage_and_layout();
+                let (output_s, _) = output.storage_and_layout();
+
+                let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+                let weights_ptr = cuda_ptr(&weights_s, DType::U8)? as *const u8;
+                let scales_ptr = cuda_ptr(&scales_s, DType::U8)? as *const u8;
+                let indices_ptr = cuda_ptr(&indices_s, DType::U32)? as *const u32;
+                let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+                let biases_ptr = if let Some(b) = biases {
+                    let (b_s, _) = b.storage_and_layout();
+                    cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                };
+
+                let stream = *cuda_dev.cu_stream() as i64;
+
+                unsafe {
+                    match dtype {
+                        DType::F16 => {
+                            if use_fused {
+                                ffi::mxfp4_moe_grouped_gemm_wmma_f16(
+                                    input_ptr,
+                                    weights_ptr,
+                                    scales_ptr,
+                                    biases_ptr,
+                                    indices_ptr,
+                                    output_ptr,
+                                    num_tokens as i32,
+                                    topk as i32,
+                                    num_experts as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    input_has_topk_dim,
+                                    stream,
+                                );
+                            } else {
+                                ffi::mxfp4_indexed_moe_gemm_f16(
+                                    input_ptr,
+                                    weights_ptr,
+                                    scales_ptr,
+                                    biases_ptr,
+                                    indices_ptr,
+                                    output_ptr,
+                                    num_tokens as i32,
+                                    topk as i32,
+                                    num_experts as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    input_has_topk_dim,
+                                    stream,
+                                );
+                            }
+                        }
+                        DType::BF16 => {
+                            if use_fused {
+                                ffi::mxfp4_moe_grouped_gemm_wmma_bf16(
+                                    input_ptr,
+                                    weights_ptr,
+                                    scales_ptr,
+                                    biases_ptr,
+                                    indices_ptr,
+                                    output_ptr,
+                                    num_tokens as i32,
+                                    topk as i32,
+                                    num_experts as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    input_has_topk_dim,
+                                    stream,
+                                );
+                            } else {
+                                ffi::mxfp4_indexed_moe_gemm_bf16(
+                                    input_ptr,
+                                    weights_ptr,
+                                    scales_ptr,
+                                    biases_ptr,
+                                    indices_ptr,
+                                    output_ptr,
+                                    num_tokens as i32,
+                                    topk as i32,
+                                    num_experts as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    input_has_topk_dim,
+                                    stream,
+                                );
+                            }
+                        }
+                        _ => {
+                            candle_core::bail!("moe_gemm_mxfp4 CUDA: unsupported dtype {:?}", dtype)
+                        }
+                    }
+                }
+            }
+
+            Ok(output)
+        }
+
+        #[cfg(feature = "metal")]
+        candle_core::Device::Metal(metal_dev) => {
+            use candle_core::{DType, Storage};
+
+            let reuse_topk = !input_has_topk_dim && topk <= 8;
+            let command_buffer = metal_dev.command_buffer()?;
+            let command_buffer_ref = command_buffer.as_ref();
+            let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
+
+            let (input_s, input_l) = input.storage_and_layout();
+            let input_ms = match &*input_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("input must be metal"),
+            };
+            let (weights_s, weights_l) = weights.storage_and_layout();
+            let weights_ms = match &*weights_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weights must be metal"),
+            };
+            let (scales_s, scales_l) = weight_scales.storage_and_layout();
+            let scales_ms = match &*scales_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weight_scales must be metal"),
+            };
+            let (indices_s, indices_l) = indices.storage_and_layout();
+            let indices_ms = match &*indices_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("indices must be metal"),
+            };
+            let (output_s, _) = output.storage_and_layout();
+            let output_ms = match &*output_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("output must be metal"),
+            };
+
+            let x = (
+                input_ms.buffer(),
+                input_l.start_offset() * dtype.size_in_bytes(),
+            );
+            let w = (
+                weights_ms.buffer(),
+                weights_l.start_offset() * weights.dtype().size_in_bytes(),
+            );
+            let sc = (
+                scales_ms.buffer(),
+                scales_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+            );
+            let idx = (
+                indices_ms.buffer(),
+                indices_l.start_offset() * indices.dtype().size_in_bytes(),
+            );
+
+            if let Some(biases) = biases {
+                let biases = if biases.is_contiguous() {
+                    biases.clone()
+                } else {
+                    biases.contiguous()?
+                };
+                let (bias_s, bias_l) = biases.storage_and_layout();
+                let bias_ms = match &*bias_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("biases must be metal"),
+                };
+                let bias_buf = (
+                    bias_ms.buffer(),
+                    bias_l.start_offset() * biases.dtype().size_in_bytes(),
+                );
+
+                metal_kernels::call_mxfp4_moe_gemm(
+                    metal_dev.device(),
+                    command_buffer_ref,
+                    metal_kernels::Kernels::default(),
+                    dtype,
+                    x,
+                    w,
+                    sc,
+                    bias_buf,
+                    idx,
+                    output_ms.buffer(),
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    n,
+                    k,
+                    true,
+                    input_has_topk_dim,
+                    reuse_topk,
+                )
+                .map_err(candle_core::Error::wrap)?;
+            } else {
+                let dummy_biases = (input_ms.buffer(), 0usize);
+
+                metal_kernels::call_mxfp4_moe_gemm(
+                    metal_dev.device(),
+                    command_buffer_ref,
+                    metal_kernels::Kernels::default(),
+                    dtype,
+                    x,
+                    w,
+                    sc,
+                    dummy_biases,
+                    idx,
+                    output_ms.buffer(),
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    n,
+                    k,
+                    false,
+                    input_has_topk_dim,
+                    reuse_topk,
+                )
+                .map_err(candle_core::Error::wrap)?;
+            }
+
+            Ok(output)
+        }
+        _ => candle_core::bail!("moe_gemm_mxfp4: unsupported backend (need CUDA or Metal)"),
+    }
+}
+
 #[cfg(feature = "metal")]
 pub fn moe_gemm(
     input: &Tensor,
@@ -1229,4 +2466,54 @@ pub fn moe_gemm_gguf(
     _: candle_core::DType,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_gguf is not implemented on this platform!")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_routed_rows_metadata, RoutedRowsMetadata};
+
+    fn assert_metadata_eq(actual: RoutedRowsMetadata, expected: RoutedRowsMetadata) {
+        assert_eq!(actual.sorted_token_ids, expected.sorted_token_ids);
+        assert_eq!(actual.scatter_ids, expected.scatter_ids);
+        assert_eq!(actual.expert_offsets, expected.expert_offsets);
+        assert_eq!(actual.expert_counts, expected.expert_counts);
+        assert_eq!(actual.sf_offsets, expected.sf_offsets);
+        assert_eq!(actual.problem_sizes, expected.problem_sizes);
+        assert_eq!(actual.total_sf_rows, expected.total_sf_rows);
+        assert_eq!(actual.total_expanded, expected.total_expanded);
+    }
+
+    #[test]
+    fn routed_rows_metadata_for_gate_up_input_uses_token_rows() {
+        let actual =
+            build_routed_rows_metadata(&[vec![2, 0], vec![1, 2]], 3, 64, 32, false).unwrap();
+        let expected = RoutedRowsMetadata {
+            sorted_token_ids: vec![0, 1, 0, 1],
+            scatter_ids: vec![1, 2, 0, 3],
+            expert_offsets: vec![0, 1, 2],
+            expert_counts: vec![1, 1, 2],
+            sf_offsets: vec![0, 128, 256],
+            problem_sizes: vec![1, 64, 32, 1, 64, 32, 2, 64, 32],
+            total_sf_rows: 384,
+            total_expanded: 4,
+        };
+        assert_metadata_eq(actual, expected);
+    }
+
+    #[test]
+    fn routed_rows_metadata_for_down_proj_input_uses_routed_rows() {
+        let actual =
+            build_routed_rows_metadata(&[vec![2, 0], vec![1, 2]], 3, 64, 32, true).unwrap();
+        let expected = RoutedRowsMetadata {
+            sorted_token_ids: vec![1, 2, 0, 3],
+            scatter_ids: vec![1, 2, 0, 3],
+            expert_offsets: vec![0, 1, 2],
+            expert_counts: vec![1, 1, 2],
+            sf_offsets: vec![0, 128, 256],
+            problem_sizes: vec![1, 64, 32, 1, 64, 32, 2, 64, 32],
+            total_sf_rows: 384,
+            total_expanded: 4,
+        };
+        assert_metadata_eq(actual, expected);
+    }
 }

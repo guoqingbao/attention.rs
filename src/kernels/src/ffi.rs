@@ -1494,6 +1494,48 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn nvfp4_quantize_activation_grouped_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        swizzled_scales: *mut c_void,
+        input_scale_invs: *const f32,
+        expert_offsets: *const i32,
+        sf_offsets: *const i32,
+        total_rows: i32,
+        num_experts: i32,
+        K: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_quantize_activation_grouped_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        swizzled_scales: *mut c_void,
+        input_scale_invs: *const f32,
+        expert_offsets: *const i32,
+        sf_offsets: *const i32,
+        total_rows: i32,
+        num_experts: i32,
+        K: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_build_metadata(
+        expert_offsets: *const i32,
+        weight_global_scales: *const f32,
+        input_scales: *const f32,
+        sf_offsets: *mut i32,
+        problem_sizes: *mut i32,
+        alphas: *mut f32,
+        input_scale_invs: *mut f32,
+        num_experts: i32,
+        N: i32,
+        K: i32,
+        stream: i64,
+    );
+
     pub fn nvfp4_swizzle_weight_scales(
         linear_scales: *const c_void,
         swizzled_scales: *mut c_void,
@@ -1510,6 +1552,7 @@ extern "C" {
         sorted_token_ids: *const i32,
         total_expanded: i32,
         K: i32,
+        map_divisor: i32,
         stream: i64,
     );
 
@@ -1519,6 +1562,7 @@ extern "C" {
         sorted_token_ids: *const i32,
         total_expanded: i32,
         K: i32,
+        map_divisor: i32,
         stream: i64,
     );
 

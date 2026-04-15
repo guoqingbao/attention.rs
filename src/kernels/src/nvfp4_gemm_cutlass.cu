@@ -398,7 +398,7 @@ static void run_fp4_gemm(
     return;
   }
 
-  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/false);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM100] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
@@ -507,7 +507,7 @@ static void run_fp4_gemm_sm120_impl(
     return;
   }
 
-  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/false);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM120 %s] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             sched_name, cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);

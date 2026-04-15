@@ -357,14 +357,176 @@ __global__ void nvfp4_moe_gather_kernel(
     const T* __restrict__ input,
     T* __restrict__ output,
     const int32_t* __restrict__ sorted_token_ids,
-    int K, int total_expanded)
+    int K, int total_expanded, int map_divisor)
 {
   int row = blockIdx.x;
   int col = threadIdx.x + blockIdx.y * blockDim.x;
   if (row >= total_expanded || col >= K) return;
 
-  int src_token = sorted_token_ids[row];
+  int src_token = sorted_token_ids[row] / map_divisor;
   output[row * K + col] = input[src_token * K + col];
+}
+
+__device__ __forceinline__ int nvfp4_find_expert_for_row(
+    const int32_t* __restrict__ expert_offsets,
+    int num_experts,
+    int row) {
+  int lo = 0;
+  int hi = num_experts;
+  while (lo + 1 < hi) {
+    int mid = (lo + hi) >> 1;
+    if (expert_offsets[mid] <= row) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__global__ void nvfp4_moe_build_metadata_kernel(
+    const int32_t* __restrict__ expert_offsets,
+    const float* __restrict__ weight_global_scales,
+    const float* __restrict__ input_scales,
+    int32_t* __restrict__ sf_offsets,
+    int32_t* __restrict__ problem_sizes,
+    float* __restrict__ alphas,
+    float* __restrict__ input_scale_invs,
+    int num_experts,
+    int N,
+    int K) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) {
+    return;
+  }
+
+  int running_sf_offset = 0;
+  for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
+    int rows = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
+    float input_scale = input_scales != nullptr ? input_scales[expert_id] : 1.0f;
+    float input_scale_inv = input_scale != 0.0f ? 1.0f / input_scale : 1.0f;
+
+    sf_offsets[expert_id] = running_sf_offset;
+    problem_sizes[expert_id * 3 + 0] = rows;
+    problem_sizes[expert_id * 3 + 1] = N;
+    problem_sizes[expert_id * 3 + 2] = K;
+    alphas[expert_id] = input_scale * weight_global_scales[expert_id];
+    input_scale_invs[expert_id] = input_scale_inv;
+
+    running_sf_offset += ((rows + 127) / 128) * 128;
+  }
+}
+
+template <typename InType>
+__global__ void nvfp4_quantize_activation_hw_grouped_kernel(
+    const InType* __restrict__ input,        // [total_rows, K]
+    uint8_t* __restrict__ output,            // [total_rows, K/2]
+    uint8_t* __restrict__ swizzled_scales,   // flat swizzled buffer
+    const float* __restrict__ input_scale_invs,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ sf_offsets,
+    int total_rows,
+    int num_experts,
+    int K,
+    int K_scale_padded) {
+  int row = blockIdx.x;
+  int block_idx = threadIdx.x;
+  int num_blocks = K / NVFP4_BLOCK_SIZE;
+  if (row >= total_rows || block_idx >= num_blocks) {
+    return;
+  }
+
+  int expert_id = nvfp4_find_expert_for_row(expert_offsets, num_experts, row);
+  int local_row = row - expert_offsets[expert_id];
+  int local_row_padded_base = sf_offsets[expert_id];
+  int rows = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
+  int rows_padded = ((rows + 127) / 128) * 128;
+  float SFScaleVal = input_scale_invs[expert_id];
+
+  int k_start = block_idx * NVFP4_BLOCK_SIZE;
+  float vals[16];
+  for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
+    vals[i] = static_cast<float>(input[row * K + k_start + i]);
+  }
+
+  float vecMax = 0.0f;
+  for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
+    vecMax = fmaxf(vecMax, fabsf(vals[i]));
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
+  __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
+  uint8_t fp8_scale_bits = fp8_sf.__x;
+  SFValue = static_cast<float>(fp8_sf);
+  float outputScale = vecMax != 0.0f ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal)) : 0.0f;
+
+  float scaled_vals_0[8], scaled_vals_1[8];
+  for (int i = 0; i < 8; ++i) {
+    scaled_vals_0[i] = vals[i] * outputScale;
+    scaled_vals_1[i] = vals[8 + i] * outputScale;
+  }
+
+  uint32_t packed_lo = fp32x8_to_e2m1x8(scaled_vals_0);
+  uint32_t packed_hi = fp32x8_to_e2m1x8(scaled_vals_1);
+  int out_offset = row * (K / 2) + k_start / 2;
+  reinterpret_cast<uint32_t*>(output + out_offset)[0] = packed_lo;
+  reinterpret_cast<uint32_t*>(output + out_offset)[1] = packed_hi;
+#else
+  float SFValue = SFScaleVal * (vecMax / 6.0f);
+  uint8_t fp8_scale_bits = 0;
+  float outputScale = 0.0f;
+
+  if (vecMax > 0.0f && SFValue > 0.0f) {
+    uint32_t bits = __float_as_uint(SFValue);
+    uint32_t sign = (bits >> 31) & 1;
+    int exp = ((bits >> 23) & 0xFF) - 127;
+    uint32_t mantissa = bits & 0x7FFFFF;
+    if (exp > 8) { exp = 8; mantissa = 0x600000; }
+    if (exp >= -9) {
+      int biased_exp = exp + 7;
+      if (biased_exp < 0) biased_exp = 0;
+      if (biased_exp > 15) biased_exp = 15;
+      uint8_t mant3 = (mantissa >> 20) & 0x7;
+      fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
+      float recon_mantissa = 1.0f + mant3 / 8.0f;
+      float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
+      if (sign) quant_scale = -quant_scale;
+      outputScale = (quant_scale != 0.0f && SFScaleVal != 0.0f)
+          ? (1.0f / (quant_scale / SFScaleVal))
+          : 0.0f;
+    }
+  }
+
+  uint8_t codes[16];
+  for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
+    codes[i] = float_to_fp4_e2m1(vals[i] * outputScale);
+  }
+
+  int out_offset = row * (K / 2) + k_start / 2;
+  for (int i = 0; i < 8; ++i) {
+    output[out_offset + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
+  }
+#endif
+
+  int innerKIdx = block_idx % 4;
+  int innerMIdx = (local_row % 128) / 32;
+  int outerMIdx = local_row % 32;
+  int kTileIdx = block_idx / 4;
+  int mTileIdx = local_row / 128;
+  int numKTiles = K_scale_padded / 4;
+  int64_t kTileStride = 512;
+  int64_t mTileStride = static_cast<int64_t>(numKTiles) * kTileStride;
+  int64_t chunk_base = static_cast<int64_t>(local_row_padded_base) * K_scale_padded;
+  int64_t dstOffset = chunk_base +
+      static_cast<int64_t>(mTileIdx) * mTileStride +
+      static_cast<int64_t>(kTileIdx) * kTileStride +
+      outerMIdx * 16 +
+      innerMIdx * 4 +
+      innerKIdx;
+
+  if (local_row < rows && local_row < rows_padded) {
+    swizzled_scales[dstOffset] = fp8_scale_bits;
+  }
 }
 
 template <typename T>
@@ -387,27 +549,109 @@ extern "C" {
 void nvfp4_moe_gather_f16(
     const void* input, void* output,
     const int32_t* sorted_token_ids,
-    int total_expanded, int K, int64_t stream)
+    int total_expanded, int K, int map_divisor, int64_t stream)
 {
   int threads = min(K, 1024);
   dim3 grid(total_expanded, (K + threads - 1) / threads);
   nvfp4_moe_gather_kernel<half><<<grid, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const half*>(input),
       static_cast<half*>(output),
-      sorted_token_ids, K, total_expanded);
+      sorted_token_ids, K, total_expanded, map_divisor);
 }
 
 void nvfp4_moe_gather_bf16(
     const void* input, void* output,
     const int32_t* sorted_token_ids,
-    int total_expanded, int K, int64_t stream)
+    int total_expanded, int K, int map_divisor, int64_t stream)
 {
   int threads = min(K, 1024);
   dim3 grid(total_expanded, (K + threads - 1) / threads);
   nvfp4_moe_gather_kernel<nv_bfloat16><<<grid, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const nv_bfloat16*>(input),
       static_cast<nv_bfloat16*>(output),
-      sorted_token_ids, K, total_expanded);
+      sorted_token_ids, K, total_expanded, map_divisor);
+}
+
+void nvfp4_moe_build_metadata(
+    const int32_t* expert_offsets,
+    const float* weight_global_scales,
+    const float* input_scales,
+    int32_t* sf_offsets,
+    int32_t* problem_sizes,
+    float* alphas,
+    float* input_scale_invs,
+    int num_experts,
+    int N,
+    int K,
+    int64_t stream)
+{
+  nvfp4_moe_build_metadata_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      expert_offsets,
+      weight_global_scales,
+      input_scales,
+      sf_offsets,
+      problem_sizes,
+      alphas,
+      input_scale_invs,
+      num_experts,
+      N,
+      K);
+}
+
+void nvfp4_quantize_activation_grouped_f16(
+    const void* input,
+    void* output,
+    void* swizzled_scales,
+    const float* input_scale_invs,
+    const int32_t* expert_offsets,
+    const int32_t* sf_offsets,
+    int total_rows,
+    int num_experts,
+    int K,
+    int K_scale_padded,
+    int64_t stream)
+{
+  dim3 grid(total_rows);
+  dim3 block(K / NVFP4_BLOCK_SIZE);
+  nvfp4_quantize_activation_hw_grouped_kernel<half><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const half*>(input),
+      static_cast<uint8_t*>(output),
+      static_cast<uint8_t*>(swizzled_scales),
+      input_scale_invs,
+      expert_offsets,
+      sf_offsets,
+      total_rows,
+      num_experts,
+      K,
+      K_scale_padded);
+}
+
+void nvfp4_quantize_activation_grouped_bf16(
+    const void* input,
+    void* output,
+    void* swizzled_scales,
+    const float* input_scale_invs,
+    const int32_t* expert_offsets,
+    const int32_t* sf_offsets,
+    int total_rows,
+    int num_experts,
+    int K,
+    int K_scale_padded,
+    int64_t stream)
+{
+  dim3 grid(total_rows);
+  dim3 block(K / NVFP4_BLOCK_SIZE);
+  nvfp4_quantize_activation_hw_grouped_kernel<nv_bfloat16><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const nv_bfloat16*>(input),
+      static_cast<uint8_t*>(output),
+      static_cast<uint8_t*>(swizzled_scales),
+      input_scale_invs,
+      expert_offsets,
+      sf_offsets,
+      total_rows,
+      num_experts,
+      K,
+      K_scale_padded);
 }
 
 void nvfp4_moe_scatter_f16(
@@ -448,14 +692,23 @@ void nvfp4_quantize_activation_f16(
 void nvfp4_quantize_activation_bf16(
     const void*, void*, void*, void*, float, int, int, int, int, int64_t) {}
 
+void nvfp4_quantize_activation_grouped_f16(
+    const void*, void*, void*, const float*, const int32_t*, const int32_t*, int, int, int, int, int64_t) {}
+
+void nvfp4_quantize_activation_grouped_bf16(
+    const void*, void*, void*, const float*, const int32_t*, const int32_t*, int, int, int, int, int64_t) {}
+
+void nvfp4_moe_build_metadata(
+    const int32_t*, const float*, const float*, int32_t*, int32_t*, float*, float*, int, int, int, int64_t) {}
+
 void nvfp4_swizzle_weight_scales(
     const void*, void*, int, int, int, int, int64_t) {}
 
 void nvfp4_moe_gather_f16(
-    const void*, void*, const int32_t*, int, int, int64_t) {}
+    const void*, void*, const int32_t*, int, int, int, int64_t) {}
 
 void nvfp4_moe_gather_bf16(
-    const void*, void*, const int32_t*, int, int, int64_t) {}
+    const void*, void*, const int32_t*, int, int, int, int64_t) {}
 
 void nvfp4_moe_scatter_f16(
     const void*, void*, const int32_t*, int, int, int64_t) {}
