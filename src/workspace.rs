@@ -7,10 +7,10 @@
 //! # Workspace Layout (when `flashinfer` feature is enabled)
 //!
 //! ```text
-//! FLOAT BUFFER (384 MiB total):
+//! FLASHINFER FLOAT BUFFER (512 MiB total):
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │  FlashInfer Plan Float (256 MiB)  │  GEMM Scratch (128 MiB)    │
-//! │  [0..256 MiB)                     │  [256 MiB..384 MiB)        │
+//! │  FlashInfer Plan Float (256 MiB)  │  FlashInfer Scratch (256 MiB)
+//! │  [0..256 MiB)                     │  [256 MiB..512 MiB)        │
 //! └─────────────────────────────────────────────────────────────────┘
 //!
 //! INT BUFFER (128 MiB):
@@ -26,7 +26,9 @@
 //!
 //! # Workspace Layout (when `flashinfer` feature is disabled)
 //!
-//! A fallback CUTLASS workspace of 384 MiB is allocated per-thread on first use.
+//! CUTLASS keeps a separate per-thread device workspace. When `flashinfer` is
+//! enabled, CUTLASS does not alias the FlashInfer float buffer because that
+//! shared path is not stable for the FP8 CUTLASS GEMM kernels.
 //!
 //! # Thread Safety
 //!
@@ -185,9 +187,8 @@ mod cuda {
         pub device_ordinal: usize,
     }
 
-    /// Fallback CUTLASS workspace when `flashinfer` feature is disabled.
-    /// This struct is only used when cutlass is enabled but flashinfer is not.
-    #[cfg(all(feature = "cutlass", not(feature = "flashinfer")))]
+    /// Dedicated CUTLASS workspace, kept separate from FlashInfer buffers.
+    #[cfg(feature = "cutlass")]
     pub struct CutlassWorkspace {
         pub buffer: CudaSlice<u8>,
         pub size: usize,
@@ -211,8 +212,8 @@ mod cuda {
         #[cfg(feature = "flashinfer")]
         pub static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
 
-        /// Fallback CUTLASS workspace when flashinfer is disabled.
-        #[cfg(all(feature = "cutlass", not(feature = "flashinfer")))]
+        /// Dedicated CUTLASS workspace.
+        #[cfg(feature = "cutlass")]
         pub static CUTLASS_WORKSPACE: RefCell<Option<CutlassWorkspace>> = const { RefCell::new(None) };
 
         /// Specialized FP8 blockscale workspace.
@@ -297,10 +298,10 @@ mod cuda {
         ))
     }
 
-    /// Returns the GEMM scratch workspace region from the FlashInfer float buffer.
+    /// Returns the FlashInfer GEMM scratch region from the shared float buffer.
     ///
-    /// This region is shared by all CUTLASS operations when `flashinfer` is enabled,
-    /// eliminating redundant workspace allocations in moe.rs, fp8_linear.rs, etc.
+    /// This remains available for FlashInfer-owned scratch usage, but CUTLASS uses
+    /// a separate dedicated workspace.
     #[cfg(feature = "flashinfer")]
     pub fn get_gemm_scratch_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
@@ -313,30 +314,7 @@ mod cuda {
         ))
     }
 
-    /// Returns the CUTLASS workspace, using shared FlashInfer scratch when available.
-    ///
-    /// When `flashinfer` is enabled, this returns a pointer into the shared GEMM scratch
-    /// region. Otherwise, it allocates a dedicated fallback buffer.
-    #[cfg(feature = "flashinfer")]
-    pub fn get_cutlass_workspace(
-        dev: &candle_core::cuda_backend::CudaDevice,
-        required_size: usize,
-    ) -> Result<(*mut std::ffi::c_void, usize)> {
-        let (ptr, size) = get_gemm_scratch_workspace(dev)?;
-        if required_size > size {
-            candle_core::bail!(
-                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
-                required_size,
-                size
-            );
-        }
-        Ok((ptr, size))
-    }
-
-    /// Returns the CUTLASS workspace when flashinfer is disabled.
-    /// Allocates a dedicated fallback buffer.
-    #[cfg(all(feature = "cutlass", not(feature = "flashinfer")))]
-    pub fn get_cutlass_workspace(
+    fn get_or_init_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
@@ -363,8 +341,20 @@ mod cuda {
         })
     }
 
+    /// Returns the dedicated CUTLASS workspace.
+    ///
+    /// Even when `flashinfer` is enabled, CUTLASS does not alias the FlashInfer
+    /// float buffer because that shared path is not stable for the FP8 CUTLASS GEMM kernels.
+    #[cfg(feature = "cutlass")]
+    pub fn get_cutlass_workspace(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        required_size: usize,
+    ) -> Result<(*mut std::ffi::c_void, usize)> {
+        get_or_init_cutlass_workspace(dev, required_size)
+    }
+
     /// Alias for CUTLASS workspace in MoE context.
-    #[cfg(any(feature = "flashinfer", feature = "cutlass"))]
+    #[cfg(feature = "cutlass")]
     pub fn get_moe_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
@@ -435,10 +425,10 @@ mod tests {
 
     #[test]
     fn constants_are_consistent() {
-        assert_eq!(WORKSPACE_FLOAT_SIZE, 384 * 1024 * 1024);
+        assert_eq!(WORKSPACE_FLOAT_SIZE, 512 * 1024 * 1024);
         assert_eq!(WORKSPACE_INT_SIZE, 128 * 1024 * 1024);
         assert_eq!(FLASHINFER_PLAN_FLOAT_SIZE, 256 * 1024 * 1024);
-        assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 128 * 1024 * 1024);
+        assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 256 * 1024 * 1024);
         assert_eq!(GEMM_SCRATCH_FLOAT_OFFSET, FLASHINFER_PLAN_FLOAT_SIZE);
     }
 }
