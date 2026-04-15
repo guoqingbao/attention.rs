@@ -1,78 +1,13 @@
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use crate::workspace::get_moe_cutlass_workspace;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use candle_core::cuda_backend::WrapErr;
 use candle_core::quantized::QTensor;
 use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use std::cell::RefCell;
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-const MOE_CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 384 * 1024 * 1024;
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-struct MoeCutlassWorkspace {
-    buffer: CudaSlice<u8>,
-    size: usize,
-    device_ordinal: usize,
-}
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-thread_local! {
-    static MOE_CUTLASS_WORKSPACE: RefCell<Option<MoeCutlassWorkspace>> = const { RefCell::new(None) };
-}
-
-#[cfg(feature = "cuda")]
-fn get_moe_cutlass_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    required_size: usize,
-) -> Result<(*mut std::ffi::c_void, usize)> {
-    #[cfg(feature = "flashinfer")]
-    {
-        let (ptr, size) = crate::flashinfer::get_gemm_scratch_workspace(dev)?;
-        if required_size > size {
-            candle_core::bail!(
-                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
-                required_size,
-                size
-            );
-        }
-        return Ok((ptr, size));
-    }
-
-    #[cfg(not(feature = "flashinfer"))]
-    {
-        MOE_CUTLASS_WORKSPACE.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let ordinal = dev.ordinal();
-            let alloc_size = required_size
-                .max(MOE_CUTLASS_WORKSPACE_FALLBACK_SIZE)
-                .max(1);
-            let needs_init = match slot.as_ref() {
-                None => true,
-                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
-            };
-
-            if needs_init {
-                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-                *slot = Some(MoeCutlassWorkspace {
-                    buffer,
-                    size: alloc_size,
-                    device_ordinal: ordinal,
-                });
-            }
-
-            let ws = slot.as_ref().unwrap();
-            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
-        })
-    }
-}
 
 #[cfg(feature = "cuda")]
 fn pad_to(val: usize, align: usize) -> usize {

@@ -2,78 +2,15 @@
 use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use crate::workspace::get_cutlass_workspace;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use candle_core::cuda_backend::WrapErr;
 #[cfg(feature = "cuda")]
 use candle_core::DType;
 use candle_core::{Result, Tensor};
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-use std::cell::RefCell;
 
 pub const MXFP4_BLOCK_SIZE: usize = 32;
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 384 * 1024 * 1024;
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-struct CutlassWorkspace {
-    buffer: CudaSlice<u8>,
-    size: usize,
-    device_ordinal: usize,
-}
-
-#[cfg(all(feature = "cuda", not(feature = "flashinfer")))]
-thread_local! {
-    static CUTLASS_WORKSPACE: RefCell<Option<CutlassWorkspace>> = const { RefCell::new(None) };
-}
-
-#[cfg(feature = "cuda")]
-fn get_cutlass_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    required_size: usize,
-) -> Result<(*mut std::ffi::c_void, usize)> {
-    #[cfg(feature = "flashinfer")]
-    {
-        let (ptr, size) = crate::flashinfer::get_gemm_scratch_workspace(dev)?;
-        if required_size > size {
-            candle_core::bail!(
-                "CUTLASS workspace requires {} bytes, shared scratch region has {} bytes",
-                required_size,
-                size
-            );
-        }
-        return Ok((ptr, size));
-    }
-
-    #[cfg(not(feature = "flashinfer"))]
-    {
-        CUTLASS_WORKSPACE.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let ordinal = dev.ordinal();
-            let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
-            let needs_init = match slot.as_ref() {
-                None => true,
-                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
-            };
-
-            if needs_init {
-                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-                *slot = Some(CutlassWorkspace {
-                    buffer,
-                    size: alloc_size,
-                    device_ordinal: ordinal,
-                });
-            }
-
-            let ws = slot.as_ref().unwrap();
-            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
-        })
-    }
-}
 
 /// Check if hardware MXFP4 (CUTLASS block-scaled tensor ops with Mxf8f6f4 schedule) is available.
 /// Requires Blackwell SM100+ and the cutlass feature.

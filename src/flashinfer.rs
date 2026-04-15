@@ -2,133 +2,16 @@ use crate::cuda_utils;
 use crate::kernels;
 use candle_core as candle;
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
-use std::cell::RefCell;
 
-/// Workspace buffer sizes for FlashInfer operations.
-pub(crate) const WORKSPACE_FLOAT_SIZE: usize = 384 * 1024 * 1024; // 384 MB
-const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024; // 128 MB
-const FLASHINFER_PLAN_FLOAT_SIZE: usize = 256 * 1024 * 1024;
-const GEMM_SCRATCH_FLOAT_OFFSET: usize = FLASHINFER_PLAN_FLOAT_SIZE;
-pub(crate) const GEMM_SCRATCH_FLOAT_SIZE: usize = WORKSPACE_FLOAT_SIZE - GEMM_SCRATCH_FLOAT_OFFSET;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WorkspaceRegion {
-    offset: usize,
-    size: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WorkspaceRegions {
-    plan_float: WorkspaceRegion,
-    gemm_scratch_float: WorkspaceRegion,
-    plan_int: WorkspaceRegion,
-}
-
-const WORKSPACE_REGIONS: WorkspaceRegions = WorkspaceRegions {
-    plan_float: WorkspaceRegion {
-        offset: 0,
-        size: FLASHINFER_PLAN_FLOAT_SIZE,
-    },
-    gemm_scratch_float: WorkspaceRegion {
-        offset: GEMM_SCRATCH_FLOAT_OFFSET,
-        size: GEMM_SCRATCH_FLOAT_SIZE,
-    },
-    plan_int: WorkspaceRegion {
-        offset: 0,
-        size: WORKSPACE_INT_SIZE,
-    },
+// Re-export workspace functions and constants for backward compatibility with external callers
+#[allow(unused_imports)]
+pub(crate) use crate::workspace::{
+    get_gemm_scratch_workspace, get_or_init_workspace, get_plan_workspace, GEMM_SCRATCH_FLOAT_SIZE,
+    WORKSPACE_FLOAT_SIZE,
 };
-
-/// Static workspace buffers for FlashInfer to avoid per-call allocation
-struct PinnedHostBuffer {
-    ptr: *mut std::ffi::c_void,
-    size: usize,
-}
-
-impl PinnedHostBuffer {
-    fn new(size: usize) -> Result<Self> {
-        if size == 0 {
-            candle::bail!("Pinned host buffer size must be > 0");
-        }
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            sys::lib()
-                .cuMemAllocHost_v2(&mut ptr, size)
-                .result()
-                .map_err(|e| candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}")))?
-        }
-        if ptr.is_null() {
-            candle::bail!("cuMemAllocHost_v2 returned null pointer");
-        }
-        Ok(Self { ptr, size })
-    }
-
-    fn as_ptr(&self) -> *mut std::ffi::c_void {
-        self.ptr
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Drop for PinnedHostBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                sys::lib()
-                    .cuMemFreeHost(self.ptr)
-                    .result()
-                    .map_err(|e| {
-                        candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}"))
-                    })
-                    .unwrap();
-            }
-        }
-    }
-}
-
-struct FlashInferWorkspace {
-    float_buffer: CudaSlice<u8>,
-    int_buffer: CudaSlice<u8>,
-    pinned_host: PinnedHostBuffer,
-    device_ordinal: usize,
-}
-
-thread_local! {
-    static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
-    static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
-}
-
-fn workspace_regions() -> WorkspaceRegions {
-    debug_assert!(
-        WORKSPACE_REGIONS.plan_float.offset + WORKSPACE_REGIONS.plan_float.size
-            <= WORKSPACE_FLOAT_SIZE
-    );
-    debug_assert!(
-        WORKSPACE_REGIONS.gemm_scratch_float.offset
-            >= WORKSPACE_REGIONS.plan_float.offset + WORKSPACE_REGIONS.plan_float.size
-    );
-    debug_assert!(
-        WORKSPACE_REGIONS.gemm_scratch_float.offset + WORKSPACE_REGIONS.gemm_scratch_float.size
-            <= WORKSPACE_FLOAT_SIZE
-    );
-    debug_assert!(
-        WORKSPACE_REGIONS.plan_int.offset + WORKSPACE_REGIONS.plan_int.size <= WORKSPACE_INT_SIZE
-    );
-    WORKSPACE_REGIONS
-}
-
-fn add_workspace_offset(
-    base: *mut std::ffi::c_void,
-    region: WorkspaceRegion,
-) -> *mut std::ffi::c_void {
-    debug_assert!(!base.is_null());
-    unsafe { (base as *mut u8).add(region.offset) as *mut std::ffi::c_void }
-}
 
 fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
     matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
@@ -232,87 +115,6 @@ fn get_cuda_f32_ptr(t: &Tensor) -> Result<*const f32> {
         }
         _ => candle::bail!("Tensor must be on CUDA and have F32 dtype"),
     }
-}
-
-pub(crate) fn get_or_init_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    for_cuda_graph: bool,
-) -> Result<(
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    usize,
-)> {
-    let ws_cell = if for_cuda_graph {
-        &WORKSPACE_GRAPH
-    } else {
-        &WORKSPACE
-    };
-    ws_cell.with(|ws| {
-        let mut ws = ws.borrow_mut();
-        let ordinal = dev.ordinal();
-
-        // Check if we need to (re)initialize the workspace
-        let needs_init = match ws.as_ref() {
-            None => true,
-            Some(existing) => existing.device_ordinal != ordinal,
-        };
-
-        if needs_init {
-            let float_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_FLOAT_SIZE) }.w()?;
-            let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
-            let pinned_host = PinnedHostBuffer::new(WORKSPACE_INT_SIZE)?;
-            *ws = Some(FlashInferWorkspace {
-                float_buffer,
-                int_buffer,
-                pinned_host,
-                device_ordinal: ordinal,
-            });
-        }
-
-        let workspace = ws.as_ref().unwrap();
-        Ok((
-            *workspace.float_buffer.device_ptr() as *mut std::ffi::c_void,
-            *workspace.int_buffer.device_ptr() as *mut std::ffi::c_void,
-            workspace.pinned_host.as_ptr(),
-            workspace.pinned_host.size(),
-        ))
-    })
-}
-
-pub(crate) fn get_plan_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    for_cuda_graph: bool,
-) -> Result<(
-    *mut std::ffi::c_void,
-    usize,
-    *mut std::ffi::c_void,
-    usize,
-    *mut std::ffi::c_void,
-    usize,
-)> {
-    let regions = workspace_regions();
-    let (float_ptr, int_ptr, page_locked_ptr, page_locked_size) =
-        get_or_init_workspace(dev, for_cuda_graph)?;
-    Ok((
-        add_workspace_offset(float_ptr, regions.plan_float),
-        regions.plan_float.size,
-        add_workspace_offset(int_ptr, regions.plan_int),
-        regions.plan_int.size,
-        page_locked_ptr,
-        page_locked_size,
-    ))
-}
-
-pub(crate) fn get_gemm_scratch_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-) -> Result<(*mut std::ffi::c_void, usize)> {
-    let regions = workspace_regions();
-    let (float_ptr, _, _, _) = get_or_init_workspace(dev, false)?;
-    Ok((
-        add_workspace_offset(float_ptr, regions.gemm_scratch_float),
-        regions.gemm_scratch_float.size,
-    ))
 }
 
 fn validate_decode_plan_info(plan_info: &[i64], data_type: i32, sm: i32) -> Result<()> {
@@ -688,13 +490,12 @@ impl FlashInferDecodeWithPlan {
             );
         }
 
+        let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         if data_type == 2 {
-            let sm = cuda_utils::sm_version(dev).unwrap_or(0);
             if sm < 90 {
                 candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
             }
         }
-        let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         validate_decode_plan_info(&self.plan_info, data_type, sm)?;
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
@@ -880,6 +681,7 @@ pub fn decode_plan(
         _ => 0,
     };
 
+    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
         get_plan_workspace(dev, enable_cuda_graph)?;
 
@@ -909,7 +711,6 @@ pub fn decode_plan(
         candle::bail!("decode_plan requires kv_len_arr_host in metadata");
     };
     let qo_indptr_host = Some(qo_indptr);
-    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
     let mut plan_info = vec![0i64; if data_type == 2 && sm == 90 { 9 } else { 10 }];
     unsafe {
         if data_type == 2 && sm == 90 {
@@ -1645,7 +1446,7 @@ pub fn prefill_ragged(
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use crate::workspace::{
         workspace_regions, GEMM_SCRATCH_FLOAT_SIZE, WORKSPACE_FLOAT_SIZE, WORKSPACE_INT_SIZE,
     };
 

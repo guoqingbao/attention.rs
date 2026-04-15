@@ -1,7 +1,7 @@
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
-use crate::flashinfer::{get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
 #[cfg(feature = "cuda")]
 use crate::kernels;
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+use crate::workspace::{get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]

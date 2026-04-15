@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cassert>
 #include <algorithm>
+#include <type_traits>
 
 #ifndef _WIN32
 #pragma GCC diagnostic push
@@ -137,6 +138,9 @@ struct Fp4MoeGemmSm100 {
 
 #if defined(ENABLE_FP4_SM120)
 
+// SM120 MoE GEMM configuration - using 128x128x128 tile for better compatibility
+// with small problem sizes (MoE often has variable M per expert).
+// The 128x256x256 tile is too large for small M problems.
 template <typename OutType>
 struct Fp4MoeGemmSm120 {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -165,7 +169,9 @@ struct Fp4MoeGemmSm120 {
 
   using ClusterShape = Shape<_1, _1, _1>;
 
-  using MmaTileShape = Shape<_128, _256, _256>;
+  // Use 128x128x128 tile instead of 128x256x256 for better small-M compatibility
+  // This matches the dense GEMM fallback tile and SM100's tile size
+  using MmaTileShape = Shape<_128, _128, _128>;
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
@@ -183,7 +189,8 @@ struct Fp4MoeGemmSm120 {
       ElementA, LayoutA*, AlignmentA,
       ElementB, LayoutB*, AlignmentB,
       ElementAccumulator, MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCount<2>,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule
   >::CollectiveOp;
 
@@ -239,11 +246,12 @@ __global__ void setup_moe_group_gemm_args(
     const int32_t* expert_offsets,
     const int32_t* sf_offsets,
     const int32_t* problem_sizes,
+    const int num_experts,
     const int K,
     const int N)
 {
-  int64_t expert_id = threadIdx.x;
-  if (expert_id >= gridDim.x * blockDim.x) return;
+  int64_t expert_id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expert_id >= num_experts) return;
 
   int64_t expert_offset = static_cast<int64_t>(expert_offsets[expert_id]);
   int64_t sf_offset = static_cast<int64_t>(sf_offsets[expert_id]);
@@ -329,7 +337,7 @@ static int run_fp4_moe_grouped_gemm_sm100(
   size_t stride_c_bytes = num_experts * sizeof(StrideC);
   size_t layout_sfa_bytes = num_experts * sizeof(LayoutSFA);
   size_t layout_sfb_bytes = num_experts * sizeof(LayoutSFB);
-  size_t stride_bytes = stride_a_bytes;  // for alloc lambda
+  size_t stride_bytes = stride_a_bytes;  // for workspace suballocation
 
   // Total workspace: 6 pointer arrays + 3 stride arrays + 2 layout arrays + padding
   size_t total_workspace = 6 * ptr_array_bytes + stride_a_bytes + stride_b_bytes +
@@ -343,24 +351,26 @@ static int run_fp4_moe_grouped_gemm_sm100(
 
   char* workspace_buf = static_cast<char*>(workspace);
   size_t workspace_offset = 0;
-  auto alloc = [&](size_t bytes, size_t alignment = 256) -> void* {
+  auto alloc_from_workspace = [&](size_t bytes, size_t alignment = 256) -> void* {
     return suballocate_workspace(
         workspace_buf, workspace_bytes, workspace_offset, bytes, alignment);
   };
 
-  auto a_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
-  auto b_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
-  auto out_ptrs = static_cast<ElementD**>(alloc(ptr_array_bytes));
-  auto a_sf_ptrs = static_cast<const ElementSFType**>(alloc(ptr_array_bytes));
-  auto b_sf_ptrs = static_cast<const ElementSFType**>(alloc(ptr_array_bytes));
-  auto alpha_ptrs = static_cast<const float**>(alloc(ptr_array_bytes));
-  auto layout_sfa_arr = static_cast<LayoutSFA*>(alloc(layout_sfa_bytes));
-  auto layout_sfb_arr = static_cast<LayoutSFB*>(alloc(layout_sfb_bytes));
+  auto a_ptrs = static_cast<const ElementType**>(alloc_from_workspace(ptr_array_bytes));
+  auto b_ptrs = static_cast<const ElementType**>(alloc_from_workspace(ptr_array_bytes));
+  auto out_ptrs = static_cast<ElementD**>(alloc_from_workspace(ptr_array_bytes));
+  auto a_sf_ptrs = static_cast<const ElementSFType**>(alloc_from_workspace(ptr_array_bytes));
+  auto b_sf_ptrs = static_cast<const ElementSFType**>(alloc_from_workspace(ptr_array_bytes));
+  auto alpha_ptrs = static_cast<const float**>(alloc_from_workspace(ptr_array_bytes));
+  auto layout_sfa_arr = static_cast<LayoutSFA*>(alloc_from_workspace(layout_sfa_bytes));
+  auto layout_sfb_arr = static_cast<LayoutSFB*>(alloc_from_workspace(layout_sfb_bytes));
 
   // Allocate stride arrays
-  auto a_strides = static_cast<StrideA*>(alloc(stride_bytes));
-  auto b_strides = static_cast<StrideB*>(alloc(num_experts * sizeof(StrideB)));
-  auto c_strides = static_cast<StrideC*>(alloc(num_experts * sizeof(StrideC)));
+  auto a_strides = static_cast<StrideA*>(alloc_from_workspace(stride_bytes));
+  auto b_strides =
+      static_cast<StrideB*>(alloc_from_workspace(num_experts * sizeof(StrideB)));
+  auto c_strides =
+      static_cast<StrideC*>(alloc_from_workspace(num_experts * sizeof(StrideC)));
   if (!a_ptrs || !b_ptrs || !out_ptrs || !a_sf_ptrs || !b_sf_ptrs || !alpha_ptrs ||
       !layout_sfa_arr || !layout_sfb_arr || !a_strides || !b_strides || !c_strides) {
     fprintf(stderr,
@@ -373,7 +383,7 @@ static int run_fp4_moe_grouped_gemm_sm100(
       ElementType, ElementD, ElementSFType, float,
       StrideA, StrideB, StrideC,
       LayoutSFA, LayoutSFB, ScaleConfig>
-      <<<1, num_experts, 0, stream>>>(
+      <<<(num_experts + 255) / 256, 256, 0, stream>>>(
           a_ptrs, b_ptrs, out_ptrs,
           a_sf_ptrs, b_sf_ptrs, alpha_ptrs,
           a_strides, b_strides, c_strides,
@@ -385,7 +395,14 @@ static int run_fp4_moe_grouped_gemm_sm100(
           static_cast<const ElementSFType*>(b_blockscales),
           alphas,
           expert_offsets, sf_offsets, problem_sizes,
+          num_experts,
           K, N);
+  cudaError_t setup_err = cudaPeekAtLastError();
+  if (setup_err != cudaSuccess) {
+    fprintf(stderr, "[NVFP4 MoE CUTLASS] setup kernel launch failed: %s\n",
+            cudaGetErrorString(setup_err));
+    return -1;
+  }
 
   Gemm gemm_op;
 
@@ -430,7 +447,9 @@ static int run_fp4_moe_grouped_gemm_sm100(
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
   if (gemm_workspace_size > 0) {
-    gemm_workspace = alloc(gemm_workspace_size);
+    // Always suballocate from the Rust-provided device workspace buffer.
+    gemm_workspace = suballocate_workspace(
+        workspace_buf, workspace_bytes, workspace_offset, gemm_workspace_size, 256);
     if (gemm_workspace == nullptr) {
       fprintf(stderr,
               "[NVFP4 MoE CUTLASS] insufficient workspace for CUTLASS GEMM: need %zu additional bytes, got %zu total\n",
@@ -446,7 +465,7 @@ static int run_fp4_moe_grouped_gemm_sm100(
     return -1;
   }
 
-  auto status = gemm_op.initialize(args, gemm_workspace);
+  auto status = gemm_op.initialize(args, gemm_workspace, stream);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] initialize failed: %s\n",
             cutlass::cutlassGetStatusString(status));
@@ -522,22 +541,22 @@ static int run_fp4_moe_grouped_gemm_sm120(
 
   char* workspace_buf = static_cast<char*>(workspace);
   size_t workspace_offset = 0;
-  auto alloc = [&](size_t bytes, size_t alignment = 256) -> void* {
+  auto alloc_from_workspace = [&](size_t bytes, size_t alignment = 256) -> void* {
     return suballocate_workspace(
         workspace_buf, workspace_bytes, workspace_offset, bytes, alignment);
   };
 
-  auto a_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
-  auto b_ptrs = static_cast<const ElementType**>(alloc(ptr_array_bytes));
-  auto out_ptrs = static_cast<ElementD**>(alloc(ptr_array_bytes));
-  auto a_sf_ptrs = static_cast<const ElementSFType**>(alloc(ptr_array_bytes));
-  auto b_sf_ptrs = static_cast<const ElementSFType**>(alloc(ptr_array_bytes));
-  auto alpha_ptrs = static_cast<const float**>(alloc(ptr_array_bytes));
-  auto layout_sfa_arr = static_cast<LayoutSFA*>(alloc(layout_sfa_bytes));
-  auto layout_sfb_arr = static_cast<LayoutSFB*>(alloc(layout_sfb_bytes));
-  auto a_strides = static_cast<StrideA*>(alloc(stride_a_bytes));
-  auto b_strides = static_cast<StrideB*>(alloc(stride_b_bytes));
-  auto c_strides = static_cast<StrideC*>(alloc(stride_c_bytes));
+  auto a_ptrs = static_cast<const ElementType**>(alloc_from_workspace(ptr_array_bytes));
+  auto b_ptrs = static_cast<const ElementType**>(alloc_from_workspace(ptr_array_bytes));
+  auto out_ptrs = static_cast<ElementD**>(alloc_from_workspace(ptr_array_bytes));
+  auto a_sf_ptrs = static_cast<const ElementSFType**>(alloc_from_workspace(ptr_array_bytes));
+  auto b_sf_ptrs = static_cast<const ElementSFType**>(alloc_from_workspace(ptr_array_bytes));
+  auto alpha_ptrs = static_cast<const float**>(alloc_from_workspace(ptr_array_bytes));
+  auto layout_sfa_arr = static_cast<LayoutSFA*>(alloc_from_workspace(layout_sfa_bytes));
+  auto layout_sfb_arr = static_cast<LayoutSFB*>(alloc_from_workspace(layout_sfb_bytes));
+  auto a_strides = static_cast<StrideA*>(alloc_from_workspace(stride_a_bytes));
+  auto b_strides = static_cast<StrideB*>(alloc_from_workspace(stride_b_bytes));
+  auto c_strides = static_cast<StrideC*>(alloc_from_workspace(stride_c_bytes));
   if (!a_ptrs || !b_ptrs || !out_ptrs || !a_sf_ptrs || !b_sf_ptrs || !alpha_ptrs ||
       !layout_sfa_arr || !layout_sfb_arr || !a_strides || !b_strides || !c_strides) {
     fprintf(stderr,
@@ -550,7 +569,7 @@ static int run_fp4_moe_grouped_gemm_sm120(
       ElementType, ElementD, ElementSFType, float,
       StrideA, StrideB, StrideC,
       LayoutSFA, LayoutSFB, ScaleConfig>
-      <<<1, num_experts, 0, stream>>>(
+      <<<(num_experts + 255) / 256, 256, 0, stream>>>(
           a_ptrs, b_ptrs, out_ptrs,
           a_sf_ptrs, b_sf_ptrs, alpha_ptrs,
           a_strides, b_strides, c_strides,
@@ -562,7 +581,14 @@ static int run_fp4_moe_grouped_gemm_sm120(
           static_cast<const ElementSFType*>(b_blockscales),
           alphas,
           expert_offsets, sf_offsets, problem_sizes,
+          num_experts,
           K, N);
+  cudaError_t setup_err = cudaPeekAtLastError();
+  if (setup_err != cudaSuccess) {
+    fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] setup kernel launch failed: %s\n",
+            cudaGetErrorString(setup_err));
+    return -1;
+  }
 
   Gemm gemm_op;
 
@@ -603,11 +629,22 @@ static int run_fp4_moe_grouped_gemm_sm120(
       epilogue_args,
       hw_info
   };
+  if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>) {
+    args.scheduler.max_swizzle_size = 1;
+  }
+  if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>) {
+    using Enum_t = decltype(args.scheduler.raster_order);
+    args.scheduler.raster_order = Enum_t::Heuristic;
+  }
+  args.hw_info.cluster_shape = dim3(1, 1, 1);
+  args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
 
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
   if (gemm_workspace_size > 0) {
-    gemm_workspace = alloc(gemm_workspace_size);
+    // Always suballocate from the Rust-provided device workspace buffer.
+    gemm_workspace = suballocate_workspace(
+        workspace_buf, workspace_bytes, workspace_offset, gemm_workspace_size, 256);
     if (gemm_workspace == nullptr) {
       fprintf(stderr,
               "[NVFP4 MoE CUTLASS SM120] insufficient workspace for CUTLASS GEMM: need %zu additional bytes, got %zu total\n",
@@ -623,14 +660,14 @@ static int run_fp4_moe_grouped_gemm_sm120(
     return -1;
   }
 
-  auto status = gemm_op.initialize(args, gemm_workspace);
+  auto status = gemm_op.initialize(args, gemm_workspace, stream);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] initialize failed: %s\n",
             cutlass::cutlassGetStatusString(status));
     return -1;
   }
 
-  status = gemm_op.run(args, gemm_workspace, stream);
+  status = gemm_op.run(stream);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
