@@ -1050,13 +1050,6 @@ pub fn moe_gemm_fp8(
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-/// Indexed NVFP4 MoE GEMM.
-///
-/// This preserves the original software path contract: callers pass raw
-/// `indices` and receive `[num_tokens, topk, n]`.
-///
-/// On Blackwell (`sm100+`) with compatible shapes, it dispatches internally to
-/// the routed hardware FP4 helper.
 pub fn moe_gemm_nvfp4(
     input: &Tensor,
     weights: &Tensor,
@@ -1065,6 +1058,7 @@ pub fn moe_gemm_nvfp4(
     input_scales: Option<&Tensor>,
     biases: Option<&Tensor>,
     indices: &Tensor,
+    pre_sorted: Option<(&Tensor, &Tensor)>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1175,34 +1169,129 @@ pub fn moe_gemm_nvfp4(
 
     let dev = input.device();
     let cuda_dev = dev.as_cuda_device()?;
-    #[cfg(feature = "cutlass")]
-    {
-        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
-        let use_hardware_fp4 = sm >= 100 && n % 32 == 0 && k % 32 == 0;
-        if use_hardware_fp4 && num_tokens > 32 {
-            use crate::sort::ArgSortOp;
+
+    // For batched prefill (num_tokens > 32), sort by expert once and dispatch
+    // to hardware FP4 (SM100+) or software WMMA (SM80+).
+    if num_tokens > 32 {
+        use crate::sort::ArgSortOp;
+
+        let (sorted_expert_ids, sorted_token_ids) = if let Some((stids, seids)) = pre_sorted {
+            (seids.clone(), stids.clone())
+        } else {
             let flat_indices = indices.flatten_all()?.contiguous()?;
-            let (experts_ids, sorted_token_ids) = flat_indices.sort(true)?;
-            let routed_input = if input_has_topk_dim {
-                input.reshape((num_tokens * topk, k))?
-            } else {
-                input.clone()
-            };
-            let output = moe_gemm_nvfp4_hardware(
-                &routed_input,
-                &weights,
-                &weight_scales,
-                &weight_global_scales,
-                input_scales,
-                &None,
-                &sorted_token_ids,
-                &experts_ids,
-                topk,
-                true,
-            )?;
-            return output.reshape((num_tokens, topk, n));
+            flat_indices.sort(true)?
+        };
+        let total_slots = num_tokens * topk;
+
+        #[cfg(feature = "cutlass")]
+        {
+            let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+            if sm >= 100 && n % 32 == 0 && k % 32 == 0 {
+                let routed_input = if input_has_topk_dim {
+                    input.reshape((num_tokens * topk, k))?
+                } else {
+                    input.clone()
+                };
+                let output = moe_gemm_nvfp4_hardware(
+                    &routed_input,
+                    &weights,
+                    &weight_scales,
+                    &weight_global_scales,
+                    input_scales,
+                    &None,
+                    &sorted_token_ids,
+                    &sorted_expert_ids,
+                    topk,
+                    true,
+                )?;
+                return output.reshape((num_tokens, topk, n));
+            }
         }
+
+        // WMMA grouped MoE path (SM80+): compute expert offsets on GPU
+        let sorted_expert_ids_u32 = sorted_expert_ids.to_dtype(DType::U32)?;
+        let sorted_token_ids_u32 = sorted_token_ids.to_dtype(DType::U32)?;
+        let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
+        let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
+        {
+            let stream = *cuda_dev.cu_stream() as i64;
+            let (seids_s, _) = sorted_expert_ids_u32.storage_and_layout();
+            let (ec_s, _) = expert_counts_t.storage_and_layout();
+            let (eo_s, _) = expert_offsets_t.storage_and_layout();
+            unsafe {
+                ffi::moe_fp8_calculate_expert_offsets(
+                    cuda_ptr(&seids_s, DType::U32)? as *const i32,
+                    cuda_ptr(&ec_s, DType::U32)? as *mut i32,
+                    cuda_ptr(&eo_s, DType::U32)? as *mut i32,
+                    num_experts as i32,
+                    total_slots as i32,
+                    true,
+                    stream,
+                );
+            }
+        }
+
+        let routed_input = if input_has_topk_dim {
+            input.reshape((num_tokens * topk, k))?
+        } else {
+            input.clone()
+        };
+
+        let output = Tensor::zeros((num_tokens * topk, n), dtype, dev)?;
+        {
+            let stream = *cuda_dev.cu_stream() as i64;
+            let (input_s, _) = routed_input.storage_and_layout();
+            let (weights_s, _) = weights.storage_and_layout();
+            let (scales_s, _) = weight_scales.storage_and_layout();
+            let (gscales_s, _) = weight_global_scales.storage_and_layout();
+            let (stids_s, _) = sorted_token_ids_u32.storage_and_layout();
+            let (eoffs_s, _) = expert_offsets_t.storage_and_layout();
+            let (output_s, _) = output.storage_and_layout();
+
+            unsafe {
+                match dtype {
+                    DType::F16 => ffi::nvfp4_moe_gemm_wmma_f16(
+                        cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                        cuda_ptr(&weights_s, DType::U8)? as *const u8,
+                        cuda_ptr(&scales_s, DType::U8)? as *const u8,
+                        cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                        cuda_ptr(&stids_s, DType::U32)? as *const i32,
+                        cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
+                        std::ptr::null(),
+                        cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                        num_experts as i32,
+                        topk as i32,
+                        total_slots as i32,
+                        n as i32,
+                        k as i32,
+                        input_has_topk_dim,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::nvfp4_moe_gemm_wmma_bf16(
+                        cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                        cuda_ptr(&weights_s, DType::U8)? as *const u8,
+                        cuda_ptr(&scales_s, DType::U8)? as *const u8,
+                        cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                        cuda_ptr(&stids_s, DType::U32)? as *const i32,
+                        cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
+                        std::ptr::null(),
+                        cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                        num_experts as i32,
+                        topk as i32,
+                        total_slots as i32,
+                        n as i32,
+                        k as i32,
+                        input_has_topk_dim,
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        return output.reshape((num_tokens, topk, n));
     }
+
     let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
     {
         let stream = *cuda_dev.cu_stream() as i64;
@@ -1275,6 +1364,7 @@ pub fn moe_gemm_nvfp4(
     _: Option<&Tensor>,
     _: Option<&Tensor>,
     _: &Tensor,
+    _: Option<(&Tensor, &Tensor)>,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_nvfp4 is not implemented on this platform!")
 }

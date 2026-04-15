@@ -2446,6 +2446,42 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn nvfp4_moe_gemm_wmma_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        sorted_token_ids: *const i32,
+        expert_offsets: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        num_experts: c_int,
+        topk: c_int,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_gemm_wmma_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        sorted_token_ids: *const i32,
+        expert_offsets: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        num_experts: c_int,
+        topk: c_int,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
     // ======================================================================
     // GPT-OSS SwiGLU kernels
     // ======================================================================
