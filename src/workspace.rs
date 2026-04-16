@@ -314,6 +314,7 @@ mod cuda {
         ))
     }
 
+    #[cfg(feature = "cutlass")]
     fn get_or_init_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
