@@ -100,6 +100,16 @@ fn main() -> Result<()> {
             .arg("-DUSE_CUTLASS")
             .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
 
+        if compute_cap >= 100 {
+            builder = builder.arg("-DENABLE_FP4");
+        }
+        if (100..120).contains(&compute_cap) {
+            builder = builder.arg("-DENABLE_FP4_SM100");
+        }
+        if compute_cap >= 120 {
+            builder = builder.arg("-DENABLE_FP4_SM120");
+        }
+
         if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
             builder = builder.arg("-DENABLE_BF16").arg("-DENABLE_FP8");
             if compute_cap >= 89 {
@@ -114,15 +124,6 @@ fn main() -> Result<()> {
             }
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
-            }
-            if compute_cap >= 100 {
-                builder = builder.arg("-DENABLE_FP4");
-            }
-            if (100..120).contains(&compute_cap) {
-                builder = builder.arg("-DENABLE_FP4_SM100");
-            }
-            if compute_cap >= 120 {
-                builder = builder.arg("-DENABLE_FP4_SM120");
             }
         }
     }

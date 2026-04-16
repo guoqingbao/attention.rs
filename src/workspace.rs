@@ -40,8 +40,6 @@ use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
 use candle_core::Result;
-#[cfg(feature = "cuda")]
-use std::cell::RefCell;
 
 /// Total size of the float workspace buffer (512 MiB).
 pub const WORKSPACE_FLOAT_SIZE: usize = 512 * 1024 * 1024;
@@ -206,19 +204,19 @@ mod cuda {
     thread_local! {
         /// Primary FlashInfer workspace (normal operations).
         #[cfg(feature = "flashinfer")]
-        pub static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
+        pub static WORKSPACE: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
 
         /// FlashInfer workspace for CUDA graph captures (separate to avoid interference).
         #[cfg(feature = "flashinfer")]
-        pub static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
+        pub static WORKSPACE_GRAPH: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
 
         /// Dedicated CUTLASS workspace.
-        #[cfg(feature = "cutlass")]
-        pub static CUTLASS_WORKSPACE: RefCell<Option<CutlassWorkspace>> = const { RefCell::new(None) };
+        #[cfg(all(feature = "cuda", feature = "cutlass"))]
+        pub static CUTLASS_WORKSPACE: std::cell::RefCell<Option<CutlassWorkspace>> = const { std::cell::RefCell::new(None) };
 
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
-        pub static FLASHINFER_FP8_WORKSPACE: RefCell<Option<FlashInferFp8Workspace>> = const { RefCell::new(None) };
+        pub static FLASHINFER_FP8_WORKSPACE: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Initializes or retrieves the FlashInfer workspace for the given device.
@@ -314,6 +312,7 @@ mod cuda {
         ))
     }
 
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
     fn get_or_init_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
@@ -345,7 +344,7 @@ mod cuda {
     ///
     /// Even when `flashinfer` is enabled, CUTLASS does not alias the FlashInfer
     /// float buffer because that shared path is not stable for the FP8 CUTLASS GEMM kernels.
-    #[cfg(feature = "cutlass")]
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
     pub fn get_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
@@ -354,7 +353,7 @@ mod cuda {
     }
 
     /// Alias for CUTLASS workspace in MoE context.
-    #[cfg(feature = "cutlass")]
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
     pub fn get_moe_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,

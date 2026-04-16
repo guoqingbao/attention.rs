@@ -4,7 +4,7 @@ use crate::cuda_utils;
 use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::workspace::get_cutlass_workspace;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use crate::workspace::get_or_init_flashinfer_fp8_workspace;

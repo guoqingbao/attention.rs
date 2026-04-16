@@ -1,6 +1,6 @@
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::workspace::get_moe_cutlass_workspace;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;

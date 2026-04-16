@@ -33,8 +33,6 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
-#include "flashinfer/cutlass_utils.cuh"
-#include "flashinfer/arch_condition.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
@@ -137,14 +135,14 @@ struct CutlassMxfp4Gemm {
     using typename Base::Params;
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf) {
-      if constexpr (flashinfer::arch::is_major_v<10> || flashinfer::arch::is_major_v<11>) {
+#if defined(ENABLE_FP4_SM100)
         this->Base::operator()(params, smem_buf);
-      } else {
+#else
         if (cute::thread0()) {
           printf("MXFP4 CUTLASS GEMM: requires SM10x/SM11x\n");
           __trap();
         }
-      }
+#endif
     }
   };
 
@@ -222,14 +220,14 @@ struct CutlassMxfp4GemmSm120 {
     using typename Base::Params;
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf) {
-      if constexpr (flashinfer::arch::is_major_v<12>) {
+#if defined(ENABLE_FP4_SM120)
         this->Base::operator()(params, smem_buf);
-      } else {
+#else
         if (cute::thread0()) {
           printf("MXFP4 CUTLASS GEMM SM120: requires SM12x\n");
           __trap();
         }
-      }
+#endif
     }
   };
 

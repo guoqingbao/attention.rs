@@ -28,7 +28,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
-#include "flashinfer/cutlass_utils.cuh"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop

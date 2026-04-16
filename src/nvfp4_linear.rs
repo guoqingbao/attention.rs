@@ -1,6 +1,6 @@
 #[cfg(feature = "cuda")]
 use crate::kernels::ffi;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::workspace::get_cutlass_workspace;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
@@ -118,148 +118,161 @@ pub fn nvfp4_matmul(
                 }
             }
 
-            let use_hardware_fp4 =
-                is_hardware_fp4_available(dev) && m >= 32 && n % 32 == 0 && k % 32 == 0;
+            let use_hardware_fp4 = cfg!(feature = "cutlass")
+                && is_hardware_fp4_available(dev)
+                && m >= 32
+                && n % 32 == 0
+                && k % 32 == 0;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
             if use_hardware_fp4 {
-                // Hardware FP4 path: quantize activations -> CUTLASS block-scaled GEMM
-                let stream = *cuda_dev.cu_stream() as i64;
-
-                let m_padded = pad_to(m, 128);
-                let k_scale_cols = k / NVFP4_BLOCK_SIZE;
-                let k_scale_padded = pad_to(k_scale_cols, 4);
-                let n_padded = pad_to(n, 128);
-
-                let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
-                let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
-                let act_scales_swizzled =
-                    Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
-
-                let weight_scales_swizzled =
-                    Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
-
-                // GEMM alpha = input_scale * weight_global_scale
-                // input_scale_inv is pre-baked into activation block scales during quantization
-                let input_scale_inv = if input_scale != 0.0 {
-                    1.0 / input_scale
-                } else {
-                    1.0
-                };
-                let alpha = input_scale * weight_global_scale;
-                let alpha_tensor = Tensor::new(&[alpha], dev)?;
-
+                #[cfg(feature = "cutlass")]
                 {
-                    let (input_s, _) = input.storage_and_layout();
-                    let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+                    // Hardware FP4 path: quantize activations -> CUTLASS block-scaled GEMM
+                    let stream = *cuda_dev.cu_stream() as i64;
 
-                    let (act_packed_s, _) = act_packed.storage_and_layout();
-                    let act_packed_ptr =
-                        cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
+                    let m_padded = pad_to(m, 128);
+                    let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+                    let k_scale_padded = pad_to(k_scale_cols, 4);
+                    let n_padded = pad_to(n, 128);
 
-                    let (act_scales_s, _) = act_scales.storage_and_layout();
-                    let act_scales_ptr =
-                        cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
+                    let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
+                    let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
+                    let act_scales_swizzled =
+                        Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
 
-                    let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
-                    let act_scales_sw_ptr =
-                        cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
+                    let weight_scales_swizzled =
+                        Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
 
-                    let (weight_s, _) = weight.storage_and_layout();
-                    let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const std::ffi::c_void;
+                    // GEMM alpha = input_scale * weight_global_scale
+                    // input_scale_inv is pre-baked into activation block scales during quantization
+                    let input_scale_inv = if input_scale != 0.0 {
+                        1.0 / input_scale
+                    } else {
+                        1.0
+                    };
+                    let alpha = input_scale * weight_global_scale;
+                    let alpha_tensor = Tensor::new(&[alpha], dev)?;
 
-                    let (scale_s, _) = scale.storage_and_layout();
-                    let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
+                    {
+                        let (input_s, _) = input.storage_and_layout();
+                        let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
 
-                    let (wscale_sw_s, _) = weight_scales_swizzled.storage_and_layout();
-                    let wscale_sw_ptr = cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+                        let (act_packed_s, _) = act_packed.storage_and_layout();
+                        let act_packed_ptr =
+                            cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
 
-                    let (output_s, _) = output.storage_and_layout();
-                    let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+                        let (act_scales_s, _) = act_scales.storage_and_layout();
+                        let act_scales_ptr =
+                            cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
 
-                    let (alpha_s, _) = alpha_tensor.storage_and_layout();
-                    let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
+                        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+                        let act_scales_sw_ptr =
+                            cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
 
-                    unsafe {
-                        match dtype {
-                            DType::F16 => ffi::nvfp4_quantize_activation_f16(
-                                input_ptr,
-                                act_packed_ptr,
-                                act_scales_ptr,
-                                act_scales_sw_ptr,
-                                input_scale_inv,
-                                m as i32,
-                                k as i32,
-                                m_padded as i32,
+                        let (weight_s, _) = weight.storage_and_layout();
+                        let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const std::ffi::c_void;
+
+                        let (scale_s, _) = scale.storage_and_layout();
+                        let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
+
+                        let (wscale_sw_s, _) = weight_scales_swizzled.storage_and_layout();
+                        let wscale_sw_ptr =
+                            cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+
+                        let (output_s, _) = output.storage_and_layout();
+                        let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+                        let (alpha_s, _) = alpha_tensor.storage_and_layout();
+                        let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
+
+                        unsafe {
+                            match dtype {
+                                DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                                    input_ptr,
+                                    act_packed_ptr,
+                                    act_scales_ptr,
+                                    act_scales_sw_ptr,
+                                    input_scale_inv,
+                                    m as i32,
+                                    k as i32,
+                                    m_padded as i32,
+                                    k_scale_padded as i32,
+                                    stream,
+                                ),
+                                DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                                    input_ptr,
+                                    act_packed_ptr,
+                                    act_scales_ptr,
+                                    act_scales_sw_ptr,
+                                    input_scale_inv,
+                                    m as i32,
+                                    k as i32,
+                                    m_padded as i32,
+                                    k_scale_padded as i32,
+                                    stream,
+                                ),
+                                _ => candle_core::bail!(
+                                    "nvfp4_matmul: unsupported dtype {:?}",
+                                    dtype
+                                ),
+                            }
+
+                            ffi::nvfp4_swizzle_weight_scales(
+                                scale_ptr,
+                                wscale_sw_ptr,
+                                n as i32,
+                                k_scale_cols as i32,
+                                n_padded as i32,
                                 k_scale_padded as i32,
                                 stream,
-                            ),
-                            DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
-                                input_ptr,
-                                act_packed_ptr,
-                                act_scales_ptr,
-                                act_scales_sw_ptr,
-                                input_scale_inv,
-                                m as i32,
-                                k as i32,
-                                m_padded as i32,
-                                k_scale_padded as i32,
-                                stream,
-                            ),
-                            _ => candle_core::bail!("nvfp4_matmul: unsupported dtype {:?}", dtype),
-                        }
+                            );
 
-                        ffi::nvfp4_swizzle_weight_scales(
-                            scale_ptr,
-                            wscale_sw_ptr,
-                            n as i32,
-                            k_scale_cols as i32,
-                            n_padded as i32,
-                            k_scale_padded as i32,
-                            stream,
-                        );
+                            let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
+                            let ws_bytes = ws_bytes as i64;
 
-                        let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
-                        let ws_bytes = ws_bytes as i64;
-
-                        match dtype {
-                            DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
-                                act_packed_ptr as *const std::ffi::c_void,
-                                weight_ptr,
-                                act_scales_sw_ptr as *const std::ffi::c_void,
-                                wscale_sw_ptr as *const std::ffi::c_void,
-                                alpha_ptr,
-                                output_ptr,
-                                m as i32,
-                                n as i32,
-                                k as i32,
-                                ws_ptr,
-                                ws_bytes,
-                                stream,
-                            ),
-                            DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
-                                act_packed_ptr as *const std::ffi::c_void,
-                                weight_ptr,
-                                act_scales_sw_ptr as *const std::ffi::c_void,
-                                wscale_sw_ptr as *const std::ffi::c_void,
-                                alpha_ptr,
-                                output_ptr,
-                                m as i32,
-                                n as i32,
-                                k as i32,
-                                ws_ptr,
-                                ws_bytes,
-                                stream,
-                            ),
-                            _ => candle_core::bail!("nvfp4_matmul: unsupported dtype {:?}", dtype),
+                            match dtype {
+                                DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
+                                    act_packed_ptr as *const std::ffi::c_void,
+                                    weight_ptr,
+                                    act_scales_sw_ptr as *const std::ffi::c_void,
+                                    wscale_sw_ptr as *const std::ffi::c_void,
+                                    alpha_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    ws_ptr,
+                                    ws_bytes,
+                                    stream,
+                                ),
+                                DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
+                                    act_packed_ptr as *const std::ffi::c_void,
+                                    weight_ptr,
+                                    act_scales_sw_ptr as *const std::ffi::c_void,
+                                    wscale_sw_ptr as *const std::ffi::c_void,
+                                    alpha_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    ws_ptr,
+                                    ws_bytes,
+                                    stream,
+                                ),
+                                _ => candle_core::bail!(
+                                    "nvfp4_matmul: unsupported dtype {:?}",
+                                    dtype
+                                ),
+                            }
                         }
                     }
-                }
 
-                if let Some(b) = bias {
-                    return Ok(output.broadcast_add(b)?);
+                    if let Some(b) = bias {
+                        return Ok(output.broadcast_add(b)?);
+                    }
                 }
             } else {
                 // Software dequant path (existing kernels)
