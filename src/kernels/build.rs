@@ -129,7 +129,9 @@ fn main() -> Result<()> {
     }
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
-        println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
+        println!("cargo:rerun-if-changed=src/flashinfer_common.cuh");
+        println!("cargo:rerun-if-changed=src/flashinfer_adapter_decode.cu");
+        println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
         // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
         // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support
