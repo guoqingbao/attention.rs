@@ -1226,7 +1226,8 @@ pub fn moe_gemm_nvfp4(
             }
         }
 
-        // WMMA grouped MoE path (SM80+): compute expert offsets on GPU
+        // WMMA grouped MoE path (SM80+): compute expert offsets on GPU.
+        // Use the light (custom kernel) path for CUDA graph compatibility.
         let sorted_expert_ids_u32 = sorted_expert_ids.to_dtype(DType::U32)?;
         let sorted_token_ids_u32 = sorted_token_ids.to_dtype(DType::U32)?;
         let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
@@ -1243,7 +1244,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&eo_s, DType::U32)? as *mut i32,
                     num_experts as i32,
                     total_slots as i32,
-                    true,
+                    false,
                     stream,
                 );
             }
@@ -1492,7 +1493,9 @@ pub fn moe_gemm_nvfp4_flashinfer(
     let cuda_dev = dev.as_cuda_device()?;
     let stream = *cuda_dev.cu_stream() as i64;
 
-    // Step 1: Compute expert offsets from sorted expert IDs
+    // Step 1: Compute expert offsets from sorted expert IDs.
+    // Always use the "light" (custom kernel) path (is_prefill=false) instead of
+    // thrust::inclusive_scan so this remains compatible with CUDA graph capture.
     let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
     let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
     {
@@ -1506,7 +1509,7 @@ pub fn moe_gemm_nvfp4_flashinfer(
                 cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
                 num_experts as i32,
                 size_m as i32,
-                is_prefill,
+                false,
                 stream,
             );
         }
@@ -1891,7 +1894,7 @@ pub fn moe_gemm_nvfp4_hardware(
                 cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
                 num_experts as i32,
                 size_m as i32,
-                is_prefill,
+                false,
                 stream,
             );
         }
