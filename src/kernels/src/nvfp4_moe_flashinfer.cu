@@ -78,7 +78,7 @@ INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120(
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-namespace {
+namespace nvfp4_moe_detail {
 
 /*
  * FlashInfer computes per-group SFA offsets with this formula:
@@ -186,7 +186,7 @@ int run_flashinfer_nvfp4_moe_gemm_sm120(
     return 0;
 }
 
-}  // namespace
+}  // namespace nvfp4_moe_detail
 
 #endif  // ENABLE_FP4_SM120 && USE_FLASHINFER
 
@@ -203,7 +203,7 @@ void flashinfer_nvfp4_moe_build_metadata(
     int num_experts,
     int64_t stream)
 {
-    flashinfer_moe_build_metadata_kernel<<<1, 1, 0,
+    nvfp4_moe_detail::flashinfer_moe_build_metadata_kernel<<<1, 1, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(
         expert_offsets, weight_global_scales, input_scales,
         sf_offsets, alphas, input_scale_invs, num_experts);
@@ -229,7 +229,7 @@ int flashinfer_nvfp4_moe_gemm_f16(
     int64_t stream)
 {
 #if defined(ENABLE_FP4_SM120) && defined(USE_FLASHINFER)
-    return run_flashinfer_nvfp4_moe_gemm_sm120<cutlass::half_t>(
+    return nvfp4_moe_detail::run_flashinfer_nvfp4_moe_gemm_sm120<cutlass::half_t>(
         gathered_input, weights, input_sf, weight_sf,
         alphas, expert_offsets, output,
         num_experts, N, K, total_rows,
@@ -262,7 +262,7 @@ int flashinfer_nvfp4_moe_gemm_bf16(
     int64_t stream)
 {
 #if defined(ENABLE_FP4_SM120) && defined(USE_FLASHINFER)
-    return run_flashinfer_nvfp4_moe_gemm_sm120<cutlass::bfloat16_t>(
+    return nvfp4_moe_detail::run_flashinfer_nvfp4_moe_gemm_sm120<cutlass::bfloat16_t>(
         gathered_input, weights, input_sf, weight_sf,
         alphas, expert_offsets, output,
         num_experts, N, K, total_rows,
