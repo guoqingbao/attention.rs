@@ -72,6 +72,7 @@ pub fn nvfp4_matmul(
     weight_global_scale: f32,
     input_scale: f32,
     bias: Option<&Tensor>,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -135,14 +136,14 @@ pub fn nvfp4_matmul(
 
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
-                && m >= 32
+                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && m >= 32
+                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
 

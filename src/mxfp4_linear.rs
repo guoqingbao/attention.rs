@@ -47,6 +47,7 @@ pub fn mxfp4_matmul(
     weight: &Tensor,
     scale: &Tensor,
     bias: Option<&Tensor>,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -109,7 +110,7 @@ pub fn mxfp4_matmul(
             }
 
             let use_hardware_mxfp4 =
-                cfg!(feature = "cutlass") && is_hardware_mxfp4_available(dev) && m >= 32;
+                cfg!(feature = "cutlass") && is_hardware_mxfp4_available(dev) && is_prefill;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
