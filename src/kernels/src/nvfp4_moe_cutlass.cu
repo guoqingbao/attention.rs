@@ -70,8 +70,11 @@ struct Fp4MoeGemmSm100 {
 
   using ElementType = cutlass::float_e2m1_t;
   using ElementSFType = cutlass::float_ue4m3_t;
-  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
-  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+
+  // SM100 requires cute::tuple<Element, SF> for the mainloop builder,
+  // matching the FlashInfer SM100 dense GEMM pattern.
+  using ElementA = cute::tuple<ElementType, ElementSFType>;
+  using ElementB = cute::tuple<ElementType, ElementSFType>;
   using ElementC = OutType;
   using ElementD = OutType;
   using ElementAccumulator = float;
@@ -81,8 +84,8 @@ struct Fp4MoeGemmSm100 {
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD_t = cutlass::layout::RowMajor;
 
-  static constexpr int AlignmentA = 32;
-  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementType>::value;
+  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementType>::value;
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
@@ -163,19 +166,16 @@ struct Fp4MoeGemmSm120 {
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   using ArchTag = cutlass::arch::Sm120;
-  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;
-  using MainloopOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
   using ClusterShape = Shape<_1, _1, _1>;
 
-  // Use 128x128x128 tile instead of 128x256x256 for better small-M compatibility
-  // This matches the dense GEMM fallback tile and SM100's tile size
   using MmaTileShape = Shape<_128, _128, _128>;
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, EpilogueOperatorClass, MmaTileShape, ClusterShape,
+      ArchTag, OperatorClass, MmaTileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator, ElementAccumulator,
       ElementC, LayoutC*, AlignmentC,
@@ -184,7 +184,7 @@ struct Fp4MoeGemmSm120 {
   >::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, MainloopOperatorClass,
+      ArchTag, OperatorClass,
       ElementA, LayoutA*, AlignmentA,
       ElementB, LayoutB*, AlignmentB,
       ElementAccumulator, MmaTileShape, ClusterShape,

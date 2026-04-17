@@ -1192,6 +1192,24 @@ pub fn moe_gemm_nvfp4(
                 } else {
                     input.clone()
                 };
+
+                #[cfg(feature = "flashinfer")]
+                if sm >= 120 {
+                    let output = moe_gemm_nvfp4_flashinfer(
+                        &routed_input,
+                        &weights,
+                        &weight_scales,
+                        &weight_global_scales,
+                        input_scales,
+                        &None,
+                        &sorted_token_ids,
+                        &sorted_expert_ids,
+                        topk,
+                        true,
+                    )?;
+                    return output.reshape((num_tokens, topk, n));
+                }
+
                 let output = moe_gemm_nvfp4_hardware(
                     &routed_input,
                     &weights,
@@ -1367,6 +1385,370 @@ pub fn moe_gemm_nvfp4(
     _: Option<(&Tensor, &Tensor)>,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_nvfp4 is not implemented on this platform!")
+}
+
+#[cfg(all(feature = "cuda", feature = "cutlass", feature = "flashinfer"))]
+#[allow(clippy::too_many_arguments)]
+/// FlashInfer-ported NVFP4 MoE grouped GEMM (SM120 only).
+///
+/// Uses FlashInfer's `CutlassNVFP4GroupwiseScaledGroupGEMMSM120` which takes
+/// flat data pointers + `m_indptr` and internally computes per-group pointer
+/// arrays. The activation scales are laid out using FlashInfer's sf_m_offset
+/// formula for compatibility with its arg-setup kernel.
+pub fn moe_gemm_nvfp4_flashinfer(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    weight_global_scales: &Tensor,
+    input_scales: Option<&Tensor>,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    use candle_core::{DType, Storage};
+
+    fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
+        match s {
+            Storage::Cuda(c) => match dtype {
+                DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+                DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+                DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+                _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+            },
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
+
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let weights = if weights.is_contiguous() {
+        weights.clone()
+    } else {
+        weights.contiguous()?
+    };
+    let weight_scales = if weight_scales.is_contiguous() {
+        weight_scales.clone()
+    } else {
+        weight_scales.contiguous()?
+    };
+    let weight_global_scales = if weight_global_scales.is_contiguous() {
+        weight_global_scales.clone()
+    } else {
+        weight_global_scales.contiguous()?
+    };
+    let sorted_token_ids = if sorted_token_ids.is_contiguous() {
+        sorted_token_ids.clone()
+    } else {
+        sorted_token_ids.contiguous()?
+    };
+    let experts_ids = if experts_ids.is_contiguous() {
+        experts_ids.clone()
+    } else {
+        experts_ids.contiguous()?
+    };
+
+    let (input_rows, k) = input.dims2()?;
+    let (num_experts, n, packed_k) = weights.dims3()?;
+    if packed_k != k / 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_flashinfer: weights shape mismatch, expected K/2={}, got {}",
+            k / 2,
+            packed_k
+        );
+    }
+    if k % crate::nvfp4_linear::NVFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_flashinfer: K must be divisible by {}, got K={k}",
+            crate::nvfp4_linear::NVFP4_BLOCK_SIZE
+        );
+    }
+
+    let size_m = sorted_token_ids.elem_count();
+    let map_divisor =
+        if input_rows == size_m {
+            1
+        } else if input_rows * topk == size_m {
+            topk as i32
+        } else {
+            candle_core::bail!(
+            "moe_gemm_nvfp4_flashinfer: input rows {} incompatible with routed size {} and topk {}",
+            input_rows, size_m, topk
+        );
+        };
+
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        candle_core::bail!("moe_gemm_nvfp4_flashinfer only accepts f16/bf16 inputs");
+    }
+
+    let dev = input.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    // Step 1: Compute expert offsets from sorted expert IDs
+    let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
+    let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
+    {
+        let (experts_ids_s, _) = experts_ids.storage_and_layout();
+        let (expert_counts_s, _) = expert_counts_t.storage_and_layout();
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        unsafe {
+            ffi::moe_fp8_calculate_expert_offsets(
+                cuda_ptr(&experts_ids_s, DType::U32)? as *const i32,
+                cuda_ptr(&expert_counts_s, DType::U32)? as *mut i32,
+                cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
+                num_experts as i32,
+                size_m as i32,
+                is_prefill,
+                stream,
+            );
+        }
+    }
+
+    // Step 2: Build metadata using FlashInfer's sf_offset formula
+    let sf_offsets_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
+    let alphas_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
+    let input_scale_invs_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
+    {
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        let (weight_global_scales_s, _) = weight_global_scales.storage_and_layout();
+        let (sf_offsets_s, _) = sf_offsets_t.storage_and_layout();
+        let (alphas_s, _) = alphas_t.storage_and_layout();
+        let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
+        let input_scales_ptr = if let Some(scales) = input_scales {
+            let (scales_s, _) = scales.storage_and_layout();
+            cuda_ptr(&scales_s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
+        unsafe {
+            ffi::flashinfer_nvfp4_moe_build_metadata(
+                cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                cuda_ptr(&weight_global_scales_s, DType::F32)? as *const f32,
+                input_scales_ptr,
+                cuda_ptr(&sf_offsets_s, DType::U32)? as *mut i32,
+                cuda_ptr(&alphas_s, DType::F32)? as *mut f32,
+                cuda_ptr(&input_scale_invs_s, DType::F32)? as *mut f32,
+                num_experts as i32,
+                stream,
+            );
+        }
+    }
+
+    // Step 3: Gather input rows by expert
+    let gathered = Tensor::zeros((size_m, k), dtype, dev)?;
+    {
+        let (input_s, _) = input.storage_and_layout();
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (sorted_s, _) = sorted_token_ids.storage_and_layout();
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_moe_gather_f16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    k as i32,
+                    map_divisor,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_moe_gather_bf16(
+                    cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    k as i32,
+                    map_divisor,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // Step 4: Quantize activations with FlashInfer-compatible sf_offsets
+    let k_scale = k / crate::nvfp4_linear::NVFP4_BLOCK_SIZE;
+    let k_scale_padded = pad_to(k_scale, 4);
+    let act_packed = Tensor::zeros((size_m, k / 2), DType::U8, dev)?;
+    // FlashInfer sf_m_offset formula: max offset = (total_rows + (E-1)*127)/128*128
+    let total_sf_rows_capacity = pad_to(size_m + 127 * num_experts, 128);
+    let act_scales_swizzled =
+        Tensor::zeros((total_sf_rows_capacity, k_scale_padded), DType::U8, dev)?;
+    {
+        let (gathered_s, _) = gathered.storage_and_layout();
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
+        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
+        let (sf_offsets_s, _) = sf_offsets_t.storage_and_layout();
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::nvfp4_quantize_activation_grouped_f16(
+                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
+                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    num_experts as i32,
+                    k as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                DType::BF16 => ffi::nvfp4_quantize_activation_grouped_bf16(
+                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
+                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
+                    cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
+                    size_m as i32,
+                    num_experts as i32,
+                    k as i32,
+                    k_scale_padded as i32,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // Step 5: Swizzle weight scales for all experts into flat buffer
+    let n_padded = pad_to(n, 128);
+    let weight_scales_swizzled =
+        Tensor::zeros((num_experts * n_padded, k_scale_padded), DType::U8, dev)?;
+    {
+        let (ws_s, _) = weight_scales.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let ws_base = cuda_ptr(&ws_s, DType::U8)?;
+        let wss_base = cuda_ptr(&wss_s, DType::U8)?;
+        for e in 0..num_experts {
+            let src_offset = (e * n * k_scale) as u64;
+            let dst_offset = (e * n_padded * k_scale_padded) as u64;
+            unsafe {
+                ffi::nvfp4_swizzle_weight_scales(
+                    (ws_base + src_offset) as *const std::ffi::c_void,
+                    (wss_base + dst_offset) as *mut std::ffi::c_void,
+                    n as i32,
+                    k_scale as i32,
+                    n_padded as i32,
+                    k_scale_padded as i32,
+                    stream,
+                );
+            }
+        }
+    }
+
+    // Step 6: Run FlashInfer grouped GEMM
+    let rep_out = Tensor::zeros((size_m, n), dtype, dev)?;
+    {
+        let (act_packed_s, _) = act_packed.storage_and_layout();
+        let (weights_s, _) = weights.storage_and_layout();
+        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
+        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
+        let (alphas_s, _) = alphas_t.storage_and_layout();
+        let (eo_s, _) = expert_offsets_t.storage_and_layout();
+        let (out_s, _) = rep_out.storage_and_layout();
+        let (workspace_ptr, workspace_bytes) = get_moe_cutlass_workspace(cuda_dev, 0)?;
+        // FlashInfer needs two workspaces (int + float). We split our single workspace.
+        let half_ws = workspace_bytes / 2;
+        let int_ws_ptr = workspace_ptr;
+        let float_ws_ptr =
+            unsafe { (workspace_ptr as *mut u8).add(half_ws) as *mut std::ffi::c_void };
+        unsafe {
+            let ret = match dtype {
+                DType::F16 => ffi::flashinfer_nvfp4_moe_gemm_f16(
+                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
+                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
+                    num_experts as i32,
+                    n as i32,
+                    k as i32,
+                    size_m as i32,
+                    int_ws_ptr,
+                    half_ws as i64,
+                    float_ws_ptr,
+                    half_ws as i64,
+                    stream,
+                ),
+                DType::BF16 => ffi::flashinfer_nvfp4_moe_gemm_bf16(
+                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
+                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
+                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
+                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
+                    num_experts as i32,
+                    n as i32,
+                    k as i32,
+                    size_m as i32,
+                    int_ws_ptr,
+                    half_ws as i64,
+                    float_ws_ptr,
+                    half_ws as i64,
+                    stream,
+                ),
+                _ => unreachable!(),
+            };
+            if ret != 0 {
+                candle_core::bail!("flashinfer_nvfp4_moe_gemm failed with error code {}", ret);
+            }
+        }
+    }
+
+    // Step 7: Scatter results back to original token order
+    let output = Tensor::zeros((size_m, n), dtype, dev)?;
+    {
+        let (rep_out_s, _) = rep_out.storage_and_layout();
+        let (sorted_s, _) = sorted_token_ids.storage_and_layout();
+        let (output_s, _) = output.storage_and_layout();
+        let weights_ptr = if let Some(t) = topk_weights {
+            let (s, _) = t.storage_and_layout();
+            cuda_ptr(&s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
+        unsafe {
+            match dtype {
+                DType::F16 => ffi::moe_fp8_scatter_rows_f16(
+                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    size_m as i64,
+                    size_m as i64,
+                    n as i64,
+                    weights_ptr,
+                    stream,
+                ),
+                DType::BF16 => ffi::moe_fp8_scatter_rows_bf16(
+                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                    size_m as i64,
+                    size_m as i64,
+                    n as i64,
+                    weights_ptr,
+                    stream,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 #[cfg(all(feature = "cuda", feature = "cutlass"))]

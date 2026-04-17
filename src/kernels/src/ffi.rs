@@ -1615,6 +1615,90 @@ extern "C" {
         stream: i64,
     );
 
+    // FlashInfer-style CUTLASS NVFP4 GEMM (SM100+, flashinfer feature)
+    pub fn flashinfer_nvfp4_cutlass_gemm_f16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        global_sf: *const f32,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        stream: i64,
+    );
+
+    pub fn flashinfer_nvfp4_cutlass_gemm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        global_sf: *const f32,
+        output: *mut c_void,
+        M: i32,
+        N: i32,
+        K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        stream: i64,
+    );
+
+    // FlashInfer-style NVFP4 MoE metadata builder (SM120 only)
+    // Computes sf_offsets using FlashInfer's alignment formula, plus alphas and input_scale_invs
+    pub fn flashinfer_nvfp4_moe_build_metadata(
+        expert_offsets: *const i32,
+        weight_global_scales: *const f32,
+        input_scales: *const f32,
+        sf_offsets: *mut i32,
+        alphas: *mut f32,
+        input_scale_invs: *mut f32,
+        num_experts: i32,
+        stream: i64,
+    );
+
+    // FlashInfer-style NVFP4 MoE grouped GEMM (SM120 only)
+    // Returns 0 on success, -1 if not implemented (caller should use existing path)
+    pub fn flashinfer_nvfp4_moe_gemm_f16(
+        gathered_input: *const c_void,
+        weights: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        alphas: *const f32,
+        expert_offsets: *const i32,
+        output: *mut c_void,
+        num_experts: i32,
+        N: i32,
+        K: i32,
+        total_rows: i32,
+        int_workspace: *mut c_void,
+        int_workspace_bytes: i64,
+        float_workspace: *mut c_void,
+        float_workspace_bytes: i64,
+        stream: i64,
+    ) -> i32;
+
+    pub fn flashinfer_nvfp4_moe_gemm_bf16(
+        gathered_input: *const c_void,
+        weights: *const c_void,
+        input_sf: *const c_void,
+        weight_sf: *const c_void,
+        alphas: *const f32,
+        expert_offsets: *const i32,
+        output: *mut c_void,
+        num_experts: i32,
+        N: i32,
+        K: i32,
+        total_rows: i32,
+        int_workspace: *mut c_void,
+        int_workspace_bytes: i64,
+        float_workspace: *mut c_void,
+        float_workspace_bytes: i64,
+        stream: i64,
+    ) -> i32;
+
     pub fn nvfp4_cutlass_moe_gemm_f16(
         output: *mut c_void,
         a: *const c_void,

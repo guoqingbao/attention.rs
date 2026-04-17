@@ -63,13 +63,19 @@ struct SMTypeAdapter<_2SM> {
 
 template <typename OutType, typename XSM>
 struct Fp4GemmSm100Config {
-  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
-  using LayoutATag = cutlass::layout::RowMajor;
-  static constexpr int AlignmentA = 32;
+  using RawElementType = cutlass::float_e2m1_t;
+  using SFType = cutlass::float_ue4m3_t;
 
-  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  // FlashInfer SM100 uses cute::tuple<Element, SF> for the mainloop builder,
+  // not nv_float4_t. This tells CUTLASS to compose data + scale factor
+  // explicitly during the mainloop, which is the correct path for SM100.
+  using ElementA = cute::tuple<RawElementType, SFType>;
+  using LayoutATag = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<RawElementType>::value;
+
+  using ElementB = cute::tuple<RawElementType, SFType>;
   using LayoutBTag = cutlass::layout::ColumnMajor;
-  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<RawElementType>::value;
 
   using ElementD = OutType;
   using ElementC = void;
@@ -82,7 +88,6 @@ struct Fp4GemmSm100Config {
   using ElementCompute = float;
   using ArchTag = cutlass::arch::Sm100;
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
-  using SFType = cutlass::float_ue4m3_t;
 };
 
 template <typename OutType>
@@ -230,7 +235,7 @@ struct CutlassFp4Gemm {
     using typename Base::Params;
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf) {
-#if defined(ENABLE_FP4_SM100) {
+#if defined(ENABLE_FP4_SM100)
         this->Base::operator()(params, smem_buf);
 #else
         if (cute::thread0()) {
@@ -238,7 +243,6 @@ struct CutlassFp4Gemm {
           __trap();
         }
 #endif
-    }
   };
 
   using GemmKernel = Sm10x11xOnly<
@@ -396,7 +400,7 @@ static void run_fp4_gemm(
     return;
   }
 
-  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/false);
+  auto run_status = gemm.run(operator_args, ws, stream, nullptr, /*launch_with_pdl=*/true);
   if (run_status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 SM100] run failed: %s (M=%d N=%d K=%d ws=%zu)\n",
             cutlass::cutlassGetStatusString(run_status), m, n, k, workspace_size);
