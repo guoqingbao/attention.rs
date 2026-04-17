@@ -24,36 +24,149 @@
 constexpr int kBlockM = 128;
 constexpr int kBlockK = 128;
 constexpr int kPackThreads = 256;
+constexpr float kLocalAbsmaxEps = 1e-10f;
+constexpr float kFp8Max = 448.0f;
+constexpr float kFp8Min = -448.0f;
 
-__device__ __forceinline__ float to_float_half(half v) {
-  return __half2float(v);
+// Non-caching global load for better memory bandwidth
+__device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
+    int4 ret;
+    asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+                 : "l"(ptr));
+    return ret;
 }
 
-__device__ __forceinline__ float to_float_bf16(__nv_bfloat16 v) {
-  return __bfloat162float(v);
+// Explicit global store
+__device__ __forceinline__ void st_global(int4* ptr, const int4& value) {
+    asm volatile(
+        "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
-#ifndef MAX_FP8_VALUE
-#define MAX_FP8_VALUE 448.0f
-#endif
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+// Subwarp reduction for small thread groups (≤16 threads)
+template <int THREADS_PER_SUBWARP>
+__device__ __forceinline__ float subwarp_reduce_max(float val) {
+    static_assert(THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1);
+    if constexpr (THREADS_PER_SUBWARP >= 16) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 8));
+    }
+    if constexpr (THREADS_PER_SUBWARP >= 8) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+    }
+    if constexpr (THREADS_PER_SUBWARP >= 4) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+    }
+    if constexpr (THREADS_PER_SUBWARP >= 2) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
     }
     return val;
 }
 
-__device__ __forceinline__ float group_reduce_max(float val) {
-    unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
-    return val;
+// Optimized single-pass FP8 quantization kernel
+// Based on SGLang's per_token_group_quant_8bit_v2 design
+// Key optimizations:
+// - Single pass: find max and quantize together (reduces memory traffic)
+// - Non-caching loads for better L2 utilization
+// - Vectorized FP8x2 conversion using __nv_cvt_float2_to_fp8x2
+// - 8 threads per 128-element group (each loads 32 bytes = 16 elements)
+template <typename T, int GROUP_SIZE, int THREADS_PER_SUBWARP, bool IS_COLUMN_MAJOR>
+__global__ void per_token_group_quant_fp8_v2_kernel(
+    const T* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int num_groups,
+    const int subwarps_per_block,
+    const int num_groups_per_row,
+    const int scale_stride) {
+    
+    // Each subwarp (THREADS_PER_SUBWARP threads) processes one group
+    // For GROUP_SIZE=128, THREADS_PER_SUBWARP=8: each thread loads 16 elements (32 bytes)
+    constexpr int VEC_SIZE = 32 / sizeof(T);  // 16 for half/bf16
+    static_assert(THREADS_PER_SUBWARP * VEC_SIZE == GROUP_SIZE, "Thread config must match group size");
+
+    const int subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
+    const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
+    
+    const int64_t block_group_id = blockIdx.x * subwarps_per_block;
+    const int64_t group_id = block_group_id + subwarp_id;
+    
+    if (group_id >= num_groups) return;
+
+    const int64_t input_offset = group_id * GROUP_SIZE + lane_id * VEC_SIZE;
+    
+    // Determine scale output location
+    float* scale_output;
+    if constexpr (IS_COLUMN_MAJOR) {
+        const int row_idx = group_id / num_groups_per_row;
+        const int col_idx = group_id % num_groups_per_row;
+        scale_output = output_s + (col_idx * scale_stride + row_idx);
+    } else {
+        scale_output = output_s + group_id;
+    }
+
+    // Load input data using non-caching loads (32 bytes = 2 x int4)
+    int4 input_vec[2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        input_vec[i] = ld_global_nc(reinterpret_cast<const int4*>(input + input_offset) + i);
+    }
+    T* input_data = reinterpret_cast<T*>(input_vec);
+
+    // Single pass: find max absolute value
+    float local_absmax = kLocalAbsmaxEps;
+    #pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+        float val;
+        if constexpr (std::is_same_v<T, __half>) {
+            val = __half2float(input_data[j]);
+        } else {
+            val = __bfloat162float(input_data[j]);
+        }
+        local_absmax = fmaxf(local_absmax, fabsf(val));
+    }
+
+    // Subwarp reduction for max
+    local_absmax = subwarp_reduce_max<THREADS_PER_SUBWARP>(local_absmax);
+
+    // Compute scale: scale_inv = absmax / kFp8Max, scale = kFp8Max / absmax
+    float scale_inv = local_absmax / kFp8Max;
+    float scale = kFp8Max / local_absmax;
+
+    // Store scale (only lane 0)
+    if (lane_id == 0) {
+        *scale_output = scale_inv;
+    }
+
+    // Quantize using vectorized FP8x2 conversion
+    int4 output_buf;
+    __nv_fp8x2_storage_t* output_fp8x2 = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+    static_assert(sizeof(output_buf) == VEC_SIZE * sizeof(__nv_fp8_e4m3));
+
+    #pragma unroll
+    for (int j = 0; j < VEC_SIZE; j += 2) {
+        float2 vals;
+        if constexpr (std::is_same_v<T, __half>) {
+            vals.x = __half2float(input_data[j]);
+            vals.y = __half2float(input_data[j + 1]);
+        } else {
+            vals.x = __bfloat162float(input_data[j]);
+            vals.y = __bfloat162float(input_data[j + 1]);
+        }
+        
+        // Scale and clamp
+        vals.x = fminf(fmaxf(vals.x * scale, kFp8Min), kFp8Max);
+        vals.y = fminf(fmaxf(vals.y * scale, kFp8Min), kFp8Max);
+        
+        // Vectorized FP8 conversion
+        output_fp8x2[j / 2] = __nv_cvt_float2_to_fp8x2(vals, __NV_SATFINITE, __NV_E4M3);
+    }
+
+    // Store output using explicit store
+    st_global(reinterpret_cast<int4*>(output_q + group_id * GROUP_SIZE + lane_id * VEC_SIZE), output_buf);
 }
 
-template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR, bool SCALE_UE8M0>
+// Fallback kernel for non-128 group sizes or older architectures
+template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR, bool SCALE_UE8M0, int THREADS_PER_GROUP = 32>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
@@ -68,7 +181,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_groups_per_row = 0,
     const int scale_stride = 0) {
     
-    const int threads_per_group = 16;
+    constexpr int threads_per_group = THREADS_PER_GROUP;
     const int64_t local_group_id = threadIdx.x / threads_per_group;
     const int lane_id = threadIdx.x % threads_per_group;
 
@@ -86,29 +199,22 @@ __global__ void per_token_group_quant_8bit_kernel(
     float* scale_output;
 
     if constexpr (IS_COLUMN_MAJOR) {
-        // const int num_elems_per_pack = 1; // float is 4 bytes
         const int row_idx = global_group_id / num_groups_per_row;
         const int col_idx = global_group_id % num_groups_per_row;
-        // Simplified for float scales (no packing needed for f32)
         scale_output = output_s + (col_idx * scale_stride + row_idx);
     } else {
         scale_output = output_s + global_group_id;
     }
 
-    // Vectorized Load Logic replacement for flashinfer
-    // Assuming T is half or bfloat16 (2 bytes). 
-    // vec_size = 16 / 2 = 8 elements.
-    using vec_t = float4; // load 16 bytes
-    const int vec_size = 16 / sizeof(T); 
+    // Vectorized Load: vec_size = 16 bytes / sizeof(T) = 8 for half/bf16
+    constexpr int vec_size = 16 / sizeof(T); 
     const int32_t num_vec_elems = group_size / vec_size;
 
-    for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-        // Load 16 bytes
-        const int4* ptr_int4 = reinterpret_cast<const int4*>(group_input + i * vec_size);
-        int4 loaded = *ptr_int4;
-        
-        // Unpack to check max
+    // First pass: find max absolute value using non-caching loads
+    for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
+        int4 loaded = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
         T* ptr_T = reinterpret_cast<T*>(&loaded);
+        
         #pragma unroll
         for (int j = 0; j < vec_size; ++j) {
             float val;
@@ -121,31 +227,32 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
     }
 
-    local_absmax = group_reduce_max(local_absmax);
+    // Warp reduction for max
+    for (int offset = threads_per_group / 2; offset > 0; offset /= 2) {
+        local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
+    }
 
     float y_s = local_absmax / max_8bit;
-    // SCALE_UE8M0 is false for us usually
 
     if (lane_id == 0) {
         *scale_output = y_s;
     }
 
-    // Quantize
-    for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-        const int4* ptr_int4 = reinterpret_cast<const int4*>(group_input + i * vec_size);
-        int4 loaded = *ptr_int4;
+    // Second pass: quantize with computed scale
+    float inv_scale = 1.0f / y_s;
+    for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
+        int4 loaded = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
         T* ptr_T = reinterpret_cast<T*>(&loaded);
 
         #pragma unroll
         for (int j = 0; j < vec_size; ++j) {
-             float val;
+            float val;
             if constexpr (std::is_same_v<T, __half>) {
                 val = __half2float(ptr_T[j]);
             } else {
                 val = __bfloat162float(ptr_T[j]);
             }
-            float q_val = fminf(fmaxf(val / y_s, min_8bit), max_8bit);
-
+            float q_val = fminf(fmaxf(val * inv_scale, min_8bit), max_8bit);
             group_output[i * vec_size + j] = static_cast<DST_DTYPE>(q_val);
         }
     }
@@ -353,14 +460,66 @@ extern "C" void fp8_quantize_per_token_group_launch(
     bool is_column_major_stats,
     cudaStream_t stream
 ) {
-    constexpr int THREADS_PER_GROUP = 16;
+    // Use optimized v2 kernel for GROUP_SIZE=128 (common case)
+    // This kernel uses single-pass design, non-caching loads, and vectorized FP8 conversion
+    if (group_size == 128) {
+        // For GROUP_SIZE=128: 8 threads per subwarp, each loads 16 elements (32 bytes)
+        constexpr int THREADS_PER_SUBWARP = 8;
+        
+        // Calculate subwarps per block to maximize occupancy
+        int subwarps_per_block = 16;  // 128 threads per block (16 * 8)
+        if (num_groups < 16) {
+            if (num_groups % 8 == 0) subwarps_per_block = 8;
+            else if (num_groups % 4 == 0) subwarps_per_block = 4;
+            else if (num_groups % 2 == 0) subwarps_per_block = 2;
+            else subwarps_per_block = 1;
+        }
+        
+        const int num_blocks = (num_groups + subwarps_per_block - 1) / subwarps_per_block;
+        const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
+        
+        if (is_input_f16) {
+            if (is_column_major_stats) {
+                per_token_group_quant_fp8_v2_kernel<__half, 128, THREADS_PER_SUBWARP, true>
+                    <<<num_blocks, num_threads, 0, stream>>>(
+                        (const __half*)input, (__nv_fp8_e4m3*)output_q, output_s,
+                        num_groups, subwarps_per_block, num_groups_per_row, scale_stride
+                    );
+            } else {
+                per_token_group_quant_fp8_v2_kernel<__half, 128, THREADS_PER_SUBWARP, false>
+                    <<<num_blocks, num_threads, 0, stream>>>(
+                        (const __half*)input, (__nv_fp8_e4m3*)output_q, output_s,
+                        num_groups, subwarps_per_block, num_groups_per_row, scale_stride
+                    );
+            }
+        } else {
+            if (is_column_major_stats) {
+                per_token_group_quant_fp8_v2_kernel<__nv_bfloat16, 128, THREADS_PER_SUBWARP, true>
+                    <<<num_blocks, num_threads, 0, stream>>>(
+                        (const __nv_bfloat16*)input, (__nv_fp8_e4m3*)output_q, output_s,
+                        num_groups, subwarps_per_block, num_groups_per_row, scale_stride
+                    );
+            } else {
+                per_token_group_quant_fp8_v2_kernel<__nv_bfloat16, 128, THREADS_PER_SUBWARP, false>
+                    <<<num_blocks, num_threads, 0, stream>>>(
+                        (const __nv_bfloat16*)input, (__nv_fp8_e4m3*)output_q, output_s,
+                        num_groups, subwarps_per_block, num_groups_per_row, scale_stride
+                    );
+            }
+        }
+        return;
+    }
+
+    // Fallback kernel for other group sizes
+    constexpr int THREADS_PER_GROUP = 32;
+    
+    // Calculate groups per block to maximize occupancy
     int groups_per_block = 1;
-    if (num_groups % 16 == 0) groups_per_block = 16;
-    else if (num_groups % 8 == 0) groups_per_block = 8;
+    if (num_groups % 8 == 0) groups_per_block = 8;
     else if (num_groups % 4 == 0) groups_per_block = 4;
     else if (num_groups % 2 == 0) groups_per_block = 2;
 
-    const int num_blocks = num_groups / groups_per_block;
+    const int num_blocks = (num_groups + groups_per_block - 1) / groups_per_block;
     const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
     // Standard E4M3 range
@@ -370,13 +529,13 @@ extern "C" void fp8_quantize_per_token_group_launch(
 
     if (is_input_f16) {
         if (is_column_major_stats) {
-            per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, true, false>
+            per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, true, false, THREADS_PER_GROUP>
                 <<<num_blocks, num_threads, 0, stream>>>(
                     (const __half*)input, output_q, output_s, group_size, num_groups, groups_per_block,
                     eps, min_8bit, max_8bit, num_groups_per_row, scale_stride
                 );
         } else {
-             per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, false, false>
+            per_token_group_quant_8bit_kernel<__half, __nv_fp8_e4m3, false, false, THREADS_PER_GROUP>
                 <<<num_blocks, num_threads, 0, stream>>>(
                     (const __half*)input, output_q, output_s, group_size, num_groups, groups_per_block,
                     eps, min_8bit, max_8bit
@@ -384,13 +543,13 @@ extern "C" void fp8_quantize_per_token_group_launch(
         }
     } else {
         if (is_column_major_stats) {
-            per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, true, false>
+            per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, true, false, THREADS_PER_GROUP>
                 <<<num_blocks, num_threads, 0, stream>>>(
                     (const __nv_bfloat16*)input, output_q, output_s, group_size, num_groups, groups_per_block,
                     eps, min_8bit, max_8bit, num_groups_per_row, scale_stride
                 );
         } else {
-             per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, false, false>
+            per_token_group_quant_8bit_kernel<__nv_bfloat16, __nv_fp8_e4m3, false, false, THREADS_PER_GROUP>
                 <<<num_blocks, num_threads, 0, stream>>>(
                     (const __nv_bfloat16*)input, output_q, output_s, group_size, num_groups, groups_per_block,
                     eps, min_8bit, max_8bit
@@ -411,6 +570,8 @@ void fp8_gemm_launcher_sm90(
                      void* workspace, size_t workspace_bytes,
                      cudaStream_t stream)
 {
+    // SM90 cooperative kernel requires TileSize M >= 128, so we use 128x128x128 tile
+    // StreamK scheduler for K-heavy problems, Persistent scheduler for balanced problems
     if (K > 3 * N) {
         cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::StreamKScheduler, T_Out, 1, 128, 128>>(
             output_ptr,

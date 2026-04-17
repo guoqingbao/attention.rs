@@ -28,6 +28,69 @@ fn get_cuda_slice<
     }
 }
 
+/// Unified FP8 matrix multiplication entry point.
+///
+/// Dispatches to the best available kernel based on hardware capability,
+/// feature flags, and `is_prefill`:
+///
+/// 1. **FlashInfer** (sm90, BF16, 128x128 blocks, decode with m<=64)
+/// 2. **CUTLASS** (sm90+, 128x128 blocks)
+/// 3. **Fallback** (any CUDA or Metal)
+///
+/// # Arguments
+/// * `input`  - [M, K] activation tensor (F16 or BF16)
+/// * `weight` - [N, K] FP8 weight tensor (U8)
+/// * `weight_scale` - [N/block_y, K/block_x] F32 scales (row-major)
+/// * `weight_scale_cutlass` - Optional pre-transposed scales for CUTLASS path
+/// * `block_size` - `[block_y, block_x]` quantization block dimensions
+/// * `is_prefill` - true during prefill phase, affects kernel selection
+pub fn fp8_matmul(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    weight_scale_cutlass: Option<&Tensor>,
+    block_size: &[usize],
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let (m, _) = input.dims2()?;
+
+    #[cfg(feature = "cuda")]
+    let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
+        crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
+    } else {
+        0
+    };
+
+    #[cfg(all(feature = "cuda", feature = "flashinfer"))]
+    {
+        // Enable only for decode phase (small M <= 64) on SM90 with BF16 and 128x128 block scales
+        let use_flashinfer = !is_prefill
+            && m <= 64
+            && (90..100).contains(&sm_version)
+            && DType::BF16 == input.dtype()
+            && block_size == [128, 128];
+        if use_flashinfer {
+            return fp8_matmul_flashinfer(&input, weight, weight_scale);
+        }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
+    {
+        let use_cutlass = sm_version >= 90 && block_size == [128, 128];
+        if use_cutlass {
+            let cutlass_scale = weight_scale_cutlass.unwrap_or(weight_scale);
+            return fp8_matmul_cutlass(&input, &weight.t()?, cutlass_scale, block_size);
+        }
+    }
+
+    fp8_matmul_fallback(&input, weight, weight_scale, block_size)
+}
+
 /// FP8 Matrix Multiplication: C = A * B^T (conventional path).
 ///
 /// # Arguments
@@ -38,7 +101,7 @@ fn get_cuda_slice<
 ///
 /// The weight tensor is expected to be in FP8 format (e4m3).
 #[allow(unused)]
-pub fn fp8_matmul(
+pub fn fp8_matmul_fallback(
     input: &Tensor,
     weight: &Tensor,
     weight_scale: &Tensor,
@@ -367,9 +430,6 @@ pub fn fp8_matmul_cutlass(
     weight_scale: &Tensor,
     block_size: &[usize],
 ) -> Result<Tensor> {
-    if !cfg!(feature = "cutlass") {
-        candle_core::bail!("fp8_matmul_cutlass requires the cutlass feature");
-    }
     if block_size.len() != 2 || block_size[0] != 128 || block_size[1] != 128 {
         candle_core::bail!("fp8_matmul_cutlass requires block_size [128, 128]");
     }

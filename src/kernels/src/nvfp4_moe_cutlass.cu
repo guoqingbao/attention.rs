@@ -142,7 +142,8 @@ struct Fp4MoeGemmSm100 {
 
 // SM120 MoE GEMM configuration - using 128x128x128 tile for better compatibility
 // with small problem sizes (MoE often has variable M per expert).
-// The 128x256x256 tile is too large for small M problems.
+// Uses KernelPtrArrayTmaWarpSpecializedPingpong for optimal software pipelining,
+// matching SGLang's implementation.
 template <typename OutType>
 struct Fp4MoeGemmSm120 {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -171,7 +172,8 @@ struct Fp4MoeGemmSm120 {
   using ClusterShape = Shape<_1, _1, _1>;
 
   using MmaTileShape = Shape<_128, _128, _128>;
-  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  // Use explicit PingPong schedule for optimal software pipelining (matches SGLang)
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -442,6 +444,11 @@ static int run_fp4_moe_grouped_gemm_sm100(
       epilogue_args,
       hw_info
   };
+  // Use AlongM raster order for better MoE workload performance (matches SGLang)
+  if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>) {
+    using RasterOrderOptions = decltype(args.scheduler.raster_order);
+    args.scheduler.raster_order = RasterOrderOptions::AlongM;
+  }
 
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
@@ -631,9 +638,10 @@ static int run_fp4_moe_grouped_gemm_sm120(
   if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>) {
     args.scheduler.max_swizzle_size = 1;
   }
+  // Use AlongM raster order for better MoE workload performance (matches SGLang)
   if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>) {
     using Enum_t = decltype(args.scheduler.raster_order);
-    args.scheduler.raster_order = Enum_t::Heuristic;
+    args.scheduler.raster_order = Enum_t::AlongM;
   }
   args.hw_info.cluster_shape = dim3(1, 1, 1);
   args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
