@@ -112,38 +112,36 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   if (row >= M || block_idx >= num_blocks) return;
 
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
+  int64_t in_base = static_cast<int64_t>(row) * K;
 
   float vals[16];
   for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
     int k_idx = k_start + i;
     if (k_idx < K) {
-      vals[i] = static_cast<float>(input[row * K + k_idx]);
+      vals[i] = static_cast<float>(input[in_base + k_idx]);
     } else {
       vals[i] = 0.0f;
     }
   }
 
-  // Find absolute maximum of the block (matching TRT-LLM's warp reduction)
   float vecMax = 0.0f;
   for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
     vecMax = fmaxf(vecMax, fabsf(vals[i]));
   }
 
+  int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Hardware path: matches TRT-LLM exactly
-  // SFValue = SFScaleVal * (vecMax / 6.0)
   float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
-  // outputScale = 1 / (float(fp8(SFValue)) / SFScaleVal)
   float outputScale = vecMax != 0.0f
       ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal))
       : 0.0f;
 
-  // Scale values and convert to FP4 using hardware intrinsics
   float scaled_vals_0[8], scaled_vals_1[8];
   for (int i = 0; i < 8; i++) {
     scaled_vals_0[i] = vals[i] * outputScale;
@@ -155,22 +153,18 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   uint32_t packed_lo = fp32x8_to_e2m1x8(scaled_vals_0);
   uint32_t packed_hi = fp32x8_to_e2m1x8(scaled_vals_1);
 
-  // Write packed FP4 output (8 bytes = 16 nibbles)
-  int out_offset = row * (K / 2) + k_start / 2;
-  reinterpret_cast<uint32_t*>(output + out_offset)[0] = packed_lo;
-  reinterpret_cast<uint32_t*>(output + out_offset)[1] = packed_hi;
+  reinterpret_cast<uint32_t*>(output + out_base)[0] = packed_lo;
+  reinterpret_cast<uint32_t*>(output + out_base)[1] = packed_hi;
 
-  scales[row * num_blocks + block_idx] = fp8_scale_bits;
+  scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
 
 #else
-  // Software fallback for pre-SM100
   float SFValue = SFScaleVal * (vecMax / 6.0f);
 
   uint8_t fp8_scale_bits = 0;
   float outputScale = 0.0f;
 
   if (vecMax > 0.0f && SFValue > 0.0f) {
-    // Software FP8 E4M3 conversion
     uint32_t bits = __float_as_uint(SFValue);
     uint32_t sign = (bits >> 31) & 1;
     int exp = ((bits >> 23) & 0xFF) - 127;
@@ -200,12 +194,11 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
     codes[i] = float_to_fp4_e2m1(vals[i] * outputScale);
   }
 
-  int out_offset = row * (K / 2) + k_start / 2;
   for (int i = 0; i < 8; i++) {
-    output[out_offset + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
+    output[out_base + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
   }
 
-  scales[row * num_blocks + block_idx] = fp8_scale_bits;
+  scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
 #endif
 }
 
@@ -363,8 +356,8 @@ __global__ void nvfp4_moe_gather_kernel(
   int col = threadIdx.x + blockIdx.y * blockDim.x;
   if (row >= total_expanded || col >= K) return;
 
-  int src_token = sorted_token_ids[row] / map_divisor;
-  output[row * K + col] = input[src_token * K + col];
+  int64_t src_token = static_cast<int64_t>(sorted_token_ids[row]) / map_divisor;
+  output[static_cast<int64_t>(row) * K + col] = input[src_token * K + col];
 }
 
 __device__ __forceinline__ int nvfp4_find_expert_for_row(
@@ -443,15 +436,18 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   float SFScaleVal = input_scale_invs[expert_id];
 
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
+  int64_t in_base = static_cast<int64_t>(row) * K + k_start;
   float vals[16];
   for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
-    vals[i] = static_cast<float>(input[row * K + k_start + i]);
+    vals[i] = static_cast<float>(input[in_base + i]);
   }
 
   float vecMax = 0.0f;
   for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
     vecMax = fmaxf(vecMax, fabsf(vals[i]));
   }
+
+  int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
@@ -468,9 +464,8 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
 
   uint32_t packed_lo = fp32x8_to_e2m1x8(scaled_vals_0);
   uint32_t packed_hi = fp32x8_to_e2m1x8(scaled_vals_1);
-  int out_offset = row * (K / 2) + k_start / 2;
-  reinterpret_cast<uint32_t*>(output + out_offset)[0] = packed_lo;
-  reinterpret_cast<uint32_t*>(output + out_offset)[1] = packed_hi;
+  reinterpret_cast<uint32_t*>(output + out_base)[0] = packed_lo;
+  reinterpret_cast<uint32_t*>(output + out_base)[1] = packed_hi;
 #else
   float SFValue = SFScaleVal * (vecMax / 6.0f);
   uint8_t fp8_scale_bits = 0;
@@ -502,9 +497,8 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
     codes[i] = float_to_fp4_e2m1(vals[i] * outputScale);
   }
 
-  int out_offset = row * (K / 2) + k_start / 2;
   for (int i = 0; i < 8; ++i) {
-    output[out_offset + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
+    output[out_base + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
   }
 #endif
 
@@ -540,8 +534,8 @@ __global__ void nvfp4_moe_scatter_kernel(
   int col = threadIdx.x + blockIdx.y * blockDim.x;
   if (row >= total_expanded || col >= N) return;
 
-  int dst_row = scatter_ids[row];
-  output[dst_row * N + col] = input[row * N + col];
+  int64_t dst_row = static_cast<int64_t>(scatter_ids[row]);
+  output[dst_row * N + col] = input[static_cast<int64_t>(row) * N + col];
 }
 
 extern "C" {

@@ -45,16 +45,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <stdio.h>
-
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = call;                                                    \
-    if (err != cudaSuccess) {                                                  \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,        \
-              cudaGetErrorString(err));                                         \
-    }                                                                          \
-  } while (0)
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #define MXFP4_BLOCK_SIZE 32
@@ -713,10 +703,10 @@ extern "C" void mxfp4_matmul_smallm_f16(const __half *input,
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
 
-  mxfp4_gemm::mxfp4_matmul_smallm_kernel<half>
-      <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
-                                      output, M, N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = mxfp4_gemm::mxfp4_matmul_smallm_kernel<half>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
+                                        output, M, N, K, has_bias);
 }
 
 extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
@@ -733,10 +723,10 @@ extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
 
-  mxfp4_gemm::mxfp4_matmul_smallm_kernel<__nv_bfloat16>
-      <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
-                                      output, M, N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = mxfp4_gemm::mxfp4_matmul_smallm_kernel<__nv_bfloat16>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
+                                        output, M, N, K, has_bias);
 #endif
 }
 
@@ -756,7 +746,6 @@ extern "C" void mxfp4_matmul_f16(const __half *input,
   mxfp4_gemm::mxfp4_matmul_tiled<half, BM, BN, BK, TM, TN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale, bias, output, M,
                                    N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 extern "C" void
@@ -775,7 +764,6 @@ mxfp4_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
   mxfp4_gemm::mxfp4_matmul_tiled<__nv_bfloat16, BM, BN, BK, TM, TN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale, bias, output, M,
                                    N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
 #endif
 }
 
@@ -794,10 +782,11 @@ extern "C" void mxfp4_indexed_moe_gemm_f16(
   dim3 grid(total_blocks);
   size_t shared_mem_size = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
 
-  mxfp4_gemm::mxfp4_moe_gemm<half><<<grid, block, shared_mem_size, stream>>>(
+  auto kernel = mxfp4_gemm::mxfp4_moe_gemm<half>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+  kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, biases, indices, output, num_tokens, topk,
       num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 extern "C" void mxfp4_indexed_moe_gemm_bf16(
@@ -817,11 +806,11 @@ extern "C" void mxfp4_indexed_moe_gemm_bf16(
   dim3 grid(total_blocks);
   size_t shared_mem_size = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
 
-  mxfp4_gemm::mxfp4_moe_gemm<__nv_bfloat16>
-      <<<grid, block, shared_mem_size, stream>>>(
-          input, weights, weight_scales, biases, indices, output, num_tokens,
-          topk, num_experts, N, K, has_bias, input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = mxfp4_gemm::mxfp4_moe_gemm<__nv_bfloat16>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+  kernel<<<grid, block, shared_mem_size, stream>>>(
+      input, weights, weight_scales, biases, indices, output, num_tokens,
+      topk, num_experts, N, K, has_bias, input_has_topk_dim);
 #endif
 }
 
@@ -848,21 +837,18 @@ static void launch_moe_tiled(
   int *g_expert_counts = nullptr;
   size_t lists_bytes = (size_t)num_experts * list_stride * sizeof(int);
   size_t counts_bytes = (size_t)num_experts * sizeof(int);
-  CUDA_CHECK(cudaMallocAsync(&g_token_lists, lists_bytes, stream));
-  CUDA_CHECK(cudaMallocAsync(&g_expert_counts, counts_bytes, stream));
-  CUDA_CHECK(cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream));
+  cudaMallocAsync(&g_token_lists, lists_bytes, stream);
+  cudaMallocAsync(&g_expert_counts, counts_bytes, stream);
+  cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream);
 
-  // Phase 1: scatter tokens to per-expert lists
   {
     dim3 scatter_block(BN / TN, BM / TM);
     dim3 scatter_grid(1, num_experts);
     mxfp4_gemm::mxfp4_moe_scatter_tokens_tiled<<<scatter_grid, scatter_block, 0, stream>>>(
         indices, g_token_lists, g_expert_counts,
         total_work, num_experts, list_stride);
-    CUDA_CHECK(cudaGetLastError());
   }
 
-  // Phase 2: tiled GEMM (no dynamic shared memory needed for token lists)
   {
     dim3 block(BN / TN, BM / TM);
     dim3 grid(CEILDIV(N, BN), num_experts);
@@ -872,11 +858,10 @@ static void launch_moe_tiled(
             input, weights, weight_scales, biases, indices, output,
             num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim,
             g_token_lists, g_expert_counts, list_stride);
-    CUDA_CHECK(cudaGetLastError());
   }
 
-  CUDA_CHECK(cudaFreeAsync(g_token_lists, stream));
-  CUDA_CHECK(cudaFreeAsync(g_expert_counts, stream));
+  cudaFreeAsync(g_token_lists, stream);
+  cudaFreeAsync(g_expert_counts, stream);
 }
 
 extern "C" void mxfp4_moe_grouped_gemm_f16(

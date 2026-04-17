@@ -46,21 +46,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
-#include <stdio.h>
 
 using namespace nvcuda::wmma;
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #define MXFP4_BLOCK_SIZE 32
-
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = call;                                                    \
-    if (err != cudaSuccess) {                                                  \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,        \
-              cudaGetErrorString(err));                                         \
-    }                                                                          \
-  } while (0)
 
 namespace mxfp4_wmma {
 
@@ -497,9 +487,10 @@ extern "C" void mxfp4_matmul_wmma_f16(const __half *input,
   dim3 block(BLOCK_THREADS);
   size_t smem = wmma_smem_bytes();
 
-  mxfp4_wmma::mxfp4_matmul_wmma_kernel<half><<<grid, block, smem, stream>>>(
+  auto kernel = mxfp4_wmma::mxfp4_matmul_wmma_kernel<half>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(
       input, weight, weight_scale, bias, output, M, N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 #ifndef NO_BF16_KERNEL
@@ -516,10 +507,10 @@ extern "C" void mxfp4_matmul_wmma_bf16(const __nv_bfloat16 *input,
   dim3 block(BLOCK_THREADS);
   size_t smem = wmma_smem_bytes();
 
-  mxfp4_wmma::mxfp4_matmul_wmma_kernel<__nv_bfloat16>
-      <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias, output,
-                                      M, N, K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = mxfp4_wmma::mxfp4_matmul_wmma_kernel<__nv_bfloat16>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale, bias, output,
+                                        M, N, K, has_bias);
 }
 #else
 extern "C" void mxfp4_matmul_wmma_bf16(const void *, const uint8_t *,
@@ -545,38 +536,34 @@ static void launch_moe_wmma(
   int *g_expert_counts = nullptr;
   size_t lists_bytes = (size_t)num_experts * list_stride * sizeof(int);
   size_t counts_bytes = (size_t)num_experts * sizeof(int);
-  CUDA_CHECK(cudaMallocAsync(&g_token_lists, lists_bytes, stream));
-  CUDA_CHECK(cudaMallocAsync(&g_expert_counts, counts_bytes, stream));
-  CUDA_CHECK(cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream));
+  cudaMallocAsync(&g_token_lists, lists_bytes, stream);
+  cudaMallocAsync(&g_expert_counts, counts_bytes, stream);
+  cudaMemsetAsync(g_expert_counts, 0, counts_bytes, stream);
 
-  // Phase 1: scatter tokens to per-expert lists
   {
     dim3 scatter_grid(1, num_experts);
     dim3 scatter_block(256);
     mxfp4_wmma::mxfp4_moe_scatter_tokens<<<scatter_grid, scatter_block, 0, stream>>>(
         indices, g_token_lists, g_expert_counts,
         total_work, num_experts, list_stride);
-    CUDA_CHECK(cudaGetLastError());
   }
 
-  // Phase 2: GEMM (fixed shared memory — WMMA tiles only)
   {
     dim3 grid(CEILDIV(N, N_BLK), num_experts);
     dim3 block(BLOCK_THREADS);
     size_t smem = wmma_smem_bytes();
 
-    CUDA_CHECK(cudaFuncSetAttribute(
-        kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    cudaFuncSetAttribute(
+        kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
     kernel_fn<<<grid, block, smem, stream>>>(
         input, weights, weight_scales, biases, indices, output,
         num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim,
         g_token_lists, g_expert_counts, list_stride);
-    CUDA_CHECK(cudaGetLastError());
   }
 
-  CUDA_CHECK(cudaFreeAsync(g_token_lists, stream));
-  CUDA_CHECK(cudaFreeAsync(g_expert_counts, stream));
+  cudaFreeAsync(g_token_lists, stream);
+  cudaFreeAsync(g_expert_counts, stream);
 }
 
 extern "C" void mxfp4_moe_grouped_gemm_wmma_f16(

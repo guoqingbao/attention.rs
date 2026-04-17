@@ -19,14 +19,15 @@
 static __global__ void count_tokens_per_expert_kernel(
     const int32_t* expert_ids, 
     int32_t* expert_counts, 
-    int size_m) 
+    int size_m,
+    int num_experts) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size_m) {
         int32_t expert_id = expert_ids[i];
-        // expert_id is from a sorted list, so we assume it's valid
-        // (i.e., 0 <= expert_id < num_experts)
-        atomicAdd(&expert_counts[expert_id], 1);
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&expert_counts[expert_id], 1);
+        }
     }
 }
 
@@ -54,7 +55,7 @@ static void calculate_expert_offsets(
     int threads = 256;
     int blocks = (size_m + threads - 1) / threads;
     count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
-        d_expert_ids, d_expert_counts, size_m
+        d_expert_ids, d_expert_counts, size_m, num_experts
     );
 
     // 3. Perform prefix sum (scan)
@@ -141,7 +142,7 @@ static void calculate_expert_offsets_light(
     int threads = 256;
     int blocks = (size_m + threads - 1) / threads;
     count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
-        d_expert_ids, d_expert_counts, size_m
+        d_expert_ids, d_expert_counts, size_m, num_experts
     );
 
     // We launch exactly one block with 'num_experts' threads (or next power of 2)

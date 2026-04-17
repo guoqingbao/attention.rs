@@ -51,17 +51,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
-#include <stdio.h>
 #include "attention/dtype_fp8.cuh"
-
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = call;                                                    \
-    if (err != cudaSuccess) {                                                  \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,        \
-              cudaGetErrorString(err));                                         \
-    }                                                                          \
-  } while (0)
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #define NVFP4_BLOCK_SIZE 16
@@ -712,11 +702,11 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
   dim3 block(THREADS);
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
-  nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>
-      <<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                      weight_global_scale, bias, output, M, N,
-                                      K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
+                                        weight_global_scale, bias, output, M, N,
+                                        K, has_bias);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -733,11 +723,11 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   dim3 block(THREADS);
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
-  nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>
-      <<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                      weight_global_scale, bias, output, M, N,
-                                      K, has_bias);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
+                                        weight_global_scale, bias, output, M, N,
+                                        K, has_bias);
 }
 #else
 extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
@@ -771,7 +761,6 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                    weight_global_scale, bias, output, M, N, K,
                                    has_bias);
 #endif
-  CUDA_CHECK(cudaGetLastError());
 }
 
 #ifndef NO_BF16_KERNEL
@@ -789,7 +778,6 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
                                    weight_global_scale, bias, output, M, N, K,
                                    has_bias);
-  CUDA_CHECK(cudaGetLastError());
 }
 #else
 extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,
@@ -811,11 +799,12 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
   dim3 block(THREADS_PER_BLOCK);
   dim3 grid(total_blocks);
   size_t shared_mem_size = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
-  nvfp4_gemm::nvfp4_moe_gemm<half><<<grid, block, shared_mem_size, stream>>>(
+  auto kernel = nvfp4_gemm::nvfp4_moe_gemm<half>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+  kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
       output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 #ifndef NO_BF16_KERNEL
@@ -832,12 +821,12 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
   dim3 block(THREADS_PER_BLOCK);
   dim3 grid(total_blocks);
   size_t shared_mem_size = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
-  nvfp4_gemm::nvfp4_moe_gemm<__nv_bfloat16>
-      <<<grid, block, shared_mem_size, stream>>>(
-          input, weights, weight_scales, weight_global_scales, biases, indices,
-          output, num_tokens, topk, num_experts, N, K, has_bias,
-          input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
+  auto kernel = nvfp4_gemm::nvfp4_moe_gemm<__nv_bfloat16>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+  kernel<<<grid, block, shared_mem_size, stream>>>(
+      input, weights, weight_scales, weight_global_scales, biases, indices,
+      output, num_tokens, topk, num_experts, N, K, has_bias,
+      input_has_topk_dim);
 }
 #else
 extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
@@ -1037,7 +1026,6 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
       input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
 }
 
 #ifndef NO_BF16_KERNEL
@@ -1061,7 +1049,6 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
       input_has_topk_dim);
-  CUDA_CHECK(cudaGetLastError());
 }
 #else
 extern "C" void nvfp4_moe_gemm_wmma_bf16(

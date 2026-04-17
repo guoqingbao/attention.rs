@@ -1464,10 +1464,14 @@ pub fn moe_gemm_nvfp4_flashinfer(
             packed_k
         );
     }
-    if k % crate::nvfp4_linear::NVFP4_BLOCK_SIZE != 0 {
+    if k % 32 != 0 {
         candle_core::bail!(
-            "moe_gemm_nvfp4_flashinfer: K must be divisible by {}, got K={k}",
-            crate::nvfp4_linear::NVFP4_BLOCK_SIZE
+            "moe_gemm_nvfp4_flashinfer: K must be divisible by 32, got K={k}",
+        );
+    }
+    if n % 8 != 0 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_flashinfer: N must be divisible by 8, got N={n}",
         );
     }
 
@@ -1487,6 +1491,14 @@ pub fn moe_gemm_nvfp4_flashinfer(
     let dtype = input.dtype();
     if !matches!(dtype, DType::F16 | DType::BF16) {
         candle_core::bail!("moe_gemm_nvfp4_flashinfer only accepts f16/bf16 inputs");
+    }
+
+    if weight_global_scales.elem_count() < num_experts {
+        candle_core::bail!(
+            "moe_gemm_nvfp4_flashinfer: weight_global_scales must have at least {} elements, got {}",
+            num_experts,
+            weight_global_scales.elem_count()
+        );
     }
 
     let dev = input.device();
