@@ -1120,6 +1120,8 @@ extern "C" {
         block_size_k: c_int,
         sm_version: c_int,
         out: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -1137,6 +1139,8 @@ extern "C" {
         block_size_k: c_int,
         sm_version: c_int,
         out: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     );
 
@@ -1150,6 +1154,42 @@ extern "C" {
         scale_stride: c_int,
         is_input_f16: bool,
         is_column_major_stats: bool,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_fused_quantize_gather(
+        input: *const c_void,
+        dst2src_map: *const i32,
+        output_q: *mut c_void,
+        output_s: *mut f32,
+        num_src_rows: c_int,
+        num_dst_rows: c_int,
+        k: c_int,
+        num_groups_per_row: c_int,
+        scale_stride: c_int,
+        map_divisor: c_int,
+        is_input_f16: bool,
+        is_column_major_scales: bool,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_fused_quantize_gather_offsets(
+        input: *const c_void,
+        dst2src_map: *const i32,
+        expert_ids: *const i32,
+        output_q: *mut c_void,
+        output_s: *mut f32,
+        expert_counts: *mut i32,
+        expert_offsets: *mut i32,
+        num_src_rows: c_int,
+        num_dst_rows: c_int,
+        k: c_int,
+        num_groups_per_row: c_int,
+        scale_stride: c_int,
+        map_divisor: c_int,
+        num_experts: c_int,
+        is_input_f16: bool,
+        is_column_major_scales: bool,
         stream: i64,
     );
 
@@ -2543,6 +2583,26 @@ extern "C" {
         n: u32,
         alpha: f32,
         limit: f32,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // Fused SiLU-and-Mul kernel
+    // =========================================================================
+
+    pub fn silu_and_mul_f16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        total_elems: i64,
+        N: i64,
+        stream: i64,
+    );
+
+    pub fn silu_and_mul_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        total_elems: i64,
+        N: i64,
         stream: i64,
     );
 

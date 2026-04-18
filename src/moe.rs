@@ -14,6 +14,50 @@ fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }
 
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+mod moe_fp8_workspace {
+    use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
+    use candle_core::cuda_backend::WrapErr;
+    use candle_core::Result;
+    use std::cell::RefCell;
+
+    struct Workspace {
+        buf: CudaSlice<u8>,
+        capacity: usize,
+        device_ordinal: usize,
+    }
+
+    thread_local! {
+        static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };
+    }
+
+    /// Returns a persistent device buffer of at least `required_bytes`, reused across calls.
+    pub fn get_moe_fp8_buf(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        required_bytes: usize,
+    ) -> Result<*mut u8> {
+        WS.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ord = dev.ordinal();
+            let need_alloc = match slot.as_ref() {
+                None => true,
+                Some(w) => w.device_ordinal != ord || w.capacity < required_bytes,
+            };
+            if need_alloc {
+                let alloc_bytes = required_bytes.max(1);
+                let buf = unsafe { dev.alloc::<u8>(alloc_bytes) }.w()?;
+                *slot = Some(Workspace {
+                    buf,
+                    capacity: alloc_bytes,
+                    device_ordinal: ord,
+                });
+            }
+            let ws = slot.as_ref().unwrap();
+            Ok(*ws.buf.device_ptr() as *mut u8)
+        })
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutedRowsMetadata {
@@ -682,7 +726,6 @@ pub fn moe_gemm_fp8(
         );
 
         #[cfg(feature = "cutlass")]
-        let device = input.device().clone();
         let input_dtype = input.dtype();
         let dev = input.device().as_cuda_device()?;
         #[cfg(feature = "cutlass")]
@@ -741,151 +784,117 @@ pub fn moe_gemm_fp8(
         #[cfg(not(feature = "cutlass"))]
         let use_cutlass = false;
 
-        if use_cutlass && (is_prefill || size_m > 128) {
+        if use_cutlass && (is_prefill || size_m > 512) {
             #[cfg(feature = "cutlass")]
             {
                 let k_blocks = (size_k + block_size_k - 1) / block_size_k;
                 let num_groups_per_row = k_blocks;
-                let num_groups = (input_rows * num_groups_per_row) as i32;
 
-                // SM100+ (Blackwell) requires column-major scale layout (UMMA::Major::MN)
-                // SM90 (Hopper) requires row-major scale layout (GMMA::Major::K)
                 let is_column_major_scales = sm_version >= 100;
 
-                let input_q = Tensor::zeros((input_rows, size_k), DType::U8, &device)?;
-                let input_scale = if is_column_major_scales {
-                    // Column-major: allocate transposed and transpose for column-major view
-                    Tensor::zeros((k_blocks, input_rows), DType::F32, &device)?.t()?
-                } else {
-                    // Row-major: standard contiguous layout
-                    Tensor::zeros((input_rows, k_blocks), DType::F32, &device)?
-                };
-                let rep_a_q = Tensor::zeros((size_m, size_k), DType::U8, &device)?;
-                let rep_a_scales = if is_column_major_scales {
-                    Tensor::zeros((k_blocks, size_m), DType::F32, &device)?.t()?
-                } else {
-                    Tensor::zeros((size_m, k_blocks), DType::F32, &device)?
-                };
-                let rep_out = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
-                let output = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
                 let map_divisor = if topk_weights.is_none() {
                     topk as i32
                 } else {
                     1
                 };
 
-                // Get scale stride for quantization kernel
-                let input_scale_stride = if is_column_major_scales {
-                    input_rows as i32 // Column-major stride
+                let scale_stride = if is_column_major_scales {
+                    size_m as i32
                 } else {
-                    num_groups_per_row as i32 // Row-major stride
+                    num_groups_per_row as i32
                 };
 
-                let (input_q, _) = input_q.storage_and_layout();
-                let input_q = match &*input_q {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
-                    _ => candle::bail!("input_q must be a cuda tensor"),
-                };
-                let (input_scale, _) = input_scale.storage_and_layout();
-                let input_scale = match &*input_scale {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle::bail!("input_scale must be a cuda tensor"),
-                };
-                let (rep_a_q, _) = rep_a_q.storage_and_layout();
-                let rep_a_q = match &*rep_a_q {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
-                    _ => candle::bail!("rep_a_q must be a cuda tensor"),
-                };
-                let (rep_a_scales, _) = rep_a_scales.storage_and_layout();
-                let rep_a_scales = match &*rep_a_scales {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle::bail!("rep_a_scales must be a cuda tensor"),
-                };
-                let (rep_out, _) = rep_out.storage_and_layout();
-                let rep_out = match &*rep_out {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
-                    _ => candle::bail!("rep_out must be a cuda tensor"),
-                };
-                let (output, _) = output.storage_and_layout();
-                let output = match &*output {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
-                    _ => candle::bail!("output must be a cuda tensor"),
-                };
+                let elem_size: usize = 2; // f16 or bf16 = 2 bytes
+                let scale_elems = k_blocks * size_m;
 
-                let expert_counts = unsafe { dev.alloc::<i32>(num_experts).w()? };
-                let expert_offsets = unsafe { dev.alloc::<i32>(num_experts + 1).w()? };
+                // Layout for scratch buffers in one persistent allocation (reused across calls).
+                // Only the final `output` needs its own CudaSlice for Tensor wrapping.
+                const ALIGN: usize = 256;
+                let rep_a_q_bytes = pad_to(size_m * size_k, ALIGN);
+                let rep_a_scales_bytes = pad_to(scale_elems * 4, ALIGN);
+                let rep_out_bytes = pad_to(size_m * size_n * elem_size, ALIGN);
+                let expert_counts_bytes = pad_to(num_experts * 4, ALIGN);
+                let expert_offsets_bytes = pad_to((num_experts + 1) * 4, ALIGN);
+                let scratch_bytes = rep_a_q_bytes
+                    + rep_a_scales_bytes
+                    + rep_out_bytes
+                    + expert_counts_bytes
+                    + expert_offsets_bytes;
+
+                let buf_base = moe_fp8_workspace::get_moe_fp8_buf(dev, scratch_bytes)?;
+
+                let mut off = 0usize;
+                let rep_a_q_ptr = unsafe { buf_base.add(off) } as *mut u8;
+                off += rep_a_q_bytes;
+                let rep_a_scales_ptr = unsafe { buf_base.add(off) } as *mut f32;
+                off += rep_a_scales_bytes;
+                let rep_out_ptr = unsafe { buf_base.add(off) };
+                off += rep_out_bytes;
+                let expert_counts_ptr = unsafe { buf_base.add(off) } as *mut i32;
+                off += expert_counts_bytes;
+                let expert_offsets_ptr = unsafe { buf_base.add(off) } as *mut i32;
+
+                let output = unsafe { dev.alloc::<T>(size_m * size_n).w()? };
+
+                let (workspace_ptr, workspace_bytes) = get_moe_cutlass_workspace(dev, 0)?;
 
                 let stream = *dev.cu_stream() as i64;
                 use core::ffi::c_void;
                 unsafe {
-                    ffi::fp8_quantize_per_token_group_launch(
-                        *input.device_ptr() as *const c_void,
-                        *input_q.device_ptr() as *mut c_void,
-                        *input_scale.device_ptr() as *mut f32,
-                        num_groups as i32,
-                        128,
-                        num_groups_per_row as i32,
-                        input_scale_stride,
-                        data_type == 0,
-                        is_column_major_scales,
-                        stream as i64,
-                    );
-
-                    ffi::moe_fp8_shuffle_rows_u8(
-                        *input_q.device_ptr() as *const u8,
-                        *sorted_token_ids.device_ptr() as *const i32,
-                        *rep_a_q.device_ptr() as *mut u8,
-                        input_rows as i64,
-                        size_m as i64,
-                        size_k as i64,
-                        map_divisor,
-                        stream as i64,
-                    );
-
-                    // Use strided shuffle for column-major scales (SM100+ Blackwell)
-                    // or regular shuffle for row-major scales (SM90)
-                    if is_column_major_scales {
-                        ffi::moe_fp8_shuffle_rows_f32_strided(
-                            *input_scale.device_ptr() as *const f32,
+                    if size_m <= 128 {
+                        ffi::moe_fp8_fused_quantize_gather_offsets(
+                            *input.device_ptr() as *const c_void,
                             *sorted_token_ids.device_ptr() as *const i32,
-                            *rep_a_scales.device_ptr() as *mut f32,
-                            input_rows as i64,
-                            size_m as i64,
-                            num_groups_per_row as i64,
-                            input_rows as i64, // src_row_stride (column-major)
-                            size_m as i64,     // dst_row_stride (column-major)
+                            *experts_ids.device_ptr() as *const i32,
+                            rep_a_q_ptr as *mut c_void,
+                            rep_a_scales_ptr,
+                            expert_counts_ptr,
+                            expert_offsets_ptr,
+                            input_rows as i32,
+                            size_m as i32,
+                            size_k as i32,
+                            num_groups_per_row as i32,
+                            scale_stride,
                             map_divisor,
+                            num_experts as i32,
+                            data_type == 0,
+                            is_column_major_scales,
                             stream as i64,
                         );
                     } else {
-                        ffi::moe_fp8_shuffle_rows_f32(
-                            *input_scale.device_ptr() as *const f32,
+                        ffi::moe_fp8_fused_quantize_gather(
+                            *input.device_ptr() as *const c_void,
                             *sorted_token_ids.device_ptr() as *const i32,
-                            *rep_a_scales.device_ptr() as *mut f32,
-                            input_rows as i64,
-                            size_m as i64,
-                            num_groups_per_row as i64,
+                            rep_a_q_ptr as *mut c_void,
+                            rep_a_scales_ptr,
+                            input_rows as i32,
+                            size_m as i32,
+                            size_k as i32,
+                            num_groups_per_row as i32,
+                            scale_stride,
                             map_divisor,
+                            data_type == 0,
+                            is_column_major_scales,
+                            stream as i64,
+                        );
+
+                        ffi::calculate_expert_offsets(
+                            *experts_ids.device_ptr() as *const i32,
+                            expert_counts_ptr,
+                            expert_offsets_ptr,
+                            num_experts as i32,
+                            size_m as i32,
                             stream as i64,
                         );
                     }
 
-                    ffi::calculate_expert_offsets(
-                        *experts_ids.device_ptr() as *const i32,
-                        *expert_counts.device_ptr() as *mut i32,
-                        *expert_offsets.device_ptr() as *mut i32,
-                        num_experts as i32,
-                        size_m as i32,
-                        stream as i64,
-                    );
-
                     if data_type == 0 {
                         ffi::moe_fp8_grouped_gemm_f16(
-                            *rep_a_q.device_ptr() as *const u8,
+                            rep_a_q_ptr as *const u8,
                             *weights.device_ptr() as *const u8,
-                            *rep_a_scales.device_ptr() as *const f32,
+                            rep_a_scales_ptr as *const f32,
                             *weight_scales.device_ptr() as *const f32,
-                            *expert_offsets.device_ptr() as *const i32,
+                            expert_offsets_ptr as *const i32,
                             num_experts as i32,
                             size_m as i32,
                             size_n as i32,
@@ -893,11 +902,13 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            rep_out_ptr as *mut c_void,
+                            workspace_ptr,
+                            workspace_bytes as i64,
                             stream as i64,
                         );
                         ffi::moe_fp8_scatter_rows_f16(
-                            *rep_out.device_ptr() as *const c_void,
+                            rep_out_ptr as *const c_void,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
@@ -908,11 +919,11 @@ pub fn moe_gemm_fp8(
                         );
                     } else {
                         ffi::moe_fp8_grouped_gemm_bf16(
-                            *rep_a_q.device_ptr() as *const u8,
+                            rep_a_q_ptr as *const u8,
                             *weights.device_ptr() as *const u8,
-                            *rep_a_scales.device_ptr() as *const f32,
+                            rep_a_scales_ptr as *const f32,
                             *weight_scales.device_ptr() as *const f32,
-                            *expert_offsets.device_ptr() as *const i32,
+                            expert_offsets_ptr as *const i32,
                             num_experts as i32,
                             size_m as i32,
                             size_n as i32,
@@ -920,11 +931,13 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            rep_out_ptr as *mut c_void,
+                            workspace_ptr,
+                            workspace_bytes as i64,
                             stream as i64,
                         );
                         ffi::moe_fp8_scatter_rows_bf16(
-                            *rep_out.device_ptr() as *const c_void,
+                            rep_out_ptr as *const c_void,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
@@ -936,7 +949,7 @@ pub fn moe_gemm_fp8(
                     }
                 }
 
-                let output = candle::CudaStorage::wrap_cuda_slice(output.clone(), dev.clone());
+                let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
                 let output = Tensor::from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
                 return Ok(output);
             }
