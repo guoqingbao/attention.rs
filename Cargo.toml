@@ -1,6 +1,6 @@
 [package]
 name = "attention-rs"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "High-performance LLM attention kernels and operations (PagedAttention, Flahinfer, Mamba, MoE, RoPE) for Candle, optimized for CUDA and Metal."
 repository = "https://github.com/guoqingbao/attention.rs"
@@ -21,7 +21,7 @@ half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_di
 tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
-kernels = { path = "./src/kernels", version="0.5.1", optional = true}
+kernels = { path = "./src/kernels", version="0.5.2", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true}
 flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7b2fbbd", optional = true }

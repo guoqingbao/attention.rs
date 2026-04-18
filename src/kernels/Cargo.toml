@@ -1,6 +1,6 @@
 [package]
 name = "kernels"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Attention, MoE and GEMM kernels for Rust"
 categories = ["science"]
