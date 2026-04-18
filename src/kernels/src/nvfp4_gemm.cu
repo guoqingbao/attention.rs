@@ -191,6 +191,9 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 // Each lane processes 2 NVFP4 blocks (32 elements) per stride iteration
 // to improve ILP and amortise the scale-fetch overhead.
 //
+// Input loading uses 128-bit vectorized loads (float4 = 8 halves per load)
+// to maximize memory bandwidth utilization on the decode path.
+//
 // On SM100+ (Blackwell): uses hw_dot_16 with __nv_cvt_fp4x2_to_halfraw2
 // intrinsics for hardware FP4 dequantization — eliminates LUT tables entirely.
 constexpr int BLOCK_N_SM = 8;
@@ -227,12 +230,26 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   const T *in_row = input + (size_t)row * K;
 
-  for (int k = tid; k < K; k += block_size) {
-    const int smem_idx = k + (k / WARP_SIZE);
-    if constexpr (std::is_same_v<T, half>) {
-      s_input[smem_idx] = __half2float(__ldg(&in_row[k]));
-    } else {
-      s_input[smem_idx] = __bfloat162float(__ldg(&in_row[k]));
+  // Vectorized input load: 128-bit (float4 = 8 halves) per transaction.
+  // K is always a multiple of 16 (NVFP4_BLOCK_SIZE), so K/8 is integral.
+  {
+    constexpr int ELEMS_PER_VEC = 8; // 8 halves = 16 bytes = 128 bits
+    const int K_vec = K / ELEMS_PER_VEC;
+    const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
+    for (int vi = tid; vi < K_vec; vi += block_size) {
+      float4 v = __ldg(&in_vec[vi]);
+      const T *elems = reinterpret_cast<const T *>(&v);
+      int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; j++) {
+        int k = base + j;
+        int smem_idx = k + (k / WARP_SIZE);
+        if constexpr (std::is_same_v<T, half>) {
+          s_input[smem_idx] = __half2float(elems[j]);
+        } else {
+          s_input[smem_idx] = __bfloat162float(elems[j]);
+        }
+      }
     }
   }
   __syncthreads();
@@ -537,12 +554,24 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         input + (size_t)token_idx * topk * K + (size_t)expert_slot_start * K;
   }
 
-  for (int k = tid; k < K; k += block_size) {
-    const int smem_idx = k + (k / WARP_SIZE);
-    if constexpr (std::is_same_v<T, half>) {
-      s_input_padded[smem_idx] = __half2float(__ldg(&in_row[k]));
-    } else {
-      s_input_padded[smem_idx] = __bfloat162float(__ldg(&in_row[k]));
+  {
+    constexpr int ELEMS_PER_VEC = 8;
+    const int K_vec = K / ELEMS_PER_VEC;
+    const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
+    for (int vi = tid; vi < K_vec; vi += block_size) {
+      float4 v = __ldg(&in_vec[vi]);
+      const T *elems = reinterpret_cast<const T *>(&v);
+      int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; j++) {
+        int k = base + j;
+        int smem_idx = k + (k / WARP_SIZE);
+        if constexpr (std::is_same_v<T, half>) {
+          s_input_padded[smem_idx] = __half2float(elems[j]);
+        } else {
+          s_input_padded[smem_idx] = __bfloat162float(elems[j]);
+        }
+      }
     }
   }
   __syncthreads();
