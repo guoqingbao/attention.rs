@@ -401,8 +401,16 @@ extern "C" void moe_gemm_gguf_prefill(
 
     int32_t* expert_offsets;
     cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
-    calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    
+    if (size_m > 32) {
+        #ifndef NO_BF16_KERNEL
+            calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #else
+            calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #endif
+    } else {
+        calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    }
+
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
     

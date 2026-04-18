@@ -487,8 +487,12 @@ extern "C" void moe_gemm_wmma(
     bool is_prefill,
     cudaStream_t stream
 ) {
-    if (is_prefill) {
-        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+    if (is_prefill && size_m > 32) {
+        #ifndef NO_BF16_KERNEL
+            calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #else
+            calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #endif
     } else {
         calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
     }
@@ -545,7 +549,11 @@ extern "C" void moe_gemm_wmma_fp8(
     cudaStream_t stream
 ) {
     if (is_prefill) {
-        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #ifndef NO_BF16_KERNEL
+            calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #else
+            calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
+        #endif
     } else {
         calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
     }
