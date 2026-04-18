@@ -56,8 +56,9 @@
 #include <mma.h>
 #include "attention/dtype_fp8.cuh"
 
-// Blackwell (SM100+) has hardware FP4 dequantization via cuda_fp4.h
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && !defined(NO_HARDWARE_FP8)
+// Blackwell (SM100+) has hardware FP4 dequantization via cuda_fp4.h.
+// NVFP4_BLACKWELL is defined by build.rs when compute_cap >= 100.
+#if defined(NVFP4_BLACKWELL) && !defined(NO_HARDWARE_FP8)
   #define NVFP4_HW_DEQUANT 1
   #include <cuda_fp4.h>
 #endif
@@ -249,10 +250,11 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
 #ifdef NVFP4_HW_DEQUANT
     // --- Blackwell hardware path: fused dequant + dot product ---
+    // No * 0.5f: HW intrinsics produce exact FP4 E2M1 float values directly.
     {
       float block_scale =
           fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale * 0.5f;
+          weight_global_scale;
       uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
       const float *in = s_input + (k + (k / WARP_SIZE));
       acc += hw_dot_16(w_vec, block_scale, in);
@@ -262,7 +264,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
     if (k2 < K) {
       float block_scale2 =
           fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale * 0.5f;
+          weight_global_scale;
       uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
       const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
       acc += hw_dot_16(w_vec2, block_scale2, in2);
@@ -406,20 +408,21 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
     for (int ln = tid; ln < BLOCK_N; ln += NUM_THREADS) {
       const int gn = bx * BLOCK_N + ln;
       if (gn < N) {
-        float block_scale =
+        float raw_scale =
             fp8_scale_to_float(__ldg(&weight_scale[(size_t)gn * scale_stride +
                                                    k_tile / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale * 0.5f;
+            weight_global_scale;
 
         uint2 w_vec = *reinterpret_cast<const uint2 *>(
             &weight[(size_t)gn * (K / 2) + k_tile / 2]);
 
 #ifdef NVFP4_HW_DEQUANT
-        hw_dequant_16(w_vec, block_scale, &s_weight[ln][0]);
+        hw_dequant_16(w_vec, raw_scale, &s_weight[ln][0]);
 #else
-        dequant_store_8(w_vec.x, block_scale, LUT0, LUT1, LUT2, LUT3,
+        float lut_scale = raw_scale * 0.5f;
+        dequant_store_8(w_vec.x, lut_scale, LUT0, LUT1, LUT2, LUT3,
                         &s_weight[ln][0]);
-        dequant_store_8(w_vec.y, block_scale, LUT0, LUT1, LUT2, LUT3,
+        dequant_store_8(w_vec.y, lut_scale, LUT0, LUT1, LUT2, LUT3,
                         &s_weight[ln][8]);
 #endif
       } else {
@@ -568,7 +571,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
       {
         float block_scale =
             fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-            global_scale * 0.5f;
+            global_scale;
         uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
         acc += hw_dot_16(w_vec, block_scale, in);
@@ -577,7 +580,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
       if (k2 < K) {
         float block_scale2 =
             fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            global_scale * 0.5f;
+            global_scale;
         uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
         const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
         acc += hw_dot_16(w_vec2, block_scale2, in2);
@@ -745,17 +748,16 @@ __global__ void nvfp4_wmma_matmul_kernel(
       int gn = bx * BN + row;
 
       if (row < BN && gn < N && k_step < K) {
-        float block_scale = fp8_scale_to_float(
+        float raw_scale = fp8_scale_to_float(
             __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
-            * weight_global_scale * 0.5f;
+            * weight_global_scale;
 
         uint2 w_vec = *reinterpret_cast<const uint2 *>(
             &weight[(size_t)gn * half_k + k_step / 2]);
 
+        uint32_t word = sub ? w_vec.y : w_vec.x;
         int col_base = sub * 8;
 #ifdef NVFP4_HW_DEQUANT
-        uint32_t word = sub ? w_vec.y : w_vec.x;
-        // Hardware dequant: 4 bytes → 8 floats via __nv_cvt_fp4x2_to_halfraw2
 #pragma unroll
         for (int j = 0; j < 4; j++) {
           uint8_t byte_val = (word >> (j * 8)) & 0xFF;
@@ -763,17 +765,17 @@ __global__ void nvfp4_wmma_matmul_kernel(
               static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
           float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
           if constexpr (std::is_same_v<T, __half>) {
-            s_b[row][col_base + j * 2]     = __float2half(f2.x * block_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * block_scale);
+            s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
+            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
           } else {
-            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x * block_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y * block_scale);
+            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
+            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
           }
         }
 #else
-        uint32_t word = sub ? w_vec.y : w_vec.x;
+        float lut_scale = raw_scale * 0.5f;
         float dq[8];
-        dequant_store_8(word, block_scale, LUT0, LUT1, LUT2, LUT3, dq);
+        dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
         #pragma unroll
         for (int j = 0; j < 8; j++) {
           if constexpr (std::is_same_v<T, __half>)
@@ -1090,10 +1092,10 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                 int sub = i & 1;
                 int gn = n_base + row;
                 if (gn < size_n && k_base < size_k) {
-                    float block_scale = fp8_scale_to_float(
+                    float raw_scale = fp8_scale_to_float(
                         __ldg(&weight_scales[(size_t)expert_id * size_n * scale_stride +
                                              (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
-                        * global_scale * 0.5f;
+                        * global_scale;
 
                     uint2 w_vec = *reinterpret_cast<const uint2*>(
                         &weights[(size_t)expert_id * size_n * half_k + (size_t)gn * half_k + k_base / 2]);
@@ -1108,16 +1110,17 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                             static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
                         float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
                         if constexpr (std::is_same_v<T, __half>) {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * block_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * block_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
                         } else {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x * block_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y * block_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
                         }
                     }
 #else
+                    float lut_scale = raw_scale * 0.5f;
                     float dq[8];
-                    dequant_store_8(word, block_scale, LUT0, LUT1, LUT2, LUT3, dq);
+                    dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         if constexpr (std::is_same_v<T, __half>)

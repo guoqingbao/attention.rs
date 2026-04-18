@@ -87,6 +87,10 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
+    if compute_cap >= 100 {
+        builder = builder.arg("-DNVFP4_BLACKWELL");
+    }
+
     if marlin_disabled {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
