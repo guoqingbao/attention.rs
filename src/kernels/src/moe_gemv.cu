@@ -11,8 +11,8 @@
  * - moe_gemv_kernel_fp8: FP8 weights with block-wise scales, warp-per-row design
  *   with shared memory input caching and 128-bit vectorized loads
  *
- * SM89+ (Hopper/Ada) uses hardware FP8 dequantization intrinsics.
- * SM100+ (Blackwell) uses __nv_cvt_fp8x2_to_halfraw2 for paired FP8 conversion.
+ * SM80+ (Ampere/Ada) uses FP8 dequantization intrinsics.
+ * SM90+ (Hopper/Blackwell) uses __nv_cvt_fp8x2_to_halfraw2 for paired FP8 conversion.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
