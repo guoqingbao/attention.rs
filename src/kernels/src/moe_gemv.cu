@@ -380,13 +380,74 @@ extern "C" void moe_gemv_transposed(
 // Grid: (ceil(N / ROWS_PER_BLOCK), M)
 // Block: ROWS_PER_BLOCK * 32 threads (one warp per row)
 //
-// Benefits over one-block-per-row:
-// - Amortizes input loading across ROWS_PER_BLOCK rows
-// - Fewer blocks → less launch overhead
-// - Better L2 locality for weight reads
+// Optimizations for Hopper (SM90) decode path:
+// - Input cached in shared memory as native half/bf16, halving smem bandwidth
+// - half2 FMA accumulation to exploit SM90 half2 throughput
+// - 32-byte vectorized weight loads (uint4) to saturate memory bandwidth
+// - Paired FP8→half2 conversion via __nv_cvt_fp8x2_to_halfraw2 (SM90 native)
+// - Dual-accumulator technique to hide FMA pipeline latency
+// - Tuned ROWS_PER_BLOCK for better occupancy and input reuse
 
-// Warp-per-row FP8 GEMV. Input cached in shared memory (as float).
-// Each warp computes dot(input, weight_row) for one output row.
+__device__ __forceinline__ float smem_to_float(half v) {
+  return __half2float(v);
+}
+#ifndef NO_BF16_KERNEL
+__device__ __forceinline__ float smem_to_float(nv_bfloat16 v) {
+  return __bfloat162float(v);
+}
+#endif
+
+// Dequant + FMA helper: converts 4 packed FP8 values and accumulates dot product
+// against 4 input values from shared memory.
+// SM90+ half path: native half2 FMA for double throughput.
+// SM90+ bf16 path: native __nv_bfloat162 FMA for double throughput.
+// Pre-SM90: scalar float FMA.
+template <typename T>
+__device__ __forceinline__ void fp8x4_dot_half2(
+    uint32_t packed, const T *smem, int offset, float &acc) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && !defined(NO_HARDWARE_FP8)
+  __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(
+      static_cast<__nv_fp8x2_storage_t>(packed & 0xFFFF), __NV_E4M3);
+  __half2_raw pair2 = __nv_cvt_fp8x2_to_halfraw2(
+      static_cast<__nv_fp8x2_storage_t>((packed >> 16) & 0xFFFF), __NV_E4M3);
+  if constexpr (std::is_same<T, half>::value) {
+    half2 in01 = *reinterpret_cast<const half2*>(&smem[offset]);
+    half2 in23 = *reinterpret_cast<const half2*>(&smem[offset + 2]);
+    half2 w01 = *reinterpret_cast<half2*>(&pair);
+    half2 w23 = *reinterpret_cast<half2*>(&pair2);
+    half2 prod1 = __hmul2(in01, w01);
+    half2 prod2 = __hmul2(in23, w23);
+    half2 sum2 = __hadd2(prod1, prod2);
+    float2 f = __half22float2(sum2);
+    acc += f.x + f.y;
+  } else {
+#ifndef NO_BF16_KERNEL
+    // Convert FP8→half pairs to bf16 pairs for native bf162 FMA
+    __nv_bfloat162 in01 = *reinterpret_cast<const __nv_bfloat162*>(&smem[offset]);
+    __nv_bfloat162 in23 = *reinterpret_cast<const __nv_bfloat162*>(&smem[offset + 2]);
+    // Convert half2 weights to bf16 pairs
+    float2 wf01 = __half22float2(*reinterpret_cast<half2*>(&pair));
+    float2 wf23 = __half22float2(*reinterpret_cast<half2*>(&pair2));
+    __nv_bfloat162 w01 = __floats2bfloat162_rn(wf01.x, wf01.y);
+    __nv_bfloat162 w23 = __floats2bfloat162_rn(wf23.x, wf23.y);
+    __nv_bfloat162 prod1 = __hmul2(in01, w01);
+    __nv_bfloat162 prod2 = __hmul2(in23, w23);
+    __nv_bfloat162 sum2 = __hadd2(prod1, prod2);
+    float2 f = vllm::bf1622float2(sum2);
+    acc += f.x + f.y;
+#endif
+  }
+#else
+  float wf0, wf1, wf2, wf3;
+  vllm_rs::fp8x4_to_float4(packed, wf0, wf1, wf2, wf3);
+  acc = fmaf(smem_to_float(smem[offset + 0]), wf0, acc);
+  acc = fmaf(smem_to_float(smem[offset + 1]), wf1, acc);
+  acc = fmaf(smem_to_float(smem[offset + 2]), wf2, acc);
+  acc = fmaf(smem_to_float(smem[offset + 3]), wf3, acc);
+#endif
+}
+
+// Warp-per-row FP8 GEMV. Input cached in shared memory in native T format.
 template <typename T, int ROWS_PER_BLOCK>
 __global__ void moe_gemv_kernel_fp8(
     const T *__restrict__ input,
@@ -421,44 +482,24 @@ __global__ void moe_gemv_kernel_fp8(
   const int warp_id = tid / 32;
   const int lane_id = tid % 32;
 
-  extern __shared__ float smem_input[];
+  // Shared memory stores input in native T format (half or bf16), halving bandwidth
+  extern __shared__ char smem_raw[];
+  T *smem_input = reinterpret_cast<T*>(smem_raw);
 
   constexpr int THREADS = ROWS_PER_BLOCK * 32;
 
-  // Vectorized load of input into shared memory as float.
-  constexpr int LOAD_VEC = 8;
+  // Load input into shared memory using 16-byte vectorized loads
+  constexpr int LOAD_VEC = 8; // 8 T elements = 16 bytes
   const int k_vec_loads = K / LOAD_VEC;
   for (int i = tid; i < k_vec_loads; i += THREADS) {
     const int base = i * LOAD_VEC;
-    float4 packed = __ldg(reinterpret_cast<const float4 *>(&input_row[base]));
-
-    if constexpr (std::is_same<T, half>::value) {
-      const half2 *h2 = reinterpret_cast<const half2 *>(&packed);
-      float2 f0 = __half22float2(h2[0]);
-      float2 f1 = __half22float2(h2[1]);
-      float2 f2 = __half22float2(h2[2]);
-      float2 f3 = __half22float2(h2[3]);
-      smem_input[base + 0] = f0.x; smem_input[base + 1] = f0.y;
-      smem_input[base + 2] = f1.x; smem_input[base + 3] = f1.y;
-      smem_input[base + 4] = f2.x; smem_input[base + 5] = f2.y;
-      smem_input[base + 6] = f3.x; smem_input[base + 7] = f3.y;
-    } else {
-#ifndef NO_BF16_KERNEL
-      const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&packed);
-      float2 f0 = vllm::bf1622float2(b2[0]);
-      float2 f1 = vllm::bf1622float2(b2[1]);
-      float2 f2 = vllm::bf1622float2(b2[2]);
-      float2 f3 = vllm::bf1622float2(b2[3]);
-      smem_input[base + 0] = f0.x; smem_input[base + 1] = f0.y;
-      smem_input[base + 2] = f1.x; smem_input[base + 3] = f1.y;
-      smem_input[base + 4] = f2.x; smem_input[base + 5] = f2.y;
-      smem_input[base + 6] = f3.x; smem_input[base + 7] = f3.y;
-#endif
-    }
+    // 16-byte load: float4 = 16 bytes = 8 half values
+    *reinterpret_cast<float4*>(&smem_input[base]) =
+        __ldg(reinterpret_cast<const float4*>(&input_row[base]));
   }
   const int vec_end = k_vec_loads * LOAD_VEC;
   for (int i = vec_end + tid; i < K; i += THREADS) {
-    smem_input[i] = vllm::to_float(input_row[i]);
+    smem_input[i] = input_row[i];
   }
   __syncthreads();
 
@@ -470,7 +511,8 @@ __global__ void moe_gemv_kernel_fp8(
   const int scale_n_idx = row / block_size_n;
   const float *row_scales = expert_scales + scale_n_idx * scale_k_dim;
 
-  float sum = 0.0f;
+  float sum0 = 0.0f;
+  float sum1 = 0.0f;
 
   constexpr int VEC = 16;
   const int k_vec = K / VEC;
@@ -478,38 +520,19 @@ __global__ void moe_gemv_kernel_fp8(
 #pragma unroll 4
   for (int vi = lane_id; vi < k_vec; vi += 32) {
     const int k_base = vi * VEC;
-    uint4 w16 = __ldg(reinterpret_cast<const uint4 *>(&weight_row[k_base]));
+    uint4 w16 = __ldg(reinterpret_cast<const uint4*>(&weight_row[k_base]));
     const float scale = __ldg(&row_scales[k_base / block_size_k]);
 
-    float partial = 0.0f;
-    float wf0, wf1, wf2, wf3;
-
-    vllm_rs::fp8x4_to_float4(w16.x, wf0, wf1, wf2, wf3);
-    partial = fmaf(smem_input[k_base +  0], wf0, partial);
-    partial = fmaf(smem_input[k_base +  1], wf1, partial);
-    partial = fmaf(smem_input[k_base +  2], wf2, partial);
-    partial = fmaf(smem_input[k_base +  3], wf3, partial);
-
-    vllm_rs::fp8x4_to_float4(w16.y, wf0, wf1, wf2, wf3);
-    partial = fmaf(smem_input[k_base +  4], wf0, partial);
-    partial = fmaf(smem_input[k_base +  5], wf1, partial);
-    partial = fmaf(smem_input[k_base +  6], wf2, partial);
-    partial = fmaf(smem_input[k_base +  7], wf3, partial);
-
-    vllm_rs::fp8x4_to_float4(w16.z, wf0, wf1, wf2, wf3);
-    partial = fmaf(smem_input[k_base +  8], wf0, partial);
-    partial = fmaf(smem_input[k_base +  9], wf1, partial);
-    partial = fmaf(smem_input[k_base + 10], wf2, partial);
-    partial = fmaf(smem_input[k_base + 11], wf3, partial);
-
-    vllm_rs::fp8x4_to_float4(w16.w, wf0, wf1, wf2, wf3);
-    partial = fmaf(smem_input[k_base + 12], wf0, partial);
-    partial = fmaf(smem_input[k_base + 13], wf1, partial);
-    partial = fmaf(smem_input[k_base + 14], wf2, partial);
-    partial = fmaf(smem_input[k_base + 15], wf3, partial);
-
-    sum = fmaf(scale, partial, sum);
+    float partial0 = 0.0f, partial1 = 0.0f;
+    fp8x4_dot_half2<T>(w16.x, smem_input, k_base + 0, partial0);
+    fp8x4_dot_half2<T>(w16.y, smem_input, k_base + 4, partial0);
+    fp8x4_dot_half2<T>(w16.z, smem_input, k_base + 8, partial1);
+    fp8x4_dot_half2<T>(w16.w, smem_input, k_base + 12, partial1);
+    sum0 = fmaf(scale, partial0, sum0);
+    sum1 = fmaf(scale, partial1, sum1);
   }
+
+  float sum = sum0 + sum1;
 
   const int k_remainder_start = k_vec * VEC;
   for (int k = k_remainder_start + lane_id; k < K; k += 32) {
@@ -521,7 +544,7 @@ __global__ void moe_gemv_kernel_fp8(
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
     float scale = __ldg(&row_scales[k / block_size_k]);
-    sum = fmaf(smem_input[k] * wf, scale, sum);
+    sum = fmaf(smem_to_float(smem_input[k]) * wf, scale, sum);
   }
 
   sum = vllm_rs::warp_reduce_sum(sum);
@@ -536,8 +559,8 @@ __global__ void moe_gemv_kernel_fp8(
   }
 }
 
-// One-block-per-row fallback for large N when RPB doesn't evenly divide.
-// Uses all BLOCK_SIZE threads in a single block for K-reduction on one output row.
+// One-block-per-row FP8 GEMV with shared memory input caching (native T format).
+// Uses all BLOCK_SIZE threads for K-reduction on one output row.
 template <typename T, int BLOCK_SIZE = 256>
 __global__ void moe_gemv_kernel_fp8_single(
     const T *__restrict__ input,
@@ -572,7 +595,27 @@ __global__ void moe_gemv_kernel_fp8_single(
   const float *row_scales = expert_scales + scale_n_idx * scale_k_dim;
 
   const int tid = threadIdx.x;
-  float sum = 0.0f;
+
+  // Shared memory in native T format + space for warp reduction
+  extern __shared__ char smem_single_raw[];
+  T *smem_input = reinterpret_cast<T*>(smem_single_raw);
+
+  // Load input into shared memory using 16-byte vectorized loads
+  constexpr int LOAD_VEC = 8;
+  const int k_vec_loads = K / LOAD_VEC;
+  for (int i = tid; i < k_vec_loads; i += BLOCK_SIZE) {
+    const int base = i * LOAD_VEC;
+    *reinterpret_cast<float4*>(&smem_input[base]) =
+        __ldg(reinterpret_cast<const float4*>(&input_row[base]));
+  }
+  const int vec_end = k_vec_loads * LOAD_VEC;
+  for (int i = vec_end + tid; i < K; i += BLOCK_SIZE) {
+    smem_input[i] = input_row[i];
+  }
+  __syncthreads();
+
+  float sum0 = 0.0f;
+  float sum1 = 0.0f;
 
   constexpr int VEC = 16;
   const int k_vec = K / VEC;
@@ -580,55 +623,19 @@ __global__ void moe_gemv_kernel_fp8_single(
 #pragma unroll 4
   for (int vi = tid; vi < k_vec; vi += BLOCK_SIZE) {
     const int k_base = vi * VEC;
-    uint4 w16 = __ldg(reinterpret_cast<const uint4 *>(&weight_row[k_base]));
+    uint4 w16 = __ldg(reinterpret_cast<const uint4*>(&weight_row[k_base]));
     const float scale = __ldg(&row_scales[k_base / block_size_k]);
 
-    // Load 16 input values
-    float in_vals[16];
-    if constexpr (std::is_same<T, half>::value) {
-      const half2 *h2 = reinterpret_cast<const half2 *>(&input_row[k_base]);
-#pragma unroll
-      for (int j = 0; j < 8; j++) {
-        float2 f = __half22float2(__ldg(&h2[j]));
-        in_vals[j*2] = f.x;
-        in_vals[j*2+1] = f.y;
-      }
-    } else {
-#ifndef NO_BF16_KERNEL
-      const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&input_row[k_base]);
-#pragma unroll
-      for (int j = 0; j < 8; j++) {
-        float2 f = vllm::bf1622float2(__ldg(&b2[j]));
-        in_vals[j*2] = f.x;
-        in_vals[j*2+1] = f.y;
-      }
-#endif
-    }
-
-    float partial = 0.0f;
-    float wf0, wf1, wf2, wf3;
-    vllm_rs::fp8x4_to_float4(w16.x, wf0, wf1, wf2, wf3);
-    partial = fmaf(in_vals[0], wf0, partial);
-    partial = fmaf(in_vals[1], wf1, partial);
-    partial = fmaf(in_vals[2], wf2, partial);
-    partial = fmaf(in_vals[3], wf3, partial);
-    vllm_rs::fp8x4_to_float4(w16.y, wf0, wf1, wf2, wf3);
-    partial = fmaf(in_vals[4], wf0, partial);
-    partial = fmaf(in_vals[5], wf1, partial);
-    partial = fmaf(in_vals[6], wf2, partial);
-    partial = fmaf(in_vals[7], wf3, partial);
-    vllm_rs::fp8x4_to_float4(w16.z, wf0, wf1, wf2, wf3);
-    partial = fmaf(in_vals[8], wf0, partial);
-    partial = fmaf(in_vals[9], wf1, partial);
-    partial = fmaf(in_vals[10], wf2, partial);
-    partial = fmaf(in_vals[11], wf3, partial);
-    vllm_rs::fp8x4_to_float4(w16.w, wf0, wf1, wf2, wf3);
-    partial = fmaf(in_vals[12], wf0, partial);
-    partial = fmaf(in_vals[13], wf1, partial);
-    partial = fmaf(in_vals[14], wf2, partial);
-    partial = fmaf(in_vals[15], wf3, partial);
-    sum = fmaf(scale, partial, sum);
+    float partial0 = 0.0f, partial1 = 0.0f;
+    fp8x4_dot_half2<T>(w16.x, smem_input, k_base + 0, partial0);
+    fp8x4_dot_half2<T>(w16.y, smem_input, k_base + 4, partial0);
+    fp8x4_dot_half2<T>(w16.z, smem_input, k_base + 8, partial1);
+    fp8x4_dot_half2<T>(w16.w, smem_input, k_base + 12, partial1);
+    sum0 = fmaf(scale, partial0, sum0);
+    sum1 = fmaf(scale, partial1, sum1);
   }
+
+  float sum = sum0 + sum1;
 
   const int k_remainder_start = k_vec * VEC;
   for (int k = k_remainder_start + tid; k < K; k += BLOCK_SIZE) {
@@ -640,23 +647,27 @@ __global__ void moe_gemv_kernel_fp8_single(
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
     float scale = __ldg(&row_scales[k / block_size_k]);
-    sum = fmaf(vllm::to_float(input_row[k]) * wf, scale, sum);
+    sum = fmaf(smem_to_float(smem_input[k]) * wf, scale, sum);
   }
 
   sum = vllm_rs::warp_reduce_sum(sum);
 
   constexpr int NUM_WARPS = BLOCK_SIZE / 32;
-  __shared__ float smem[NUM_WARPS];
+  // Warp reduction area after input data in shared memory
+  float *smem_reduce = reinterpret_cast<float*>(smem_single_raw + K * sizeof(T));
+  // Align to float boundary
+  smem_reduce = reinterpret_cast<float*>(
+    (reinterpret_cast<uintptr_t>(smem_reduce) + 3) & ~uintptr_t(3));
   const int warp_id = tid / 32;
   const int lane_id = tid % 32;
 
   if (lane_id == 0) {
-    smem[warp_id] = sum;
+    smem_reduce[warp_id] = sum;
   }
   __syncthreads();
 
   if (warp_id == 0) {
-    sum = (lane_id < NUM_WARPS) ? smem[lane_id] : 0.0f;
+    sum = (lane_id < NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
 #pragma unroll
     for (int offset = NUM_WARPS / 2; offset > 0; offset >>= 1) {
       sum += __shfl_xor_sync(0xffffffff, sum, offset);
@@ -690,16 +701,17 @@ extern "C" void moe_gemv_fp8(
     int dtype,
     cudaStream_t stream) {
 
-  // Shared memory: K floats for input caching
-  int smem_bytes = size_k * sizeof(float);
+  // Shared memory: K elements in native T format (half/bf16 = 2 bytes each)
+  int elem_size = (dtype == 0) ? sizeof(half) : sizeof(nv_bfloat16);
+  int smem_bytes = size_k * elem_size;
 
   // Choose ROWS_PER_BLOCK (= warps per block) based on N dimension.
   // More rows → fewer blocks, better input reuse, but need enough N to fill.
   // Thread count = ROWS_PER_BLOCK * 32.
   //
-  // For N=512: RPB=8 → 64 blocks per token, 256 threads/block
-  // For N=2048: RPB=8 → 256 blocks per token, 256 threads/block
-  // For large N: RPB=4 → more blocks for better SM utilization
+  // For N=512:  RPB=16 → 32 blocks per token, 512 threads/block
+  // For N=2048: RPB=8  → 256 blocks per token, 256 threads/block
+  // For N=4096: RPB=4  → 1024 blocks per token, 128 threads/block
 
   auto launch = [&]<int RPB>() {
     dim3 grid(CEILDIV(size_n, RPB), size_m);
@@ -724,19 +736,22 @@ extern "C" void moe_gemv_fp8(
   };
 
   // For small-to-medium N: use warp-per-row kernel with shared memory input caching.
-  // For large N (>2048): use one-block-per-row with 256 threads for more K parallelism.
+  // For large N (>2048): use single-row kernel with shared memory + 256 threads.
   if (size_n <= 512) {
     launch.template operator()<16>();
   } else if (size_n <= 2048) {
     launch.template operator()<8>();
   } else {
-    // Large N: use single-row kernel (256 threads per output element)
+    // Large N: single-row kernel with shared memory input caching
     constexpr int BLOCK_SIZE = 256;
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    // smem for input (K elements as T) + warp reduction (NUM_WARPS floats, aligned)
+    int smem_single = size_k * elem_size + 16 + NUM_WARPS * sizeof(float);
     dim3 grid(size_n, size_m);
     dim3 block(BLOCK_SIZE);
 
     if (dtype == 0) {
-      moe_gemv_kernel_fp8_single<half, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+      moe_gemv_kernel_fp8_single<half, BLOCK_SIZE><<<grid, block, smem_single, stream>>>(
           reinterpret_cast<const half *>(input),
           weights, weight_scales, sorted_token_ids, expert_ids,
           topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
@@ -744,7 +759,7 @@ extern "C" void moe_gemv_fp8(
     }
 #ifndef NO_BF16_KERNEL
     else if (dtype == 1) {
-      moe_gemv_kernel_fp8_single<nv_bfloat16, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+      moe_gemv_kernel_fp8_single<nv_bfloat16, BLOCK_SIZE><<<grid, block, smem_single, stream>>>(
           reinterpret_cast<const nv_bfloat16 *>(input),
           weights, weight_scales, sorted_token_ids, expert_ids,
           topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
