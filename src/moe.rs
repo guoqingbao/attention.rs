@@ -870,13 +870,12 @@ pub fn moe_gemm_fp8(
                         );
                     }
 
-                    ffi::moe_fp8_calculate_expert_offsets(
+                    ffi::calculate_expert_offsets(
                         *experts_ids.device_ptr() as *const i32,
                         *expert_counts.device_ptr() as *mut i32,
                         *expert_offsets.device_ptr() as *mut i32,
                         num_experts as i32,
                         size_m as i32,
-                        is_prefill,
                         stream as i64,
                     );
 
@@ -1222,13 +1221,12 @@ pub fn moe_gemm_nvfp4(
             let (ec_s, _) = expert_counts_t.storage_and_layout();
             let (eo_s, _) = expert_offsets_t.storage_and_layout();
             unsafe {
-                ffi::moe_fp8_calculate_expert_offsets(
+                ffi::calculate_expert_offsets(
                     cuda_ptr(&seids_s, DType::U32)? as *const i32,
                     cuda_ptr(&ec_s, DType::U32)? as *mut i32,
                     cuda_ptr(&eo_s, DType::U32)? as *mut i32,
                     num_experts as i32,
                     total_slots as i32,
-                    is_prefill,
                     stream,
                 );
             }
@@ -1390,7 +1388,7 @@ pub fn moe_gemm_nvfp4_hardware(
     sorted_token_ids: &Tensor,
     experts_ids: &Tensor,
     topk: usize,
-    is_prefill: bool,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1507,13 +1505,12 @@ pub fn moe_gemm_nvfp4_hardware(
         let (expert_counts_s, _) = expert_counts_t.storage_and_layout();
         let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
         unsafe {
-            ffi::moe_fp8_calculate_expert_offsets(
+            ffi::calculate_expert_offsets(
                 cuda_ptr(&experts_ids_s, DType::U32)? as *const i32,
                 cuda_ptr(&expert_counts_s, DType::U32)? as *mut i32,
                 cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
                 num_experts as i32,
                 size_m as i32,
-                is_prefill,
                 stream,
             );
         }

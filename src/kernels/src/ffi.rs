@@ -1039,13 +1039,12 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
-    pub fn moe_fp8_calculate_expert_offsets(
+    pub fn calculate_expert_offsets(
         expert_ids: *const i32,
         expert_counts: *mut i32,
         expert_offsets: *mut i32,
         num_experts: c_int,
         size_m: c_int,
-        is_prefill: bool,
         stream: i64,
     );
 

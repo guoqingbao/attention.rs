@@ -4,164 +4,197 @@
 #endif
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/scan.h>
-#include <thrust/execution_policy.h>
 
-/**
- * @brief Counts the number of tokens assigned to each expert.
- *
- * @param expert_ids     Device pointer to the sorted expert IDs [size_m].
- * @param expert_counts  Device pointer to the output counts [num_experts]
- * (must be pre-initialized to zero).
- * @param size_m         Total number of tokens.
- */
-static __global__ void count_tokens_per_expert_kernel(
-    const int32_t* expert_ids, 
-    int32_t* expert_counts, 
+// ---------------------------------------------------------------------------
+// High-performance expert offset computation — thrust-free, CUDA-graph safe.
+//
+// Two paths:
+//   * Small path  (size_m <= 128): fused count + scan in a single warp launch.
+//   * Large path  (size_m > 128):  multi-block warp-reduction count +
+//                                  single-block Blelloch exclusive scan.
+// ---------------------------------------------------------------------------
+
+// ---- helpers ---------------------------------------------------------------
+static __device__ __forceinline__ int next_pow2_dev(int v) {
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+static __host__ __forceinline__ int next_pow2_host(int v) {
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+// ---- Large path: optimised count kernel with warp-level reduction ----------
+static __global__ void count_tokens_per_expert_warp(
+    const int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ expert_counts,
     int size_m,
-    int num_experts) 
+    int num_experts)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size_m) {
-        int32_t expert_id = expert_ids[i];
-        if (expert_id >= 0 && expert_id < num_experts) {
-            atomicAdd(&expert_counts[expert_id], 1);
-        }
-    }
-}
+    extern __shared__ int32_t s_counts[];
 
-/**
- * @brief Calculates expert offsets array on the GPU.
- *
- * @param d_expert_ids     Device pointer to sorted expert IDs [size_m].
- * @param size_m           Total number of tokens.
- * @param d_expert_offsets Device pointer for output offsets [num_experts + 1].
- * @param num_experts      Number of experts.
- * @param stream           CUDA stream.
- */
-static void calculate_expert_offsets(
-    const int32_t* d_expert_ids,
-    int size_m,
-    int32_t* d_expert_counts,
-    int32_t* d_expert_offsets,
-    int num_experts,
-    cudaStream_t stream
-) {
-    // 1. Zero-initialize the counts buffer
-    cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
+    const int tid = threadIdx.x;
 
-    // 2. Launch kernel to count tokens per expert
-    int threads = 256;
-    int blocks = (size_m + threads - 1) / threads;
-    count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
-        d_expert_ids, d_expert_counts, size_m, num_experts
-    );
-
-    // 3. Perform prefix sum (scan)
-    // We will use inclusive_scan on [counts] and store results in [offsets + 1]
-    // This is a common and efficient pattern.
-
-    // Wrap raw pointers for Thrust
-    thrust::device_ptr<const int32_t> d_counts_ptr(d_expert_counts);
-    thrust::device_ptr<int32_t> d_offsets_ptr(d_expert_offsets);
-
-    // Run inclusive scan.
-    // Input:  [c0, c1, c2, ...] (size num_experts)
-    // Output: [c0, c0+c1, c0+c1+c2, ...] (stored at offsets[1])
-    thrust::inclusive_scan(
-        thrust::cuda::par.on(stream), // Execute on the specified stream
-        d_counts_ptr,                 // Input start
-        d_counts_ptr + num_experts,   // Input end
-        d_offsets_ptr + 1             // Output start (shifted by 1)
-    );
-
-    // 4. Set the first offset (offsets[0]) to 0
-    // This completes the exclusive scan.
-    cudaMemsetAsync(d_expert_offsets, 0, sizeof(int32_t), stream);
-}
-
-
-// This performs an EXCLUSIVE scan: [c0, c1] -> [0, c0, c0+c1]
-// Assumptions: num_experts <= 1024 (fits in one block)
-static __global__ void expert_prefix_sum_kernel(
-    const int32_t* __restrict__ counts,
-    int32_t* __restrict__ offsets,
-    int num_experts
-) {
-    // Use shared memory for fast scanning
-    // Size needs to be enough for num_experts
-    extern __shared__ int32_t temp_storage[];
-
-    int tid = threadIdx.x;
-
-    // We pad with 0 if tid >= num_experts
-    int val = (tid < num_experts) ? counts[tid] : 0;
-    temp_storage[tid] = val;
-    
+    for (int e = tid; e < num_experts; e += blockDim.x)
+        s_counts[e] = 0;
     __syncthreads();
 
-    // Hillis-Steele Parallel Scan (Inclusive in shared mem)
-    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
-        int temp_val = 0;
-        if (tid >= offset) {
-            temp_val = temp_storage[tid - offset];
-        }
-        __syncthreads();
-        if (tid >= offset) {
-            temp_storage[tid] += temp_val;
-        }
-        __syncthreads();
+    const int gid = blockIdx.x * blockDim.x + tid;
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = gid; i < size_m; i += stride) {
+        int32_t eid = expert_ids[i];
+        if (eid >= 0 && eid < num_experts)
+            atomicAdd(&s_counts[eid], 1);
     }
+    __syncthreads();
 
-    // The result at temp_storage[i] is the inclusive sum of counts[0..i]
-    // We want offsets[i] = inclusive_sum[i-1]
-    // We want offsets[0] = 0
-    
-    if (tid < num_experts) {
-        // Shift right: Offset[i+1] gets the inclusive sum up to i
-        offsets[tid + 1] = temp_storage[tid];
-        
-        // Handle the first element separately
-        if (tid == 0) {
-            offsets[0] = 0;
-        }
-    }
+    for (int e = tid; e < num_experts; e += blockDim.x)
+        if (s_counts[e] != 0)
+            atomicAdd(&expert_counts[e], s_counts[e]);
 }
 
-static void calculate_expert_offsets_light(
+// Blelloch exclusive scan (work-efficient, single block, any num_experts<=1024)
+static __global__ void blelloch_exclusive_scan_kernel(
+    const int32_t* __restrict__ counts,
+    int32_t* __restrict__ offsets,
+    int num_experts)
+{
+    extern __shared__ int32_t temp[];
+    const int tid = threadIdx.x;
+    const int n = blockDim.x;  // next power of 2 >= num_experts
+
+    temp[tid] = (tid < num_experts) ? counts[tid] : 0;
+    __syncthreads();
+
+    // Up-sweep (reduce)
+    for (int d = 1; d < n; d <<= 1) {
+        int idx = (tid + 1) * (d << 1) - 1;
+        if (idx < n)
+            temp[idx] += temp[idx - d];
+        __syncthreads();
+    }
+
+    if (tid == 0) temp[n - 1] = 0;
+    __syncthreads();
+
+    // Down-sweep
+    for (int d = n >> 1; d >= 1; d >>= 1) {
+        int idx = (tid + 1) * (d << 1) - 1;
+        if (idx < n) {
+            int32_t t = temp[idx - d];
+            temp[idx - d] = temp[idx];
+            temp[idx] += t;
+        }
+        __syncthreads();
+    }
+
+    if (tid < num_experts)
+        offsets[tid] = temp[tid];
+    if (tid == 0)
+        offsets[num_experts] = temp[num_experts - 1] + counts[num_experts - 1];
+}
+
+// ---- Small path: fused count + scan in a single block ----------------------
+static __global__ void fused_count_and_scan_kernel(
+    const int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ expert_counts,
+    int32_t* __restrict__ expert_offsets,
+    int size_m,
+    int num_experts)
+{
+    extern __shared__ int32_t smem[];
+
+    const int tid = threadIdx.x;
+
+    for (int e = tid; e < num_experts; e += blockDim.x)
+        smem[e] = 0;
+    __syncthreads();
+
+    for (int i = tid; i < size_m; i += blockDim.x) {
+        int32_t eid = expert_ids[i];
+        if (eid >= 0 && eid < num_experts)
+            atomicAdd(&smem[eid], 1);
+    }
+    __syncthreads();
+
+    if (tid < num_experts)
+        expert_counts[tid] = smem[tid];
+    __syncthreads();
+
+    // Warp-style exclusive scan in shared memory (Blelloch in-place)
+    const int n = blockDim.x;  // power of 2 >= num_experts
+    int val = (tid < num_experts) ? smem[tid] : 0;
+    smem[tid] = val;
+    __syncthreads();
+
+    for (int d = 1; d < n; d <<= 1) {
+        int idx = (tid + 1) * (d << 1) - 1;
+        if (idx < n)
+            smem[idx] += smem[idx - d];
+        __syncthreads();
+    }
+
+    if (tid == 0) smem[n - 1] = 0;
+    __syncthreads();
+
+    for (int d = n >> 1; d >= 1; d >>= 1) {
+        int idx = (tid + 1) * (d << 1) - 1;
+        if (idx < n) {
+            int32_t t = smem[idx - d];
+            smem[idx - d] = smem[idx];
+            smem[idx] += t;
+        }
+        __syncthreads();
+    }
+
+    if (tid < num_experts)
+        expert_offsets[tid] = smem[tid];
+    if (tid == 0)
+        expert_offsets[num_experts] = smem[num_experts - 1] + expert_counts[num_experts - 1];
+}
+
+// ---- Public API (same interface as the old functions) ----------------------
+
+static void g_calculate_expert_offsets(
     const int32_t* d_expert_ids,
     int size_m,
     int32_t* d_expert_counts,
     int32_t* d_expert_offsets,
     int num_experts,
-    cudaStream_t stream
-) {
-    cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
+    cudaStream_t stream)
+{
+    const int scan_threads = next_pow2_host(num_experts < 32 ? 32 : num_experts);
 
-    int threads = 256;
-    int blocks = (size_m + threads - 1) / threads;
-    count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
-        d_expert_ids, d_expert_counts, size_m, num_experts
-    );
+    if (size_m <= 128) {
+        // Fused path: single kernel launch
+        size_t smem = scan_threads * sizeof(int32_t);
+        fused_count_and_scan_kernel<<<1, scan_threads, smem, stream>>>(
+            d_expert_ids, d_expert_counts, d_expert_offsets, size_m, num_experts);
+    } else {
+        // Two-kernel path: optimised count then Blelloch scan
+        cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
 
-    // We launch exactly one block with 'num_experts' threads (or next power of 2)
-    // We need shared memory size = threads * sizeof(int32_t)
-    int scan_threads = num_experts;
-    
-    // Round up scan_threads to next power of 2 if needed, 
-    // or just use a fixed size like 1024 if num_experts is small enough.
-    if (scan_threads < 32) scan_threads = 32;
-    else if (scan_threads > 1024) {
-        // Error: This custom kernel only supports up to 1024 experts
-        // Handle error or assert here
+        const int count_threads = 256;
+        const int max_blocks = 128;
+        int count_blocks = (size_m + count_threads - 1) / count_threads;
+        if (count_blocks > max_blocks) count_blocks = max_blocks;
+        size_t smem_count = num_experts * sizeof(int32_t);
+        count_tokens_per_expert_warp<<<count_blocks, count_threads, smem_count, stream>>>(
+            d_expert_ids, d_expert_counts, size_m, num_experts);
+
+        size_t smem_scan = scan_threads * sizeof(int32_t);
+        blelloch_exclusive_scan_kernel<<<1, scan_threads, smem_scan, stream>>>(
+            d_expert_counts, d_expert_offsets, num_experts);
     }
-
-    size_t smem_size = scan_threads * sizeof(int32_t);
-
-    expert_prefix_sum_kernel<<<1, scan_threads, smem_size, stream>>>(
-        d_expert_counts, 
-        d_expert_offsets, 
-        num_experts
-    );
 }
