@@ -80,7 +80,7 @@ inline __device__ void zero(half2& dst) {
 // On older archs, uses software conversion.
 __device__ __forceinline__ void fp8x4_to_float4(
     uint32_t packed, float &f0, float &f1, float &f2, float &f3) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && !defined(NO_HARDWARE_FP8)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && !defined(NO_HARDWARE_FP8)
   // Blackwell: convert 2 FP8 values at a time
   __half2_raw pair0 = __nv_cvt_fp8x2_to_halfraw2(
       static_cast<__nv_fp8x2_storage_t>(packed & 0xFFFF), __NV_E4M3);
@@ -405,7 +405,7 @@ __device__ __forceinline__ float smem_to_float(nv_bfloat16 v) {
 template <typename T>
 __device__ __forceinline__ void fp8x4_dot_half2(
     uint32_t packed, const T *smem, int offset, float &acc) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && !defined(NO_HARDWARE_FP8)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && !defined(NO_HARDWARE_FP8)
   __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(
       static_cast<__nv_fp8x2_storage_t>(packed & 0xFFFF), __NV_E4M3);
   __half2_raw pair2 = __nv_cvt_fp8x2_to_halfraw2(

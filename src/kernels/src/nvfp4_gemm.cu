@@ -49,6 +49,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -127,6 +128,19 @@ __device__ __forceinline__ void dequant_store_8(int q4, float scale,
   dst[5] = (float)(int8_t)(w.y >> 16) * scale;
   dst[6] = (float)(int8_t)(w.x >> 24) * scale;
   dst[7] = (float)(int8_t)(w.y >> 24) * scale;
+}
+
+// Alignment-safe uint2 load from byte-packed weight arrays.
+// V100 (SM70) can fault on misaligned uint2 loads from uint8_t* pointers;
+// SM80+ handles this fine. memcpy is optimized to a single LDG by NVCC.
+__device__ __forceinline__ uint2 load_uint2_safe(const uint8_t *ptr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  uint2 v;
+  memcpy(&v, ptr, sizeof(uint2));
+  return v;
+#else
+  return *reinterpret_cast<const uint2 *>(ptr);
+#endif
 }
 
 #ifdef NVFP4_HW_DEQUANT
@@ -232,7 +246,18 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   // Vectorized input load: 128-bit (float4 = 8 halves) per transaction.
   // K is always a multiple of 16 (NVFP4_BLOCK_SIZE), so K/8 is integral.
+  // On SM < 80 (V100) use scalar loads to avoid misaligned float4 access.
   {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+    for (int i = tid; i < K; i += block_size) {
+      int smem_idx = i + (i / WARP_SIZE);
+      if constexpr (std::is_same_v<T, half>) {
+        s_input[smem_idx] = __half2float(__ldg(&in_row[i]));
+      } else {
+        s_input[smem_idx] = __bfloat162float(__ldg(&in_row[i]));
+      }
+    }
+#else
     constexpr int ELEMS_PER_VEC = 8; // 8 halves = 16 bytes = 128 bits
     const int K_vec = K / ELEMS_PER_VEC;
     const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
@@ -251,6 +276,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
         }
       }
     }
+#endif
   }
   __syncthreads();
 
@@ -293,7 +319,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
           weight_global_scale * 0.5f;
 
-      uint2 w_vec = *reinterpret_cast<const uint2 *>(w_row + k / 2);
+      uint2 w_vec = load_uint2_safe(w_row + k / 2);
       const float *in = s_input + (k + (k / WARP_SIZE));
 
       int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
@@ -323,7 +349,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
           dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
           weight_global_scale * 0.5f;
 
-      uint2 w_vec2 = *reinterpret_cast<const uint2 *>(w_row + k2 / 2);
+      uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
       const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
       int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
@@ -430,7 +456,7 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
                                                    k_tile / NVFP4_BLOCK_SIZE])) *
             weight_global_scale;
 
-        uint2 w_vec = *reinterpret_cast<const uint2 *>(
+        uint2 w_vec = load_uint2_safe(
             &weight[(size_t)gn * (K / 2) + k_tile / 2]);
 
 #ifdef NVFP4_HW_DEQUANT
@@ -555,6 +581,16 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
   }
 
   {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+    for (int i = tid; i < K; i += block_size) {
+      int smem_idx = i + (i / WARP_SIZE);
+      if constexpr (std::is_same_v<T, half>) {
+        s_input_padded[smem_idx] = __half2float(__ldg(&in_row[i]));
+      } else {
+        s_input_padded[smem_idx] = __bfloat162float(__ldg(&in_row[i]));
+      }
+    }
+#else
     constexpr int ELEMS_PER_VEC = 8;
     const int K_vec = K / ELEMS_PER_VEC;
     const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
@@ -573,6 +609,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         }
       }
     }
+#endif
   }
   __syncthreads();
 
@@ -621,7 +658,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
             dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             global_scale * 0.5f;
 
-        uint2 w_vec = *reinterpret_cast<const uint2 *>(w_row + k / 2);
+        uint2 w_vec = load_uint2_safe(w_row + k / 2);
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
 
         int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
@@ -652,7 +689,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
             dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
             global_scale * 0.5f;
 
-        uint2 w_vec2 = *reinterpret_cast<const uint2 *>(w_row + k2 / 2);
+        uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
         const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
 
         int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
@@ -781,7 +818,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
             __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
             * weight_global_scale;
 
-        uint2 w_vec = *reinterpret_cast<const uint2 *>(
+        uint2 w_vec = load_uint2_safe(
             &weight[(size_t)gn * half_k + k_step / 2]);
 
         uint32_t word = sub ? w_vec.y : w_vec.x;
@@ -1126,7 +1163,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                                              (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
                         * global_scale;
 
-                    uint2 w_vec = *reinterpret_cast<const uint2*>(
+                    uint2 w_vec = load_uint2_safe(
                         &weights[(size_t)expert_id * size_n * half_k + (size_t)gn * half_k + k_base / 2]);
 
                     uint32_t word = sub ? w_vec.y : w_vec.x;
