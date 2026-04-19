@@ -25,7 +25,10 @@
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/nvfp4_gemm.cu
  *
  * Notes:
- * - LUT-based FP4 E2M1 dequantization via byte_perm intrinsics (shared with MXFP4)
+ * - LUT-based FP4 E2M1 dequantization via byte_perm intrinsics (SM < 100)
+ * - On SM100+ (Blackwell): hardware FP4 dequantization via cuda_fp4.h
+ *   __nv_cvt_fp4x2_to_halfraw2 intrinsics — eliminates LUT tables entirely,
+ *   with fused dequant+dot product (hw_dot_16) for decode kernels
  * - FP8 E4M3 block scale conversion uses dtype_fp8.cuh dispatch_fp8_to_float
  *   for hardware intrinsics on SM89+ with software fallback on older GPUs
  * - Small-M kernel uses warp-stride loops for memory-bound decode workloads
@@ -53,6 +56,13 @@
 #include <mma.h>
 #include "attention/dtype_fp8.cuh"
 
+// Blackwell (SM100+) has hardware FP4 dequantization via cuda_fp4.h.
+// NVFP4_BLACKWELL is defined by build.rs when compute_cap >= 100.
+#if defined(NVFP4_BLACKWELL) && !defined(NO_HARDWARE_FP8)
+  #define NVFP4_HW_DEQUANT 1
+  #include <cuda_fp4.h>
+#endif
+
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #define NVFP4_BLOCK_SIZE 16
 #define MOE_BLOCK_N 8
@@ -62,6 +72,30 @@ namespace nvfp4_gemm {
 
 using vllm::fp8::dispatch_fp8_to_float;
 
+// ============================================================================
+// FP8 block scale conversion — hardware on SM89+, software fallback
+// ============================================================================
+
+__device__ __forceinline__ float fp8_scale_to_float(uint8_t raw) {
+  return dispatch_fp8_to_float(raw);
+}
+
+#ifdef NVFP4_HW_DEQUANT
+// Paired FP8 scale conversion: 2 FP8 E4M3 values → 2 floats
+__device__ __forceinline__ float2 fp8x2_scale_to_float2(uint16_t raw2) {
+  __half2_raw h2 = __nv_cvt_fp8x2_to_halfraw2(
+      static_cast<__nv_fp8x2_storage_t>(raw2), __NV_E4M3);
+  return make_float2(
+      __half2float(*reinterpret_cast<__half*>(&h2.x)),
+      __half2float(*reinterpret_cast<__half*>(&h2.y)));
+}
+#endif
+
+// ============================================================================
+// FP4 dequantization paths
+// ============================================================================
+
+// --- Legacy LUT-based path (SM < 100) ---
 __device__ __forceinline__ int2 get_int_from_table_16(const int q4,
                                                       const uint32_t table0,
                                                       const uint32_t table1,
@@ -95,12 +129,73 @@ __device__ __forceinline__ void dequant_store_8(int q4, float scale,
   dst[7] = (float)(int8_t)(w.y >> 24) * scale;
 }
 
+#ifdef NVFP4_HW_DEQUANT
+// --- Blackwell hardware path (SM100+) ---
+// Converts 8 packed FP4 values (one uint32 = 8 nibbles) to 8 floats using
+// hardware __nv_cvt_fp4x2_to_halfraw2 intrinsic (2 FP4 → half2 per call).
+// Each byte holds 2 FP4 E2M1 values; a uint32 holds 4 bytes = 8 values.
+__device__ __forceinline__ void hw_dequant_8(uint32_t packed, float scale,
+                                             float *dst) {
+  // Process 4 bytes, each containing 2 FP4 nibbles
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    uint8_t byte_val = (packed >> (i * 8)) & 0xFF;
+    __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+        static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
+    float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+    dst[i * 2]     = f2.x * scale;
+    dst[i * 2 + 1] = f2.y * scale;
+  }
+}
+
+// Dequantize 16 FP4 values from a uint2 (8 bytes) into 16 floats.
+// Replaces the LUT path: get_int_from_table_16 + cast chain.
+__device__ __forceinline__ void hw_dequant_16(uint2 packed, float scale,
+                                              float *dst) {
+  hw_dequant_8(packed.x, scale, dst);
+  hw_dequant_8(packed.y, scale, dst + 8);
+}
+
+// Fused 16-element dot product: dequant FP4 + multiply-accumulate with input.
+// Each byte is 2 FP4 values; we convert and fmaf immediately to avoid
+// register spilling (16 floats would require 16 regs).
+__device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
+                                           const float *input) {
+  float acc = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    uint8_t b0 = (packed.x >> (i * 8)) & 0xFF;
+    __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+        static_cast<__nv_fp4x2_storage_t>(b0), __NV_E2M1);
+    float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+    acc = fmaf(input[i * 2],     f2.x * scale, acc);
+    acc = fmaf(input[i * 2 + 1], f2.y * scale, acc);
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    uint8_t b1 = (packed.y >> (i * 8)) & 0xFF;
+    __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+        static_cast<__nv_fp4x2_storage_t>(b1), __NV_E2M1);
+    float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+    acc = fmaf(input[8 + i * 2],     f2.x * scale, acc);
+    acc = fmaf(input[8 + i * 2 + 1], f2.y * scale, acc);
+  }
+  return acc;
+}
+#endif // NVFP4_HW_DEQUANT
+
 // Small-M matmul for NVFP4: dot-product per output element, one warp per N.
 // NVFP4 uses block_size=16 and FP8 E4M3 block scales + FP32 global scale.
 // Grid: (ceil(N/BLOCK_N_SM), M)  Block: (BLOCK_N_SM * 32)
 //
 // Each lane processes 2 NVFP4 blocks (32 elements) per stride iteration
 // to improve ILP and amortise the scale-fetch overhead.
+//
+// Input loading uses 128-bit vectorized loads (float4 = 8 halves per load)
+// to maximize memory bandwidth utilization on the decode path.
+//
+// On SM100+ (Blackwell): uses hw_dot_16 with __nv_cvt_fp4x2_to_halfraw2
+// intrinsics for hardware FP4 dequantization — eliminates LUT tables entirely.
 constexpr int BLOCK_N_SM = 8;
 
 template <typename T>
@@ -114,10 +209,12 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
                                     int K, bool has_bias) {
   extern __shared__ float s_input[];
 
+#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+#endif
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -133,13 +230,26 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   const T *in_row = input + (size_t)row * K;
 
-  // Load input row into shared memory with padding to avoid bank conflicts.
-  for (int k = tid; k < K; k += block_size) {
-    const int smem_idx = k + (k / WARP_SIZE);
-    if constexpr (std::is_same_v<T, half>) {
-      s_input[smem_idx] = __half2float(__ldg(&in_row[k]));
-    } else {
-      s_input[smem_idx] = __bfloat162float(__ldg(&in_row[k]));
+  // Vectorized input load: 128-bit (float4 = 8 halves) per transaction.
+  // K is always a multiple of 16 (NVFP4_BLOCK_SIZE), so K/8 is integral.
+  {
+    constexpr int ELEMS_PER_VEC = 8; // 8 halves = 16 bytes = 128 bits
+    const int K_vec = K / ELEMS_PER_VEC;
+    const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
+    for (int vi = tid; vi < K_vec; vi += block_size) {
+      float4 v = __ldg(&in_vec[vi]);
+      const T *elems = reinterpret_cast<const T *>(&v);
+      int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; j++) {
+        int k = base + j;
+        int smem_idx = k + (k / WARP_SIZE);
+        if constexpr (std::is_same_v<T, half>) {
+          s_input[smem_idx] = __half2float(elems[j]);
+        } else {
+          s_input[smem_idx] = __bfloat162float(elems[j]);
+        }
+      }
     }
   }
   __syncthreads();
@@ -151,13 +261,33 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   float acc = 0.0f;
 
-  // Each lane processes 2 consecutive NVFP4 blocks (32 elements) per step.
-  // stride = warp_size * 32 = 1024 elements/iteration.
   constexpr int ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE; // 32
   for (int k = lane_id * ELEMS_PER_LANE; k < K;
        k += WARP_SIZE * ELEMS_PER_LANE) {
 
-    // --- First NVFP4 block of 16 ---
+#ifdef NVFP4_HW_DEQUANT
+    // --- Blackwell hardware path: fused dequant + dot product ---
+    // No * 0.5f: HW intrinsics produce exact FP4 E2M1 float values directly.
+    {
+      float block_scale =
+          fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+          weight_global_scale;
+      uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+      const float *in = s_input + (k + (k / WARP_SIZE));
+      acc += hw_dot_16(w_vec, block_scale, in);
+    }
+
+    int k2 = k + NVFP4_BLOCK_SIZE;
+    if (k2 < K) {
+      float block_scale2 =
+          fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+          weight_global_scale;
+      uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+      const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
+      acc += hw_dot_16(w_vec2, block_scale2, in2);
+    }
+#else
+    // --- Legacy LUT path (SM < 100) ---
     {
       float block_scale =
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
@@ -187,7 +317,6 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24) * block_scale, acc);
     }
 
-    // --- Second NVFP4 block of 16 ---
     int k2 = k + NVFP4_BLOCK_SIZE;
     if (k2 < K) {
       float block_scale2 =
@@ -217,6 +346,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
       acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
     }
+#endif // NVFP4_HW_DEQUANT
   }
 
 #pragma unroll
@@ -256,10 +386,12 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
   __shared__ float s_input[BLOCK_M][BLOCK_K + 1];
   __shared__ float s_weight[BLOCK_N][BLOCK_K + 1];
 
+#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+#endif
 
   const int tid = threadIdx.y * THREADS_N + threadIdx.x;
   const int bx = blockIdx.x;
@@ -290,22 +422,26 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
       s_input[lm][lk] = val;
     }
 
-    // NVFP4 uses block_size=16, so for a BLOCK_K=16 tile, one scale per row
     for (int ln = tid; ln < BLOCK_N; ln += NUM_THREADS) {
       const int gn = bx * BLOCK_N + ln;
       if (gn < N) {
-        float block_scale =
-            dispatch_fp8_to_float(__ldg(&weight_scale[(size_t)gn * scale_stride +
+        float raw_scale =
+            fp8_scale_to_float(__ldg(&weight_scale[(size_t)gn * scale_stride +
                                                    k_tile / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale * 0.5f;
+            weight_global_scale;
 
         uint2 w_vec = *reinterpret_cast<const uint2 *>(
             &weight[(size_t)gn * (K / 2) + k_tile / 2]);
 
-        dequant_store_8(w_vec.x, block_scale, LUT0, LUT1, LUT2, LUT3,
+#ifdef NVFP4_HW_DEQUANT
+        hw_dequant_16(w_vec, raw_scale, &s_weight[ln][0]);
+#else
+        float lut_scale = raw_scale * 0.5f;
+        dequant_store_8(w_vec.x, lut_scale, LUT0, LUT1, LUT2, LUT3,
                         &s_weight[ln][0]);
-        dequant_store_8(w_vec.y, block_scale, LUT0, LUT1, LUT2, LUT3,
+        dequant_store_8(w_vec.y, lut_scale, LUT0, LUT1, LUT2, LUT3,
                         &s_weight[ln][8]);
+#endif
       } else {
 #pragma unroll
         for (int k = 0; k < BLOCK_K; k++)
@@ -375,10 +511,12 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
                         bool input_has_topk_dim) {
   extern __shared__ float s_input_padded[];
 
+#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+#endif
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -416,12 +554,24 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         input + (size_t)token_idx * topk * K + (size_t)expert_slot_start * K;
   }
 
-  for (int k = tid; k < K; k += block_size) {
-    const int smem_idx = k + (k / WARP_SIZE);
-    if constexpr (std::is_same_v<T, half>) {
-      s_input_padded[smem_idx] = __half2float(__ldg(&in_row[k]));
-    } else {
-      s_input_padded[smem_idx] = __bfloat162float(__ldg(&in_row[k]));
+  {
+    constexpr int ELEMS_PER_VEC = 8;
+    const int K_vec = K / ELEMS_PER_VEC;
+    const float4 *in_vec = reinterpret_cast<const float4 *>(in_row);
+    for (int vi = tid; vi < K_vec; vi += block_size) {
+      float4 v = __ldg(&in_vec[vi]);
+      const T *elems = reinterpret_cast<const T *>(&v);
+      int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; j++) {
+        int k = base + j;
+        int smem_idx = k + (k / WARP_SIZE);
+        if constexpr (std::is_same_v<T, half>) {
+          s_input_padded[smem_idx] = __half2float(elems[j]);
+        } else {
+          s_input_padded[smem_idx] = __bfloat162float(elems[j]);
+        }
+      }
     }
   }
   __syncthreads();
@@ -445,6 +595,26 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
     constexpr int MOE_ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE; // 32
     for (int k = lane_id * MOE_ELEMS_PER_LANE; k < K;
          k += WARP_SIZE * MOE_ELEMS_PER_LANE) {
+
+#ifdef NVFP4_HW_DEQUANT
+      {
+        float block_scale =
+            fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+            global_scale;
+        uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+        const float *in = s_input_padded + (k + (k / WARP_SIZE));
+        acc += hw_dot_16(w_vec, block_scale, in);
+      }
+      int k2 = k + NVFP4_BLOCK_SIZE;
+      if (k2 < K) {
+        float block_scale2 =
+            fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+            global_scale;
+        uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+        const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
+        acc += hw_dot_16(w_vec2, block_scale2, in2);
+      }
+#else
       // --- First NVFP4 block of 16 ---
       {
         float block_scale =
@@ -505,6 +675,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
         acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
       }
+#endif // NVFP4_HW_DEQUANT
     }
 
 #pragma unroll
@@ -562,10 +733,12 @@ __global__ void nvfp4_wmma_matmul_kernel(
   using namespace nvcuda::wmma;
   using namespace nvfp4_gemm;
 
+#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+#endif
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -584,12 +757,11 @@ __global__ void nvfp4_wmma_matmul_kernel(
     for (int j = 0; j < 2; j++)
       fill_fragment(acc[i][j], 0.0f);
 
-  __shared__ T s_a[BM][WMMA_BK + 4]; // +4 padding
+  __shared__ T s_a[BM][WMMA_BK + 4];
   __shared__ T s_b[BN][WMMA_BK + 4];
 
   for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
 
-    // --- Load A [BM × 16]: 128 threads, 64*16=1024 elements, 8 per thread ---
     #pragma unroll
     for (int i = tid; i < BM * WMMA_BK; i += 128) {
       int r = i / WMMA_BK;
@@ -599,26 +771,40 @@ __global__ void nvfp4_wmma_matmul_kernel(
       s_a[r][c] = (gr < M && gc < K) ? input[(size_t)gr * K + gc] : T(0);
     }
 
-    // --- Dequant B [BN × 16]: distribute 64 rows across 128 threads ---
-    // Each row = one NVFP4 block of 16 packed in 8 bytes (uint2)
-    // 128 threads, 64 rows → 2 threads per row (each handles 8 elements)
     {
-      int row = tid / 2;           // 0..63
-      int sub = tid & 1;           // 0: low 8 elements, 1: high 8 elements
+      int row = tid / 2;
+      int sub = tid & 1;
       int gn = bx * BN + row;
 
       if (row < BN && gn < N && k_step < K) {
-        float block_scale = dispatch_fp8_to_float(
+        float raw_scale = fp8_scale_to_float(
             __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
-            * weight_global_scale * 0.5f;
+            * weight_global_scale;
 
         uint2 w_vec = *reinterpret_cast<const uint2 *>(
             &weight[(size_t)gn * half_k + k_step / 2]);
 
         uint32_t word = sub ? w_vec.y : w_vec.x;
         int col_base = sub * 8;
+#ifdef NVFP4_HW_DEQUANT
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          uint8_t byte_val = (word >> (j * 8)) & 0xFF;
+          __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+              static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
+          float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+          if constexpr (std::is_same_v<T, __half>) {
+            s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
+            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+          } else {
+            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
+            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+          }
+        }
+#else
+        float lut_scale = raw_scale * 0.5f;
         float dq[8];
-        dequant_store_8(word, block_scale, LUT0, LUT1, LUT2, LUT3, dq);
+        dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
         #pragma unroll
         for (int j = 0; j < 8; j++) {
           if constexpr (std::is_same_v<T, __half>)
@@ -626,6 +812,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
           else
             s_b[row][col_base + j] = __float2bfloat16(dq[j]);
         }
+#endif
       } else if (row < BN) {
         int col_base = sub * 8;
         #pragma unroll
@@ -870,10 +1057,12 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
 ) {
     using namespace nvcuda::wmma;
 
+#ifndef NVFP4_HW_DEQUANT
     const uint32_t LUT0 = 0x03020100;
     const uint32_t LUT1 = 0x0C080604;
     const uint32_t LUT2 = 0xFDFEFF00;
     const uint32_t LUT3 = 0xF4F8FAFC;
+#endif
 
     const int expert_id = blockIdx.x;
     const int n_tile_idx = blockIdx.y;
@@ -925,29 +1114,42 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                 }
             }
 
-            // Dequant B tile: NVFP4 weights for this expert
-            // 32 N-rows × 16 K-elements = 32 dequant units, 128 threads → 4 threads/row
-            // Each row = 1 NVFP4 block of 16 packed in uint2 (8 bytes)
-            // Split: 2 threads per row (each handles 8 elements via one dequant_store_8 call)
             constexpr int B_ROWS = MOE_N_BLK;
             constexpr int B_STRIDE = MOE_WMMA_K + 4;
             for (int i = tid; i < B_ROWS * 2; i += MOE_THREADS) {
                 int row = i / 2;
-                int sub = i & 1;  // 0: low 8, 1: high 8
+                int sub = i & 1;
                 int gn = n_base + row;
                 if (gn < size_n && k_base < size_k) {
-                    float block_scale = dispatch_fp8_to_float(
+                    float raw_scale = fp8_scale_to_float(
                         __ldg(&weight_scales[(size_t)expert_id * size_n * scale_stride +
                                              (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
-                        * global_scale * 0.5f;
+                        * global_scale;
 
                     uint2 w_vec = *reinterpret_cast<const uint2*>(
                         &weights[(size_t)expert_id * size_n * half_k + (size_t)gn * half_k + k_base / 2]);
 
                     uint32_t word = sub ? w_vec.y : w_vec.x;
                     int col_base = sub * 8;
+#ifdef NVFP4_HW_DEQUANT
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        uint8_t byte_val = (word >> (j * 8)) & 0xFF;
+                        __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+                            static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
+                        float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+                        if constexpr (std::is_same_v<T, __half>) {
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+                        } else {
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+                        }
+                    }
+#else
+                    float lut_scale = raw_scale * 0.5f;
                     float dq[8];
-                    dequant_store_8(word, block_scale, LUT0, LUT1, LUT2, LUT3, dq);
+                    dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         if constexpr (std::is_same_v<T, __half>)
@@ -955,6 +1157,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                         else
                             s_b[row * B_STRIDE + col_base + j] = __float2bfloat16(dq[j]);
                     }
+#endif
                 } else {
                     int col_base = sub * 8;
                     #pragma unroll
