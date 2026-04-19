@@ -2111,6 +2111,7 @@ pub fn moe_gemm_mxfp4(
                 .map_err(candle_core::Error::wrap)?;
             }
 
+            drop(output_s);
             Ok(output)
         }
         _ => candle_core::bail!("moe_gemm_mxfp4: unsupported backend (need CUDA or Metal)"),
