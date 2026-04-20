@@ -90,10 +90,10 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
 
 // ============================================================================
 // Activation quantization kernel (SM100+ hardware path)
-// Matches TRT-LLM/FlashInfer quantize_with_block_size exactly:
-//   SFValue = SFScaleVal * (vecMax / 6.0)
+// Uses precise division (__fdividef) instead of rcp.approx.ftz:
+//   SFValue = SFScaleVal * vecMax / 6.0
 //   fp8_scale = fp8_e4m3(SFValue)
-//   outputScale = 1 / (float(fp8_scale) / SFScaleVal)
+//   outputScale = SFScaleVal / float(fp8_scale)
 //   quantized_val = val * outputScale
 // ============================================================================
 
@@ -104,7 +104,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
     const InType* __restrict__ input,   // [M, K]
     uint8_t* __restrict__ output,       // [M, K/2] packed FP4
     uint8_t* __restrict__ scales,       // [M_padded, K/16] FP8 E4M3 block scales
-    float SFScaleVal,                   // globalScale = (448*6)/amax or 1/input_scale
+    float SFScaleVal,                   // 1/input_scale
     int M, int K, int M_padded)
 {
   int row = blockIdx.x;
@@ -136,14 +136,14 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
+  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
   float outputScale = SFValue != 0.0f
-      ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal))
+      ? __fdividef(SFScaleVal, SFValue)
       : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
@@ -457,11 +457,15 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = SFScaleVal * (vecMax * fast_rcp_ftz(6.0f));
+  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
+
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
-  float outputScale = SFValue != 0.0f ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal)) : 0.0f;
+
+  float outputScale = SFValue != 0.0f
+      ? __fdividef(SFScaleVal, SFValue)
+      : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
   for (int i = 0; i < 8; ++i) {

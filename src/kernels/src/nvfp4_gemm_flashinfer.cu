@@ -144,6 +144,76 @@ using flashinfer::gemm::FP4GemmType;
 namespace {
 
 template <typename T>
+CutlassGemmConfig select_fp4_config(
+    const std::vector<CutlassGemmConfig>& configs, int m, int n, int k)
+{
+  if (configs.size() <= 1) return configs[0];
+
+  // For SM120 there's typically only one config; for SM100 we have many.
+  // Try each config and pick the one that can launch successfully with
+  // the best tile utilization for the given problem size.
+  CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> probe;
+
+  int best_idx = 0;
+  float best_score = -1.0f;
+  for (int i = 0; i < (int)configs.size(); i++) {
+    try {
+      size_t ws = probe.getWorkspaceSize(m, n, k, 1);
+      (void)ws;
+    } catch (...) {
+      continue;
+    }
+
+    int cta_m = 128, cta_n = 128;
+    int tile_id = configs[i].getTileConfigAsInt();
+
+    if (configs[i].sm_version >= 120) {
+      switch (tile_id) {
+        case 2: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x128B
+        case 3: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x64B
+        case 4: cta_m = 256; cta_n = 128; break;  // CtaShape256x128x64B
+        case 5: cta_m = 128; cta_n = 256; break;  // CtaShape128x256x64B
+        case 6: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x256B
+        case 7: cta_m = 256; cta_n = 128; break;  // CtaShape256x128x128B
+        default: break;
+      }
+    } else if (configs[i].sm_version >= 100) {
+      switch (tile_id) {
+        case 2: cta_m = 64;  cta_n = 32;  break;
+        case 3: cta_m = 64;  cta_n = 64;  break;
+        case 4: cta_m = 64;  cta_n = 128; break;
+        case 5: cta_m = 64;  cta_n = 256; break;
+        case 6: cta_m = 128; cta_n = 8;   break;
+        case 7: cta_m = 128; cta_n = 16;  break;
+        case 8: cta_m = 128; cta_n = 32;  break;
+        case 9: cta_m = 128; cta_n = 64;  break;
+        case 10: cta_m = 128; cta_n = 128; break;
+        case 11: cta_m = 128; cta_n = 256; break;
+        case 12: cta_m = 128; cta_n = 128; break;
+        case 13: cta_m = 128; cta_n = 256; break;
+        case 14: cta_m = 256; cta_n = 64;  break;
+        case 15: cta_m = 256; cta_n = 128; break;
+        case 16: cta_m = 256; cta_n = 256; break;
+        default: break;
+      }
+    }
+
+    int grid_m = (m + cta_m - 1) / cta_m;
+    int grid_n = (n + cta_n - 1) / cta_n;
+    float util_m = (float)m / (grid_m * cta_m);
+    float util_n = (float)n / (grid_n * cta_n);
+    float wave_count = (float)(grid_m * grid_n);
+    float score = util_m * util_n * fminf(wave_count, 132.0f);
+
+    if (score > best_score) {
+      best_score = score;
+      best_idx = i;
+    }
+  }
+  return configs[best_idx];
+}
+
+template <typename T>
 void run_flashinfer_fp4_gemm(
     void* D, const void* A, const void* B,
     const void* input_sf, const void* weight_sf,
@@ -157,8 +227,7 @@ void run_flashinfer_fp4_gemm(
   auto configs = runner.getConfigs();
   if (configs.empty()) return;
 
-  // Tactic 0 is the best from FlashInfer's profiling-based reordering
-  CutlassGemmConfig config = configs[0];
+  CutlassGemmConfig config = select_fp4_config<T>(configs, m, n, k);
 
   size_t required_ws = runner.getWorkspaceSize(m, n, k, 1);
   if (required_ws > workspace_bytes) {
