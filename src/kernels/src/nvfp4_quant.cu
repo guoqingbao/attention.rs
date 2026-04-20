@@ -97,6 +97,8 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
 //   quantized_val = val * outputScale
 // ============================================================================
 
+static constexpr int NVFP4_QUANT_MAX_THREADS = 512;
+
 template <typename InType>
 __global__ void nvfp4_quantize_activation_hw_kernel(
     const InType* __restrict__ input,   // [M, K]
@@ -106,13 +108,15 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
     int M, int K, int M_padded)
 {
   int row = blockIdx.x;
-  int block_idx = threadIdx.x;
   int num_blocks = K / NVFP4_BLOCK_SIZE;
 
-  if (row >= M || block_idx >= num_blocks) return;
+  if (row >= M) return;
+
+  int64_t in_base = static_cast<int64_t>(row) * K;
+
+  for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
 
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
-  int64_t in_base = static_cast<int64_t>(row) * K;
 
   float vals[16];
   for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
@@ -138,7 +142,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
-  float outputScale = vecMax != 0.0f
+  float outputScale = SFValue != 0.0f
       ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal))
       : 0.0f;
 
@@ -164,7 +168,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   uint8_t fp8_scale_bits = 0;
   float outputScale = 0.0f;
 
-  if (vecMax > 0.0f && SFValue > 0.0f) {
+  if (SFValue > 0.0f) {
     uint32_t bits = __float_as_uint(SFValue);
     uint32_t sign = (bits >> 31) & 1;
     int exp = ((bits >> 23) & 0xFF) - 127;
@@ -200,6 +204,8 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
 
   scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
 #endif
+
+  } // for block_idx
 }
 
 // ============================================================================
@@ -271,7 +277,7 @@ void nvfp4_quantize_activation_f16(
 {
   int num_blocks_k = K / NVFP4_BLOCK_SIZE;
   dim3 grid(M);
-  dim3 block(num_blocks_k);
+  dim3 block(min(num_blocks_k, NVFP4_QUANT_MAX_THREADS));
 
   nvfp4_quantize_activation_hw_kernel<half><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const half*>(input),
@@ -302,7 +308,7 @@ void nvfp4_quantize_activation_bf16(
 {
   int num_blocks_k = K / NVFP4_BLOCK_SIZE;
   dim3 grid(M);
-  dim3 block(num_blocks_k);
+  dim3 block(min(num_blocks_k, NVFP4_QUANT_MAX_THREADS));
 
   nvfp4_quantize_activation_hw_kernel<nv_bfloat16><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const nv_bfloat16*>(input),
@@ -422,9 +428,8 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
     int K,
     int K_scale_padded) {
   int row = blockIdx.x;
-  int block_idx = threadIdx.x;
   int num_blocks = K / NVFP4_BLOCK_SIZE;
-  if (row >= total_rows || block_idx >= num_blocks) {
+  if (row >= total_rows) {
     return;
   }
 
@@ -434,6 +439,8 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   int rows = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
   int rows_padded = ((rows + 127) / 128) * 128;
   float SFScaleVal = input_scale_invs[expert_id];
+
+  for (int block_idx = threadIdx.x; block_idx < num_blocks; block_idx += blockDim.x) {
 
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
   int64_t in_base = static_cast<int64_t>(row) * K + k_start;
@@ -454,7 +461,7 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
-  float outputScale = vecMax != 0.0f ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal)) : 0.0f;
+  float outputScale = SFValue != 0.0f ? fast_rcp_ftz(SFValue * fast_rcp_ftz(SFScaleVal)) : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
   for (int i = 0; i < 8; ++i) {
@@ -471,7 +478,7 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   uint8_t fp8_scale_bits = 0;
   float outputScale = 0.0f;
 
-  if (vecMax > 0.0f && SFValue > 0.0f) {
+  if (SFValue > 0.0f) {
     uint32_t bits = __float_as_uint(SFValue);
     uint32_t sign = (bits >> 31) & 1;
     int exp = ((bits >> 23) & 0xFF) - 127;
@@ -521,6 +528,8 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   if (local_row < rows && local_row < rows_padded) {
     swizzled_scales[dstOffset] = fp8_scale_bits;
   }
+
+  } // for block_idx
 }
 
 template <typename T>
@@ -606,7 +615,7 @@ void nvfp4_quantize_activation_grouped_f16(
     int64_t stream)
 {
   dim3 grid(total_rows);
-  dim3 block(K / NVFP4_BLOCK_SIZE);
+  dim3 block(min(K / NVFP4_BLOCK_SIZE, NVFP4_QUANT_MAX_THREADS));
   nvfp4_quantize_activation_hw_grouped_kernel<half><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const half*>(input),
       static_cast<uint8_t*>(output),
@@ -634,7 +643,7 @@ void nvfp4_quantize_activation_grouped_bf16(
     int64_t stream)
 {
   dim3 grid(total_rows);
-  dim3 block(K / NVFP4_BLOCK_SIZE);
+  dim3 block(min(K / NVFP4_BLOCK_SIZE, NVFP4_QUANT_MAX_THREADS));
   nvfp4_quantize_activation_hw_grouped_kernel<nv_bfloat16><<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<const nv_bfloat16*>(input),
       static_cast<uint8_t*>(output),

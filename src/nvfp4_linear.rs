@@ -45,11 +45,74 @@ fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }
 
+/// Pre-swizzle NVFP4 weight scales from linear [N, K/16] layout to the CUTLASS
+/// 128x4 block-interleaved layout. Call once at model load time and pass the
+/// result to [`nvfp4_matmul`] via `weight_scale_swizzled` to avoid re-swizzling
+/// on every inference call.
+///
+/// * `scale` - [N, K/16] U8 FP8 E4M3 block scales (linear / row-major)
+/// * `n` - number of output channels (weight rows)
+/// * `k` - full K dimension (not K/16)
+///
+/// Returns a U8 tensor of shape [N_padded, K_scale_padded] in swizzled layout.
+#[allow(unused)]
+pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+    let scale = if scale.is_contiguous() {
+        scale.clone()
+    } else {
+        scale.contiguous()?
+    };
+    let dev = scale.device();
+
+    match dev {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_dev) => {
+            use candle_core::Storage;
+
+            let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+            let k_scale_padded = pad_to(k_scale_cols, 4);
+            let n_padded = pad_to(n, 128);
+
+            let swizzled = Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
+
+            {
+                let (scale_s, _) = scale.storage_and_layout();
+                let scale_ptr = match &*scale_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+
+                let (sw_s, _) = swizzled.storage_and_layout();
+                let sw_ptr = match &*sw_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+
+                let stream = *cuda_dev.cu_stream() as i64;
+                unsafe {
+                    ffi::nvfp4_swizzle_weight_scales(
+                        scale_ptr as *const std::ffi::c_void,
+                        sw_ptr as *mut std::ffi::c_void,
+                        n as i32,
+                        k_scale_cols as i32,
+                        n_padded as i32,
+                        k_scale_padded as i32,
+                        stream,
+                    );
+                }
+            }
+
+            Ok(swizzled)
+        }
+        _ => candle_core::bail!("swizzle_nvfp4_weight_scales: unsupported backend (need CUDA)"),
+    }
+}
+
 /// NVFP4 linear: output = input @ weight^T [+ bias]
 ///
 /// * `input` - [M, K] in F16/BF16
 /// * `weight` - [N, K/2] packed U8 (2 FP4 E2M1 nibbles per byte)
-/// * `scale` - [N, K/16] U8 FP8 E4M3 block scales
+/// * `scale` - [N, K/16] U8 FP8 E4M3 block scales (linear layout)
 /// * `weight_global_scale` - scalar F32 weight-side global scale
 ///   (from `weight_scale_2` or `1/weight_global_scale` in the checkpoint)
 /// * `input_scale` - scalar F32 activation-side global scale
@@ -58,12 +121,17 @@ fn pad_to(val: usize, align: usize) -> usize {
 ///   quantization and to compute the GEMM epilogue alpha = input_scale * weight_global_scale.
 ///   Ignored by the software path (activations stay in FP16/BF16).
 /// * `bias` - Optional [N] in F16/BF16
+/// * `weight_scale_swizzled` - Optional pre-swizzled weight scales from
+///   [`swizzle_nvfp4_weight_scales`]. When provided, skips per-call swizzling.
 ///
 /// On Blackwell (SM100+) with cutlass feature: uses hardware FP4 tensor cores
 /// via CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly).
 /// On older GPUs: uses software dequant path (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [M, N] in same dtype as input
+
+/// Like [`nvfp4_matmul`] but accepts optional pre-swizzled weight scales to
+/// avoid redundant per-call swizzling on the hardware FP4 path.
 #[allow(unused)]
 pub fn nvfp4_matmul(
     input: &Tensor,
@@ -73,6 +141,7 @@ pub fn nvfp4_matmul(
     input_scale: f32,
     bias: Option<&Tensor>,
     is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -165,8 +234,14 @@ pub fn nvfp4_matmul(
                     let act_scales_swizzled =
                         Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
 
-                    let weight_scales_swizzled =
-                        Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
+                    let wscale_sw_owned;
+                    let wscale_sw_ref = if let Some(preswizzled) = weight_scale_swizzled {
+                        preswizzled
+                    } else {
+                        wscale_sw_owned =
+                            Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
+                        &wscale_sw_owned
+                    };
 
                     let input_scale_inv = if input_scale != 0.0 {
                         1.0 / input_scale
@@ -198,7 +273,7 @@ pub fn nvfp4_matmul(
                         let (scale_s, _) = scale.storage_and_layout();
                         let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
 
-                        let (wscale_sw_s, _) = weight_scales_swizzled.storage_and_layout();
+                        let (wscale_sw_s, _) = wscale_sw_ref.storage_and_layout();
                         let wscale_sw_ptr =
                             cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
 
@@ -240,15 +315,17 @@ pub fn nvfp4_matmul(
                                 ),
                             }
 
-                            ffi::nvfp4_swizzle_weight_scales(
-                                scale_ptr,
-                                wscale_sw_ptr,
-                                n as i32,
-                                k_scale_cols as i32,
-                                n_padded as i32,
-                                k_scale_padded as i32,
-                                stream,
-                            );
+                            if weight_scale_swizzled.is_none() {
+                                ffi::nvfp4_swizzle_weight_scales(
+                                    scale_ptr,
+                                    wscale_sw_ptr,
+                                    n as i32,
+                                    k_scale_cols as i32,
+                                    n_padded as i32,
+                                    k_scale_padded as i32,
+                                    stream,
+                                );
+                            }
 
                             let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
                             let ws_bytes = ws_bytes as i64;
