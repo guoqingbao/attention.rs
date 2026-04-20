@@ -107,7 +107,7 @@ fn main() -> Result<()> {
             .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
 
         if compute_cap >= 100 {
-            builder = builder.arg("-DENABLE_FP4");
+            builder = builder.arg("-DENABLE_FP4").arg("-DCUTLASS_ENABLE_GDC_FOR_SM100");
         }
         if (100..120).contains(&compute_cap) {
             builder = builder.arg("-DENABLE_FP4_SM100");

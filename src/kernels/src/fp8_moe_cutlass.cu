@@ -464,7 +464,7 @@ cutlass::Status launch_grouped_gemm(
   }
 
   if (status == cutlass::Status::kSuccess) {
-    status = gemm_op.run(stream);
+    status = gemm_op.run(args, workspace, stream, nullptr, /*launch_with_pdl=*/true);
   }
 
   // ---- cleanup ----

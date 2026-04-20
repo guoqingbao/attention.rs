@@ -284,7 +284,7 @@ cutlass::Status cutlass_gemm_caller(typename GemmKernel::Arguments const& args,
   if (init_status != cutlass::Status::kSuccess) {
     return init_status;
   }
-  return gemm_op.run(args, workspace, stream);
+  return gemm_op.run(args, workspace, stream, nullptr, /*launch_with_pdl=*/true);
 }
 
 template <

@@ -478,7 +478,7 @@ static int run_fp4_moe_grouped_gemm_sm100(
     return -1;
   }
 
-  status = gemm_op.run(args, gemm_workspace, stream);
+  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/true);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
@@ -674,7 +674,7 @@ static int run_fp4_moe_grouped_gemm_sm120(
     return -1;
   }
 
-  status = gemm_op.run(stream);
+  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/true);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
