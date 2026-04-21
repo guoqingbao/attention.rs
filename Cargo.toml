@@ -2,7 +2,7 @@
 name = "attention-rs"
 version = "0.5.2"
 edition = "2021"
-description = "High-performance LLM attention kernels and operations (PagedAttention, Flahinfer, Mamba, MoE, RoPE) for Candle, optimized for CUDA and Metal."
+description = "High-performance LLM inference kernels for Candle: PagedAttention, FlashInfer, MoE, FP8/FP4, Mamba/GDN, RoPE — CUDA and Metal."
 repository = "https://github.com/guoqingbao/attention.rs"
 homepage = "https://github.com/guoqingbao/attention.rs"
 documentation = "https://docs.rs/attention-rs"

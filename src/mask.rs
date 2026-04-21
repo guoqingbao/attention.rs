@@ -112,6 +112,11 @@ impl candle::InplaceOp1 for CausalMask {
     }
 }
 
+/// Apply a causal (lower-triangular) attention mask in-place.
+///
+/// Positions above the diagonal are set to `-inf`. When `sliding_window` is
+/// `Some(w)`, positions more than `w` tokens before the current position are
+/// also masked out.
 pub fn causal_mask(mask: &Tensor, sliding_window: Option<usize>) -> Result<()> {
     let op = CausalMask {
         sliding_window: sliding_window.unwrap_or(0) as i32,

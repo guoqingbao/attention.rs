@@ -38,7 +38,7 @@ fn pad_to(val: usize, align: usize) -> usize {
 /// * `input` - [M, K] in F16/BF16
 /// * `weight` - [N, K/2] packed U8 (2 FP4 nibbles per byte)
 /// * `scale` - [N, K/32] U8 E8M0 scales
-/// * `bias` - Optional [N] in F16/BF16
+/// * `bias` - Optional \[N\] in F16/BF16
 ///
 /// Returns [M, N] in same dtype as input
 #[allow(unused)]

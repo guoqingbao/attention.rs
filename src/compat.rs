@@ -1,5 +1,10 @@
 use candle_core::{DType, Device, Result, Shape, Storage, Tensor};
 
+/// Numerically-stable softmax over the last dimension.
+///
+/// Delegates to `candle_nn::ops::softmax_last_dim` when `candle-upstream` or
+/// `candle-custom` is active; falls back to a pure-tensor implementation when
+/// only `candle-upstream-core-only` is enabled.
 pub fn softmax_last_dim(t: &Tensor) -> Result<Tensor> {
     #[cfg(any(feature = "candle-upstream", feature = "candle-custom"))]
     {
@@ -15,6 +20,7 @@ pub fn softmax_last_dim(t: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// SiLU (Sigmoid Linear Unit) activation: `x * sigmoid(x)`.
 pub fn silu(t: &Tensor) -> Result<Tensor> {
     #[cfg(any(feature = "candle-upstream", feature = "candle-custom"))]
     {
@@ -27,6 +33,7 @@ pub fn silu(t: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// Sigmoid activation: `1 / (1 + exp(-x))`.
 pub fn sigmoid(t: &Tensor) -> Result<Tensor> {
     #[cfg(any(feature = "candle-upstream", feature = "candle-custom"))]
     {

@@ -183,8 +183,14 @@ mod cuda_sort {
     }
 }
 
+/// GPU-accelerated argsort and sort extension trait for [`Tensor`].
+///
+/// Sorts along the last dimension. On CUDA, uses CUB radix sort for high
+/// throughput; on other backends falls back to `Tensor::arg_sort_last_dim`.
 pub trait ArgSortOp {
+    /// Return the indices that would sort the last dimension.
     fn arg_sort(&self, asc: bool) -> Result<Tensor>;
+    /// Sort the last dimension, returning `(sorted_values, indices)`.
     fn sort(&self, asc: bool) -> Result<(Tensor, Tensor)>;
 }
 

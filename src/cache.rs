@@ -2,6 +2,11 @@
 use candle_core::{backend::BackendDevice, Device, Result, Storage, Tensor};
 use std::collections::HashMap;
 
+/// Copy KV-cache blocks between devices (CPU <-> GPU, GPU <-> GPU).
+///
+/// `block_mapping` maps source block indices to destination block indices.
+/// Supports CPU-to-CUDA, CUDA-to-CPU, CUDA-to-CUDA, and the equivalent Metal
+/// transfers on macOS. Accepted dtypes: F16, BF16, U8.
 pub fn swap_blocks(
     src: &Tensor,
     dst: &Tensor,
@@ -422,6 +427,9 @@ pub fn swap_blocks(
     }
 }
 
+/// Zero-fill the specified blocks in a KV cache tensor.
+///
+/// Useful for evicting stale cache entries before reuse.
 pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
     use candle_core::DType;
     use half::{bf16, f16};
