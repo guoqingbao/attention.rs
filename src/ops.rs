@@ -43,6 +43,7 @@ impl CustomOp1 for NonZero {
             CpuStorage::F16(vs) => self.nonzero(vs, layout),
             CpuStorage::F32(vs) => self.nonzero(vs, layout),
             CpuStorage::F64(vs) => self.nonzero(vs, layout),
+            _ => Vec::new(),
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;
@@ -52,7 +53,10 @@ impl CustomOp1 for NonZero {
     }
 }
 
+/// Extension trait providing `nonzero` (indices of non-zero elements) for [`Tensor`].
 pub trait NonZeroOp {
+    /// Return a 2-D tensor of shape `[nnz, ndim]` containing the multi-index
+    /// coordinates of every non-zero element.
     fn nonzero(&self) -> Result<Tensor>;
 }
 
@@ -68,8 +72,11 @@ impl NonZeroOp for Tensor {
     }
 }
 
+/// Extension trait for splitting a tensor into chunks along a given dimension.
 pub trait SplitOp {
+    /// Split into sub-tensors with sizes given by `splits` along `dim`.
     fn split<D: Dim>(&self, splits: &[usize], dim: D) -> Result<Vec<Tensor>>;
+    /// Convenience for splitting into exactly two parts.
     fn split2<D: Dim>(&self, splits: &[usize], dim: D) -> Result<(Tensor, Tensor)>;
 }
 
@@ -95,7 +102,10 @@ impl SplitOp for Tensor {
     }
 }
 
+/// Extension trait providing histogram-style `bincount` for integer tensors.
 pub trait BincountOp {
+    /// Count occurrences of each value in a 1-D non-negative integer tensor.
+    /// The output vector has length `max(max_value + 1, minlength)`.
     fn bincount(&self, minlength: u32) -> Result<Vec<u32>>;
 }
 

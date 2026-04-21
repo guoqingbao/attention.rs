@@ -1,83 +1,289 @@
+//! # attention-rs
+//!
+//! High-performance GPU kernels for LLM inference, built on
+//! [Candle](https://github.com/huggingface/candle).
+//!
+//! `attention-rs` provides production-ready CUDA and Metal implementations of the
+//! core operations needed to serve large language models at scale:
+//!
+//! - **[PagedAttention]** -- memory-efficient KV-cache attention with paged block
+//!   allocation, supporting GQA/MQA, ALiBi, sliding window, softcapping, and
+//!   FP8 KV caches.
+//! - **FlashInfer** (`flashinfer`) -- plan-then-run FlashInfer attention for both
+//!   prefill and decode, with ragged-batch and MLA variants.
+//! - **[Mixture-of-Experts](moe)** -- fused MoE GEMM for F16/BF16, FP8, NVFP4,
+//!   MXFP4, and GGUF-quantized expert weights (WMMA prefill + GEMV decode).
+//! - **[FP8 linear](fp8_linear)** -- block-scaled FP8 matrix multiplication with
+//!   FlashInfer, CUTLASS, and software-dequant paths.
+//! - **[MXFP4 linear](mxfp4_linear)** -- MX FP4 (E8M0-scaled) GEMM with hardware
+//!   CUTLASS Blackwell and software WMMA paths. CUDA + Metal.
+//! - **[NVFP4 linear](nvfp4_linear)** -- NVIDIA FP4 (E2M1 + FP8 block scales)
+//!   GEMM with FlashInfer, CUTLASS, and software paths. Blackwell SM100+.
+//! - **[Gated Delta Net](gdn)** -- Causal Conv1d, delta-rule recurrence, gated
+//!   RMSNorm, and L2 norm kernels for Qwen 3.5's linear attention layers.
+//! - **[MambaCache](mamba_cache::MambaCache)** -- slot-based state management for
+//!   Mamba / GDN convolutional and recurrent states with prefix caching.
+//! - **[Fused RoPE](fused_rope)** -- fused rotary position embeddings that
+//!   eliminate the index-select kernel. CUDA + Metal.
+//! - **[Multi-Head Latent Attention](mla)** -- paged decode/prefill and
+//!   FlashInfer-accelerated MLA for DeepSeek-style compressed KV heads.
+//! - **GPU Sampling** (`sampler`) -- fused Top-K / Top-P / temperature sampling
+//!   on CUDA with a single kernel launch.
+//!
+//! ## Quick start
+//!
+//! ```toml
+//! [dependencies]
+//! attention-rs = { version = "0.5", features = ["cuda"] }
+//! ```
+//!
+//! ## Candle compatibility
+//!
+//! By default `attention-rs` depends on upstream `candle-core 0.10` from
+//! crates.io. To use the [`guoqingbao/candle`](https://github.com/guoqingbao/candle)
+//! fork instead, disable default features and enable `candle-custom`:
+//!
+//! ```toml
+//! attention-rs = { version = "0.5", default-features = false, features = ["candle-custom", "cuda"] }
+//! ```
+//!
+//! ## Feature flags
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `candle-upstream` *(default)* | Use `candle-core`/`candle-nn` from crates.io |
+//! | `candle-custom` | Use the `guoqingbao/candle` fork |
+//! | `cuda` | Enable CUDA kernels (requires NVIDIA GPU + CUDA toolkit) |
+//! | `metal` | Enable Metal kernels (requires macOS + Apple Silicon) |
+//! | `flashattn` | Enable Flash Attention v2 integration |
+//! | `flashinfer` | Enable FlashInfer attention kernels (implies `cuda`) |
+//! | `cutlass` | Enable CUTLASS-optimized FP8/FP4 paths (SM90+) |
+//! | `trtllm` | Enable TensorRT-LLM cubin loader (implies `flashinfer`) |
+//! | `graph` | Enable CUDA graph capture support (custom fork only) |
+
+#[cfg(feature = "candle-custom")]
+extern crate candle_core_custom as candle_core;
+#[cfg(feature = "candle-custom")]
+extern crate candle_nn_custom as candle_nn;
+
+#[cfg(all(feature = "candle-upstream", feature = "candle-custom"))]
+compile_error!("Enable exactly one of `candle-upstream` or `candle-custom`, not both.");
+#[cfg(not(any(
+    feature = "candle-upstream",
+    feature = "candle-upstream-core-only",
+    feature = "candle-custom"
+)))]
+compile_error!(
+    "Enable exactly one of `candle-upstream`, `candle-upstream-core-only`, or `candle-custom`."
+);
+
 #[cfg(all(feature = "cuda", feature = "metal"))]
 compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.");
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
-compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
+/// Compatibility shims for API differences between upstream Candle and the
+/// custom fork. Prefer calling these helpers over raw `Tensor` methods when
+/// your code must compile against both Candle variants.
+pub mod compat;
 
+/// Fused Mixture-of-Experts GEMM kernels (F16/BF16, FP8, NVFP4, MXFP4, GGUF).
 pub mod moe;
+
+/// Low-level paged attention and KV-cache reshape kernels.
 pub mod paged_attention;
+
+/// Dynamic FP8 KV-cache scale tracking.
 pub mod scale_update;
+
+/// GPU workspace allocation for FlashInfer plans and CUTLASS scratch buffers.
 #[cfg(feature = "cuda")]
 pub mod workspace;
+
 use candle_core::{Device, Result, Tensor};
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
+
+/// Fused rotary position embeddings (RoPE) with index-select elimination.
 pub mod fused_rope;
+
+/// Causal attention mask generation on GPU.
 pub mod mask;
+
+/// Fused Top-K / Top-P / temperature GPU sampling.
 #[cfg(feature = "cuda")]
 pub mod sampler;
+
+/// GPU-accelerated argsort and sort for tensors.
 pub mod sort;
+
+/// Fused Top-K extraction with softmax for MoE routing.
 pub mod topk;
+
+/// Raw CUDA kernel FFI bindings (re-exported for advanced use).
 #[cfg(feature = "cuda")]
 pub use kernels;
+
+/// Raw Metal kernel bindings (re-exported for advanced use).
 #[cfg(feature = "metal")]
 pub use metal_kernels;
+
+/// KV-cache block management (swap, clear).
 pub mod cache;
+
+/// CUDA device capability queries (compute capability, SM version).
 #[cfg(feature = "cuda")]
 pub mod cuda_utils;
+
+/// FP8 (E4M3) block-scaled linear with FlashInfer, CUTLASS, and fallback paths.
 pub mod fp8_linear;
+
+/// Gated Delta Net kernels: causal conv1d, delta-rule recurrence, gated RMSNorm,
+/// and L2 normalization for linear attention architectures (Qwen 3.5).
 pub mod gdn;
+
+/// Slot-based state cache for Mamba and Gated Delta Net layers.
 pub mod mamba_cache;
+
+/// Multi-Head Latent Attention (MLA) for DeepSeek-style compressed KV heads.
 pub mod mla;
+
+/// MXFP4 (E8M0-scaled FP4) linear layer -- CUDA (WMMA + CUTLASS Blackwell) and Metal.
 pub mod mxfp4_linear;
+
+/// NVFP4 (E2M1 + FP8 block-scaled) linear layer -- CUTLASS, FlashInfer, and
+/// software dequant paths. Blackwell SM100+.
 pub mod nvfp4_linear;
+
+/// Tensor utility ops: `nonzero`, `split`, `bincount`.
 pub mod ops;
+
+/// Fused SiLU-and-multiply activation for gated FFN layers.
 pub mod silu_and_mul;
+
+/// Fused SwiGLU activation with optional alpha scaling and value clamping.
 pub mod swiglu;
 
+/// FlashInfer paged attention: plan-then-run API for prefill, decode, ragged
+/// batches, and FP8 KV caches.
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
+/// TensorRT-LLM cubin artifact downloader and loader.
 #[cfg(feature = "trtllm")]
 pub mod trtllm_cubin_loader;
 
-const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+const KV_SCALE_UPDATE_ITERATION: i32 = 128;
+
+/// Metadata for FlashInfer-style paged attention.
+///
+/// This struct carries the index structures and pre-computed plan info
+/// required by the `flashinfer` module's plan-then-run API. Populate it
+/// once per batch and pass it inside [`InputMetadata::flashinfer_metadata`].
 pub struct FlashInferMetadata {
+    /// CSR row-pointer into `indices` (device tensor, U32).
     pub indptr: Tensor,
+    /// Host-side copy of `indptr` for plan functions.
     pub indptr_host: Vec<u32>,
+    /// Flattened page indices (device tensor, U32).
     pub indices: Tensor,
+    /// Number of valid KV entries in the last page per sequence (device, U32).
     pub last_len: Tensor,
+    /// Host copy of `last_len` (needed by `flashinfer::decode_plan`).
     pub last_len_host: Option<Vec<u32>>,
+    /// Per-sequence KV lengths on host (needed by plan functions).
     pub kv_len_arr_host: Option<Vec<u32>>,
+    /// Total number of query rows across the batch (for prefill).
     pub total_num_rows: Option<u32>,
+    /// Per-token batch index (device, U32). Required for ragged prefill.
     pub batch_indices: Option<Tensor>,
+    /// Per-token position ids (device, U32). Required for ragged prefill.
     pub positions: Option<Tensor>,
+    /// Whether CUDA graph capture is active (affects workspace handling).
     pub use_cuda_graph: bool,
+    /// Pre-computed plan blob for decode (from `flashinfer::decode_plan`).
     pub decode_plan_info: Option<Vec<i64>>,
+    /// Pre-computed plan blob for prefill (from `flashinfer::prefill_plan`).
     pub prefill_plan_info: Option<Vec<i64>>,
+    /// Pre-computed plan blob for MLA decode (from `mla::mla_decode_plan`).
     pub mla_decode_plan_info: Option<Vec<i64>>,
+    /// Pre-computed plan blob for MLA prefill (from `mla::mla_prefill_plan`).
     pub mla_prefill_plan_info: Option<Vec<i64>>,
 }
 
+/// Per-forward metadata that controls attention routing and KV-cache indexing.
+///
+/// Construct one `InputMetadata` per forward call and pass it to
+/// [`PagedAttention::forward`]. The struct determines whether the call is a
+/// prefill or decode, which attention backend to use, and where to read/write
+/// KV cache blocks.
 pub struct InputMetadata {
+    /// `true` during prompt prefill, `false` during autoregressive decode.
     pub is_prefill: bool,
+    /// `true` when using Multi-Head Latent Attention (DeepSeek-style compressed KV).
     pub is_mla: bool,
+    /// Sequence IDs in the current batch (used for Mamba/GDN slot lookup).
     pub sequence_ids: Option<Vec<usize>>,
+    /// Slot mapping for Mamba/GDN state caches.
     pub mamba_slot_mapping: Option<Tensor>,
+    /// Maps each token to a flat slot index in the KV cache (device, I64).
     pub slot_mapping: Tensor,
+    /// Block table mapping sequences to KV cache block indices.
+    /// Shape: `[batch_size, max_num_blocks_per_seq]`.
     pub block_tables: Option<Tensor>,
+    /// Number of context tokens per sequence (device, U32).
     pub context_lens: Option<Tensor>,
+    /// Cumulative query sequence lengths for variable-length batches (device, U32).
     pub cu_seqlens_q: Option<Tensor>,
+    /// Cumulative key sequence lengths for variable-length batches (device, U32).
     pub cu_seqlens_k: Option<Tensor>,
+    /// Maximum query sequence length in the batch.
     pub max_seqlen_q: usize,
+    /// Maximum key sequence length in the batch.
     pub max_seqlen_k: usize,
+    /// Maximum context length across all sequences.
     pub max_context_len: usize,
+    /// Force-disable Flash Attention even when the feature is compiled in.
     pub disable_flash_attn: Option<bool>,
+    /// Per-sequence lengths on host (used by FlashInfer ragged prefill).
     pub seqlens: Option<Vec<u32>>,
+    /// FlashInfer-specific index structures and plan data.
     pub flashinfer_metadata: Option<FlashInferMetadata>,
 }
 
+/// High-level attention dispatcher with automatic backend selection.
+///
+/// `PagedAttention` manages the full attention forward pass including KV-cache
+/// writes, backend selection (FlashInfer > FlashAttn > PagedAttention > naive SDP),
+/// and FP8 KV-scale tracking. It is the primary entry point for serving attention
+/// in an inference engine.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use attention_rs::{PagedAttention, InputMetadata};
+/// use candle_core::{Device, DType, Tensor};
+///
+/// let attn = PagedAttention::new(
+///     32,        // num_attention_heads
+///     128,       // head_dim
+///     0.08838,   // scale (1/sqrt(head_dim))
+///     Some(8),   // num_key_value_heads (GQA)
+///     None,      // sliding_window
+///     Device::Cuda(0),
+///     None,      // alibi_slopes
+///     false,     // fp8_kvcache
+/// )?;
+///
+/// let output = attn.forward(
+///     &query, &key, &value,
+///     None,           // attention_mask
+///     Some(k_cache),  // key_cache
+///     Some(v_cache),  // value_cache
+///     &input_metadata,
+///     None,           // softcapping
+/// )?;
+/// ```
 #[allow(dead_code)]
 pub struct PagedAttention {
     num_attention_heads: usize,
@@ -228,6 +434,19 @@ impl PagedAttention {
         Ok(())
     }
 
+    /// Create a new `PagedAttention` instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_attention_heads` -- Total number of query heads.
+    /// * `head_dim` -- Dimension of each attention head.
+    /// * `scale` -- Softmax scaling factor, typically `1.0 / sqrt(head_dim)`.
+    /// * `num_key_value_heads` -- Number of KV heads (for GQA/MQA). Defaults to
+    ///   `num_attention_heads` when `None`.
+    /// * `sliding_window` -- Optional sliding-window size in tokens.
+    /// * `device` -- Target device for internal tensors.
+    /// * `alibi_slopes` -- Optional ALiBi bias slopes, one per query head.
+    /// * `fp8_kvcache` -- Enable dynamic FP8 KV-cache scale tracking.
     pub fn new(
         num_attention_heads: usize,
         head_dim: usize,
@@ -350,7 +569,7 @@ impl PagedAttention {
                     att = att.broadcast_add(&q_chunk_mask)?;
                 }
 
-                att = candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
+                att = crate::compat::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
                     .to_dtype(att.dtype())?;
 
                 let att_chunk = att.matmul(&value_seq)?;
@@ -484,6 +703,16 @@ impl PagedAttention {
         )
     }
 
+    /// Run the full attention forward pass with automatic backend selection.
+    ///
+    /// The dispatch order is:
+    /// 1. **FlashInfer** (if `flashinfer` feature + valid metadata + supported GQA group)
+    /// 2. **Flash Attention** (if `flashattn` feature + not disabled)
+    /// 3. **Paged Attention** (CUDA/Metal custom kernels for decode or chunked prefill)
+    /// 4. **Naive SDP** (CPU fallback for prefill without block tables)
+    ///
+    /// KV cache is written via [`paged_attention::reshape_and_cache`] as a side
+    /// effect when `key_cache` and `value_cache` are provided.
     #[allow(clippy::too_many_arguments)]
     #[allow(unused_variables)]
     #[allow(unused_mut)]

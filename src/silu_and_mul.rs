@@ -89,10 +89,7 @@ fn silu_and_mul_cuda(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
                 );
             }
             let storage = candle::CudaStorage::wrap_cuda_slice(output, dev);
-            Ok(Tensor::from_storage(
-                candle::Storage::Cuda(storage),
-                out_shape,
-            )?)
+            crate::compat::tensor_from_storage(candle::Storage::Cuda(storage), out_shape)
         }
         DType::BF16 => {
             let output = unsafe { dev.alloc::<half::bf16>(total_elems) }.w()?;
@@ -107,10 +104,7 @@ fn silu_and_mul_cuda(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
                 );
             }
             let storage = candle::CudaStorage::wrap_cuda_slice(output, dev);
-            Ok(Tensor::from_storage(
-                candle::Storage::Cuda(storage),
-                out_shape,
-            )?)
+            crate::compat::tensor_from_storage(candle::Storage::Cuda(storage), out_shape)
         }
         _ => unreachable!(),
     }
@@ -120,6 +114,6 @@ fn silu_and_mul_cuda(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
 fn silu_and_mul_cpu(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
     let gate = gate_up.narrow(candle_core::D::Minus1, 0, half_dim)?;
     let up = gate_up.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
-    let silu_gate = candle_nn::ops::silu(&gate)?;
+    let silu_gate = crate::compat::silu(&gate)?;
     silu_gate.mul(&up)
 }

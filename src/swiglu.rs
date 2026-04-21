@@ -215,10 +215,10 @@ fn gptoss_swiglu_cpu(gate: &Tensor, up: &Tensor, alpha: f32, limit: f32) -> Resu
     let gate_clamped = gate.clamp(f32::NEG_INFINITY, limit)?;
     let up_clamped = up.clamp(-limit, limit)?;
 
-    let gate_scaled = (&gate_clamped * alpha as f64)?;
-    let sigmoid_val = candle_nn::ops::sigmoid(&gate_scaled)?;
-    let glu = (&gate_clamped * &sigmoid_val)?;
+    let gate_scaled = gate_clamped.affine(alpha as f64, 0.0)?;
+    let sigmoid_val = crate::compat::sigmoid(&gate_scaled)?;
+    let glu = gate_clamped.mul(&sigmoid_val)?;
 
-    let up_plus_one = (&up_clamped + 1.0)?;
+    let up_plus_one = (up_clamped.affine(1.0, 1.0))?;
     up_plus_one.mul(&glu)
 }

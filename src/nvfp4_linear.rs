@@ -121,7 +121,7 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result
 ///   Used by the hardware FP4 path to pre-scale activation block scales during
 ///   quantization and to compute the GEMM epilogue alpha = input_scale * weight_global_scale.
 ///   Ignored by the software path (activations stay in FP16/BF16).
-/// * `bias` - Optional [N] in F16/BF16
+/// * `bias` - Optional \[N\] in F16/BF16
 /// * `weight_scale_swizzled` - Optional pre-swizzled weight scales from
 ///   [`swizzle_nvfp4_weight_scales`]. When provided, skips per-call swizzling.
 ///

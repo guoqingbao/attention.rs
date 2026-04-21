@@ -1,3 +1,6 @@
+#[cfg(feature = "candle-custom")]
+extern crate candle_core_custom as candle_core;
+
 use candle_core::{DType, MetalStorage};
 use metal::{
     Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, Function,

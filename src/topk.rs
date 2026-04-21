@@ -6,6 +6,14 @@ use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
+/// Fused Top-K extraction with softmax normalization.
+///
+/// Returns `(topk_weights, topk_indices)` where `topk_weights` are the
+/// softmax-normalized scores for the top-`topk` experts per token.
+/// Shape: `[num_tokens, topk]` each.
+///
+/// On CUDA with large batches (>64 tokens) this uses a fused GPU kernel;
+/// otherwise it falls back to an unfused softmax + argsort + gather path.
 #[cfg(feature = "cuda")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
@@ -53,12 +61,16 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         // )?;
 
         let topk_weights = candle::CudaStorage::wrap_cuda_slice(topk_weights, dev.clone());
-        let topk_weights =
-            Tensor::from_storage(candle::Storage::Cuda(topk_weights), (num_tokens, topk))?;
+        let topk_weights = crate::compat::tensor_from_storage(
+            candle::Storage::Cuda(topk_weights),
+            (num_tokens, topk),
+        )?;
 
         let topk_indices = candle::CudaStorage::wrap_cuda_slice(topk_indices, dev.clone());
-        let topk_indices =
-            Tensor::from_storage(candle::Storage::Cuda(topk_indices), (num_tokens, topk))?;
+        let topk_indices = crate::compat::tensor_from_storage(
+            candle::Storage::Cuda(topk_indices),
+            (num_tokens, topk),
+        )?;
 
         Ok((topk_weights, topk_indices))
     }
@@ -68,7 +80,7 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         cuda_fwd(logits, topk)
     } else {
         // unfused topk suitable for decoding
-        let routing_weights = candle_nn::ops::softmax_last_dim(&logits)?;
+        let routing_weights = crate::compat::softmax_last_dim(&logits)?;
         let indices = routing_weights
             .arg_sort_last_dim(false)?
             .narrow(candle::D::Minus1, 0, topk)?
@@ -79,9 +91,10 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     }
 }
 
+/// Fused Top-K extraction with softmax normalization (non-CUDA fallback).
 #[cfg(not(feature = "cuda"))]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
-    let routing_weights = candle_nn::ops::softmax_last_dim(&logits)?;
+    let routing_weights = crate::compat::softmax_last_dim(&logits)?;
     let indices = routing_weights
         .arg_sort_last_dim(false)?
         .narrow(candle::D::Minus1, 0, topk)?

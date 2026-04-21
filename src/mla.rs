@@ -67,11 +67,11 @@ fn mla_flashinfer_dtype(dtype: DType) -> candle_core::Result<u32> {
 
 /// Write per-token ckv and k_pe into paged MLA cache using slot_mapping.
 ///
-/// ckv: [num_tokens, kv_lora_rank]
-/// k_pe: [num_tokens, kpe_head_dim]
-/// ckv_cache: [num_blocks, block_size, kv_lora_rank]
-/// kpe_cache: [num_blocks, block_size, kpe_head_dim]
-/// slot_mapping: [num_tokens] (i64)
+/// * `ckv` -- \[num_tokens, kv_lora_rank\]
+/// * `k_pe` -- \[num_tokens, kpe_head_dim\]
+/// * `ckv_cache` -- \[num_blocks, block_size, kv_lora_rank\]
+/// * `kpe_cache` -- \[num_blocks, block_size, kpe_head_dim\]
+/// * `slot_mapping` -- \[num_tokens\] (i64)
 pub fn concat_and_cache_mla(
     ckv: &Tensor,
     k_pe: &Tensor,
@@ -133,6 +133,12 @@ pub fn concat_and_cache_mla(
     {
         let _ = (ckv, k_pe, ckv_cache, kpe_cache, slot_mapping);
         candle_core::bail!("concat_and_cache_mla not yet implemented for Metal")
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        let _ = (ckv, k_pe, ckv_cache, kpe_cache, slot_mapping);
+        candle_core::bail!("concat_and_cache_mla requires cuda or metal feature")
     }
 }
 
