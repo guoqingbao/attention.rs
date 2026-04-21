@@ -114,7 +114,7 @@ fn resolve_rope_layout(q: &Tensor, k: &Tensor) -> Result<RopeLayout> {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(all(not(feature = "cuda"), feature = "metal"))]
 fn launch_fused_rope_metal(
     q: &Tensor,
     k: &Tensor,
@@ -926,7 +926,7 @@ impl FusedRope {
     // ========================================================================
 
     /// Apply fused rotary embedding in-place (Metal version)
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     #[allow(unused)]
     pub fn apply_inplace(
         q: &Tensor,
@@ -950,7 +950,7 @@ impl FusedRope {
 
     /// Apply fused rotary embedding in-place to only the leading `rotary_dim`
     /// channels of Q/K tensors on non-CUDA backends.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply_inplace_partial(
         q: &Tensor,
         k: &Tensor,
@@ -964,7 +964,7 @@ impl FusedRope {
     }
 
     /// Apply fused rotary embedding (Metal version) - returns new tensors
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply(
         q: &Tensor,
         k: &Tensor,
@@ -973,7 +973,6 @@ impl FusedRope {
         positions: &Tensor,
         is_interleaved: bool,
     ) -> Result<(Tensor, Tensor)> {
-        // Clone tensors (Metal will modify in-place)
         let q_out = q.contiguous()?.clone();
         let k_out = k.contiguous()?.clone();
         Self::apply_inplace(&q_out, &k_out, cos, sin, positions, is_interleaved)?;
@@ -981,7 +980,7 @@ impl FusedRope {
     }
 
     /// Convenience: non-interleaved RoPE (Metal)
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply_rope(
         q: &Tensor,
         k: &Tensor,
@@ -993,7 +992,7 @@ impl FusedRope {
     }
 
     /// Convenience: interleaved RoPE (Metal)
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply_rope_i(
         q: &Tensor,
         k: &Tensor,
@@ -1005,7 +1004,7 @@ impl FusedRope {
     }
 
     /// Convenience: non-interleaved RoPE in-place (Metal)
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply_rope_inplace(
         q: &Tensor,
         k: &Tensor,
@@ -1017,7 +1016,7 @@ impl FusedRope {
     }
 
     /// Convenience: interleaved RoPE in-place (Metal)
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     pub fn apply_rope_i_inplace(
         q: &Tensor,
         k: &Tensor,

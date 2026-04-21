@@ -43,6 +43,7 @@ impl CustomOp1 for NonZero {
             CpuStorage::F16(vs) => self.nonzero(vs, layout),
             CpuStorage::F32(vs) => self.nonzero(vs, layout),
             CpuStorage::F64(vs) => self.nonzero(vs, layout),
+            _ => Vec::new(),
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;

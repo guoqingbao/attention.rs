@@ -578,7 +578,8 @@ pub fn moe_gemm(
         }
 
         let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
-        let output = Tensor::from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
+        let output =
+            crate::compat::tensor_from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
 
         Ok(output)
     }
@@ -937,7 +938,10 @@ pub fn moe_gemm_fp8(
                 }
 
                 let output = candle::CudaStorage::wrap_cuda_slice(output.clone(), dev.clone());
-                let output = Tensor::from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
+                let output = crate::compat::tensor_from_storage(
+                    candle::Storage::Cuda(output),
+                    (size_m, size_n),
+                )?;
                 return Ok(output);
             }
         }
@@ -995,7 +999,8 @@ pub fn moe_gemm_fp8(
         }
 
         let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
-        let output = Tensor::from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
+        let output =
+            crate::compat::tensor_from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
 
         Ok(output)
     }
@@ -2410,7 +2415,8 @@ pub fn moe_gemm_gguf(
         }
 
         let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
-        let output = Tensor::from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
+        let output =
+            crate::compat::tensor_from_storage(candle::Storage::Cuda(output), (size_m, size_n))?;
 
         Ok(output)
     }

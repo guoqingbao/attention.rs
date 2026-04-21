@@ -842,8 +842,8 @@ impl MambaCache {
 
     pub fn reset_all(&mut self) -> Result<()> {
         for layer_idx in 0..self.num_gdn_layers {
-            self.conv_states[layer_idx].zero_()?;
-            self.recurrent_states[layer_idx].zero_()?;
+            crate::compat::tensor_zero_inplace(&self.conv_states[layer_idx])?;
+            crate::compat::tensor_zero_inplace(&self.recurrent_states[layer_idx])?;
         }
         self.seq_to_slot.clear();
         self.free_slots = (0..self.max_batch_size).rev().collect();

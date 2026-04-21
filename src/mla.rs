@@ -134,6 +134,12 @@ pub fn concat_and_cache_mla(
         let _ = (ckv, k_pe, ckv_cache, kpe_cache, slot_mapping);
         candle_core::bail!("concat_and_cache_mla not yet implemented for Metal")
     }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        let _ = (ckv, k_pe, ckv_cache, kpe_cache, slot_mapping);
+        candle_core::bail!("concat_and_cache_mla requires cuda or metal feature")
+    }
 }
 
 /// Partition size for split-K decode (must match CUDA kernel constant).

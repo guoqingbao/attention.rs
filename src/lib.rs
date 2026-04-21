@@ -1,9 +1,23 @@
+#[cfg(feature = "candle-custom")]
+extern crate candle_core_custom as candle_core;
+#[cfg(feature = "candle-custom")]
+extern crate candle_nn_custom as candle_nn;
+
+#[cfg(all(feature = "candle-upstream", feature = "candle-custom"))]
+compile_error!("Enable exactly one of `candle-upstream` or `candle-custom`, not both.");
+#[cfg(not(any(
+    feature = "candle-upstream",
+    feature = "candle-upstream-core-only",
+    feature = "candle-custom"
+)))]
+compile_error!(
+    "Enable exactly one of `candle-upstream`, `candle-upstream-core-only`, or `candle-custom`."
+);
+
 #[cfg(all(feature = "cuda", feature = "metal"))]
 compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.");
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
-compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
-
+pub mod compat;
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
@@ -350,7 +364,7 @@ impl PagedAttention {
                     att = att.broadcast_add(&q_chunk_mask)?;
                 }
 
-                att = candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
+                att = crate::compat::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
                     .to_dtype(att.dtype())?;
 
                 let att_chunk = att.matmul(&value_seq)?;
