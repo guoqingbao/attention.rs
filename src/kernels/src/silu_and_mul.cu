@@ -8,13 +8,22 @@
 //
 // Given a contiguous [M, 2*N] tensor (gate_up), computes:
 //   out[i, j] = silu(gate_up[i, j]) * gate_up[i, j + N]
-// where silu(x) = x / (1 + exp(-x))
+// where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 //
 // This replaces three separate ops: narrow+contiguous (gate), narrow+contiguous (up),
 // silu(gate), gate*up — saving 3 kernel launches and 3 intermediate allocations.
 
+// Numerically stable SiLU implementation:
+// For x >= 0: silu(x) = x / (1 + exp(-x))      -- exp(-x) is small, no overflow
+// For x < 0:  silu(x) = x * exp(x) / (1 + exp(x)) -- exp(x) is small, no overflow
+// This avoids precision loss from large exp() values.
 __device__ __forceinline__ float silu_f(float x) {
-  return x / (1.0f + expf(-x));
+  if (x >= 0.0f) {
+    return x / (1.0f + expf(-x));
+  } else {
+    float ex = expf(x);
+    return x * ex / (1.0f + ex);
+  }
 }
 
 template <typename T>
