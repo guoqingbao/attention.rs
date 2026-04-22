@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
-    if compute_cap >= 100 {
+    if compute_cap >= 100 && !std::env::var("NO_HARDWARE_FP4_DECODING").is_ok() {
         builder = builder.arg("-DNVFP4_BLACKWELL");
     }
 
