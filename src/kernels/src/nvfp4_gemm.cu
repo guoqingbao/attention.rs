@@ -130,6 +130,23 @@ __device__ __forceinline__ void dequant_store_8(int q4, float scale,
   dst[7] = (float)(int8_t)(w.y >> 24) * scale;
 }
 
+// Unscaled variant: stores raw LUT integer values as float.
+// Used by WMMA kernels to defer scale multiplication to FP32 post-accumulation.
+__device__ __forceinline__ void dequant_store_8_unscaled(int q4,
+                                                         uint32_t LUT0, uint32_t LUT1,
+                                                         uint32_t LUT2, uint32_t LUT3,
+                                                         float *dst) {
+  int2 w = get_int_from_table_16(q4, LUT0, LUT1, LUT2, LUT3);
+  dst[0] = (float)(int8_t)(w.x);
+  dst[1] = (float)(int8_t)(w.y);
+  dst[2] = (float)(int8_t)(w.x >> 8);
+  dst[3] = (float)(int8_t)(w.y >> 8);
+  dst[4] = (float)(int8_t)(w.x >> 16);
+  dst[5] = (float)(int8_t)(w.y >> 16);
+  dst[6] = (float)(int8_t)(w.x >> 24);
+  dst[7] = (float)(int8_t)(w.y >> 24);
+}
+
 // Alignment-safe uint2 load from byte-packed weight arrays.
 // V100 (SM70) can fault on misaligned uint2 loads from uint8_t* pointers;
 // SM80+ handles this fine. memcpy is optimized to a single LDG by NVCC.
@@ -287,13 +304,15 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   float acc = 0.0f;
 
+  // Deferred-scale dot product: accumulate input * weight_unit (unscaled) per
+  // 16-element block, then multiply once by block_scale. This avoids baking
+  // the scale into each weight element before fmaf, which would introduce a
+  // rounding on every element. Instead we get one rounding per 16-element block.
   constexpr int ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE; // 32
   for (int k = lane_id * ELEMS_PER_LANE; k < K;
        k += WARP_SIZE * ELEMS_PER_LANE) {
 
 #ifdef NVFP4_HW_DEQUANT
-    // --- Blackwell hardware path: fused dequant + dot product ---
-    // No * 0.5f: HW intrinsics produce exact FP4 E2M1 float values directly.
     {
       float block_scale =
           fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
@@ -313,7 +332,6 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       acc += hw_dot_16(w_vec2, block_scale2, in2);
     }
 #else
-    // --- Legacy LUT path (SM < 100) ---
     {
       float block_scale =
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
@@ -322,25 +340,29 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       uint2 w_vec = load_uint2_safe(w_row + k / 2);
       const float *in = s_input + (k + (k / WARP_SIZE));
 
+      // Accumulate unscaled dot product for this 16-element block
+      float block_acc = 0.0f;
       int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in[0], (float)(int8_t)(w0.x) * block_scale, acc);
-      acc = fmaf(in[1], (float)(int8_t)(w0.y) * block_scale, acc);
-      acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8) * block_scale, acc);
-      acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8) * block_scale, acc);
-      acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16) * block_scale, acc);
-      acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16) * block_scale, acc);
-      acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24) * block_scale, acc);
-      acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24) * block_scale, acc);
+      block_acc = fmaf(in[0], (float)(int8_t)(w0.x), block_acc);
+      block_acc = fmaf(in[1], (float)(int8_t)(w0.y), block_acc);
+      block_acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8), block_acc);
+      block_acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8), block_acc);
+      block_acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16), block_acc);
+      block_acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16), block_acc);
+      block_acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24), block_acc);
+      block_acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24), block_acc);
 
       int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in[8], (float)(int8_t)(w1.x) * block_scale, acc);
-      acc = fmaf(in[9], (float)(int8_t)(w1.y) * block_scale, acc);
-      acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8) * block_scale, acc);
-      acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8) * block_scale, acc);
-      acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16) * block_scale, acc);
-      acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16) * block_scale, acc);
-      acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24) * block_scale, acc);
-      acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24) * block_scale, acc);
+      block_acc = fmaf(in[8], (float)(int8_t)(w1.x), block_acc);
+      block_acc = fmaf(in[9], (float)(int8_t)(w1.y), block_acc);
+      block_acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8), block_acc);
+      block_acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8), block_acc);
+      block_acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16), block_acc);
+      block_acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16), block_acc);
+      block_acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24), block_acc);
+      block_acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24), block_acc);
+
+      acc = fmaf(block_acc, block_scale, acc);
     }
 
     int k2 = k + NVFP4_BLOCK_SIZE;
@@ -352,25 +374,28 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
       const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
+      float block_acc2 = 0.0f;
       int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in2[0], (float)(int8_t)(w2a.x) * block_scale2, acc);
-      acc = fmaf(in2[1], (float)(int8_t)(w2a.y) * block_scale2, acc);
-      acc = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8) * block_scale2, acc);
-      acc = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8) * block_scale2, acc);
-      acc = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16) * block_scale2, acc);
-      acc = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16) * block_scale2, acc);
-      acc = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24) * block_scale2, acc);
-      acc = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24) * block_scale2, acc);
+      block_acc2 = fmaf(in2[0], (float)(int8_t)(w2a.x), block_acc2);
+      block_acc2 = fmaf(in2[1], (float)(int8_t)(w2a.y), block_acc2);
+      block_acc2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), block_acc2);
+      block_acc2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), block_acc2);
+      block_acc2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), block_acc2);
+      block_acc2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), block_acc2);
+      block_acc2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), block_acc2);
+      block_acc2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), block_acc2);
 
       int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in2[8], (float)(int8_t)(w2b.x) * block_scale2, acc);
-      acc = fmaf(in2[9], (float)(int8_t)(w2b.y) * block_scale2, acc);
-      acc = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8) * block_scale2, acc);
-      acc = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8) * block_scale2, acc);
-      acc = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16) * block_scale2, acc);
-      acc = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16) * block_scale2, acc);
-      acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
-      acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
+      block_acc2 = fmaf(in2[8], (float)(int8_t)(w2b.x), block_acc2);
+      block_acc2 = fmaf(in2[9], (float)(int8_t)(w2b.y), block_acc2);
+      block_acc2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), block_acc2);
+      block_acc2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), block_acc2);
+      block_acc2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), block_acc2);
+      block_acc2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), block_acc2);
+      block_acc2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), block_acc2);
+      block_acc2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), block_acc2);
+
+      acc = fmaf(block_acc2, block_scale2, acc);
     }
 #endif // NVFP4_HW_DEQUANT
   }
@@ -652,7 +677,6 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         acc += hw_dot_16(w_vec2, block_scale2, in2);
       }
 #else
-      // --- First NVFP4 block of 16 ---
       {
         float block_scale =
             dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
@@ -661,28 +685,30 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         uint2 w_vec = load_uint2_safe(w_row + k / 2);
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
 
+        float block_acc = 0.0f;
         int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in[0], (float)(int8_t)(w0.x) * block_scale, acc);
-        acc = fmaf(in[1], (float)(int8_t)(w0.y) * block_scale, acc);
-        acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8) * block_scale, acc);
-        acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8) * block_scale, acc);
-        acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16) * block_scale, acc);
-        acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16) * block_scale, acc);
-        acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24) * block_scale, acc);
-        acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24) * block_scale, acc);
+        block_acc = fmaf(in[0], (float)(int8_t)(w0.x), block_acc);
+        block_acc = fmaf(in[1], (float)(int8_t)(w0.y), block_acc);
+        block_acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8), block_acc);
+        block_acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8), block_acc);
+        block_acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16), block_acc);
+        block_acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16), block_acc);
+        block_acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24), block_acc);
+        block_acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24), block_acc);
 
         int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in[8], (float)(int8_t)(w1.x) * block_scale, acc);
-        acc = fmaf(in[9], (float)(int8_t)(w1.y) * block_scale, acc);
-        acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8) * block_scale, acc);
-        acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8) * block_scale, acc);
-        acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16) * block_scale, acc);
-        acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16) * block_scale, acc);
-        acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24) * block_scale, acc);
-        acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24) * block_scale, acc);
+        block_acc = fmaf(in[8], (float)(int8_t)(w1.x), block_acc);
+        block_acc = fmaf(in[9], (float)(int8_t)(w1.y), block_acc);
+        block_acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8), block_acc);
+        block_acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8), block_acc);
+        block_acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16), block_acc);
+        block_acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16), block_acc);
+        block_acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24), block_acc);
+        block_acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24), block_acc);
+
+        acc = fmaf(block_acc, block_scale, acc);
       }
 
-      // --- Second NVFP4 block of 16 ---
       int k2 = k + NVFP4_BLOCK_SIZE;
       if (k2 < K) {
         float block_scale2 =
@@ -692,25 +718,28 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
         const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
 
+        float block_acc2 = 0.0f;
         int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in2[0], (float)(int8_t)(w2a.x) * block_scale2, acc);
-        acc = fmaf(in2[1], (float)(int8_t)(w2a.y) * block_scale2, acc);
-        acc = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8) * block_scale2, acc);
-        acc = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8) * block_scale2, acc);
-        acc = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16) * block_scale2, acc);
-        acc = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16) * block_scale2, acc);
-        acc = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24) * block_scale2, acc);
-        acc = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24) * block_scale2, acc);
+        block_acc2 = fmaf(in2[0], (float)(int8_t)(w2a.x), block_acc2);
+        block_acc2 = fmaf(in2[1], (float)(int8_t)(w2a.y), block_acc2);
+        block_acc2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), block_acc2);
+        block_acc2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), block_acc2);
+        block_acc2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), block_acc2);
+        block_acc2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), block_acc2);
+        block_acc2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), block_acc2);
+        block_acc2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), block_acc2);
 
         int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in2[8], (float)(int8_t)(w2b.x) * block_scale2, acc);
-        acc = fmaf(in2[9], (float)(int8_t)(w2b.y) * block_scale2, acc);
-        acc = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8) * block_scale2, acc);
-        acc = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8) * block_scale2, acc);
-        acc = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16) * block_scale2, acc);
-        acc = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16) * block_scale2, acc);
-        acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
-        acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
+        block_acc2 = fmaf(in2[8], (float)(int8_t)(w2b.x), block_acc2);
+        block_acc2 = fmaf(in2[9], (float)(int8_t)(w2b.y), block_acc2);
+        block_acc2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), block_acc2);
+        block_acc2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), block_acc2);
+        block_acc2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), block_acc2);
+        block_acc2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), block_acc2);
+        block_acc2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), block_acc2);
+        block_acc2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), block_acc2);
+
+        acc = fmaf(block_acc2, block_scale2, acc);
       }
 #endif // NVFP4_HW_DEQUANT
     }
@@ -757,6 +786,19 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 
 #define WMMA_BK 16
 
+// Deferred-scale WMMA NVFP4 GEMM: stores unscaled unit FP4 values into B-tile
+// (exact in FP16) and applies per-column block scales in FP32 after each
+// mma_sync, eliminating FP16 truncation of scaled weights.
+//
+// Why this matters: the original kernel multiplied dequantized FP4 values by
+// block_scale * global_scale and truncated to FP16/BF16 before WMMA. For large
+// K (many K-tiles), truncation errors in each B-tile accumulate and degrade
+// output precision — causing repetitive text at 32K+ context lengths.
+//
+// This version stores exact unit FP4 values (small integers / exact halfs) in
+// the B-tile, runs WMMA unscaled, then applies the block scale in FP32 after
+// store_matrix_sync. Cost: one extra shared-memory pass per K-step, which is
+// negligible vs. the WMMA compute and global memory traffic.
 template <typename T, int BM, int BN>
 __global__ void nvfp4_wmma_matmul_kernel(
     const T *__restrict__ input,
@@ -787,15 +829,18 @@ __global__ void nvfp4_wmma_matmul_kernel(
   const int warp_row = (warp_id / 2) * 32;
   const int warp_col = (warp_id % 2) * 32;
 
-  fragment<accumulator, 16, 16, 16, float> acc[2][2];
-  #pragma unroll
-  for (int i = 0; i < 2; i++)
-    #pragma unroll
-    for (int j = 0; j < 2; j++)
-      fill_fragment(acc[i][j], 0.0f);
-
   __shared__ T s_a[BM][WMMA_BK + 4];
   __shared__ T s_b[BN][WMMA_BK + 4];
+  __shared__ float s_bscale[BN];
+  // s_tmp: scratch for store_matrix_sync of unscaled WMMA partial
+  // s_out: FP32 running accumulator across K-steps
+  __shared__ float s_tmp[BM][BN + 4];
+  __shared__ float s_out[BM][BN + 4];
+
+  for (int i = tid; i < BM * (BN + 4); i += 128) {
+    reinterpret_cast<float*>(s_out)[i] = 0.0f;
+  }
+  __syncthreads();
 
   for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
 
@@ -808,16 +853,27 @@ __global__ void nvfp4_wmma_matmul_kernel(
       s_a[r][c] = (gr < M && gc < K) ? input[(size_t)gr * K + gc] : T(0);
     }
 
+    for (int i = tid; i < BN; i += 128) {
+      int gn = bx * BN + i;
+      if (gn < N) {
+        float bs = fp8_scale_to_float(
+            __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
+            * weight_global_scale;
+#ifndef NVFP4_HW_DEQUANT
+        bs *= 0.5f;
+#endif
+        s_bscale[i] = bs;
+      } else {
+        s_bscale[i] = 0.0f;
+      }
+    }
+
     {
       int row = tid / 2;
       int sub = tid & 1;
       int gn = bx * BN + row;
 
       if (row < BN && gn < N && k_step < K) {
-        float raw_scale = fp8_scale_to_float(
-            __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
-            * weight_global_scale;
-
         uint2 w_vec = load_uint2_safe(
             &weight[(size_t)gn * half_k + k_step / 2]);
 
@@ -831,17 +887,16 @@ __global__ void nvfp4_wmma_matmul_kernel(
               static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
           float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
           if constexpr (std::is_same_v<T, __half>) {
-            s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+            s_b[row][col_base + j * 2]     = __float2half(f2.x);
+            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y);
           } else {
-            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x);
+            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y);
           }
         }
 #else
-        float lut_scale = raw_scale * 0.5f;
         float dq[8];
-        dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
+        dequant_store_8_unscaled(word, LUT0, LUT1, LUT2, LUT3, dq);
         #pragma unroll
         for (int j = 0; j < 8; j++) {
           if constexpr (std::is_same_v<T, __half>)
@@ -860,9 +915,15 @@ __global__ void nvfp4_wmma_matmul_kernel(
 
     __syncthreads();
 
-    // --- WMMA compute ---
+    // WMMA: unscaled partial into temp accumulators
     fragment<matrix_a, 16, 16, 16, T, row_major> a_frag;
     fragment<matrix_b, 16, 16, 16, T, col_major> b_frag;
+    fragment<accumulator, 16, 16, 16, float> tmp[2][2];
+    #pragma unroll
+    for (int fi = 0; fi < 2; fi++)
+      #pragma unroll
+      for (int fj = 0; fj < 2; fj++)
+        fill_fragment(tmp[fi][fj], 0.0f);
 
     #pragma unroll
     for (int fi = 0; fi < 2; fi++) {
@@ -870,23 +931,29 @@ __global__ void nvfp4_wmma_matmul_kernel(
       for (int fj = 0; fj < 2; fj++) {
         load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][0], WMMA_BK + 4);
         load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][0], WMMA_BK + 4);
-        mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
+        mma_sync(tmp[fi][fj], a_frag, b_frag, tmp[fi][fj]);
       }
+    }
+
+    // Store unscaled partial to s_tmp
+    #pragma unroll
+    for (int fi = 0; fi < 2; fi++)
+      #pragma unroll
+      for (int fj = 0; fj < 2; fj++)
+        store_matrix_sync(&s_tmp[warp_row + fi * 16][warp_col + fj * 16],
+                          tmp[fi][fj], BN + 4, mem_row_major);
+    __syncthreads();
+
+    // Apply per-column block scale in FP32 and accumulate into s_out
+    for (int i = tid; i < BM * BN; i += 128) {
+      int r = i / BN;
+      int c = i % BN;
+      s_out[r][c] += s_tmp[r][c] * s_bscale[c];
     }
     __syncthreads();
   }
 
-  // --- Store output: from accumulators through shared memory ---
-  __shared__ float s_out[BM][BN + 4];
-
-  #pragma unroll
-  for (int fi = 0; fi < 2; fi++)
-    #pragma unroll
-    for (int fj = 0; fj < 2; fj++)
-      store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
-                        acc[fi][fj], BN + 4, mem_row_major);
-  __syncthreads();
-
+  // Write final FP32 results to output
   for (int i = tid; i < BM * BN; i += 128) {
     int r = i / BN;
     int c = i % BN;
@@ -1062,10 +1129,10 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
 
 
 // ============================================================================
-// WMMA-based grouped MoE GEMM for NVFP4 (SM80+)
+// WMMA-based grouped MoE GEMM for NVFP4 (SM80+) — deferred-scale variant
 //
-// Each block handles one expert segment (sorted tokens) × one N-tile.
-// B-tile loads dequantize NVFP4 weights into shared memory, then uses WMMA.
+// Same deferred-scale approach as the dense WMMA kernel: stores unscaled unit
+// FP4 values in B-tile, applies per-column block scales in FP32 after WMMA.
 //
 // Grid: (num_experts, ceil(N/N_BLK))
 // Block: 128 threads (4 warps), 2×2 warp layout → 32×32 output tile.
@@ -1122,19 +1189,28 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
     const int warp_m_idx = warp_id / 2;
     const int warp_n_idx = warp_id % 2;
 
+    // Shared memory layout:
+    //   s_a:      [M_BLK, K_BLK]       — A-tile (input activations)
+    //   s_b:      [N_BLK, K_BLK + 4]   — B-tile (unscaled unit FP4 weights)
+    //   s_bscale: [N_BLK]              — per-column block scales for this K-step
+    //   s_tmp:    [M_BLK, N_BLK]       — scratch for store_matrix_sync
+    //   s_c:      [M_BLK, N_BLK]       — FP32 running accumulator
     extern __shared__ uint8_t smem_raw[];
-    T* s_a = reinterpret_cast<T*>(smem_raw);                       // [M_BLK, K_BLK]
-    T* s_b = s_a + MOE_M_BLK * MOE_WMMA_K;                        // [N_BLK, K_BLK + 4]
-    float* s_c = reinterpret_cast<float*>(s_b + MOE_N_BLK * (MOE_WMMA_K + 4));  // [M_BLK, N_BLK]
+    T* s_a = reinterpret_cast<T*>(smem_raw);
+    T* s_b = s_a + MOE_M_BLK * MOE_WMMA_K;
+    constexpr int B_STRIDE = MOE_WMMA_K + 4;
+    float* s_bscale = reinterpret_cast<float*>(s_b + MOE_N_BLK * B_STRIDE);
+    float* s_tmp = s_bscale + MOE_N_BLK;
+    float* s_c = s_tmp + MOE_M_BLK * MOE_N_BLK;
 
     for (int m_base = 0; m_base < num_rows; m_base += MOE_M_BLK) {
-        fragment<accumulator, 16, 16, 16, float> c_frag;
-        fill_fragment(c_frag, 0.0f);
+        // Zero the per-M-tile FP32 accumulator
+        for (int i = tid; i < MOE_M_BLK * MOE_N_BLK; i += MOE_THREADS) {
+            s_c[i] = 0.0f;
+        }
+        __syncthreads();
 
         for (int k_base = 0; k_base < size_k; k_base += MOE_WMMA_K) {
-            // Load A tile: inputs for this expert segment
-            // sorted_token_ids maps to flat [num_tokens * topk] indices.
-            // The actual input row = tok_idx / topk (input shape: [num_input_rows, K])
             constexpr int A_ELEMS = MOE_M_BLK * MOE_WMMA_K;
             for (int i = tid; i < A_ELEMS; i += MOE_THREADS) {
                 int m_local = i / MOE_WMMA_K;
@@ -1151,18 +1227,29 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                 }
             }
 
-            constexpr int B_ROWS = MOE_N_BLK;
-            constexpr int B_STRIDE = MOE_WMMA_K + 4;
-            for (int i = tid; i < B_ROWS * 2; i += MOE_THREADS) {
+            // Load block scales for this K-tile
+            for (int i = tid; i < MOE_N_BLK; i += MOE_THREADS) {
+                int gn = n_base + i;
+                if (gn < size_n) {
+                    float bs = fp8_scale_to_float(
+                        __ldg(&weight_scales[(size_t)expert_id * size_n * scale_stride +
+                                             (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
+                        * global_scale;
+#ifndef NVFP4_HW_DEQUANT
+                    bs *= 0.5f;
+#endif
+                    s_bscale[i] = bs;
+                } else {
+                    s_bscale[i] = 0.0f;
+                }
+            }
+
+            // Load B-tile: unscaled unit FP4 values
+            for (int i = tid; i < MOE_N_BLK * 2; i += MOE_THREADS) {
                 int row = i / 2;
                 int sub = i & 1;
                 int gn = n_base + row;
                 if (gn < size_n && k_base < size_k) {
-                    float raw_scale = fp8_scale_to_float(
-                        __ldg(&weight_scales[(size_t)expert_id * size_n * scale_stride +
-                                             (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
-                        * global_scale;
-
                     uint2 w_vec = load_uint2_safe(
                         &weights[(size_t)expert_id * size_n * half_k + (size_t)gn * half_k + k_base / 2]);
 
@@ -1176,17 +1263,16 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                             static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
                         float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
                         if constexpr (std::is_same_v<T, __half>) {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y);
                         } else {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y);
                         }
                     }
 #else
-                    float lut_scale = raw_scale * 0.5f;
                     float dq[8];
-                    dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
+                    dequant_store_8_unscaled(word, LUT0, LUT1, LUT2, LUT3, dq);
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         if constexpr (std::is_same_v<T, __half>)
@@ -1205,21 +1291,31 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
 
             __syncthreads();
 
+            // WMMA: unscaled partial into temp accumulator
             fragment<matrix_a, 16, 16, 16, T, row_major> a_frag;
             fragment<matrix_b, 16, 16, 16, T, col_major> b_frag;
+            fragment<accumulator, 16, 16, 16, float> tmp_frag;
+            fill_fragment(tmp_frag, 0.0f);
 
             load_matrix_sync(a_frag, s_a + warp_m_idx * 16 * MOE_WMMA_K, MOE_WMMA_K);
             load_matrix_sync(b_frag, s_b + warp_n_idx * 16 * B_STRIDE, B_STRIDE);
-            mma_sync(c_frag, a_frag, b_frag, c_frag);
+            mma_sync(tmp_frag, a_frag, b_frag, tmp_frag);
 
+            // Store unscaled partial to s_tmp
+            store_matrix_sync(s_tmp + warp_m_idx * 16 * MOE_N_BLK + warp_n_idx * 16,
+                              tmp_frag, MOE_N_BLK, mem_row_major);
+            __syncthreads();
+
+            // Apply per-column block scale in FP32 and accumulate into s_c
+            for (int i = tid; i < MOE_M_BLK * MOE_N_BLK; i += MOE_THREADS) {
+                int r = i / MOE_N_BLK;
+                int c = i % MOE_N_BLK;
+                s_c[r * MOE_N_BLK + c] += s_tmp[r * MOE_N_BLK + c] * s_bscale[c];
+            }
             __syncthreads();
         }
 
-        // Store accumulated results
-        store_matrix_sync(s_c + warp_m_idx * 16 * MOE_N_BLK + warp_n_idx * 16,
-                          c_frag, MOE_N_BLK, mem_row_major);
-        __syncthreads();
-
+        // Write final results
         constexpr int C_ELEMS = MOE_M_BLK * MOE_N_BLK;
         for (int i = tid; i < C_ELEMS; i += MOE_THREADS) {
             int m_local = i / MOE_N_BLK;
@@ -1260,7 +1356,8 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
   dim3 block(MOE_THREADS);
   size_t smem = MOE_M_BLK * MOE_WMMA_K * sizeof(__half)
               + MOE_N_BLK * (MOE_WMMA_K + 4) * sizeof(__half)
-              + MOE_M_BLK * MOE_N_BLK * sizeof(float);
+              + MOE_N_BLK * sizeof(float)
+              + 2 * MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__half><<<grid, block, smem, stream>>>(
       input, weights, weight_scales, weight_global_scales,
       sorted_token_ids, expert_offsets, topk_weights,
@@ -1283,7 +1380,8 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
   dim3 block(MOE_THREADS);
   size_t smem = MOE_M_BLK * MOE_WMMA_K * sizeof(__nv_bfloat16)
               + MOE_N_BLK * (MOE_WMMA_K + 4) * sizeof(__nv_bfloat16)
-              + MOE_M_BLK * MOE_N_BLK * sizeof(float);
+              + MOE_N_BLK * sizeof(float)
+              + 2 * MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__nv_bfloat16><<<grid, block, smem, stream>>>(
       input, weights, weight_scales, weight_global_scales,
       sorted_token_ids, expert_offsets, topk_weights,
