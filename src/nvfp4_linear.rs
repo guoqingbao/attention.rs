@@ -206,14 +206,14 @@ pub fn nvfp4_matmul(
 
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
-                && is_prefill
+                && m > 32
                 && n % 32 == 0
                 && k % 32 == 0;
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && is_prefill
+                && m > 32
                 && n % 32 == 0
                 && k % 32 == 0;
 
@@ -235,13 +235,10 @@ pub fn nvfp4_matmul(
                     let act_scales_swizzled =
                         Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
 
-                    let wscale_sw_owned;
                     let wscale_sw_ref = if let Some(preswizzled) = weight_scale_swizzled {
                         preswizzled
                     } else {
-                        wscale_sw_owned =
-                            Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
-                        &wscale_sw_owned
+                        candle_core::bail!("nvfp4_matmul requires pre-swizzled weight scales for long-context inference. Call swizzle_nvfp4_weight_scales at model load time.");
                     };
 
                     let input_scale_inv = if input_scale != 0.0 {
@@ -316,17 +313,9 @@ pub fn nvfp4_matmul(
                                 ),
                             }
 
-                            if weight_scale_swizzled.is_none() {
-                                ffi::nvfp4_swizzle_weight_scales(
-                                    scale_ptr,
-                                    wscale_sw_ptr,
-                                    n as i32,
-                                    k_scale_cols as i32,
-                                    n_padded as i32,
-                                    k_scale_padded as i32,
-                                    stream,
-                                );
-                            }
+                            // weight_scale_swizzled must be provided - per-call swizzling is not allowed
+                            // because it's CUDA-graph incompatible
+                            debug_assert!(weight_scale_swizzled.is_some(), "weight_scale_swizzled must be provided");
 
                             let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
                             let ws_bytes = ws_bytes as i64;

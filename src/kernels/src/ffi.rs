@@ -1045,6 +1045,7 @@ extern "C" {
         expert_offsets: *mut i32,
         num_experts: c_int,
         size_m: c_int,
+        is_prefill: bool,
         stream: i64,
     );
 

@@ -110,7 +110,7 @@ pub fn mxfp4_matmul(
             }
 
             let use_hardware_mxfp4 =
-                cfg!(feature = "cutlass") && is_hardware_mxfp4_available(dev) && is_prefill;
+                cfg!(feature = "cutlass") && is_hardware_mxfp4_available(dev) && m > 32;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();

@@ -172,6 +172,7 @@ static void g_calculate_expert_offsets(
     int32_t* d_expert_counts,
     int32_t* d_expert_offsets,
     int num_experts,
+    bool is_prefill,
     cudaStream_t stream)
 {
     const int scan_threads = next_pow2_host(num_experts < 32 ? 32 : num_experts);

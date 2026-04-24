@@ -70,6 +70,18 @@ pub fn fp8_matmul(
     {
         let (m, _) = input.dims2()?;
         // Enable only for decode phase (small M <= 64) on SM90 with BF16 and 128x128 block scales
+        #[cfg(debug_assertions)]
+        tracing::debug!(
+            "fp8_matmul: is_prefill={}, M={}, SM={}, using={}",
+            is_prefill, m, sm_version,
+            if !is_prefill && m <= 64 && sm_version >= 90 {
+                "flashinfer"
+            } else if is_prefill && sm_version >= 90 {
+                "cutlass"
+            } else {
+                "fallback"
+            }
+        );
         let use_flashinfer = !is_prefill
             && m <= 64
             && (90..100).contains(&sm_version)

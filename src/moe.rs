@@ -876,6 +876,7 @@ pub fn moe_gemm_fp8(
                         *expert_offsets.device_ptr() as *mut i32,
                         num_experts as i32,
                         size_m as i32,
+                        is_prefill,
                         stream as i64,
                     );
 
@@ -1059,6 +1060,7 @@ pub fn moe_gemm_nvfp4(
     indices: &Tensor,
     pre_sorted: Option<(&Tensor, &Tensor)>,
     is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1227,6 +1229,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&eo_s, DType::U32)? as *mut i32,
                     num_experts as i32,
                     total_slots as i32,
+                    is_prefill,
                     stream,
                 );
             }
@@ -1388,7 +1391,7 @@ pub fn moe_gemm_nvfp4_hardware(
     sorted_token_ids: &Tensor,
     experts_ids: &Tensor,
     topk: usize,
-    _is_prefill: bool,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1511,6 +1514,7 @@ pub fn moe_gemm_nvfp4_hardware(
                 cuda_ptr(&expert_offsets_s, DType::U32)? as *mut i32,
                 num_experts as i32,
                 size_m as i32,
+                is_prefill,
                 stream,
             );
         }
@@ -1778,6 +1782,7 @@ pub fn moe_gemm_mxfp4(
     biases: Option<&Tensor>,
     indices: &Tensor,
     is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()

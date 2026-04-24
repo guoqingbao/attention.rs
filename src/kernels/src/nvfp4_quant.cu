@@ -136,14 +136,14 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
+  float SFValue = SFScaleVal * vecMax / 6.0f;
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
   float outputScale = SFValue != 0.0f
-      ? __fdividef(SFScaleVal, SFValue)
+      ? SFScaleVal / SFValue
       : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
@@ -457,14 +457,14 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
+  float SFValue = SFScaleVal * vecMax / 6.0f;
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
   float outputScale = SFValue != 0.0f
-      ? __fdividef(SFScaleVal, SFValue)
+      ? SFScaleVal / SFValue
       : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
