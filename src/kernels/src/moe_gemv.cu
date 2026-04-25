@@ -153,10 +153,6 @@ __global__ void moe_gemv_kernel(
 
   float sum = 0.0f;
 
-  #ifndef NO_BF16_KERNEL
-    __nv_bfloat162 prod;
-    vllm_rs::zero(prod);
-  #endif
   for (int k = tid; k < k_vec; k += BLOCK_SIZE) {
     float4 in_val = in_vec[k];
     float4 w_val = w_vec[k];
@@ -173,16 +169,14 @@ __global__ void moe_gemv_kernel(
         sum = fmaf(in_f.y, w_f.y, sum);
       } else {
 #ifndef NO_BF16_KERNEL
-        prod = __hadd2(__hmul2(in_v2[i], w_v2[i]), prod);
+        float2 in_f = __bfloat1622float2(in_v2[i]);
+        float2 w_f = __bfloat1622float2(w_v2[i]);
+        sum = fmaf(in_f.x, w_f.x, sum);
+        sum = fmaf(in_f.y, w_f.y, sum);
 #endif
       }
     }
   }
-
-  #ifndef NO_BF16_KERNEL
-    float2 f = vllm::bf1622float2(prod);
-    sum += f.x + f.y;
-  #endif
   const int remainder_start = k_vec * LOAD_VEC_SIZE;
   for (int k = remainder_start + tid; k < K; k += BLOCK_SIZE) {
     sum = __fmaf_rn(vllm::to_float(input_row[k]), vllm::to_float(weight_row[k]),
@@ -406,37 +400,19 @@ template <typename T>
 __device__ __forceinline__ void fp8x4_dot_half2(
     uint32_t packed, const T *smem, int offset, float &acc) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && !defined(NO_HARDWARE_FP8)
+  // Use HW FP8→half conversion (exact for E4M3), then accumulate in float32
+  // for full precision. Avoids half2/bf162 intermediate arithmetic that loses
+  // mantissa bits during multiply-add.
   __half2_raw pair = __nv_cvt_fp8x2_to_halfraw2(
       static_cast<__nv_fp8x2_storage_t>(packed & 0xFFFF), __NV_E4M3);
   __half2_raw pair2 = __nv_cvt_fp8x2_to_halfraw2(
       static_cast<__nv_fp8x2_storage_t>((packed >> 16) & 0xFFFF), __NV_E4M3);
-  if constexpr (std::is_same<T, half>::value) {
-    half2 in01 = *reinterpret_cast<const half2*>(&smem[offset]);
-    half2 in23 = *reinterpret_cast<const half2*>(&smem[offset + 2]);
-    half2 w01 = *reinterpret_cast<half2*>(&pair);
-    half2 w23 = *reinterpret_cast<half2*>(&pair2);
-    half2 prod1 = __hmul2(in01, w01);
-    half2 prod2 = __hmul2(in23, w23);
-    half2 sum2 = __hadd2(prod1, prod2);
-    float2 f = __half22float2(sum2);
-    acc += f.x + f.y;
-  } else {
-#ifndef NO_BF16_KERNEL
-    // Convert FP8→half pairs to bf16 pairs for native bf162 FMA
-    __nv_bfloat162 in01 = *reinterpret_cast<const __nv_bfloat162*>(&smem[offset]);
-    __nv_bfloat162 in23 = *reinterpret_cast<const __nv_bfloat162*>(&smem[offset + 2]);
-    // Convert half2 weights to bf16 pairs
-    float2 wf01 = __half22float2(*reinterpret_cast<half2*>(&pair));
-    float2 wf23 = __half22float2(*reinterpret_cast<half2*>(&pair2));
-    __nv_bfloat162 w01 = __floats2bfloat162_rn(wf01.x, wf01.y);
-    __nv_bfloat162 w23 = __floats2bfloat162_rn(wf23.x, wf23.y);
-    __nv_bfloat162 prod1 = __hmul2(in01, w01);
-    __nv_bfloat162 prod2 = __hmul2(in23, w23);
-    __nv_bfloat162 sum2 = __hadd2(prod1, prod2);
-    float2 f = vllm::bf1622float2(sum2);
-    acc += f.x + f.y;
-#endif
-  }
+  float2 wf01 = __half22float2(*reinterpret_cast<half2*>(&pair));
+  float2 wf23 = __half22float2(*reinterpret_cast<half2*>(&pair2));
+  acc = fmaf(smem_to_float(smem[offset + 0]), wf01.x, acc);
+  acc = fmaf(smem_to_float(smem[offset + 1]), wf01.y, acc);
+  acc = fmaf(smem_to_float(smem[offset + 2]), wf23.x, acc);
+  acc = fmaf(smem_to_float(smem[offset + 3]), wf23.y, acc);
 #else
   float wf0, wf1, wf2, wf3;
   vllm_rs::fp8x4_to_float4(packed, wf0, wf1, wf2, wf3);
@@ -544,7 +520,7 @@ __global__ void moe_gemv_kernel_fp8(
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
     float scale = __ldg(&row_scales[k / block_size_k]);
-    sum = fmaf(smem_to_float(smem_input[k]) * wf, scale, sum);
+    sum = fmaf(smem_to_float(smem_input[k]), wf * scale, sum);
   }
 
   sum = vllm_rs::warp_reduce_sum(sum);
@@ -647,7 +623,7 @@ __global__ void moe_gemv_kernel_fp8_single(
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
     float scale = __ldg(&row_scales[k / block_size_k]);
-    sum = fmaf(smem_to_float(smem_input[k]) * wf, scale, sum);
+    sum = fmaf(smem_to_float(smem_input[k]), wf * scale, sum);
   }
 
   sum = vllm_rs::warp_reduce_sum(sum);

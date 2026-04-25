@@ -171,8 +171,9 @@ __device__ __forceinline__ void hw_dequant_16(uint2 packed, float scale,
 }
 
 // Fused 16-element dot product: dequant FP4 + multiply-accumulate with input.
-// Each byte is 2 FP4 values; we convert and fmaf immediately to avoid
-// register spilling (16 floats would require 16 regs).
+// Accumulates the unscaled dot product first, then applies scale once at the
+// end. This halves the number of floating-point roundings per block (16 fmafs
+// + 1 fmaf vs. 16 muls + 16 fmafs), improving precision for large K.
 __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
                                            const float *input) {
   float acc = 0.0f;
@@ -182,8 +183,8 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
     __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
         static_cast<__nv_fp4x2_storage_t>(b0), __NV_E2M1);
     float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
-    acc = fmaf(input[i * 2],     f2.x * scale, acc);
-    acc = fmaf(input[i * 2 + 1], f2.y * scale, acc);
+    acc = fmaf(input[i * 2],     f2.x, acc);
+    acc = fmaf(input[i * 2 + 1], f2.y, acc);
   }
 #pragma unroll
   for (int i = 0; i < 4; i++) {
@@ -191,10 +192,10 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
     __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
         static_cast<__nv_fp4x2_storage_t>(b1), __NV_E2M1);
     float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
-    acc = fmaf(input[8 + i * 2],     f2.x * scale, acc);
-    acc = fmaf(input[8 + i * 2 + 1], f2.y * scale, acc);
+    acc = fmaf(input[8 + i * 2],     f2.x, acc);
+    acc = fmaf(input[8 + i * 2 + 1], f2.y, acc);
   }
-  return acc;
+  return acc * scale;
 }
 #endif // NVFP4_HW_DEQUANT
 
@@ -314,6 +315,8 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
     }
 #else
     // --- Legacy LUT path (SM < 100) ---
+    // Accumulate unscaled dot product per block, apply scale once at the end
+    // to halve the number of floating-point roundings per 16-element block.
     {
       float block_scale =
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
@@ -322,25 +325,27 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       uint2 w_vec = load_uint2_safe(w_row + k / 2);
       const float *in = s_input + (k + (k / WARP_SIZE));
 
+      float partial = 0.0f;
       int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in[0], (float)(int8_t)(w0.x) * block_scale, acc);
-      acc = fmaf(in[1], (float)(int8_t)(w0.y) * block_scale, acc);
-      acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8) * block_scale, acc);
-      acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8) * block_scale, acc);
-      acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16) * block_scale, acc);
-      acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16) * block_scale, acc);
-      acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24) * block_scale, acc);
-      acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24) * block_scale, acc);
+      partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
+      partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
+      partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
+      partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
+      partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
+      partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
+      partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
+      partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
 
       int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in[8], (float)(int8_t)(w1.x) * block_scale, acc);
-      acc = fmaf(in[9], (float)(int8_t)(w1.y) * block_scale, acc);
-      acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8) * block_scale, acc);
-      acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8) * block_scale, acc);
-      acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16) * block_scale, acc);
-      acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16) * block_scale, acc);
-      acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24) * block_scale, acc);
-      acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24) * block_scale, acc);
+      partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
+      partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
+      partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
+      partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
+      partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
+      partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
+      partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
+      partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+      acc = fmaf(partial, block_scale, acc);
     }
 
     int k2 = k + NVFP4_BLOCK_SIZE;
@@ -352,25 +357,27 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
       const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
+      float partial2 = 0.0f;
       int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in2[0], (float)(int8_t)(w2a.x) * block_scale2, acc);
-      acc = fmaf(in2[1], (float)(int8_t)(w2a.y) * block_scale2, acc);
-      acc = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8) * block_scale2, acc);
-      acc = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8) * block_scale2, acc);
-      acc = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16) * block_scale2, acc);
-      acc = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16) * block_scale2, acc);
-      acc = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24) * block_scale2, acc);
-      acc = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24) * block_scale2, acc);
+      partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
+      partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
+      partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
+      partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
+      partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
+      partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
+      partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
+      partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
 
       int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-      acc = fmaf(in2[8], (float)(int8_t)(w2b.x) * block_scale2, acc);
-      acc = fmaf(in2[9], (float)(int8_t)(w2b.y) * block_scale2, acc);
-      acc = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8) * block_scale2, acc);
-      acc = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8) * block_scale2, acc);
-      acc = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16) * block_scale2, acc);
-      acc = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16) * block_scale2, acc);
-      acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
-      acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
+      partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
+      partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
+      partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
+      partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
+      partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
+      partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
+      partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
+      partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+      acc = fmaf(partial2, block_scale2, acc);
     }
 #endif // NVFP4_HW_DEQUANT
   }
@@ -391,7 +398,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
     if constexpr (std::is_same_v<T, half>) {
       output[(size_t)row * N + n_idx] = __float2half(acc);
     } else {
-      output[(size_t)row * N + n_idx] = __float2bfloat16(acc);
+      output[(size_t)row * N + n_idx] = __float2bfloat16_rn(acc);
     }
   }
 }
@@ -515,7 +522,7 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
           if constexpr (std::is_same_v<T, half>) {
             output[(size_t)row * N + col] = __float2half(val);
           } else {
-            output[(size_t)row * N + col] = __float2bfloat16(val);
+            output[(size_t)row * N + col] = __float2bfloat16_rn(val);
           }
         }
       }
@@ -661,25 +668,27 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         uint2 w_vec = load_uint2_safe(w_row + k / 2);
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
 
+        float partial = 0.0f;
         int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in[0], (float)(int8_t)(w0.x) * block_scale, acc);
-        acc = fmaf(in[1], (float)(int8_t)(w0.y) * block_scale, acc);
-        acc = fmaf(in[2], (float)(int8_t)(w0.x >> 8) * block_scale, acc);
-        acc = fmaf(in[3], (float)(int8_t)(w0.y >> 8) * block_scale, acc);
-        acc = fmaf(in[4], (float)(int8_t)(w0.x >> 16) * block_scale, acc);
-        acc = fmaf(in[5], (float)(int8_t)(w0.y >> 16) * block_scale, acc);
-        acc = fmaf(in[6], (float)(int8_t)(w0.x >> 24) * block_scale, acc);
-        acc = fmaf(in[7], (float)(int8_t)(w0.y >> 24) * block_scale, acc);
+        partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
+        partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
+        partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
+        partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
+        partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
+        partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
+        partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
+        partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
 
         int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in[8], (float)(int8_t)(w1.x) * block_scale, acc);
-        acc = fmaf(in[9], (float)(int8_t)(w1.y) * block_scale, acc);
-        acc = fmaf(in[10], (float)(int8_t)(w1.x >> 8) * block_scale, acc);
-        acc = fmaf(in[11], (float)(int8_t)(w1.y >> 8) * block_scale, acc);
-        acc = fmaf(in[12], (float)(int8_t)(w1.x >> 16) * block_scale, acc);
-        acc = fmaf(in[13], (float)(int8_t)(w1.y >> 16) * block_scale, acc);
-        acc = fmaf(in[14], (float)(int8_t)(w1.x >> 24) * block_scale, acc);
-        acc = fmaf(in[15], (float)(int8_t)(w1.y >> 24) * block_scale, acc);
+        partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
+        partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
+        partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
+        partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
+        partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
+        partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
+        partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
+        partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+        acc = fmaf(partial, block_scale, acc);
       }
 
       // --- Second NVFP4 block of 16 ---
@@ -692,25 +701,27 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
         const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
 
+        float partial2 = 0.0f;
         int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in2[0], (float)(int8_t)(w2a.x) * block_scale2, acc);
-        acc = fmaf(in2[1], (float)(int8_t)(w2a.y) * block_scale2, acc);
-        acc = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8) * block_scale2, acc);
-        acc = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8) * block_scale2, acc);
-        acc = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16) * block_scale2, acc);
-        acc = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16) * block_scale2, acc);
-        acc = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24) * block_scale2, acc);
-        acc = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24) * block_scale2, acc);
+        partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
+        partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
+        partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
+        partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
+        partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
+        partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
+        partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
+        partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
 
         int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-        acc = fmaf(in2[8], (float)(int8_t)(w2b.x) * block_scale2, acc);
-        acc = fmaf(in2[9], (float)(int8_t)(w2b.y) * block_scale2, acc);
-        acc = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8) * block_scale2, acc);
-        acc = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8) * block_scale2, acc);
-        acc = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16) * block_scale2, acc);
-        acc = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16) * block_scale2, acc);
-        acc = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24) * block_scale2, acc);
-        acc = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24) * block_scale2, acc);
+        partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
+        partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
+        partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
+        partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
+        partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
+        partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
+        partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
+        partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+        acc = fmaf(partial2, block_scale2, acc);
       }
 #endif // NVFP4_HW_DEQUANT
     }
@@ -735,7 +746,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
       if constexpr (std::is_same_v<T, half>) {
         output[out_idx] = __float2half(acc);
       } else {
-        output[out_idx] = __float2bfloat16(acc);
+        output[out_idx] = __float2bfloat16_rn(acc);
       }
     }
   }
@@ -834,8 +845,8 @@ __global__ void nvfp4_wmma_matmul_kernel(
             s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
             s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
           } else {
-            s_b[row][col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+            s_b[row][col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
+            s_b[row][col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
           }
         }
 #else
@@ -847,7 +858,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
           if constexpr (std::is_same_v<T, __half>)
             s_b[row][col_base + j] = __float2half(dq[j]);
           else
-            s_b[row][col_base + j] = __float2bfloat16(dq[j]);
+            s_b[row][col_base + j] = __float2bfloat16_rn(dq[j]);
         }
 #endif
       } else if (row < BN) {
@@ -903,7 +914,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
       if constexpr (std::is_same_v<T, __half>)
         output[(size_t)gr * N + gc] = __float2half(val);
       else
-        output[(size_t)gr * N + gc] = __float2bfloat16(val);
+        output[(size_t)gr * N + gc] = __float2bfloat16_rn(val);
     }
   }
 }
@@ -1179,8 +1190,8 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                             s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
                             s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
                         } else {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16(f2.x * raw_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16(f2.y * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
+                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
                         }
                     }
 #else
@@ -1192,7 +1203,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                         if constexpr (std::is_same_v<T, __half>)
                             s_b[row * B_STRIDE + col_base + j] = __float2half(dq[j]);
                         else
-                            s_b[row * B_STRIDE + col_base + j] = __float2bfloat16(dq[j]);
+                            s_b[row * B_STRIDE + col_base + j] = __float2bfloat16_rn(dq[j]);
                     }
 #endif
                 } else {
@@ -1235,7 +1246,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                     if constexpr (std::is_same_v<T, __half>)
                         output[(size_t)tok_idx * size_n + n_global] = __float2half(val);
                     else
-                        output[(size_t)tok_idx * size_n + n_global] = __float2bfloat16(val);
+                        output[(size_t)tok_idx * size_n + n_global] = __float2bfloat16_rn(val);
                 }
             }
         }

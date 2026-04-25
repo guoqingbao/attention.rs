@@ -50,12 +50,6 @@ __device__ __forceinline__ uint32_t fp32x8_to_e2m1x8(float (&vals)[8]) {
   return result;
 }
 
-__device__ __forceinline__ float fast_rcp_ftz(float x) {
-  float r;
-  asm("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
-  return r;
-}
-
 #endif // __CUDA_ARCH__ >= 1000
 
 // ============================================================================
@@ -66,21 +60,24 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
   float abs_val = fabsf(val);
   uint8_t sign = (val < 0.0f) ? 0x8 : 0x0;
 
+  // Round-to-nearest-even at midpoints between representable FP4 E2M1 values.
+  // Representable: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (codes 0-7).
+  // At exact midpoints, round to the value with an even code (0,2,4,6).
   uint8_t code;
-  if (abs_val < 0.25f) {
-    code = 0x0;  // 0.0
+  if (abs_val <= 0.25f) {
+    code = 0x0;  // 0.0  (midpoint 0.25 rounds to even code 0)
   } else if (abs_val < 0.75f) {
     code = 0x1;  // 0.5
-  } else if (abs_val < 1.25f) {
-    code = 0x2;  // 1.0
+  } else if (abs_val <= 1.25f) {
+    code = 0x2;  // 1.0  (midpoint 0.75→1.0 already correct; 1.25 rounds to even code 2)
   } else if (abs_val < 1.75f) {
     code = 0x3;  // 1.5
-  } else if (abs_val < 2.5f) {
-    code = 0x4;  // 2.0
+  } else if (abs_val <= 2.5f) {
+    code = 0x4;  // 2.0  (midpoint 1.75→2.0 already correct; 2.5 rounds to even code 4)
   } else if (abs_val < 3.5f) {
     code = 0x5;  // 3.0
-  } else if (abs_val < 5.0f) {
-    code = 0x6;  // 4.0
+  } else if (abs_val <= 5.0f) {
+    code = 0x6;  // 4.0  (midpoint 3.5→4.0 already correct; 5.0 rounds to even code 6)
   } else {
     code = 0x7;  // 6.0
   }
@@ -90,7 +87,7 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
 
 // ============================================================================
 // Activation quantization kernel (SM100+ hardware path)
-// Uses precise division (__fdividef) instead of rcp.approx.ftz:
+// Uses precise division __fdiv_rn instead of __fdividef and rcp.approx.ftz:
 //   SFValue = SFScaleVal * vecMax / 6.0
 //   fp8_scale = fp8_e4m3(SFValue)
 //   outputScale = SFScaleVal / float(fp8_scale)
@@ -136,14 +133,14 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
+  float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
   float outputScale = SFValue != 0.0f
-      ? __fdividef(SFScaleVal, SFValue)
+      ? __fdiv_rn(SFScaleVal, SFValue)
       : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
@@ -163,7 +160,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
 
 #else
-  float SFValue = SFScaleVal * (vecMax / 6.0f);
+  float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
 
   uint8_t fp8_scale_bits = 0;
   float outputScale = 0.0f;
@@ -180,15 +177,29 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
       if (biased_exp < 0) biased_exp = 0;
       if (biased_exp > 15) biased_exp = 15;
 
-      uint8_t mant3 = (mantissa >> 20) & 0x7;
+      // Round mantissa to 3 bits (round-to-nearest-even) instead of truncating
+      int mant3 = (int)((mantissa >> 20) & 0x7);
+      uint32_t remainder = mantissa & 0xFFFFF;
+      uint32_t halfway = 0x80000u;
+      bool round_up = (remainder > halfway) ||
+                       (remainder == halfway && (mant3 & 1));
+      if (round_up) {
+        mant3++;
+        if (mant3 > 7) {
+          mant3 = 0;
+          biased_exp++;
+        }
+      }
+      if (biased_exp > 15) { biased_exp = 15; mant3 = 7; }
+
       fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
 
       float recon_mantissa = 1.0f + mant3 / 8.0f;
       float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
       if (sign) quant_scale = -quant_scale;
 
-      outputScale = (quant_scale != 0.0f && SFScaleVal != 0.0f)
-          ? (1.0f / (quant_scale / SFScaleVal))
+      outputScale = (quant_scale != 0.0f)
+          ? __fdiv_rn(SFScaleVal, quant_scale)
           : 0.0f;
     }
   }
@@ -457,14 +468,14 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   int64_t out_base = static_cast<int64_t>(row) * (K / 2) + k_start / 2;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float SFValue = __fdividef(SFScaleVal * vecMax, 6.0f);
+  float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
   uint8_t fp8_scale_bits = fp8_sf.__x;
   SFValue = static_cast<float>(fp8_sf);
 
   float outputScale = SFValue != 0.0f
-      ? __fdividef(SFScaleVal, SFValue)
+      ? __fdiv_rn(SFScaleVal, SFValue)
       : 0.0f;
 
   float scaled_vals_0[8], scaled_vals_1[8];
@@ -478,7 +489,7 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   reinterpret_cast<uint32_t*>(output + out_base)[0] = packed_lo;
   reinterpret_cast<uint32_t*>(output + out_base)[1] = packed_hi;
 #else
-  float SFValue = SFScaleVal * (vecMax / 6.0f);
+  float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
   uint8_t fp8_scale_bits = 0;
   float outputScale = 0.0f;
 
@@ -492,13 +503,25 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
       int biased_exp = exp + 7;
       if (biased_exp < 0) biased_exp = 0;
       if (biased_exp > 15) biased_exp = 15;
-      uint8_t mant3 = (mantissa >> 20) & 0x7;
+      int mant3 = (int)((mantissa >> 20) & 0x7);
+      uint32_t remainder = mantissa & 0xFFFFF;
+      uint32_t halfway = 0x80000u;
+      bool round_up = (remainder > halfway) ||
+                       (remainder == halfway && (mant3 & 1));
+      if (round_up) {
+        mant3++;
+        if (mant3 > 7) {
+          mant3 = 0;
+          biased_exp++;
+        }
+      }
+      if (biased_exp > 15) { biased_exp = 15; mant3 = 7; }
       fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
       float recon_mantissa = 1.0f + mant3 / 8.0f;
       float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
       if (sign) quant_scale = -quant_scale;
-      outputScale = (quant_scale != 0.0f && SFScaleVal != 0.0f)
-          ? (1.0f / (quant_scale / SFScaleVal))
+      outputScale = (quant_scale != 0.0f)
+          ? __fdiv_rn(SFScaleVal, quant_scale)
           : 0.0f;
     }
   }

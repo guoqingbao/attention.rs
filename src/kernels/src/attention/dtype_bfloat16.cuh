@@ -402,7 +402,7 @@ inline __device__ float sum(bf16_8_t v) {
 
 // From float32 to bfloat16.
 inline __device__ void from_float(__nv_bfloat16& dst, float src) {
-  dst = __float2bfloat16(src);
+  dst = __float2bfloat16_rn(src);
 }
 
 inline __device__ void from_float(__nv_bfloat162& dst, float2 src) {

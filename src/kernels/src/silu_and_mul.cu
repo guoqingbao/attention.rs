@@ -52,7 +52,7 @@ __device__ __forceinline__ half from_float_val<half>(float x) {
 #ifndef NO_BF16_KERNEL
 template <>
 __device__ __forceinline__ __nv_bfloat16 from_float_val<__nv_bfloat16>(float x) {
-  return __float2bfloat16(x);
+  return __float2bfloat16_rn(x);
 }
 #endif
 
@@ -138,8 +138,8 @@ __global__ void silu_and_mul_vec_kernel(
       out_v2[i] = __floats2half2_rn(results[i * 2], results[i * 2 + 1]);
     } else {
 #ifndef NO_BF16_KERNEL
-      out_v2[i].x = __float2bfloat16(results[i * 2]);
-      out_v2[i].y = __float2bfloat16(results[i * 2 + 1]);
+      out_v2[i].x = __float2bfloat16_rn(results[i * 2]);
+      out_v2[i].y = __float2bfloat16_rn(results[i * 2 + 1]);
 #endif
     }
   }
