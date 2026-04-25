@@ -46,7 +46,7 @@ __device__ __forceinline__ T from_float_val(float x);
 
 template <>
 __device__ __forceinline__ half from_float_val<half>(float x) {
-  return __float2half(x);
+  return __float2half_rn(x);
 }
 
 #ifndef NO_BF16_KERNEL
