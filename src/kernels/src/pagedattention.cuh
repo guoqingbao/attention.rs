@@ -324,7 +324,7 @@ __device__ void paged_attention_kernel(
   exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
 
   // Compute softmax.
-  const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
+  const float inv_sum = __fdiv_rn(1.f, exp_sum + 1e-6f);
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
     logits[i] *= inv_sum;
   }
@@ -628,7 +628,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   }
   __syncthreads();
   global_exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], global_exp_sum);
-  const float inv_global_exp_sum = __fdividef(1.0f, global_exp_sum + 1e-6f);
+  const float inv_global_exp_sum = __fdiv_rn(1.0f, global_exp_sum + 1e-6f);
 
   // Aggregate tmp_out to out.
   const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
