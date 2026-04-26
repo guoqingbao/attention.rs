@@ -72,7 +72,15 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result
 
             let k_scale_cols = k / NVFP4_BLOCK_SIZE;
             let k_scale_padded = pad_to(k_scale_cols, 4);
-            let n_padded = pad_to(n, 128);
+
+            // For SM70 and below, use 16-byte alignment instead of 128-byte
+            // to ensure proper CUDA memory alignment
+            let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize;
+            let n_padded = if sm >= 100 {
+                pad_to(n, 128)
+            } else {
+                pad_to(n, 16)
+            };
 
             let swizzled = Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
 
@@ -228,7 +236,15 @@ pub fn nvfp4_matmul(
                     let m_padded = pad_to(m, 128);
                     let k_scale_cols = k / NVFP4_BLOCK_SIZE;
                     let k_scale_padded = pad_to(k_scale_cols, 4);
-                    let n_padded = pad_to(n, 128);
+
+                    // For SM70 and below, use 16-byte alignment instead of 128-byte
+                    // to ensure proper CUDA memory alignment
+                    let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize;
+                    let n_padded = if sm >= 100 {
+                        pad_to(n, 128)
+                    } else {
+                        pad_to(n, 16)
+                    };
 
                     let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
                     let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
@@ -413,9 +429,16 @@ pub fn nvfp4_matmul(
                 }
             } else {
                 // Software dequant path (existing kernels)
+                // Use swizzled scales if provided, otherwise use raw scales
+                let scale_to_use = if let Some(swizzled) = weight_scale_swizzled {
+                    swizzled
+                } else {
+                    &scale
+                };
+
                 let (input_s, _) = input.storage_and_layout();
                 let (weight_s, _) = weight.storage_and_layout();
-                let (scale_s, _) = scale.storage_and_layout();
+                let (scale_s, _) = scale_to_use.storage_and_layout();
                 let (output_s, _) = output.storage_and_layout();
 
                 let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;

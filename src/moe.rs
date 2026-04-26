@@ -1059,6 +1059,7 @@ pub fn moe_gemm_nvfp4(
     indices: &Tensor,
     pre_sorted: Option<(&Tensor, &Tensor)>,
     is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1241,9 +1242,15 @@ pub fn moe_gemm_nvfp4(
         let output = Tensor::zeros((num_tokens * topk, n), dtype, dev)?;
         {
             let stream = *cuda_dev.cu_stream() as i64;
+            let scales_to_use = if let Some(swizzled) = weight_scale_swizzled {
+                swizzled
+            } else {
+                &weight_scales
+            };
+
             let (input_s, _) = routed_input.storage_and_layout();
             let (weights_s, _) = weights.storage_and_layout();
-            let (scales_s, _) = weight_scales.storage_and_layout();
+            let (scales_s, _) = scales_to_use.storage_and_layout();
             let (gscales_s, _) = weight_global_scales.storage_and_layout();
             let (stids_s, _) = sorted_token_ids_u32.storage_and_layout();
             let (eoffs_s, _) = expert_offsets_t.storage_and_layout();
@@ -1297,9 +1304,15 @@ pub fn moe_gemm_nvfp4(
     {
         let stream = *cuda_dev.cu_stream() as i64;
 
+        let scales_to_use = if let Some(swizzled) = weight_scale_swizzled {
+            swizzled
+        } else {
+            &weight_scales
+        };
+
         let (input_s, _) = input.storage_and_layout();
         let (weights_s, _) = weights.storage_and_layout();
-        let (scales_s, _) = weight_scales.storage_and_layout();
+        let (scales_s, _) = scales_to_use.storage_and_layout();
         let (gscales_s, _) = weight_global_scales.storage_and_layout();
         let (indices_s, _) = indices.storage_and_layout();
         let (output_s, _) = output.storage_and_layout();
@@ -1778,6 +1791,7 @@ pub fn moe_gemm_mxfp4(
     biases: Option<&Tensor>,
     indices: &Tensor,
     is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -1886,10 +1900,17 @@ pub fn moe_gemm_mxfp4(
             let use_fused = is_prefill;
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
+            // Use swizzled scales if provided, otherwise use raw scales
+            let scales_to_use = if let Some(swizzled) = weight_scale_swizzled {
+                swizzled
+            } else {
+                &weight_scales
+            };
+
             {
                 let (input_s, _) = input.storage_and_layout();
                 let (weights_s, _) = weights.storage_and_layout();
-                let (scales_s, _) = weight_scales.storage_and_layout();
+                let (scales_s, _) = scales_to_use.storage_and_layout();
                 let (indices_s, _) = indices.storage_and_layout();
                 let (output_s, _) = output.storage_and_layout();
 
@@ -2003,6 +2024,13 @@ pub fn moe_gemm_mxfp4(
             let command_buffer_ref = command_buffer.as_ref();
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
+            // Use swizzled scales if provided, otherwise use raw scales
+            let scales_to_use = if let Some(swizzled) = weight_scale_swizzled {
+                swizzled
+            } else {
+                &weight_scales
+            };
+
             {
                 let (input_s, input_l) = input.storage_and_layout();
                 let input_ms = match &*input_s {
@@ -2014,7 +2042,7 @@ pub fn moe_gemm_mxfp4(
                     Storage::Metal(s) => s,
                     _ => candle_core::bail!("weights must be metal"),
                 };
-                let (scales_s, scales_l) = weight_scales.storage_and_layout();
+                let (scales_s, scales_l) = scales_to_use.storage_and_layout();
                 let scales_ms = match &*scales_s {
                     Storage::Metal(s) => s,
                     _ => candle_core::bail!("weight_scales must be metal"),
@@ -2040,7 +2068,7 @@ pub fn moe_gemm_mxfp4(
                 );
                 let sc = (
                     scales_ms.buffer(),
-                    scales_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+                    scales_l.start_offset() * scales_to_use.dtype().size_in_bytes(),
                 );
                 let idx = (
                     indices_ms.buffer(),
