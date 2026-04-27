@@ -197,6 +197,7 @@ void mla_prefill_run_typed(
     void* ckv_cache, void* kpe_cache,
     const int32_t* kv_indices,
     int32_t num_heads, int32_t page_size, float sm_scale,
+    float rope_scale, float rope_theta,
     void* float_workspace, size_t float_workspace_size,
     void* int_workspace, size_t int_workspace_size,
     const int64_t* plan_info_vec, bool causal, cudaStream_t stream)
@@ -262,6 +263,8 @@ void mla_prefill_run_typed(
     params.o_stride_h = HEAD_DIM_CKV;
 
     params.sm_scale = sm_scale;
+    params.rope_scale = rope_scale;
+    params.rope_theta = rope_theta;
     params.return_lse_base_on_e = false;
 
     cudaError_t status;
@@ -409,6 +412,7 @@ void flashinfer_mla_prefill_run_wrapper(
     void* ckv_cache, void* kpe_cache,
     const int32_t* kv_indices,
     int32_t num_heads, int32_t page_size, float sm_scale,
+    float rope_scale, float rope_theta,
     void* float_workspace, int64_t float_workspace_size,
     void* int_workspace, int64_t int_workspace_size,
     const int64_t* plan_info,
@@ -423,14 +427,14 @@ void flashinfer_mla_prefill_run_wrapper(
     if (dtype == 1) {
         mla_prefill_run_typed<nv_bfloat16>(
             o, q_nope, q_pe, ckv_cache, kpe_cache, kv_indices,
-            num_heads, page_size, sm_scale,
+            num_heads, page_size, sm_scale, rope_scale, rope_theta,
             float_workspace, float_workspace_size,
             int_workspace, int_workspace_size,
             plan_info, causal, stream);
     } else {
         mla_prefill_run_typed<half>(
             o, q_nope, q_pe, ckv_cache, kpe_cache, kv_indices,
-            num_heads, page_size, sm_scale,
+            num_heads, page_size, sm_scale, rope_scale, rope_theta,
             float_workspace, float_workspace_size,
             int_workspace, int_workspace_size,
             plan_info, causal, stream);

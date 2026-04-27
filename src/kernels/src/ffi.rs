@@ -2714,6 +2714,8 @@ extern "C" {
         num_heads: c_int,
         page_size: c_int,
         sm_scale: f32,
+        rope_scale: f32,
+        rope_theta: f32,
         float_workspace: *mut c_void,
         float_workspace_size: i64,
         int_workspace: *mut c_void,

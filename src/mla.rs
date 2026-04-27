@@ -546,6 +546,8 @@ pub fn mla_prefill_run(
     num_heads: usize,
     page_size: usize,
     sm_scale: f32,
+    rope_scale: f32,
+    rope_theta: f32,
     plan_info: &[i64],
     causal: bool,
 ) -> Result<Tensor> {
@@ -583,6 +585,8 @@ pub fn mla_prefill_run(
             num_heads as i32,
             page_size as i32,
             sm_scale,
+            rope_scale,
+            rope_theta,
             ws_float_ptr,
             WORKSPACE_FLOAT_SIZE as i64,
             ws_int_ptr,
