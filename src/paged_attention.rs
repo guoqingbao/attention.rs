@@ -930,15 +930,7 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(all(not(feature = "flashattn"), feature = "flash-decoding"))]
-        if kc_rank != 4 {
-            candle::bail!(
-                "flash-decoding expects `key_cache` tensor to be of rank 4 \
-                    (key_cache: {kc_l:?})"
-            )
-        }
-
-        #[cfg(all(not(feature = "flashattn"), not(feature = "flash-decoding")))]
+        #[cfg(not(feature = "flashattn"))]
         if kc_rank != 5 {
             candle::bail!(
                 "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -975,13 +967,7 @@ impl ReshapeCache {
             (block_size, 1)
         };
 
-        #[cfg(all(not(feature = "flashattn"), feature = "flash-decoding"))]
-        let (_num_blocks, block_size, _x) = {
-            let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
-            (num_blocks, block_size, 1)
-        };
-
-        #[cfg(all(not(feature = "flashattn"), not(feature = "flash-decoding")))]
+        #[cfg(not(feature = "flashattn"))]
         let (block_size, x) = {
             let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
@@ -1473,7 +1459,8 @@ pub fn gcu_paged_attention<
             .collect();
         let cl_data: Vec<u32> = context_lens.to_vec1()?;
 
-        let mut expanded_bt: Vec<u32> = Vec::with_capacity(num_query_tokens * max_num_blocks_per_seq);
+        let mut expanded_bt: Vec<u32> =
+            Vec::with_capacity(num_query_tokens * max_num_blocks_per_seq);
         let mut expanded_cl: Vec<u32> = Vec::with_capacity(num_query_tokens);
 
         for seq_idx in 0..num_seqs {
@@ -1580,8 +1567,8 @@ fn gcu_update_cache<
     value_cache: &Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
-    use candle::Storage;
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::Storage;
     let dev = key.device().as_gcu_device()?;
     let (k, k_l) = key.storage_and_layout();
     let k = match &*k {
@@ -1622,7 +1609,7 @@ fn gcu_update_cache<
         candle::bail!("paged-attention expects input tensors of rank 3 (k: {k_l:?}, v: {v_l:?})")
     }
 
-    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
+    #[cfg(feature = "flashattn")]
     if kc_rank != 4 {
         candle::bail!(
             "flash-attention expects `key_cache` tensor to be of rank 4 \
@@ -1630,7 +1617,7 @@ fn gcu_update_cache<
         )
     }
 
-    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
+    #[cfg(not(feature = "flashattn"))]
     if kc_rank != 5 {
         candle::bail!(
             "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -1663,14 +1650,14 @@ fn gcu_update_cache<
         candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
     }
 
-    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
+    #[cfg(feature = "flashattn")]
     let (num_blocks, block_size, _x) = {
         // [num_blocks, block_size, num_heads, head_size]
         let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
         (num_blocks, block_size, 1)
     };
 
-    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
+    #[cfg(not(feature = "flashattn"))]
     let (num_blocks, block_size, x) = {
         let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
         if num_heads_kc != num_heads || head_size_kc != head_size / x {
@@ -1701,7 +1688,7 @@ fn gcu_update_cache<
     let key_stride = k_l.stride()[0] as i32;
     let value_stride = v_l.stride()[0] as i32;
 
-    #[cfg(any(feature = "flash-decoding", feature = "flash-attn"))]
+    #[cfg(feature = "flashattn")]
     {
         let block_stride = kc_l.stride()[0];
         let page_stride = kc_l.stride()[1];
@@ -1720,7 +1707,8 @@ fn gcu_update_cache<
         // Convert on CPU and upload to device since GCU to_dtype(i64→u32) is unreliable.
         let slot_i64_cpu: Vec<i64> = slot_mapping.to_vec1()?;
         let slot_i32_cpu: Vec<i32> = slot_i64_cpu.iter().map(|&v| v as i32).collect();
-        let slot_i32_tensor = Tensor::from_vec(slot_i32_cpu, slot_mapping.shape(), slot_mapping.device())?;
+        let slot_i32_tensor =
+            Tensor::from_vec(slot_i32_cpu, slot_mapping.shape(), slot_mapping.device())?;
         let (si32_storage, si32_layout) = slot_i32_tensor.storage_and_layout();
         let si32_gcu = match &*si32_storage {
             Storage::Gcu(g) => g,
@@ -1754,7 +1742,7 @@ fn gcu_update_cache<
         }
     }
 
-    #[cfg(not(any(feature = "flash-decoding", feature = "flash-attn")))]
+    #[cfg(not(feature = "flashattn"))]
     {
         use candle::gcu_backend::ubridge;
         use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;

@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { path = "/root/candle-vllm-gcu/candle-gcu/candle/candle-core", version = "0.8.3" }
-candle-nn = { path = "/root/candle-vllm-gcu/candle-gcu/candle/candle-nn", version = "0.8.3" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="7717653" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="7717653" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
@@ -24,15 +24,12 @@ gcu-kernels = {path = "./src/gcu-kernels", version="0.1.6", optional = true}
 kernels = { path = "./src/kernels", version="0.4.2", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.1.9", optional = true}
-flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7b2fbbd", optional = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "dep:gcu-kernels"]
 graph = ["candle-core/graph"]
-flashattn = ["dep:flashattn-rs", "flashattn-rs/flash-context", "kernels/no-fp8-kvcache"]
-flash-attn = []
-flash-decoding = ["flash-attn"]
+flashattn = []
 flash-context = []
 no-marlin = ["dep:kernels", "kernels/no-marlin"]
 no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]

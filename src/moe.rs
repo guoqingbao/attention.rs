@@ -847,155 +847,245 @@ pub fn moe_gemm_fp8(
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
 }
 
-
-
-// GCU indexed MoE (ubridge) — same 7-arg `moe_gemm` surface as CUDA.
-#[cfg(feature = "gcu")]
-fn indexed_moe_func<
-    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
->(
-    input: &Tensor,
-    weight: &Tensor,
-    indices: &Tensor,
-) -> Result<Tensor> {
-    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
-    use candle::gcu_backend::ubridge::ffi::{indexed_moe_bf16, indexed_moe_f16};
-    use candle::gcu_backend::WrapErr;
-    use candle::Storage;
-    use candle_core::DType;
-    use half::{bf16, f16};
-    let dev = input.device().as_gcu_device()?;
-    let (input_value, input_l) = input.storage_and_layout();
-    let (weight_value, weight_l) = weight.storage_and_layout();
-    let (indices_value, indices_l) = indices.storage_and_layout();
-
-    assert!(
-        input.dims().len() == 3 && weight.dims().len() == 3 && indices.dims().len() == 2,
-        "Invalid input dims!"
-    );
-    let (b1, topk) = indices.dims2()?;
-    let (batch, m, k) = input.dims3()?;
-    let (num_experts, n, k1) = weight.dims3()?;
-    let tile_size = if batch > 12 { 128 } else { 64 };
-    assert!(
-        k % tile_size == 0,
-        "indexed_moe: k dim must be aligned to {}!",
-        tile_size
-    );
-    assert!(
-        n % tile_size == 0,
-        "indexed_moe: n dim must be aligned to {}!",
-        tile_size
-    );
-
-    let out = dev.alloc::<T>(batch * topk * n).w()?;
-
-    assert!(
-        b1 == batch,
-        "the first dim of indices tensor should match input and expert out!"
-    );
-    assert!(
-        k == k1,
-        "weight tensor should match input tensor for matmul!"
-    );
-
-    let stream = dev.stream_inner().unwrap();
-    let input_value = match &*input_value {
-        Storage::Gcu(s) => s,
-        _ => candle::bail!("tensor must be a gcu tensor"),
-    };
-    let input_value = input_value.as_gcu_slice::<T>()?;
-    let input_value = input_value.slice(input_l.start_offset()..);
-
-    let weight_value = match &*weight_value {
-        Storage::Gcu(s) => s,
-        _ => candle::bail!("tensor must be a gcu tensor"),
-    };
-    let weight_value = weight_value.as_gcu_slice::<T>()?;
-    let weight_value = weight_value.slice(weight_l.start_offset()..);
-
-    let indices_value = match &*indices_value {
-        Storage::Gcu(s) => s,
-        _ => candle::bail!("tensor must be a gcu tensor"),
-    };
-    let indices_value = indices_value.as_gcu_slice::<u32>()?;
-    let indices_value = indices_value.slice(indices_l.start_offset()..);
-
-    match input.dtype() {
-        DType::F16 => unsafe {
-            indexed_moe_f16(
-                input_value.device_ptr() as *mut f16,
-                weight_value.device_ptr() as *mut f16,
-                out.device_ptr() as *mut f16,
-                indices_value.device_ptr() as *mut u32,
-                n as i32,
-                k as i32,
-                m as i32,
-                batch as i32,
-                topk as i32,
-                num_experts as i32,
-                stream as *mut core::ffi::c_void,
-            );
-        },
-        DType::BF16 => unsafe {
-            indexed_moe_bf16(
-                input_value.device_ptr() as *mut bf16,
-                weight_value.device_ptr() as *mut bf16,
-                out.device_ptr() as *mut bf16,
-                indices_value.device_ptr() as *mut u32,
-                n as i32,
-                k as i32,
-                m as i32,
-                batch as i32,
-                topk as i32,
-                num_experts as i32,
-                stream as *mut core::ffi::c_void,
-            );
-        },
-        _ => {
-            panic!("not supported data type!")
-        }
-    }
-    let s_out = candle::GcuStorage::wrap_gcu_slice(out, dev.clone());
-    Ok(Tensor::from_storage(
-        candle::Storage::Gcu(s_out),
-        (batch, topk, n),
-    )?)
-}
-
-/// GCU `moe_gemm` — `sorted_token_ids` carries expert indices for the indexed kernel.
+/// GCU `moe_gemm` — uses the fused MoE kernel (moe_align_block_size +
+/// invoke_fused_moe) matching the CUDA pattern.
+///
+/// * `input`              – [num_tokens, K] (2D) in f16 or bf16
+/// * `weights`            – [num_experts, N, K] (3D)
+/// * `topk_weights`       – optional [num_tokens * topk] f32 gating weights
+/// * `sorted_token_ids`   – [max_padded_num] i32 from moe_align_block_size
+/// * `experts_ids`        – [max_block_num] i32 from moe_align_block_size
+/// * `num_tokens_post_pad`– [1] i32 tensor from moe_align_block_size
+/// * `topk`               – number of experts per token
+/// * `block_size`         – must match the block_size used in moe_align_block_size
+/// * `num_tokens`         – original number of tokens (before topk expansion)
 #[cfg(feature = "gcu")]
 pub fn moe_gemm(
     input: &Tensor,
     weights: &Tensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
-    _experts_ids: &Tensor,
+    experts_ids: &Tensor,
+    num_tokens_post_pad: &Tensor,
     topk: usize,
-    _is_prefill: bool,
+    block_size: usize,
+    num_tokens: usize,
 ) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::{invoke_fused_moe_bf16, invoke_fused_moe_f16};
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
     use candle_core::DType;
     use half::{bf16, f16};
-    let _ = topk_weights;
-    let _ = topk;
-    match input.dtype() {
-        DType::F16 => indexed_moe_func::<f16>(input, weights, sorted_token_ids),
-        DType::BF16 => indexed_moe_func::<bf16>(input, weights, sorted_token_ids),
-        dt => {
-            candle::bail!("indexed_moe is only supported for f16 and bf16 ({dt:?})")
+
+    let (_input_rows, size_k1) = input.dims2()?;
+    let (num_experts, size_n, size_k) = weights.dims3()?;
+    assert!(
+        size_k == size_k1,
+        "input K={} and weight K={} mismatch!",
+        size_k1,
+        size_k
+    );
+
+    let mul_routed_weight: i32 = if topk_weights.is_some() { 1 } else { 0 };
+    let topk_ids_size = (num_tokens * topk) as i32;
+
+    let dev = input.device().as_gcu_device()?;
+    let stream = dev.stream_inner().unwrap();
+
+    let (sorted_s, sorted_l) = sorted_token_ids.storage_and_layout();
+    let sorted_ptr = match &*sorted_s {
+        Storage::Gcu(c) => {
+            let s = c.as_gcu_slice::<i32>()?;
+            let s = s.slice(sorted_l.start_offset()..);
+            s.device_ptr()
         }
+        _ => candle::bail!("sorted_token_ids must be a gcu tensor"),
+    };
+
+    let (experts_s, experts_l) = experts_ids.storage_and_layout();
+    let experts_ptr = match &*experts_s {
+        Storage::Gcu(c) => {
+            let s = c.as_gcu_slice::<i32>()?;
+            let s = s.slice(experts_l.start_offset()..);
+            s.device_ptr()
+        }
+        _ => candle::bail!("experts_ids must be a gcu tensor"),
+    };
+
+    let (ntp_s, ntp_l) = num_tokens_post_pad.storage_and_layout();
+    let ntp_ptr = match &*ntp_s {
+        Storage::Gcu(c) => {
+            let s = c.as_gcu_slice::<i32>()?;
+            let s = s.slice(ntp_l.start_offset()..);
+            s.device_ptr()
+        }
+        _ => candle::bail!("num_tokens_post_pad must be a gcu tensor"),
+    };
+
+    let topk_weights_ptr = if let Some(tw) = topk_weights {
+        let (tw_s, tw_l) = tw.storage_and_layout();
+        match &*tw_s {
+            Storage::Gcu(c) => {
+                let s = c.as_gcu_slice::<f32>()?;
+                let s = s.slice(tw_l.start_offset()..);
+                s.device_ptr() as *mut f32
+            }
+            _ => candle::bail!("topk_weights must be a gcu tensor"),
+        }
+    } else {
+        std::ptr::null_mut::<f32>()
+    };
+
+    let out_rows = topk_ids_size as usize;
+    let m_arg = num_tokens as i32;
+
+    macro_rules! launch_fused_moe {
+        ($ty:ty, $ffi_fn:ident) => {{
+            let (input_s, input_l) = input.storage_and_layout();
+            let input_ptr = match &*input_s {
+                Storage::Gcu(c) => {
+                    let s = c.as_gcu_slice::<$ty>()?;
+                    let s = s.slice(input_l.start_offset()..);
+                    s.device_ptr()
+                }
+                _ => candle::bail!("input must be a gcu tensor"),
+            };
+
+            let (weights_s, weights_l) = weights.storage_and_layout();
+            let weights_ptr = match &*weights_s {
+                Storage::Gcu(c) => {
+                    let s = c.as_gcu_slice::<$ty>()?;
+                    let s = s.slice(weights_l.start_offset()..);
+                    s.device_ptr()
+                }
+                _ => candle::bail!("weight must be a gcu tensor"),
+            };
+
+            let output = dev.alloc_zeros::<$ty>(out_rows * size_n).w()?;
+            unsafe {
+                $ffi_fn(
+                    output.device_ptr() as *mut $ty,
+                    input_ptr as *mut $ty,
+                    weights_ptr as *mut $ty,
+                    std::ptr::null_mut::<$ty>(),
+                    topk_weights_ptr,
+                    sorted_ptr as *mut i32,
+                    experts_ptr as *mut i32,
+                    ntp_ptr as *mut i32,
+                    m_arg,
+                    size_k as i32,
+                    size_n as i32,
+                    num_experts as i32,
+                    topk_ids_size,
+                    topk as i32,
+                    block_size as i32,
+                    mul_routed_weight,
+                    0,
+                    stream as *mut core::ffi::c_void,
+                );
+            }
+            let output = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
+            Tensor::from_storage(candle::Storage::Gcu(output), (out_rows, size_n))
+        }};
     }
+
+    match input.dtype() {
+        DType::F16 => launch_fused_moe!(f16, invoke_fused_moe_f16),
+        DType::BF16 => launch_fused_moe!(bf16, invoke_fused_moe_bf16),
+        _ => candle::bail!("invoke_fused_moe only supports f16/bf16"),
+    }
+}
+
+/// GCU moe_align_block_size — calls the ubridge kernel to sort tokens by expert
+/// and produce the sorted_token_ids + experts_ids + num_tokens_post_pad needed
+/// by invoke_fused_moe.
+#[cfg(feature = "gcu")]
+pub fn gcu_moe_align_block_size(
+    topk_ids: &Tensor,
+    num_experts: usize,
+    block_size: usize,
+    token_num: usize,
+    topk: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::moe_align_block_size;
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
+
+    let dev = topk_ids.device().as_gcu_device()?;
+    let stream = dev.stream_inner().unwrap();
+
+    let m = token_num * topk;
+    let max_padded_num = m + num_experts * (block_size - 1);
+    let max_block_num = max_padded_num / block_size;
+
+    let sorted_ids = dev.alloc::<i32>(max_padded_num).w()?;
+    let experts_ids_buf = dev.alloc::<i32>(max_block_num).w()?;
+    let num_tokens_post_pad = dev.alloc::<i32>(1).w()?;
+
+    let topk_ids_i32 = if topk_ids.dtype() != candle_core::DType::U32 {
+        topk_ids.to_dtype(candle_core::DType::U32)?
+    } else {
+        topk_ids.clone()
+    };
+    let topk_ids_flat = topk_ids_i32.flatten_all()?.contiguous()?;
+
+    let (topk_s, topk_l) = topk_ids_flat.storage_and_layout();
+    let topk_ptr = match &*topk_s {
+        Storage::Gcu(c) => {
+            let s = c.as_gcu_slice::<u32>()?;
+            let s = s.slice(topk_l.start_offset()..);
+            s.device_ptr()
+        }
+        _ => candle::bail!("topk_ids must be a gcu tensor"),
+    };
+
+    unsafe {
+        moe_align_block_size(
+            sorted_ids.device_ptr() as *mut i32,
+            experts_ids_buf.device_ptr() as *mut i32,
+            num_tokens_post_pad.device_ptr() as *mut i32,
+            topk_ptr as *const i32,
+            std::ptr::null::<i32>(), // real_token_num (null = use token_num)
+            std::ptr::null::<i32>(), // expert_map (null = identity)
+            num_experts as i32,
+            block_size as i32,
+            token_num as i32,
+            topk as i32,
+            stream as *mut core::ffi::c_void,
+        );
+    }
+
+    let sorted_ids_tensor = {
+        let s = candle::GcuStorage::wrap_gcu_slice(sorted_ids, dev.clone());
+        Tensor::from_storage(candle::Storage::Gcu(s), (max_padded_num,))?
+    };
+    let experts_ids_tensor = {
+        let s = candle::GcuStorage::wrap_gcu_slice(experts_ids_buf, dev.clone());
+        Tensor::from_storage(candle::Storage::Gcu(s), (max_block_num,))?
+    };
+    let num_tokens_post_pad_tensor = {
+        let s = candle::GcuStorage::wrap_gcu_slice(num_tokens_post_pad, dev.clone());
+        Tensor::from_storage(candle::Storage::Gcu(s), (1,))?
+    };
+
+    Ok((
+        sorted_ids_tensor,
+        experts_ids_tensor,
+        num_tokens_post_pad_tensor,
+    ))
 }
 
 #[cfg(all(not(feature = "cuda"), not(feature = "gcu")))]
 pub fn moe_gemm(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: bool,
+    _input: &Tensor,
+    _weights: &Tensor,
+    _topk_weights: &Option<Tensor>,
+    _sorted_token_ids: &Tensor,
+    _experts_ids: &Tensor,
+    _topk: usize,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm is not implemented on this platform!")
 }

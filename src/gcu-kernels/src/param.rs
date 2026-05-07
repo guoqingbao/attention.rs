@@ -442,7 +442,10 @@ pub fn build_kvcache_params(
         (0, 0, 0)
     };
 
-    assert!([16, 32, 64, 128].contains(&page_block_size), "block size msut be 16, 32, 64, or 128.");
+    assert!(
+        [16, 32, 64, 128].contains(&page_block_size),
+        "block size must be 16, 32, 64, or 128."
+    );
     /* ---------------- rotary ---------------- */
     let (seqlen_ro, rotary_dim) = if rotary_en {
         let cos = rotary_cos.as_ref().unwrap();

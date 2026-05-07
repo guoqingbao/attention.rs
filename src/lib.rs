@@ -17,10 +17,10 @@ pub mod sampler;
 #[cfg(feature = "cuda")]
 pub mod sort;
 pub mod topk;
-#[cfg(feature = "cuda")]
-pub use kernels;
 #[cfg(feature = "gcu")]
 pub use gcu_kernels;
+#[cfg(feature = "cuda")]
+pub use kernels;
 #[cfg(feature = "metal")]
 pub use metal_kernels;
 pub mod cache;
@@ -446,7 +446,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(all(feature = "flashattn", feature = "gcu", feature = "flash-decoding"))]
+    #[cfg(all(feature = "flashattn", feature = "gcu"))]
     pub fn flash_forward(
         &self,
         query: &Tensor,
@@ -457,18 +457,36 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        let (_, attention_heads, _, head_size) = query.shape().dims4()?;
-        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+        let (attention_heads, key_value_heads, head_size) = if query.rank() == 4 {
+            let (_, ah, _, hs) = query.shape().dims4()?;
+            let (_, kvh, _, _) = key.shape().dims4()?;
+            (ah, kvh, hs)
+        } else {
+            let (_, ah, hs) = query.shape().dims3()?;
+            let (_, kvh, _) = key.shape().dims3()?;
+            (ah, kvh, hs)
+        };
         let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
-        let query_3d = query
-            .transpose(1, 2)?
-            .reshape(((), attention_heads, head_size))?;
-        let key_3d = key
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
-        let value_3d = value
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
+        let query_3d = if query.rank() == 4 {
+            query
+                .transpose(1, 2)?
+                .reshape(((), attention_heads, head_size))?
+        } else {
+            query.clone()
+        };
+        let key_3d = if key.rank() == 4 {
+            key.transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?
+        } else {
+            key.clone()
+        };
+        let value_3d = if value.rank() == 4 {
+            value
+                .transpose(1, 2)?
+                .reshape(((), key_value_heads, head_size))?
+        } else {
+            value.clone()
+        };
 
         reshape_and_cache(
             &key_3d,
@@ -483,10 +501,16 @@ impl PagedAttention {
         if input_metadata.is_prefill {
             return if input_metadata.block_tables.is_none() {
                 self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping)
+                // let (q_bm, k_bm, v_bm, _, _, _) = Self::batch_major_qkv(query, key, value)?;
+                // self.sdp_prefill(&q_bm, &k_bm, &v_bm, None, input_metadata, softcapping)
             } else {
                 let block_tables = input_metadata.block_tables.as_ref().unwrap();
                 let context_lens = input_metadata.context_lens.as_ref().unwrap();
-                let cu_seqlens_q = input_metadata.cu_seqlens_q.as_ref().unwrap().to_vec1::<u32>()?;
+                let cu_seqlens_q = input_metadata
+                    .cu_seqlens_q
+                    .as_ref()
+                    .unwrap()
+                    .to_vec1::<u32>()?;
                 let num_seqs = cu_seqlens_q.len() - 1;
 
                 let mut outputs = Vec::new();
@@ -740,7 +764,6 @@ impl PagedAttention {
             }
         }
 
-        #[cfg(all(feature = "flash-decoding", feature = "gcu"))]
         if !input_metadata.disable_flash_attn.unwrap_or(false) {
             return self.flash_forward(
                 query,
@@ -751,50 +774,6 @@ impl PagedAttention {
                 input_metadata,
                 softcapping,
             );
-        }
-
-        #[cfg(all(feature = "flashattn", not(feature = "gcu")))]
-        if !input_metadata.disable_flash_attn.unwrap_or(false) {
-            return self.flash_forward(
-                query,
-                key,
-                value,
-                key_cache,
-                value_cache,
-                input_metadata,
-                softcapping,
-            );
-        }
-
-        #[cfg(all(feature = "flashattn", feature = "gcu", not(feature = "flash-decoding")))]
-        if !input_metadata.disable_flash_attn.unwrap_or(false)
-            && input_metadata.is_prefill
-            && input_metadata.block_tables.is_none()
-        {
-            let (_, attention_heads, _, head_size) = query.shape().dims4()?;
-            let (_, key_value_heads, _, _) = key.shape().dims4()?;
-            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
-            let query_3d = query
-                .transpose(1, 2)?
-                .reshape(((), attention_heads, head_size))?;
-            let key_3d = key
-                .transpose(1, 2)?
-                .reshape(((), key_value_heads, head_size))?;
-            let value_3d = value
-                .transpose(1, 2)?
-                .reshape(((), key_value_heads, head_size))?;
-
-            reshape_and_cache(
-                &key_3d,
-                &value_3d,
-                key_cache.as_ref().unwrap(),
-                value_cache.as_ref().unwrap(),
-                self.k_scale.as_ref(),
-                self.v_scale.as_ref(),
-                &slot_mapping,
-            )?;
-
-            return self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping);
         }
 
         let mut att = if input_metadata.is_prefill && input_metadata.block_tables.is_none() {

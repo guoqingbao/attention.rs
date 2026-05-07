@@ -184,13 +184,47 @@ fn gcu_topk_func<
 
 #[cfg(feature = "gcu")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
-    use half::{bf16, f16};
-    match logits.dtype() {
-        DType::F16 => gcu_topk_func::<f16>(logits, topk),
-        DType::BF16 => gcu_topk_func::<bf16>(logits, topk),
-        DType::F32 => gcu_topk_func::<f32>(logits, topk),
-        dt => {
-            candle::bail!("topk is only supported for f32, f16 and bf16 ({dt:?})")
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::topk_softmax_f32;
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
+
+    let logits = logits.contiguous()?;
+    let (num_tokens, num_experts) = logits.dims2()?;
+    let dev = logits.device().as_gcu_device()?;
+    let stream = dev.stream_inner().unwrap();
+
+    let (logits_s, logits_l) = logits.storage_and_layout();
+    let logits_ptr = match &*logits_s {
+        Storage::Gcu(c) => {
+            let s = c.as_gcu_slice::<f32>()?;
+            let s = s.slice(logits_l.start_offset()..);
+            s.device_ptr()
         }
+        _ => candle::bail!("logits must be a f32 gcu tensor"),
+    };
+
+    let output = dev.alloc::<f32>(num_tokens * topk).w()?;
+    let index = dev.alloc::<u32>(num_tokens * topk).w()?;
+
+    unsafe {
+        topk_softmax_f32(
+            logits_ptr as *mut f32,
+            output.device_ptr() as *mut f32,
+            index.device_ptr() as *mut i32,
+            num_tokens as i32,
+            num_experts as i32,
+            topk as i32,
+            0,
+            stream as *mut core::ffi::c_void,
+        );
     }
+
+    let s_out = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
+    let topk_weights = Tensor::from_storage(candle::Storage::Gcu(s_out), (num_tokens, topk))?;
+
+    let s_idx = candle::GcuStorage::wrap_gcu_slice(index, dev.clone());
+    let topk_ids = Tensor::from_storage(candle::Storage::Gcu(s_idx), (num_tokens, topk))?;
+
+    Ok((topk_weights, topk_ids))
 }

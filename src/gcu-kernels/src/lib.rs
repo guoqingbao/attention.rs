@@ -3,7 +3,7 @@ pub mod param;
 use candle_core as candle;
 use candle_core::{DType, Result, Storage, Tensor};
 use ffi::{flash_attn_fwd_host, fwd_kvcache_attn_host, varlen_attn_fwd_host};
-use param::{build_flash_params, build_varlen_params, build_kvcache_params, dim3};
+use param::{build_flash_params, build_kvcache_params, build_varlen_params, dim3};
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -280,8 +280,8 @@ fn flash_attn_kvcache_func<
         causal,
         window_size_left,
         window_size_right,
-        true,      //is_rotary_interleaved,//TODO
-        0, //num_splits, //TODO
+        true, //is_rotary_interleaved,//TODO
+        0,    //num_splits, //TODO
         dim3 { x: 2, y: 1, z: 1 },
         dim3 { x: 12, y: 1, z: 1 },
     )?;

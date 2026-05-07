@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
-candle-core = { path = "/root/candle-vllm-gcu/candle-gcu/candle/candle-core", version = "0.8.3" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="7717653" }
 
 [build-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
