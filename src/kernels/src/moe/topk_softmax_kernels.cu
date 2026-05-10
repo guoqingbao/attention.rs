@@ -515,8 +515,146 @@ void topkGatingSoftmaxKernelLauncher(
     }
 }
 
+// Warp-level top-k selection from pre-computed scores (no softmax).
+// Designed for decode path (small num_tokens) with sigmoid routing.
+template <int TPB>
+__launch_bounds__(TPB)
+__global__ void topkSelectKernel(
+    const float* __restrict__ scores,
+    float* __restrict__ topk_weights,
+    uint32_t* __restrict__ topk_indices,
+    const int num_experts,
+    const int k)
+{
+    using cub_kvp = cub::KeyValuePair<int, float>;
+    using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+    __shared__ typename BlockReduce::TempStorage tmpStorage;
+
+    cub::ArgMax arg_max;
+    const int row = blockIdx.x;
+    const int row_offset = row * num_experts;
+
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+        cub_kvp thread_kvp;
+        thread_kvp.key = 0;
+        thread_kvp.value = -1.f;
+
+        for (int e = threadIdx.x; e < num_experts; e += TPB) {
+            cub_kvp inp_kvp;
+            inp_kvp.key = e;
+            inp_kvp.value = scores[row_offset + e];
+
+            for (int prior = 0; prior < k_idx; ++prior) {
+                if (topk_indices[row * k + prior] == (uint32_t)e) {
+                    inp_kvp.value = -1.f;
+                }
+            }
+            thread_kvp = arg_max(inp_kvp, thread_kvp);
+        }
+
+        const cub_kvp result = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        if (threadIdx.x == 0) {
+            topk_weights[row * k + k_idx] = result.value;
+            topk_indices[row * k + k_idx] = (uint32_t)result.key;
+        }
+        __syncthreads();
+    }
+}
+
+// Fused sigmoid + optional bias + topk + weight gather kernel.
+// Replaces 4 separate kernels: sigmoid, bias_add, topk_select, gather.
+// Computes sigmoid(logits), adds bias for expert selection, finds top-k,
+// then returns original sigmoid weights (before bias) at selected indices.
+template <int TPB>
+__launch_bounds__(TPB)
+__global__ void fusedSigmoidTopkKernel(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    float* __restrict__ topk_weights,
+    uint32_t* __restrict__ topk_indices,
+    const int num_experts,
+    const int k)
+{
+    using cub_kvp = cub::KeyValuePair<int, float>;
+    using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+    __shared__ typename BlockReduce::TempStorage tmpStorage;
+    __shared__ float shared_sigmoid[512];
+
+    cub::ArgMax arg_max;
+    const int row = blockIdx.x;
+    const int row_offset = row * num_experts;
+
+    // Phase 1: compute sigmoid scores and biased scores
+    for (int e = threadIdx.x; e < num_experts; e += TPB) {
+        float logit = logits[row_offset + e];
+        float sig = 1.0f / (1.0f + __expf(-logit));
+        shared_sigmoid[e] = sig;
+    }
+    __syncthreads();
+
+    // Phase 2: iterative top-k from biased scores
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+        cub_kvp thread_kvp;
+        thread_kvp.key = 0;
+        thread_kvp.value = -1.f;
+
+        for (int e = threadIdx.x; e < num_experts; e += TPB) {
+            float biased = shared_sigmoid[e];
+            if (bias) biased += bias[e];
+
+            cub_kvp inp_kvp;
+            inp_kvp.key = e;
+            inp_kvp.value = biased;
+
+            for (int prior = 0; prior < k_idx; ++prior) {
+                if (topk_indices[row * k + prior] == (uint32_t)e) {
+                    inp_kvp.value = -1.f;
+                }
+            }
+            thread_kvp = arg_max(inp_kvp, thread_kvp);
+        }
+
+        const cub_kvp result = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        if (threadIdx.x == 0) {
+            topk_weights[row * k + k_idx] = shared_sigmoid[result.key];
+            topk_indices[row * k + k_idx] = (uint32_t)result.key;
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace moe
 } // namespace vllm
+
+extern "C" void topk_select(
+    const float* scores,
+    float* topk_weights,
+    uint32_t* topk_indices,
+    const int num_experts,
+    const int num_tokens,
+    const int topk,
+    cudaStream_t stream)
+{
+    constexpr int TPB = 256;
+    vllm::moe::topkSelectKernel<TPB><<<num_tokens, TPB, 0, stream>>>(
+        scores, topk_weights, topk_indices, num_experts, topk);
+}
+
+extern "C" void fused_sigmoid_topk(
+    const float* logits,
+    const float* bias,
+    float* topk_weights,
+    uint32_t* topk_indices,
+    const int num_experts,
+    const int num_tokens,
+    const int topk,
+    cudaStream_t stream)
+{
+    constexpr int TPB = 256;
+    int smem = num_experts * sizeof(float);
+    vllm::moe::fusedSigmoidTopkKernel<TPB><<<num_tokens, TPB, 0, stream>>>(
+        logits, bias, topk_weights, topk_indices, num_experts, topk);
+}
 
 extern "C" void topk_softmax(
     const float* gating_output,               // [num_tokens, num_experts]

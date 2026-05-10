@@ -657,6 +657,27 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn topk_select(
+        scores: *const f32,     // in: [num_tokens, num_experts]
+        topk_weights: *mut f32, // out: [num_tokens, topk]
+        topk_indices: *mut u32, // out: [num_tokens, topk]
+        num_experts: i32,
+        num_tokens: i32,
+        topk: i32,
+        stream: i64,
+    );
+
+    pub fn fused_sigmoid_topk(
+        logits: *const f32,     // in: [num_tokens, num_experts]
+        bias: *const f32,       // in: [num_experts] or null
+        topk_weights: *mut f32, // out: [num_tokens, topk] (original sigmoid scores)
+        topk_indices: *mut u32, // out: [num_tokens, topk]
+        num_experts: i32,
+        num_tokens: i32,
+        topk: i32,
+        stream: i64,
+    );
+
     pub fn sampling_f32(
         logits_d: *const f32,
         out_tokens_d: *mut i32,

@@ -711,36 +711,18 @@ extern "C" void moe_gemv_fp8(
 #endif
   };
 
-  // For small-to-medium N: use warp-per-row kernel with shared memory input caching.
-  // For large N (>2048): use single-row kernel with shared memory + 256 threads.
-  if (size_n <= 512) {
+  // Use warp-per-row kernel for all N values. More rows per block gives better
+  // input reuse from shared memory and higher per-warp utilization.
+  // Each warp processes one output row with the full K-reduction.
+  if (size_k <= 512 && size_n > 512) {
+    launch.template operator()<16>();
+  } else if (size_n <= 512) {
     launch.template operator()<16>();
   } else if (size_n <= 2048) {
     launch.template operator()<8>();
+  } else if (size_n <= 4096) {
+    launch.template operator()<4>();
   } else {
-    // Large N: single-row kernel with shared memory input caching
-    constexpr int BLOCK_SIZE = 256;
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
-    // smem for input (K elements as T) + warp reduction (NUM_WARPS floats, aligned)
-    int smem_single = size_k * elem_size + 16 + NUM_WARPS * sizeof(float);
-    dim3 grid(size_n, size_m);
-    dim3 block(BLOCK_SIZE);
-
-    if (dtype == 0) {
-      moe_gemv_kernel_fp8_single<half, BLOCK_SIZE><<<grid, block, smem_single, stream>>>(
-          reinterpret_cast<const half *>(input),
-          weights, weight_scales, sorted_token_ids, expert_ids,
-          topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
-          size_m, size_n, size_k, block_size_n, block_size_k);
-    }
-#ifndef NO_BF16_KERNEL
-    else if (dtype == 1) {
-      moe_gemv_kernel_fp8_single<nv_bfloat16, BLOCK_SIZE><<<grid, block, smem_single, stream>>>(
-          reinterpret_cast<const nv_bfloat16 *>(input),
-          weights, weight_scales, sorted_token_ids, expert_ids,
-          topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
-          size_m, size_n, size_k, block_size_n, block_size_k);
-    }
-#endif
+    launch.template operator()<2>();
   }
 }

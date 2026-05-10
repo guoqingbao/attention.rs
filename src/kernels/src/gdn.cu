@@ -52,7 +52,7 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
 }
 
 __device__ __forceinline__ float silu_float(float x) {
-    return x / (1.0f + expf(-x));
+    return x / (1.0f + __expf(-x));
 }
 
 static constexpr int GDN_WARP_SIZE = 32;
@@ -1527,11 +1527,11 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     int num_heads,
     int k_dim,
     int v_dim) {
-    const int seq_head = blockIdx.y; // batch_idx * num_heads + head_idx
+    const int seq_head = blockIdx.y;
     const int lane = threadIdx.x;
     const int warp_id = threadIdx.y;
     const int v_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    if (v_idx >= v_dim || seq_head >= batch * num_heads) return;
+    if (seq_head >= batch * num_heads) return;
 
     const int seq_idx = seq_head / num_heads;
     const int head_idx = seq_head % num_heads;
@@ -1543,7 +1543,6 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const int seq_len = end - start;
     if (seq_len <= 0) return;
 
-    // Pointers: input layout is [total_tokens, num_heads, dim]
     const int token_stride_k = num_heads * k_dim;
     const int token_stride_v = num_heads * v_dim;
     const int token_stride_g = num_heads;
@@ -1555,61 +1554,112 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const T* beta_base = beta + start * token_stride_g + head_idx;
     T* out_base = out + start * token_stride_v + head_idx * v_dim;
 
-    float* state_col = state + (((slot * num_heads + head_idx) * v_dim + v_idx) * k_dim);
+    // Double-buffered shared memory: 2 sets of q_buf/k_buf/scalars
+    // Overlaps next timestep's load with current computation, eliminating one sync.
+    __shared__ float q_buf[2][BK];
+    __shared__ float k_buf[2][BK];
+    __shared__ float scalars[2][2]; // [buf_idx][0=decay, 1=beta]
+
+    const bool v_valid = (v_idx < v_dim);
+
+    float* state_col = v_valid ?
+        state + (((slot * num_heads + head_idx) * v_dim + v_idx) * k_dim) : nullptr;
 
     constexpr int ROWS_PER_LANE = (BK + GDN_WARP_SIZE - 1) / GDN_WARP_SIZE;
     float s_shard[ROWS_PER_LANE];
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_LANE; ++r) {
-        const int k_idx = r * GDN_WARP_SIZE + lane;
-        s_shard[r] = (k_idx < k_dim) ? state_col[k_idx] : 0.0f;
-    }
-
-    for (int t = 0; t < seq_len; ++t) {
-        const T* q_t = q_base + t * token_stride_k;
-        const T* k_t = k_base + t * token_stride_k;
-        const T* v_t = v_base + t * token_stride_v;
-
-        float q_reg[ROWS_PER_LANE];
-        float k_reg[ROWS_PER_LANE];
+    if (v_valid) {
 #pragma unroll
         for (int r = 0; r < ROWS_PER_LANE; ++r) {
             const int k_idx = r * GDN_WARP_SIZE + lane;
-            q_reg[r] = (k_idx < k_dim) ? to_float(q_t[k_idx]) : 0.0f;
-            k_reg[r] = (k_idx < k_dim) ? to_float(k_t[k_idx]) : 0.0f;
-        }
-
-        const float decay = to_float(g_base[t * token_stride_g]);
-        const float beta_t = to_float(beta_base[t * token_stride_g]);
-
-        float kv_partial = 0.0f;
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; ++r) {
-            s_shard[r] *= decay;
-            kv_partial = __fmaf_rn(s_shard[r], k_reg[r], kv_partial);
-        }
-        const float kv_mem = warp_reduce_sum(kv_partial);
-        const float delta = (to_float(v_t[v_idx]) - kv_mem) * beta_t;
-
-        float y_partial = 0.0f;
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; ++r) {
-            s_shard[r] = __fmaf_rn(k_reg[r], delta, s_shard[r]);
-            y_partial = __fmaf_rn(s_shard[r], q_reg[r], y_partial);
-        }
-        const float y_t = warp_reduce_sum(y_partial);
-
-        if (lane == 0) {
-            out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+            s_shard[r] = (k_idx < k_dim) ? state_col[k_idx] : 0.0f;
         }
     }
 
-    // Store the transposed [V, K] state back.
+    constexpr int TOTAL_THREADS = WARPS_PER_BLOCK * GDN_WARP_SIZE;
+    const int tid = warp_id * GDN_WARP_SIZE + lane;
+
+    // Preload first timestep into buffer 0
+    if (seq_len > 0) {
+        const T* q_0 = q_base;
+        const T* k_0 = k_base;
+        for (int j = tid; j < BK; j += TOTAL_THREADS) {
+            if (j < k_dim) {
+                q_buf[0][j] = to_float(q_0[j]);
+                k_buf[0][j] = to_float(k_0[j]);
+            } else {
+                q_buf[0][j] = 0.0f;
+                k_buf[0][j] = 0.0f;
+            }
+        }
+        if (tid == 0) {
+            scalars[0][0] = to_float(g_base[0]);
+            scalars[0][1] = to_float(beta_base[0]);
+        }
+        __syncthreads();
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int cur = t & 1;
+        const int nxt = 1 - cur;
+
+        // Start loading next timestep into the other buffer (overlaps with compute)
+        if (t + 1 < seq_len) {
+            const T* q_next = q_base + (t + 1) * token_stride_k;
+            const T* k_next = k_base + (t + 1) * token_stride_k;
+            for (int j = tid; j < BK; j += TOTAL_THREADS) {
+                if (j < k_dim) {
+                    q_buf[nxt][j] = to_float(q_next[j]);
+                    k_buf[nxt][j] = to_float(k_next[j]);
+                } else {
+                    q_buf[nxt][j] = 0.0f;
+                    k_buf[nxt][j] = 0.0f;
+                }
+            }
+            if (tid == 0) {
+                scalars[nxt][0] = to_float(g_base[(t + 1) * token_stride_g]);
+                scalars[nxt][1] = to_float(beta_base[(t + 1) * token_stride_g]);
+            }
+        }
+
+        if (v_valid) {
+            const float decay = scalars[cur][0];
+            const float beta_t = scalars[cur][1];
+
+            float kv_partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_LANE; ++r) {
-        const int k_idx = r * GDN_WARP_SIZE + lane;
-        if (k_idx < k_dim) {
-            state_col[k_idx] = s_shard[r];
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] *= decay;
+                kv_partial = __fmaf_rn(s_shard[r], k_buf[cur][k_idx], kv_partial);
+            }
+            const float kv_mem = warp_reduce_sum(kv_partial);
+            const float delta = (to_float(v_base[t * token_stride_v + v_idx]) - kv_mem) * beta_t;
+
+            float y_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] = __fmaf_rn(k_buf[cur][k_idx], delta, s_shard[r]);
+                y_partial = __fmaf_rn(s_shard[r], q_buf[cur][k_idx], y_partial);
+            }
+            const float y_t = warp_reduce_sum(y_partial);
+
+            if (lane == 0) {
+                out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+            }
+        }
+
+        // Single sync: ensures next buffer load is complete before it's used
+        __syncthreads();
+    }
+
+    if (v_valid) {
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            if (k_idx < k_dim) {
+                state_col[k_idx] = s_shard[r];
+            }
         }
     }
 }
