@@ -232,7 +232,7 @@ impl PagedAttention {
             let o_stride_tokens = q_l.stride()[0] as i32;
             let sinks_ptr = std::ptr::null();
 
-            let (query_start_len_ptr, num_query_seqs) = {
+            let (query_start_len_ptr, _num_query_seqs) = {
                 let (cu_query_lens, cu_query_lens_layout) = cu_query_lens.storage_and_layout();
                 let cu_query_lens = match &*cu_query_lens {
                     candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
@@ -245,21 +245,19 @@ impl PagedAttention {
 
             unsafe {
                 // Calculate shared memory requirement for optimized kernel:
-                // smem_size = 32 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
+                // smem_size = 64 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
                 // sizeof(cache_t) = 2 for fp16/bf16, 1 for fp8
                 let cache_elem_size = if k_scales_ptr.is_null() {
                     2usize
                 } else {
                     1usize
                 };
-                let smem_size = 32 + 2 * head_size * block_size * cache_elem_size;
+                let smem_size = 64 + 2 * head_size * block_size * cache_elem_size;
+                let opt_eligible = smem_size <= 64 * 1024;
 
-                // Use optimized kernel with shared memory tiling when:
-                // 1. Tokens attention with KV cache is large (i.e., >1024 tokens)
-                // 2. Single sequence (optimized kernel assumes all tokens in chunk share same KV blocks)
-                // 3. Shared memory fits within 64KB (minimum on modern GPUs, extended via cudaFuncSetAttribute)
-                let single_seq = num_query_seqs == 1 && num_seqs_bt == 1;
-                if num_seqs > 1024 && single_seq && smem_size <= 64 * 1024 {
+                // Use optimized kernel with shared-memory KV tiling when smem fits
+                // and sequences have enough context. Works for both single and batched.
+                if opt_eligible && self.max_context_len > 1024 {
                     kernels::ffi::paged_attention_prefill_opt(
                         out_ptr,
                         q_ptr,

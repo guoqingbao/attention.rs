@@ -145,11 +145,15 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
         int num_blocks;
         int start_block_idx;
         int start_token_idx;
+        int seq_query_start;
+        int seq_query_len;
+        int q_pos_start;
+        int boundary_seq_idx;    // second sequence if chunk spans boundary, -1 otherwise
+        int boundary_token_pos;  // first token of second sequence within chunk
     };
     SeqInfo* shared_seq_info = reinterpret_cast<SeqInfo*>(smem_buffer);
     
-    // K/V tiles after seq info (aligned to 16 bytes)
-    cache_t* k_smem = reinterpret_cast<cache_t*>(smem_buffer + 32);
+    cache_t* k_smem = reinterpret_cast<cache_t*>(smem_buffer + 64);
     cache_t* v_smem = k_smem + (HEAD_SIZE * BLOCK_SIZE);
 
     constexpr int THREAD_GROUP_SIZE = 1;
@@ -175,10 +179,9 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
     const int64_t q_stride_heads = (int64_t)HEAD_SIZE;
     const int64_t o_stride_heads = (int64_t)HEAD_SIZE;
 
-    // --- Lane 0 computes sequence info and broadcasts via shared memory ---
+    // Lane 0 resolves the dominant sequence and detects chunk-boundary crossings
     if (lane == 0) {
         int seq_idx = 0;
-        // Binary search for sequence index using chunk_start (first token in chunk)
         if (chunk_start < (int)query_start_len[num_seqs] && chunk_start >= (int)query_start_len[0]) {
             int left = 0, right = num_seqs - 1;
             while (left <= right) {
@@ -195,31 +198,96 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
         }
         
         uint32_t seq_len_full = seq_lens[seq_idx];
-        int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        int seq_query_start = query_start_len[seq_idx];
+        int seq_query_end = query_start_len[seq_idx + 1];
+        int seq_query_len = seq_query_end - seq_query_start;
+        int q_pos_start = (int)seq_len_full - seq_query_len;
+        int first_local_q_pos = chunk_start - seq_query_start;
+        if (first_local_q_pos < 0) first_local_q_pos = 0;
+        int first_q_abs_pos = q_pos_start + first_local_q_pos;
+        int num_blocks_seq = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
         
         int start_token_idx = 0;
         int start_block_idx = 0;
-        if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
-            start_token_idx = (int)seq_len_full - sliding_window;
+        if (sliding_window > 0 && sliding_window <= first_q_abs_pos) {
+            start_token_idx = first_q_abs_pos + 1 - sliding_window;
             start_block_idx = start_token_idx / BLOCK_SIZE;
         }
         
+        // Detect if this chunk spans a sequence boundary
+        int chunk_end = chunk_start + TOKEN_CHUNK_SIZE;
+        int boundary_seq = -1;
+        int boundary_pos = TOKEN_CHUNK_SIZE;
+        if (seq_idx + 1 < num_seqs && seq_query_end < chunk_end && seq_query_end > chunk_start) {
+            boundary_seq = seq_idx + 1;
+            boundary_pos = seq_query_end - chunk_start;
+        }
+
         shared_seq_info->seq_idx = seq_idx;
-        shared_seq_info->num_blocks = num_blocks;
+        shared_seq_info->num_blocks = num_blocks_seq;
         shared_seq_info->start_block_idx = start_block_idx;
         shared_seq_info->start_token_idx = start_token_idx;
+        shared_seq_info->seq_query_start = seq_query_start;
+        shared_seq_info->seq_query_len = seq_query_len;
+        shared_seq_info->q_pos_start = q_pos_start;
+        shared_seq_info->boundary_seq_idx = boundary_seq;
+        shared_seq_info->boundary_token_pos = boundary_pos;
     }
     __syncthreads();
     
-    // All threads read the shared sequence info
-    const int seq_idx = shared_seq_info->seq_idx;
-    const int num_blocks = shared_seq_info->num_blocks;
-    const int start_block_idx = shared_seq_info->start_block_idx;
-    const int start_token_idx = shared_seq_info->start_token_idx;
-    const uint32_t seq_len_full = seq_lens[seq_idx];
-    const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
+    // All threads read shared info for the dominant (first) sequence
+    const int dom_seq_idx = shared_seq_info->seq_idx;
+    const int dom_num_blocks = shared_seq_info->num_blocks;
+    const int dom_start_block_idx = shared_seq_info->start_block_idx;
+    const int dom_start_token_idx = shared_seq_info->start_token_idx;
+    const int dom_seq_query_start = shared_seq_info->seq_query_start;
+    const int dom_q_pos_start = shared_seq_info->q_pos_start;
+    const int boundary_seq_idx = shared_seq_info->boundary_seq_idx;
+    const int boundary_token_pos = shared_seq_info->boundary_token_pos;
 
-    // Vector types
+    // Per-thread sequence resolution: am I in the dominant or boundary sequence?
+    const bool in_boundary_seq = (boundary_seq_idx >= 0 && lane >= boundary_token_pos);
+    
+    // Each thread resolves its own sequence context
+    int my_seq_idx, my_num_blocks, my_start_block_idx, my_start_token_idx;
+    int my_seq_query_start, my_q_pos_start;
+    uint32_t my_seq_len_full;
+    
+    if (!in_boundary_seq) {
+        my_seq_idx = dom_seq_idx;
+        my_num_blocks = dom_num_blocks;
+        my_start_block_idx = dom_start_block_idx;
+        my_start_token_idx = dom_start_token_idx;
+        my_seq_query_start = dom_seq_query_start;
+        my_q_pos_start = dom_q_pos_start;
+        my_seq_len_full = seq_lens[dom_seq_idx];
+    } else {
+        my_seq_idx = boundary_seq_idx;
+        my_seq_len_full = seq_lens[boundary_seq_idx];
+        my_seq_query_start = query_start_len[boundary_seq_idx];
+        int my_seq_query_len = query_start_len[boundary_seq_idx + 1] - my_seq_query_start;
+        my_q_pos_start = (int)my_seq_len_full - my_seq_query_len;
+        my_num_blocks = (int)((my_seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        int local_q = token_start - my_seq_query_start;
+        if (local_q < 0) local_q = 0;
+        int abs_q = my_q_pos_start + local_q;
+        my_start_token_idx = 0;
+        my_start_block_idx = 0;
+        if (sliding_window > 0 && sliding_window <= abs_q) {
+            my_start_token_idx = abs_q + 1 - sliding_window;
+            my_start_block_idx = my_start_token_idx / BLOCK_SIZE;
+        }
+    }
+
+    const uint32_t* my_block_table = block_tables + (int64_t)my_seq_idx * (int64_t)block_table_stride;
+    const int my_local_q_pos = token_start - my_seq_query_start;
+    const int my_q_abs_pos = my_q_pos_start + my_local_q_pos;
+    
+    // Recompute sliding window for this specific thread
+    if (sliding_window > 0 && sliding_window <= my_q_abs_pos && !in_boundary_seq) {
+        my_start_token_idx = my_q_abs_pos + 1 - sliding_window;
+    }
+
     using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
     using Float_vec = typename Vec<float, VEC_SIZE>::Type;
@@ -232,7 +300,6 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
     const bool head_active = (qh_base_idx < num_queries_per_kv) && (query_head_idx < num_query_heads);
     const bool lane_active = (token_start < num_query_tokens);
 
-    // Load Q
     const int64_t q_off = (int64_t)token_start * q_stride_tokens + (int64_t)query_head_idx * q_stride_heads;
     const int64_t o_off = (int64_t)token_start * (int64_t)o_stride_tokens + (int64_t)query_head_idx * o_stride_heads;
     
@@ -251,94 +318,179 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 
     const int elems_per_block = HEAD_SIZE * BLOCK_SIZE;
 
-    // --- Main Loop Over KV Blocks ---
-    // ALL threads iterate the same number of times (num_blocks is shared)
-    for (int blk = start_block_idx; blk < num_blocks; ++blk) {
-        const uint32_t physical_block = block_table_for_seq[blk];
+    // --- Boundary-sequence threads: non-tiled path (read from global memory) ---
+    // These threads cannot participate in cooperative KV loading for the dominant
+    // sequence since they need different KV blocks. They run independently.
+    if (in_boundary_seq && head_active && lane_active) {
+        for (int blk = my_start_block_idx; blk < my_num_blocks; ++blk) {
+            const uint32_t physical_block = my_block_table[blk];
+            const bool valid_block = (physical_block != UINT32_MAX) &&
+                                     ((uint64_t)physical_block < (uint64_t)total_num_blocks);
+            if (!valid_block) continue;
+
+            const int block_in_full = blk * BLOCK_SIZE;
+            const int64_t k_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
+            const int64_t v_base = k_base;
+            bool in_contexts[BLOCK_SIZE];
+
+            for (int b = 0; b < BLOCK_SIZE; ++b) {
+                const int token_idx_in_full = block_in_full + b;
+                bool in_context = (token_idx_in_full <= my_q_abs_pos);
+                bool in_window = (token_idx_in_full >= my_start_token_idx);
+                in_contexts[b] = in_context && in_window;
+
+                if (!in_context || !in_window) {
+                    qk_block[b] = -INFINITY;
+                } else {
+                    K_vec k_vec_local[NUM_VECS];
+                    #pragma unroll
+                    for (int k = 0; k < NUM_VECS; k++) {
+                        int d = k * VEC_SIZE;
+                        int gy = d / X;
+                        int gx = d % X;
+                        int64_t k_idx = k_base + b * X + gy * (BLOCK_SIZE * X) + gx;
+                        if constexpr (!is_quantized) {
+                            k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_cache[k_idx]);
+                        } else {
+                            Quant_vec fp8_k = *reinterpret_cast<const Quant_vec*>(&k_cache[k_idx]);
+                            k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k, k_scales[kv_head_idx]);
+                        }
+                    }
+                    float qk = Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
+                    if (softscapping != 1.0) qk = fast_tanh_opt(qk / softscapping) * softscapping;
+                    if (use_alibi) qk += alibi * float(token_idx_in_full - my_q_abs_pos);
+                    qk_block[b] = qk;
+                }
+            }
+
+            float Smax = -INFINITY;
+            #pragma unroll
+            for (int b = 0; b < BLOCK_SIZE; ++b) Smax = fmaxf(Smax, qk_block[b]);
+            const float m_j = fmaxf(M, Smax);
+            const float alpha_v = __expf(M - m_j);
+            M = m_j;
+            L = L * alpha_v;
+            #pragma unroll
+            for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha_v;
+
+            Float_vec p_vec[NUM_BLOCK_VECS];
+            float acc_lane = 0.f;
+            #pragma unroll
+            for (int b = 0; b < BLOCK_SIZE; ++b) {
+                if (in_contexts[b]) {
+                    const float P = __expf(qk_block[b] - M);
+                    reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
+                    acc_lane += P;
+                } else {
+                    reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = 0.f;
+                }
+            }
+            L += acc_lane;
+
+            for (int k = 0; k < HEAD_SIZE; ++k) {
+                const cache_t* v_row = &v_cache[v_base + (int64_t)k * BLOCK_SIZE];
+                for (int bv = 0; bv < NUM_BLOCK_VECS; bv++) {
+                    Float_vec v_val;
+                    if constexpr (!is_quantized) {
+                        v_val = to_float(*reinterpret_cast<const K_vec*>(v_row + bv * VEC_SIZE));
+                    } else {
+                        Quant_vec fp8_v = *reinterpret_cast<const Quant_vec*>(v_row + bv * VEC_SIZE);
+                        v_val = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v, v_scales[kv_head_idx]);
+                    }
+                    acc_vec[k] += dot(p_vec[bv], v_val);
+                }
+            }
+        }
+
+        // Write boundary-thread output
+        using O_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
+        O_vec o_vec[NUM_VECS];
+        #pragma unroll
+        for (int k = 0; k < HEAD_SIZE; k++) {
+            float outv = acc_vec[k] / (L + 1e-6f);
+            from_float(reinterpret_cast<scalar_t*>(&o_vec[k / VEC_SIZE])[k % VEC_SIZE], outv);
+        }
+        #pragma unroll
+        for (int k = 0; k < NUM_VECS; k++) {
+            *reinterpret_cast<O_vec*>(out + o_off + k * VEC_SIZE) = o_vec[k];
+        }
+    }
+
+    // Boundary threads are done; they still participate in __syncthreads below
+    // but skip computation for dominant-sequence KV blocks.
+    
+    // --- Dominant-sequence threads: cooperative shared-memory tiled path ---
+    const uint32_t* dom_block_table = block_tables + (int64_t)dom_seq_idx * (int64_t)block_table_stride;
+
+    for (int blk = dom_start_block_idx; blk < dom_num_blocks; ++blk) {
+        const uint32_t physical_block = dom_block_table[blk];
         const bool valid_block = (physical_block != UINT32_MAX) && 
                                  ((uint64_t)physical_block < (uint64_t)total_num_blocks);
 
-        // --- Cooperative Load to Shared Memory ---
-        // ALL threads participate in loading (valid_block is same for all)
+        // ALL threads cooperatively load KV into shared memory
         if (valid_block) {
             const int64_t k_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
             const cache_t* k_src = k_cache + k_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
                 k_smem[i] = k_src[i];
             }
-
-            const int64_t v_base = (int64_t)physical_block * kv_block_stride + (int64_t)kv_head_idx * kv_head_stride;
-            const cache_t* v_src = v_cache + v_base;
+            const cache_t* v_src = v_cache + k_base;
             for (int i = tid; i < elems_per_block; i += block_dim) {
                 v_smem[i] = v_src[i];
             }
         }
         
-        // SYNC 1: All threads must hit this after loading
         __syncthreads();
 
-        // Skip computation if block invalid, but DO NOT use continue
-        // All threads still proceed to SYNC 2 at the end
-        if (valid_block) {
+        // Only dominant-sequence threads compute attention from tiled data
+        if (valid_block && !in_boundary_seq) {
             const int block_in_full = blk * BLOCK_SIZE;
             bool in_contexts[BLOCK_SIZE];
 
-            // --- Compute Q * K ---
             for (int b = 0; b < BLOCK_SIZE; ++b) {
                 const int token_idx_in_full = block_in_full + b;
-                
-                bool in_context = (token_idx_in_full < (int)seq_len_full);
-                bool in_window = (token_idx_in_full >= start_token_idx);
+                bool in_context = (token_idx_in_full <= my_q_abs_pos);
+                bool in_window = (token_idx_in_full >= my_start_token_idx);
                 in_contexts[b] = in_context && in_window;
 
                 if (!in_context || !in_window || !lane_active) {
                     qk_block[b] = -INFINITY;
                 } else {
                     K_vec k_vec_local[NUM_VECS];
-
                     #pragma unroll
                     for (int k = 0; k < NUM_VECS; k++) {
                         int d = k * VEC_SIZE;
                         int gy = d / X;
                         int gx = d % X;
                         int smem_idx = b * X + gy * (BLOCK_SIZE * X) + gx;
-
                         if constexpr (!is_quantized) {
                             k_vec_local[k] = *reinterpret_cast<const K_vec*>(&k_smem[smem_idx]);
                         } else {
-                            Quant_vec fp8_k_vec = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
-                            k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k_vec, k_scales[kv_head_idx]);
+                            Quant_vec fp8_k = *reinterpret_cast<const Quant_vec*>(&k_smem[smem_idx]);
+                            k_vec_local[k] = vllm::fp8::scaled_convert<K_vec, Quant_vec>(fp8_k, k_scales[kv_head_idx]);
                         }
                     }
-
                     float qk = Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vec, k_vec_local) * sm_scale;
-                    if (softscapping != 1.0) {
-                        qk = fast_tanh_opt(qk / softscapping) * softscapping;
-                    }
-                    if (use_alibi) {
-                        qk += alibi * float(token_idx_in_full - ((int)seq_len_full - 1));
-                    }
+                    if (softscapping != 1.0) qk = fast_tanh_opt(qk / softscapping) * softscapping;
+                    if (use_alibi) qk += alibi * float(token_idx_in_full - my_q_abs_pos);
                     qk_block[b] = qk;
                 }
             }
 
-            // Only active threads do softmax and accumulation
             if (head_active && lane_active) {
-                // --- Softmax (Online) ---
                 float Smax = -INFINITY;
                 #pragma unroll
                 for (int b = 0; b < BLOCK_SIZE; ++b) Smax = fmaxf(Smax, qk_block[b]);
 
                 const float m_j = fmaxf(M, Smax);
-                const float alpha = __expf(M - m_j);
+                const float alpha_v = __expf(M - m_j);
                 M = m_j;
-                L = L * alpha;
+                L = L * alpha_v;
                 
                 #pragma unroll
-                for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha;
+                for (int i = 0; i < HEAD_SIZE; ++i) acc_vec[i] *= alpha_v;
 
                 Float_vec p_vec[NUM_BLOCK_VECS];
-
                 float acc_lane = 0.f;
                 #pragma unroll
                 for (int b = 0; b < BLOCK_SIZE; ++b) {
@@ -352,35 +504,29 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
                 }
                 L += acc_lane;
 
-                // --- Compute P * V ---
                 for (int k = 0; k < HEAD_SIZE; ++k) {
                     const cache_t* v_row_ptr = &v_smem[(int64_t)k * BLOCK_SIZE];
-                    
                     for (int b_vec = 0; b_vec < NUM_BLOCK_VECS; b_vec++) {
                         const cache_t* src = v_row_ptr + b_vec * VEC_SIZE;
-                        
                         Float_vec v_val_vec;
                         if constexpr (!is_quantized) {
                             v_val_vec = to_float(*reinterpret_cast<const K_vec*>(src));
                         } else {
-                            Quant_vec fp8_v_vec = *reinterpret_cast<const Quant_vec*>(src);
-                            v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v_vec, v_scales[kv_head_idx]);
+                            Quant_vec fp8_v = *reinterpret_cast<const Quant_vec*>(src);
+                            v_val_vec = vllm::fp8::scaled_convert<Float_vec, Quant_vec>(fp8_v, v_scales[kv_head_idx]);
                         }
-                        
                         acc_vec[k] += dot(p_vec[b_vec], v_val_vec);
                     }
                 }
-            } // end if head_active && lane_active
-        } // end if valid_block
+            }
+        }
         
-        // SYNC 2: ALL threads must hit this before next iteration
         __syncthreads();
-    } // End Block Loop
+    }
 
-    using O_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
-
-    // Write output
-    if (head_active && lane_active) {
+    // Write dominant-thread output
+    if (!in_boundary_seq && head_active && lane_active) {
+        using O_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
         O_vec o_vec[NUM_VECS];
         #pragma unroll
         for (int k = 0; k < HEAD_SIZE; k++) {
@@ -472,7 +618,7 @@ void paged_attention_prefill_opt_launcher(
   const float* alibi_slopes_ptr = nullptr;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
   const cudaStream_t stream = (cudaStream_t)stream_;
-  size_t smem_size = 32 + 2 * head_size * BLOCK_SIZE * sizeof(cache_T);
+  size_t smem_size = 64 + 2 * head_size * BLOCK_SIZE * sizeof(cache_T);
   
   switch (head_size) {
     case 64:

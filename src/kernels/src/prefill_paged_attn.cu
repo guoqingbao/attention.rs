@@ -174,18 +174,24 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
     // --- Find which sequence this token belongs to ---
     int seq_idx = 0;
+    int seq_query_start = 0;
+    int seq_query_len = 0;
     for (int i = 0; i < num_seqs; i++) {
         int s = query_start_len[i];
         int e = query_start_len[i + 1];
         if (token_start >= s && token_start < e) {
           seq_idx = i;
-          int seq_len = (e - s);
-          if (seq_len <= 0) return;
+          seq_query_start = s;
+          seq_query_len = e - s;
+          if (seq_query_len <= 0) return;
           break;
         }
     }
 
     const uint32_t seq_len_full = seq_lens[seq_idx];
+    const int q_pos_start = (int)seq_len_full - seq_query_len;
+    const int local_q_pos = token_start - seq_query_start;
+    const int q_abs_pos = q_pos_start + local_q_pos;
     const int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
     const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
     // const int context_len = (int)seq_len_full - 1;
@@ -226,11 +232,13 @@ __global__ void chunked_prefill_paged_attention_kernel(
     float L = 1.f;
 
     // Sliding Window Calculation
-    // We only attend to tokens in range [start_token_idx, seq_len_full)
+    // Each query token can only attend to keys up through its own absolute
+    // position. Using seq_len_full here would expose future tokens inside the
+    // current prefill chunk.
     int start_token_idx = 0;
     int start_block_idx = 0;
-    if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
-        start_token_idx = (int)seq_len_full - sliding_window;
+    if (sliding_window > 0 && sliding_window <= q_abs_pos) {
+        start_token_idx = q_abs_pos + 1 - sliding_window;
         start_block_idx = start_token_idx / BLOCK_SIZE;
     }
 
@@ -249,8 +257,8 @@ __global__ void chunked_prefill_paged_attention_kernel(
         for (int b = 0; b < BLOCK_SIZE; ++b) {
             const int token_idx_in_full = block_in_full + b;
             
-            // Masking logic: Must be in valid context AND within sliding window
-            bool in_context = (token_idx_in_full < (int)seq_len_full);
+            // Masking logic: Must be in valid causal context AND within sliding window
+            bool in_context = (token_idx_in_full <= q_abs_pos);
             bool in_window = (token_idx_in_full >= start_token_idx);
 
             // Store status for P·V later
@@ -287,8 +295,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
             // Add ALiBi positional bias if enabled
             if (use_alibi) {
-                const int context_len = (int)seq_len_full - 1;
-                qk_block[b] += alibi * float(token_idx_in_full - context_len);
+                qk_block[b] += alibi * float(token_idx_in_full - q_abs_pos);
             }
         } // blk
 
