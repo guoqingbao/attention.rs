@@ -3,8 +3,7 @@
 // For hybrid models (e.g., Qwen3.5), GatedDeltaNet layers require:
 // - conv_state:  [max_batch, d_conv, conv_kernel_size - 1] per GDN layer
 // - recurrent_state:
-//   - CUDA: [max_batch, num_heads, value_head_dim, key_head_dim] for coalesced GDN access
-//   - other backends: [max_batch, num_heads, key_head_dim, value_head_dim]
+//   - All backends: [max_batch, num_heads, key_head_dim, value_head_dim]
 //
 // The cache uses slot-based indexing: each sequence is assigned a slot index,
 // and states are updated in-place during forward passes.
@@ -337,11 +336,7 @@ impl MambaCache {
                 conv_dtype,
                 device,
             )?);
-            let recurrent_shape = if matches!(device, Device::Cuda(_)) {
-                (max_batch_size, num_heads, head_v_dim, head_k_dim)
-            } else {
-                (max_batch_size, num_heads, head_k_dim, head_v_dim)
-            };
+            let recurrent_shape = (max_batch_size, num_heads, head_k_dim, head_v_dim);
             recurrent_states.push(Tensor::zeros(recurrent_shape, recurrent_dtype, device)?);
         }
 
@@ -583,7 +578,7 @@ impl MambaCache {
     }
 
     /// Get mutable reference to the full recurrent state tensor for a layer
-    /// Shape is backend-specific; CUDA stores [max_batch, num_heads, value_head_dim, key_head_dim].
+    /// Shape: [max_batch, num_heads, key_head_dim, value_head_dim].
     pub fn recurrent_state_mut(&mut self, gdn_layer_idx: usize) -> &mut Tensor {
         &mut self.recurrent_states[gdn_layer_idx]
     }

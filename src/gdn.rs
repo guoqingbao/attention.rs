@@ -691,6 +691,42 @@ pub fn gated_delta_rule_decode_slots(
 }
 
 #[cfg(feature = "metal")]
+pub fn gated_delta_rule_decode_slots_gqa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    q_scale: f32,
+) -> Result<Tensor> {
+    let q_c = ensure_contiguous(q)?;
+    let k_c = ensure_contiguous(k)?;
+    let v_c = ensure_contiguous(v)?;
+    let g_c = ensure_contiguous(g)?;
+    let beta_c = ensure_contiguous(beta)?;
+
+    let (batch, num_k_heads, k_dim) = q_c.dims3()?;
+    let num_v_heads = v_c.dim(1)?;
+    let kv_group_size = num_v_heads / num_k_heads;
+
+    let q_exp = q_c
+        .unsqueeze(2)?
+        .broadcast_as((batch, num_k_heads, kv_group_size, k_dim))?
+        .reshape((batch, num_v_heads, k_dim))?
+        .contiguous()?;
+    let k_exp = k_c
+        .unsqueeze(2)?
+        .broadcast_as((batch, num_k_heads, kv_group_size, k_dim))?
+        .reshape((batch, num_v_heads, k_dim))?
+        .contiguous()?;
+    let q_scaled = (q_exp * q_scale as f64)?;
+
+    gated_delta_rule_decode_slots(&q_scaled, &k_exp, &v_c, &g_c, &beta_c, state, slots)
+}
+
+#[cfg(feature = "metal")]
 pub fn gated_delta_rule_recurrence_varlen(
     q: &Tensor,
     k: &Tensor,
@@ -1338,7 +1374,7 @@ pub fn gated_rmsnorm_silu_mul(
 /// - `q`, `k`: `[bh, seq, k_dim]`
 /// - `v`: `[bh, seq, v_dim]`
 /// - `g`, `beta`: `[bh, seq]`
-/// - CUDA `state`: `[bh, v_dim, k_dim]` (updated in place)
+/// - CUDA `state`: `[bh, k_dim, v_dim]` (updated in place)
 ///
 /// Note: this function expects caller-side q/k normalization to already be applied.
 #[cfg(feature = "cuda")]
@@ -1360,11 +1396,10 @@ pub fn gated_delta_rule_recurrence(
 
             let original_shape = state.shape().clone();
             let (bh_s, k_dim_s, v_dim_s) = if original_shape.rank() == 4 {
-                let (b, h, v, k) = state.dims4()?;
+                let (b, h, k, v) = state.dims4()?;
                 (b * h, k, v)
             } else {
-                let (bh_s, v_dim_s, k_dim_s) = state.dims3()?;
-                (bh_s, k_dim_s, v_dim_s)
+                state.dims3()?
             };
 
             if bh != bh_k
@@ -1508,7 +1543,7 @@ pub fn gated_delta_rule_decode_slots(
     v: &Tensor,    // [batch, heads, v_dim]
     g: &Tensor,    // [batch, heads]
     beta: &Tensor, // [batch, heads]
-    state: &mut Tensor, // CUDA: [max_batch, heads, v_dim, k_dim]
+    state: &mut Tensor, // CUDA: [max_batch, heads, k_dim, v_dim]
     slots: &Tensor, // [batch] i64
 ) -> Result<Tensor> {
     match q.device() {
@@ -1748,11 +1783,14 @@ pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
 /// Batched variable-length recurrence: processes multiple sequences in one CUDA launch.
 /// Accepts native dtype inputs (bf16/f16/f32) with FP32 state.
 ///
+/// When k_dim=128, v_dim=128, and max sequence length > 4096, automatically dispatches
+/// to the WY32 chunk-based kernel for significantly better throughput.
+///
 /// Shapes:
 /// - `q`, `k`: `[total_tokens, num_heads, k_dim]`
 /// - `v`: `[total_tokens, num_heads, v_dim]`
 /// - `g`, `beta`: `[total_tokens, num_heads]`
-/// - CUDA `state`: `[max_batch, num_heads, v_dim, k_dim]` (FP32, updated in place)
+/// - CUDA `state`: `[max_batch, num_heads, k_dim, v_dim]` (FP32, updated in place)
 /// - `slots`: `[batch]` i64
 /// - `cu_seqlens`: `[batch + 1]` u32
 #[cfg(feature = "cuda")]
@@ -1881,6 +1919,229 @@ pub fn gated_delta_rule_recurrence_varlen(
                 "Invalid tensor device {:?} for gated_delta_rule_recurrence_varlen",
                 q.device()
             );
+        }
+    }
+}
+
+/// GQA variant: q/k have num_k_heads, v/g/beta/state/out have num_v_heads.
+/// Fuses q_scale multiplication into the kernel to avoid separate allocation.
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_recurrence_varlen_gqa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    cu_seqlens: &Tensor,
+    q_scale: f32,
+) -> Result<Tensor> {
+    match q.device() {
+        Device::Cuda(dev) => {
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
+            let g_c = ensure_contiguous(g)?;
+            let beta_c = ensure_contiguous(beta)?;
+
+            let (total_tokens, num_k_heads, k_dim) = q_c.dims3()?;
+            let num_v_heads = v_c.dim(1)?;
+            let v_dim = v_c.dim(2)?;
+            let batch = slots.dim(0)?;
+
+            if num_v_heads % num_k_heads != 0 {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen_gqa: num_v_heads {} not divisible by num_k_heads {}",
+                    num_v_heads,
+                    num_k_heads
+                );
+            }
+
+            if state.dtype() != DType::F32 {
+                candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen_gqa expects FP32 state, got {:?}",
+                    state.dtype()
+                );
+            }
+
+            let out = Tensor::zeros((total_tokens, num_v_heads, v_dim), q.dtype(), q.device())?;
+
+            let q_ptr = get_cuda_const_ptr(&q_c)?;
+            let k_ptr = get_cuda_const_ptr(&k_c)?;
+            let v_ptr = get_cuda_const_ptr(&v_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)?;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+
+            match q.dtype() {
+                DType::BF16 => unsafe {
+                    ffi::gated_delta_rule_recurrence_varlen_gqa_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        cu_ptr,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                DType::F16 => unsafe {
+                    ffi::gated_delta_rule_recurrence_varlen_gqa_f16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        cu_ptr,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                dt => candle_core::bail!(
+                    "gated_delta_rule_recurrence_varlen_gqa: unsupported dtype {:?}",
+                    dt
+                ),
+            }
+            Ok(out)
+        }
+        _ => {
+            candle_core::bail!("Invalid device for gated_delta_rule_recurrence_varlen_gqa");
+        }
+    }
+}
+
+/// GQA decode: q/k have num_k_heads, v/g/beta/state/out have num_v_heads.
+/// Fuses q_scale multiplication and exp(g) into the kernel.
+/// State is FP32.
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_decode_slots_gqa(
+    q: &Tensor,         // [batch, num_k_heads, k_dim]
+    k: &Tensor,         // [batch, num_k_heads, k_dim]
+    v: &Tensor,         // [batch, num_v_heads, v_dim]
+    g: &Tensor,         // [batch, num_v_heads] (log-space, NOT exp'd)
+    beta: &Tensor,      // [batch, num_v_heads]
+    state: &mut Tensor, // [max_batch, num_v_heads, k_dim, v_dim] FP32
+    slots: &Tensor,     // [batch] i64
+    q_scale: f32,
+) -> Result<Tensor> {
+    match q.device() {
+        Device::Cuda(dev) => {
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
+            let g_c = ensure_contiguous(g)?;
+            let beta_c = ensure_contiguous(beta)?;
+
+            let (batch, num_k_heads, k_dim) = q_c.dims3()?;
+            let num_v_heads = v_c.dim(1)?;
+            let v_dim = v_c.dim(2)?;
+
+            if num_v_heads % num_k_heads != 0 {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots_gqa: num_v_heads {} not divisible by num_k_heads {}",
+                    num_v_heads,
+                    num_k_heads
+                );
+            }
+            if slots.dtype() != DType::I64 || slots.dim(0)? != batch {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots_gqa expects slots [batch] I64, got {:?} {:?}",
+                    slots.shape(),
+                    slots.dtype()
+                );
+            }
+            if state.dtype() != DType::F32 {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots_gqa expects FP32 state, got {:?}",
+                    state.dtype()
+                );
+            }
+            if !state.is_contiguous() {
+                candle_core::bail!("gated_delta_rule_decode_slots_gqa expects contiguous state");
+            }
+
+            let out = Tensor::zeros((batch, num_v_heads, v_dim), q.dtype(), q.device())?;
+
+            let q_ptr = get_cuda_const_ptr(&q_c)?;
+            let k_ptr = get_cuda_const_ptr(&k_c)?;
+            let v_ptr = get_cuda_const_ptr(&v_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)?;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+
+            match q.dtype() {
+                DType::BF16 => unsafe {
+                    ffi::gated_delta_rule_decode_slots_gqa_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                DType::F16 => unsafe {
+                    ffi::gated_delta_rule_decode_slots_gqa_f16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                dt => candle_core::bail!(
+                    "gated_delta_rule_decode_slots_gqa: unsupported dtype {:?}",
+                    dt
+                ),
+            }
+            Ok(out)
+        }
+        _ => {
+            candle_core::bail!("Invalid device for gated_delta_rule_decode_slots_gqa");
         }
     }
 }

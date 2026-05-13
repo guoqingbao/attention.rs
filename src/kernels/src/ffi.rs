@@ -2148,6 +2148,117 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn gated_delta_rule_decode_slots_gqa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+    pub fn gated_delta_rule_decode_slots_gqa_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+
+    // Grouped-Query varlen recurrence (num_k_heads != num_v_heads, fused q_scale)
+    pub fn gated_delta_rule_recurrence_varlen_gqa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+    pub fn gated_delta_rule_recurrence_varlen_gqa_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+
+    // Persistent GQA varlen prefill (H in registers, 128 threads per CTA)
+    pub fn gated_delta_rule_prefill_persistent_varlen_gqa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+    pub fn gated_delta_rule_prefill_persistent_varlen_gqa_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
+
     // =========================================================================
     // MXFP4 GEMM
     // =========================================================================
