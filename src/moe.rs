@@ -1032,18 +1032,148 @@ pub fn moe_gemm_fp8(
 }
 
 #[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_fp8(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Tensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: usize,
-    _: usize,
-    _: bool,
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    block_size_n: usize,
+    block_size_k: usize,
+    is_prefill: bool,
 ) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    {
+        use candle_core::{DType, Storage};
+
+        let dev = input.device();
+        let dtype = input.dtype();
+        let metal_dev = match dev {
+            candle_core::Device::Metal(d) => d,
+            _ => candle_core::bail!("moe_gemm_fp8: expected Metal device"),
+        };
+
+        let (input_rows, size_k1) = input.dims2()?;
+        let size_m = if topk_weights.is_none() {
+            input_rows * topk
+        } else {
+            input_rows
+        };
+        let (num_experts, size_n, size_k) = weights.dims3()?;
+        assert!(
+            size_k == size_k1,
+            "input {:?} and weight {:?} last dim mismatch!",
+            size_k1,
+            size_k
+        );
+        assert!(
+            weights.dtype() == DType::U8,
+            "moe_gemm_fp8 expects U8 weights for FP8, got {:?}",
+            weights.dtype()
+        );
+        assert!(
+            weight_scales.dtype() == DType::F32,
+            "moe_gemm_fp8 expects f32 scales, got {:?}",
+            weight_scales.dtype()
+        );
+
+        let output = Tensor::zeros((size_m, size_n), dtype, dev)?;
+
+        let command_buffer = metal_dev.command_buffer()?;
+        let command_buffer_ref = command_buffer.as_ref();
+
+        {
+            let (input_s, input_l) = input.storage_and_layout();
+            let input_ms = match &*input_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("input must be metal"),
+            };
+
+            let (w_s, w_l) = weights.storage_and_layout();
+            let w_ms = match &*w_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weights must be metal"),
+            };
+
+            let (ws_s, ws_l) = weight_scales.storage_and_layout();
+            let ws_ms = match &*ws_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weight_scales must be metal"),
+            };
+
+            let (st_s, st_l) = sorted_token_ids.storage_and_layout();
+            let st_ms = match &*st_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("sorted_token_ids must be metal"),
+            };
+
+            let (ei_s, ei_l) = experts_ids.storage_and_layout();
+            let ei_ms = match &*ei_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("expert_ids must be metal"),
+            };
+
+            let tw_buf_pair = if let Some(tw) = topk_weights {
+                let (tw_s, tw_l) = tw.storage_and_layout();
+                let tw_ms = match &*tw_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("topk_weights must be metal"),
+                };
+                Some((
+                    tw_ms.buffer().clone(),
+                    tw_l.start_offset() * tw.dtype().size_in_bytes(),
+                ))
+            } else {
+                None
+            };
+
+            let (output_s, output_l) = output.storage_and_layout();
+            let output_ms = match &*output_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("output must be metal"),
+            };
+
+            let tw_ref = tw_buf_pair
+                .as_ref()
+                .map(|(buf, off)| (buf as &metal::Buffer, *off));
+
+            crate::metal_kernels::call_fp8_moe_gemm(
+                metal_dev.device(),
+                command_buffer_ref,
+                crate::metal_kernels::Kernels::default(),
+                dtype,
+                input_ms.buffer(),
+                input_l.start_offset() * dtype.size_in_bytes(),
+                w_ms.buffer(),
+                w_l.start_offset() * weights.dtype().size_in_bytes(),
+                ws_ms.buffer(),
+                ws_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+                st_ms.buffer(),
+                st_l.start_offset() * sorted_token_ids.dtype().size_in_bytes(),
+                ei_ms.buffer(),
+                ei_l.start_offset() * experts_ids.dtype().size_in_bytes(),
+                tw_ref,
+                output_ms.buffer(),
+                output_l.start_offset() * dtype.size_in_bytes(),
+                num_experts as i32,
+                topk as i32,
+                size_m as i32,
+                size_n as i32,
+                size_k as i32,
+                block_size_n as i32,
+                block_size_k as i32,
+                is_prefill,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        }
+
+        return Ok(output);
+    }
+
+    #[cfg(not(feature = "metal"))]
     candle_core::bail!("moe_gemm_fp8 is not implemented on this platform!")
 }
 
@@ -1358,17 +1488,202 @@ pub fn moe_gemm_nvfp4(
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_nvfp4(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Tensor,
-    _: &Tensor,
-    _: Option<&Tensor>,
-    _: Option<&Tensor>,
-    _: &Tensor,
-    _: Option<(&Tensor, &Tensor)>,
-    _: bool,
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    weight_global_scales: &Tensor,
+    _input_scales: Option<&Tensor>,
+    _biases: Option<&Tensor>,
+    indices: &Tensor,
+    _pre_sorted: Option<(&Tensor, &Tensor)>,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
-    candle_core::bail!("moe_gemm_nvfp4 is not implemented on this platform!")
+    use candle_core::DType;
+
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let weights = if weights.is_contiguous() {
+        weights.clone()
+    } else {
+        weights.contiguous()?
+    };
+    let weight_scales = if weight_scales.is_contiguous() {
+        weight_scales.clone()
+    } else {
+        weight_scales.contiguous()?
+    };
+    let weight_global_scales = if weight_global_scales.is_contiguous() {
+        weight_global_scales.clone()
+    } else {
+        weight_global_scales.contiguous()?
+    };
+    let indices = if indices.is_contiguous() {
+        indices.clone()
+    } else {
+        indices.contiguous()?
+    };
+
+    let indices_dims = indices.dims();
+    if indices_dims.len() != 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: expected indices rank 2 [num_tokens, topk], got {:?}",
+            indices_dims
+        );
+    }
+    let num_tokens = indices_dims[0];
+    let topk = indices_dims[1];
+
+    let input_dims = input.dims();
+    let (k, input_has_topk_dim) = match input_dims {
+        [t, kk] => {
+            if *t != num_tokens {
+                candle_core::bail!(
+                    "moe_gemm_nvfp4: input/indices mismatch: input tokens={t}, indices tokens={num_tokens}"
+                );
+            }
+            (*kk, false)
+        }
+        [t, tk, kk] => {
+            if *t != num_tokens || *tk != topk {
+                candle_core::bail!(
+                    "moe_gemm_nvfp4: input/indices mismatch: input={input_dims:?}, indices={indices_dims:?}"
+                );
+            }
+            (*kk, true)
+        }
+        _ => candle_core::bail!(
+            "moe_gemm_nvfp4: expected input rank 2 or 3, got {:?}",
+            input_dims
+        ),
+    };
+
+    if k % crate::nvfp4_linear::NVFP4_BLOCK_SIZE != 0 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: K must be divisible by {}, got K={k}",
+            crate::nvfp4_linear::NVFP4_BLOCK_SIZE
+        );
+    }
+
+    let w_dims = weights.dims();
+    if w_dims.len() != 3 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: expected weights rank 3 [E, N, K/2], got {:?}",
+            w_dims
+        );
+    }
+    let num_experts = w_dims[0];
+    let n = w_dims[1];
+    if w_dims[2] != k / 2 {
+        candle_core::bail!(
+            "moe_gemm_nvfp4: weights shape mismatch, expected [E, N, K/2]=[{}, {}, {}], got {:?}",
+            num_experts,
+            n,
+            k / 2,
+            w_dims
+        );
+    }
+
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        candle_core::bail!("moe_gemm_nvfp4 only accepts f16/bf16 inputs");
+    }
+
+    let dev = input.device();
+
+    match dev {
+        #[cfg(feature = "metal")]
+        candle_core::Device::Metal(metal_dev) => {
+            use candle_core::Storage;
+
+            let reuse_topk = !input_has_topk_dim && topk <= 8;
+
+            let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
+
+            let command_buffer = metal_dev.command_buffer()?;
+            let command_buffer_ref = command_buffer.as_ref();
+
+            {
+                let (input_s, input_l) = input.storage_and_layout();
+                let input_ms = match &*input_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("input must be metal"),
+                };
+                let (weights_s, weights_l) = weights.storage_and_layout();
+                let weights_ms = match &*weights_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weights must be metal"),
+                };
+                let (scales_s, scales_l) = weight_scales.storage_and_layout();
+                let scales_ms = match &*scales_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weight_scales must be metal"),
+                };
+                let (gscales_s, gscales_l) = weight_global_scales.storage_and_layout();
+                let gscales_ms = match &*gscales_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weight_global_scales must be metal"),
+                };
+                let (indices_s, indices_l) = indices.storage_and_layout();
+                let indices_ms = match &*indices_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("indices must be metal"),
+                };
+                let (output_s, _) = output.storage_and_layout();
+                let output_ms = match &*output_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("output must be metal"),
+                };
+
+                let x = (
+                    input_ms.buffer(),
+                    input_l.start_offset() * dtype.size_in_bytes(),
+                );
+                let w = (
+                    weights_ms.buffer(),
+                    weights_l.start_offset() * weights.dtype().size_in_bytes(),
+                );
+                let sc = (
+                    scales_ms.buffer(),
+                    scales_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+                );
+                let gs = (
+                    gscales_ms.buffer(),
+                    gscales_l.start_offset() * weight_global_scales.dtype().size_in_bytes(),
+                );
+                let idx = (
+                    indices_ms.buffer(),
+                    indices_l.start_offset() * indices.dtype().size_in_bytes(),
+                );
+
+                metal_kernels::call_nvfp4_moe_gemm(
+                    metal_dev.device(),
+                    command_buffer_ref,
+                    metal_kernels::Kernels::default(),
+                    dtype,
+                    x,
+                    w,
+                    sc,
+                    gs,
+                    idx,
+                    output_ms.buffer(),
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    n,
+                    k,
+                    input_has_topk_dim,
+                    reuse_topk,
+                )
+                .map_err(candle_core::Error::wrap)?;
+            }
+
+            Ok(output)
+        }
+        _ => candle_core::bail!("moe_gemm_nvfp4: unsupported backend (need CUDA or Metal)"),
+    }
 }
 
 #[cfg(all(feature = "cuda", feature = "cutlass"))]

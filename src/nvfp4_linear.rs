@@ -1,5 +1,7 @@
 #[cfg(feature = "cuda")]
 use crate::kernels::ffi;
+#[cfg(feature = "metal")]
+use crate::metal_kernels;
 #[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::workspace::get_cutlass_workspace;
 #[cfg(feature = "cuda")]
@@ -513,6 +515,108 @@ pub fn nvfp4_matmul(
 
             Ok(output)
         }
-        _ => candle_core::bail!("nvfp4_matmul: unsupported backend (need CUDA)"),
+        #[cfg(feature = "metal")]
+        candle_core::Device::Metal(metal_dev) => {
+            use candle_core::Storage;
+
+            let output = Tensor::zeros((m, n), dtype, dev)?;
+
+            let command_buffer = metal_dev.command_buffer()?;
+            let command_buffer_ref = command_buffer.as_ref();
+
+            {
+                let (input_s, input_l) = input.storage_and_layout();
+                let input_ms = match &*input_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("input must be metal"),
+                };
+                let (weight_s, weight_l) = weight.storage_and_layout();
+                let weight_ms = match &*weight_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weight must be metal"),
+                };
+                let (scale_s, scale_l) = scale.storage_and_layout();
+                let scale_ms = match &*scale_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("scale must be metal"),
+                };
+                let (output_s, _output_l) = output.storage_and_layout();
+                let output_ms = match &*output_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("output must be metal"),
+                };
+
+                let x = (
+                    input_ms.buffer(),
+                    input_l.start_offset() * dtype.size_in_bytes(),
+                );
+                let w = (
+                    weight_ms.buffer(),
+                    weight_l.start_offset() * weight.dtype().size_in_bytes(),
+                );
+                let sc = (
+                    scale_ms.buffer(),
+                    scale_l.start_offset() * scale.dtype().size_in_bytes(),
+                );
+
+                if let Some(b) = bias {
+                    let b = if b.is_contiguous() {
+                        b.clone()
+                    } else {
+                        b.contiguous()?
+                    };
+                    let (bias_s, bias_l) = b.storage_and_layout();
+                    let bias_ms = match &*bias_s {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("bias must be metal"),
+                    };
+                    let bias_buf = (
+                        bias_ms.buffer(),
+                        bias_l.start_offset() * b.dtype().size_in_bytes(),
+                    );
+
+                    metal_kernels::call_nvfp4_matmul(
+                        metal_dev.device(),
+                        command_buffer_ref,
+                        metal_kernels::Kernels::default(),
+                        dtype,
+                        x,
+                        w,
+                        sc,
+                        bias_buf,
+                        output_ms.buffer(),
+                        m,
+                        n,
+                        k,
+                        weight_global_scale,
+                        true,
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                } else {
+                    let dummy_bias = (input_ms.buffer(), 0usize);
+
+                    metal_kernels::call_nvfp4_matmul(
+                        metal_dev.device(),
+                        command_buffer_ref,
+                        metal_kernels::Kernels::default(),
+                        dtype,
+                        x,
+                        w,
+                        sc,
+                        dummy_bias,
+                        output_ms.buffer(),
+                        m,
+                        n,
+                        k,
+                        weight_global_scale,
+                        false,
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
+            }
+
+            Ok(output)
+        }
+        _ => candle_core::bail!("nvfp4_matmul: unsupported backend (need CUDA or Metal)"),
     }
 }
