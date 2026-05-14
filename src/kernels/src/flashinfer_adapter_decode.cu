@@ -317,7 +317,7 @@ void flashinfer_decode_run_wrapper(
         }
         auto run_decode_fp8 = [&](auto dtype_q_val) {
             using DTypeQ = decltype(dtype_q_val);
-            using DTypeKV = uint8_t;
+            using DTypeKV = __nv_fp8_e4m3;
             using DTypeOut = DTypeQ;
             using IdType = int32_t;
 

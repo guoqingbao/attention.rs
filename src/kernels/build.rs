@@ -127,7 +127,7 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
-            if compute_cap >= 89 {
+            if compute_cap >= 80 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
             }
             if compute_cap >= 90 {
@@ -140,6 +140,7 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed=src/flashinfer_common.cuh");
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_decode.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
+        println!("cargo:rerun-if-changed=src/flashinfer_prefill_fp8_fa2.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
         // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
         // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support

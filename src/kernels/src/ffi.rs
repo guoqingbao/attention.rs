@@ -1367,6 +1367,60 @@ extern "C" {
     );
 
     #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_prefill_plan_fp8_fa2(
+        q_cu_seqlens_host: *const i32,
+        indptr_host: *const i32,
+        kv_len_arr_host: *const i32,
+        total_num_rows: i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        enable_cuda_graph: bool,
+        window_left: i32,
+        out_data_type: i32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: usize,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_prefill_run_fp8_fa2(
+        out_ptr: *mut c_void,
+        q_ptr: *mut c_void,
+        q_cu_seqlens: *mut i32,
+        total_num_rows: i32,
+        k_data: *mut c_void,
+        v_data: *mut c_void,
+        indices: *mut i32,
+        indptr: *mut i32,
+        last_len: *mut i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        sm_scale: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        window_left: i32,
+        logits_soft_cap: f32,
+        out_data_type: i32,
+        plan_info_vec: *const i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
     pub fn flashinfer_prefill_ragged_wrapper(
         out_ptr: *mut c_void,
         q_ptr: *const c_void,

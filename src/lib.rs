@@ -254,7 +254,7 @@ impl PagedAttention {
             num_queries_per_kv,
             alibi_slopes,
             k_scale: if fp8_kvcache {
-                Some(Tensor::zeros(
+                Some(Tensor::ones(
                     (num_key_value_heads,),
                     candle_core::DType::F32,
                     &device,
@@ -263,7 +263,7 @@ impl PagedAttention {
                 None
             },
             v_scale: if fp8_kvcache {
-                Some(Tensor::zeros(
+                Some(Tensor::ones(
                     (num_key_value_heads,),
                     candle_core::DType::F32,
                     &device,
@@ -521,7 +521,11 @@ impl PagedAttention {
                 };
 
                 if flashinfer_group_supported {
-                    self.maybe_update_kv_scales(&key, &value)?;
+                    // FlashInfer FA2 path: skip per-head scale updates.
+                    // With scale=1.0, append_kv_cache does raw BF16->FP8 cast,
+                    // and the FA2 attention kernel does raw FP8->float cast — both match.
+                    // The SM90 Hopper kernel handles per-head scales natively via
+                    // its additional_params, so 1.0 scales are also fine there.
 
                     if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
                         crate::flashinfer::append_kv_cache(

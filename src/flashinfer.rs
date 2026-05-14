@@ -332,8 +332,8 @@ impl candle::CustomOp1 for FlashInferAppend {
 
         let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
             let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-            if sm < 90 {
-                candle::bail!("flashinfer fp8 append requires sm90+, got sm{}", sm);
+            if sm < 80 {
+                candle::bail!("flashinfer fp8 append requires sm80+, got sm{}", sm);
             }
             let k_scales = self
                 .k_scale
@@ -492,11 +492,22 @@ impl FlashInferDecodeWithPlan {
 
         let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         if data_type == 2 {
-            if sm < 90 {
-                candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
+            if sm < 80 {
+                candle::bail!("flashinfer fp8 decode requires sm80+, got sm{}", sm);
             }
         }
-        validate_decode_plan_info(&self.plan_info, data_type, sm)?;
+        // For FP8 with head_dim >= 256, use the generic (non-SM90) path to avoid
+        // kernel launch failures in the SM90 FP8 attention kernel with large head dims.
+        let use_sm90_fp8 = data_type == 2 && sm == 90 && self.head_dim < 256;
+        let effective_data_type = data_type;
+        let effective_sm = if use_sm90_fp8 {
+            sm
+        } else if data_type == 2 {
+            0
+        } else {
+            sm
+        };
+        validate_decode_plan_info(&self.plan_info, effective_data_type, effective_sm)?;
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
@@ -523,7 +534,7 @@ impl FlashInferDecodeWithPlan {
         };
 
         unsafe {
-            if data_type == 2 && sm == 90 {
+            if use_sm90_fp8 {
                 kernels::ffi::flashinfer_decode_run_wrapper_fp8(
                     out_ptr,
                     q_ptr as *mut std::ffi::c_void,
@@ -711,9 +722,11 @@ pub fn decode_plan(
         candle::bail!("decode_plan requires kv_len_arr_host in metadata");
     };
     let qo_indptr_host = Some(qo_indptr);
-    let mut plan_info = vec![0i64; if data_type == 2 && sm == 90 { 9 } else { 10 }];
+    // For FP8 with head_dim >= 256, use the generic decode plan (not SM90-specific)
+    let use_sm90_fp8 = data_type == 2 && sm == 90 && head_dim < 256;
+    let mut plan_info = vec![0i64; if use_sm90_fp8 { 9 } else { 10 }];
     unsafe {
-        if data_type == 2 && sm == 90 {
+        if use_sm90_fp8 {
             kernels::ffi::flashinfer_decode_plan_wrapper_fp8(
                 indptr_host.as_ptr() as *mut i32,
                 qo_indptr_host
@@ -766,7 +779,14 @@ pub fn decode_plan(
         }
     }
 
-    validate_decode_plan_info(&plan_info, data_type, sm)?;
+    let validate_sm = if use_sm90_fp8 {
+        sm
+    } else if data_type == 2 {
+        0
+    } else {
+        sm
+    };
+    validate_decode_plan_info(&plan_info, data_type, validate_sm)?;
     Ok(plan_info)
 }
 
@@ -786,6 +806,7 @@ pub fn prefill_plan(
     page_size: usize,
     out_dtype: DType,
     window_left: Option<i32>,
+    kv_dtype: Option<DType>,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
     let sm = cuda_utils::sm_version(dev).unwrap_or(0);
@@ -825,30 +846,59 @@ pub fn prefill_plan(
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
         get_plan_workspace(dev, false)?;
 
-    let mut plan_info = vec![0i64; if sm == 90 { 10 } else { 16 }];
+    let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
+    let use_fp8_fa2_plan = is_fp8 && sm >= 90 && head_dim >= 256;
+    // SM90 uses 10-element plan except for FP8 + head_dim >= 256 which needs FA2 plan (16-element)
+    let use_sm90_plan = sm == 90 && head_dim < 256 && !use_fp8_fa2_plan;
+    let mut plan_info = vec![0i64; if use_sm90_plan { 10 } else { 16 }];
     unsafe {
-        kernels::ffi::flashinfer_prefill_plan_wrapper(
-            q_cu_seqlens_host.as_ptr() as *const i32,
-            indptr_host.as_ptr() as *const i32,
-            kv_len_arr_host.as_ptr() as *const i32,
-            total_num_rows as i32,
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            page_size as i32,
-            false,
-            window_left.unwrap_or(-1),
-            out_data_type,
-            ws_float_ptr,
-            ws_float_size,
-            ws_int_ptr,
-            ws_int_size,
-            page_locked_ptr,
-            page_locked_size,
-            plan_info.as_mut_ptr(),
-            *dev.cu_stream() as i64,
-        );
+        if use_fp8_fa2_plan {
+            kernels::ffi::flashinfer_prefill_plan_fp8_fa2(
+                q_cu_seqlens_host.as_ptr() as *const i32,
+                indptr_host.as_ptr() as *const i32,
+                kv_len_arr_host.as_ptr() as *const i32,
+                total_num_rows as i32,
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                page_size as i32,
+                false,
+                window_left.unwrap_or(-1),
+                out_data_type,
+                ws_float_ptr,
+                ws_float_size,
+                ws_int_ptr,
+                ws_int_size,
+                page_locked_ptr,
+                page_locked_size,
+                plan_info.as_mut_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        } else {
+            kernels::ffi::flashinfer_prefill_plan_wrapper(
+                q_cu_seqlens_host.as_ptr() as *const i32,
+                indptr_host.as_ptr() as *const i32,
+                kv_len_arr_host.as_ptr() as *const i32,
+                total_num_rows as i32,
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                page_size as i32,
+                false,
+                window_left.unwrap_or(-1),
+                out_data_type,
+                ws_float_ptr,
+                ws_float_size,
+                ws_int_ptr,
+                ws_int_size,
+                page_locked_ptr,
+                page_locked_size,
+                plan_info.as_mut_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        }
     }
     validate_prefill_plan_info(&plan_info, ws_float_size, ws_int_size)?;
     Ok(plan_info)
@@ -1149,7 +1199,10 @@ impl FlashInferFP8PagedPrefill {
         let dev = q.device();
         let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         if sm < 90 {
-            candle::bail!("flashinfer fp8 paged prefill requires sm90+, got sm{}", sm);
+            candle::bail!(
+                "flashinfer fp8 paged prefill (SM90 path) requires sm90+, got sm{}",
+                sm
+            );
         }
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
@@ -1335,8 +1388,8 @@ impl FlashInferRaggedPrefill {
         let mut v_scale_ptr = std::ptr::null();
         if data_type == 2 {
             let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-            if sm < 90 {
-                candle::bail!("flashinfer fp8 ragged prefill requires sm90+, got sm{}", sm);
+            if sm < 80 {
+                candle::bail!("flashinfer fp8 ragged prefill requires sm80+, got sm{}", sm);
             }
             let k_scales = self
                 .k_scale

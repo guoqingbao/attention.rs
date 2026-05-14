@@ -283,7 +283,7 @@ void flashinfer_prefill_plan_wrapper(
     }
 
 #if defined(SM_90_PASS)
-    {
+    if (head_dim < 256) {
         PrefillPlanSM90Info plan_info;
         PrefillSM90Plan<int32_t>(
             workspace_float, workspace_float_size,
@@ -303,8 +303,8 @@ void flashinfer_prefill_plan_wrapper(
                 plan_info_out[1 + i] = vec[i];
             }
         }
-    }
-#else
+    } else
+#endif
     {
         PrefillPlanInfo plan_info;
         PrefillPlan<int32_t>(
@@ -329,7 +329,6 @@ void flashinfer_prefill_plan_wrapper(
             }
         }
     }
-#endif
 #endif
 }
 
@@ -371,91 +370,38 @@ void flashinfer_prefill_run_wrapper(
 
     if (data_type == 2) {
 #if defined(SM_90_PASS) && defined(FLASHINFER_ENABLE_FP8_E4M3)
-        extern void flashinfer_prefill_run_fp8(
-            void*, void*, int32_t, void*, void*, int32_t*,
-            int32_t, int32_t, int32_t, int32_t, float,
-            const float*, const float*, void*, int32_t,
-            const int64_t*, cudaStream_t);
-        flashinfer_prefill_run_fp8(
-            out_ptr, q_ptr, total_num_rows, k_data, v_data, indices,
-            num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
-            k_scale_ptr, v_scale_ptr, workspace_int, out_data_type,
-            plan_info_vec, stream);
-#elif defined(FLASHINFER_ENABLE_FP8_E4M3)
-        if (tag != 0) {
-            fprintf(stderr, "[flashinfer][prefill_run] FA2 FP8 path but plan tag=%lld (expected 0)\n", (long long)tag);
+        if (head_dim < 256) {
+            extern void flashinfer_prefill_run_fp8(
+                void*, void*, int32_t, void*, void*, int32_t*,
+                int32_t, int32_t, int32_t, int32_t, float,
+                const float*, const float*, void*, int32_t,
+                const int64_t*, cudaStream_t);
+            flashinfer_prefill_run_fp8(
+                out_ptr, q_ptr, total_num_rows, k_data, v_data, indices,
+                num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
+                k_scale_ptr, v_scale_ptr, workspace_int, out_data_type,
+                plan_info_vec, stream);
             return;
         }
-        auto run_fp8_fa2 = [&](auto dtype_q_val) {
-            using DTypeQ = decltype(dtype_q_val);
-            using DTypeKV = uint8_t;
-            using DTypeOut = DTypeQ;
-            using IdType = int32_t;
-
-            PrefillPlanInfo plan_info;
-            std::vector<int64_t> vec(plan_data, plan_data + 15);
-            plan_info.FromVector(vec);
-
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                paged_kv_t<DTypeKV, IdType> paged_kv(
-                    num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
-                    (DTypeKV*)k_data, (DTypeKV*)v_data,
-                    indices, indptr, last_len
-                );
-
-                using ParamsType = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
-                ParamsType params(
-                    (DTypeQ*)q_ptr, paged_kv, nullptr, q_cu_seqlens,
-                    nullptr, nullptr,
-                    (DTypeOut*)out_ptr, nullptr, nullptr,
-                    num_qo_heads, num_qo_heads * head_dim, head_dim,
-                    window_left > 0 ? window_left : -1, logits_soft_cap, sm_scale, rope_scale, rope_theta
-                );
-
-                params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
-                params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.qo_tile_indices_offset);
-                params.kv_tile_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_tile_indices_offset);
-                params.o_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.o_indptr_offset);
-                params.kv_chunk_size_ptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.kv_chunk_size_ptr_offset);
-                params.max_total_num_rows = plan_info.total_num_rows;
-                params.padded_batch_size = plan_info.padded_batch_size;
-                params.partition_kv = plan_info.split_kv;
-                params.merge_indptr = nullptr;
-                params.block_valid_mask = nullptr;
-                if (plan_info.split_kv) {
-                    params.merge_indptr = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.merge_indptr_offset);
-                    if (plan_info.enable_cuda_graph) {
-                        params.block_valid_mask = GetPtrFromBaseOffset<bool>(workspace_int, plan_info.block_valid_mask_offset);
-                    }
-                }
-                params.total_num_rows = nullptr;
-                if (plan_info.enable_cuda_graph) {
-                    params.total_num_rows = GetPtrFromBaseOffset<uint32_t>(workspace_int, plan_info.total_num_rows_offset);
-                }
-
-                DTypeOut* tmp_v = nullptr;
-                float* tmp_s = nullptr;
-                if (plan_info.split_kv) {
-                    tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
-                    tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
-                }
-
-                DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                    using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                    BatchPrefillWithPagedKVCacheDispatched<
-                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
-                        PosEncodingMode::kNone, false, MaskMode::kCausal,
-                        AttentionType, ParamsType>(
-                        params, tmp_v, tmp_s, false, stream
-                    );
-                });
-            });
-        };
-        if (out_data_type == 1) {
-            run_fp8_fa2(nv_bfloat16{});
-        } else {
-            run_fp8_fa2(half{});
-        }
+#endif
+#if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        extern void flashinfer_prefill_run_fp8_fa2(
+            void*, void*, int32_t*, int32_t,
+            void*, void*, int32_t*, int32_t*, int32_t*,
+            int32_t, int32_t, int32_t, int32_t, int32_t, float,
+            const float*, const float*,
+            void*, size_t, void*, size_t,
+            int32_t, float, int32_t,
+            const int64_t*, cudaStream_t);
+        flashinfer_prefill_run_fp8_fa2(
+            out_ptr, q_ptr, q_cu_seqlens, total_num_rows,
+            k_data, v_data, indices, indptr, last_len,
+            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
+            k_scale_ptr, v_scale_ptr,
+            workspace_float, workspace_float_size,
+            workspace_int, workspace_int_size,
+            window_left, logits_soft_cap, out_data_type,
+            plan_info_vec, stream);
 #else
         fprintf(stderr, "[flashinfer][prefill_run] FP8 prefill requires SM89+ with FP8 support\n");
 #endif
@@ -463,11 +409,7 @@ void flashinfer_prefill_run_wrapper(
     }
 
 #if defined(SM_90_PASS)
-    if (tag != 1) {
-        fprintf(stderr, "[flashinfer][prefill_run] SM90 build but plan tag=%lld (expected 1)\n", (long long)tag);
-        return;
-    }
-    {
+    if (tag == 1) {
         PrefillPlanSM90Info plan_info;
         std::vector<int64_t> vec(plan_data, plan_data + 9);
         plan_info.FromVector(vec);
@@ -518,11 +460,7 @@ void flashinfer_prefill_run_wrapper(
         }
     }
 #else
-    if (tag != 0) {
-        fprintf(stderr, "[flashinfer][prefill_run] non-SM90 build but plan tag=%lld (expected 0)\n", (long long)tag);
-        return;
-    }
-    {
+    if (tag == 0) {
         PrefillPlanInfo plan_info;
         std::vector<int64_t> vec(plan_data, plan_data + 15);
         plan_info.FromVector(vec);

@@ -29,7 +29,6 @@
 #include <flashinfer/pos_enc.cuh>
 using namespace flashinfer;
 
-#if !defined(SM_90_PASS)
 static inline bool ValidateWorkspaceOffset(
     const char* name,
     int64_t offset,
@@ -72,7 +71,6 @@ static inline bool ValidatePrefillPlanInfoBounds(
            ValidateWorkspaceOffset(
                "block_valid_mask", plan_info.block_valid_mask_offset, int_workspace_size, "int");
 }
-#endif
 
 #if !defined(SM_90_PASS)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
