@@ -1005,10 +1005,6 @@ impl ReshapeCache {
 
         unsafe {
             if is_flash_cache {
-                assert!(
-                    k_scales_ptr.is_null() && v_scales_ptr.is_null(),
-                    "fp8 kvcache is not supported under flash context!"
-                );
                 let block_stride = kc_l.stride()[0];
                 let page_stride = kc_l.stride()[1];
                 let head_stride = kc_l.stride()[2];
@@ -1311,4 +1307,74 @@ pub fn reshape_and_cache(
         slot_mapping: slot_mapping.to_owned(),
     };
     key.inplace_op1(&op)
+}
+
+#[cfg(feature = "cuda")]
+pub fn convert_to_fp8(input: &Tensor, fixed_scale: Option<f32>) -> Result<(Tensor, Tensor)> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::WrapErr;
+    use std::ffi::c_int;
+
+    let input = input.contiguous()?;
+    let (s, l) = input.storage_and_layout();
+    let s = match &*s {
+        Storage::Cuda(s) => s,
+        _ => candle::bail!("convert_to_fp8: input must be a cuda tensor"),
+    };
+    let dev = s.device();
+    let dtype = s.dtype();
+    let internal_type = match dtype {
+        DType::F16 => 0u32,
+        DType::BF16 => 1u32,
+        _ => candle::bail!("convert_to_fp8: only f16/bf16 supported, got {dtype:?}"),
+    };
+
+    let rank = l.shape().rank();
+    let dims = l.shape().dims();
+    let (num_tokens, num_heads, head_dim) = if rank == 3 {
+        (dims[0], dims[1], dims[2])
+    } else if rank == 4 {
+        (dims[0] * dims[1], dims[2], dims[3])
+    } else {
+        candle::bail!(
+            "convert_to_fp8: expected rank 3 or 4, got {rank} ({:?})",
+            l.shape()
+        )
+    };
+
+    let num_elements = l.shape().elem_count();
+    let input_ptr = match dtype {
+        DType::F16 => {
+            let sl = s.as_cuda_slice::<half::f16>()?;
+            *sl.slice(l.start_offset()..).device_ptr() as *const core::ffi::c_void
+        }
+        DType::BF16 => {
+            let sl = s.as_cuda_slice::<half::bf16>()?;
+            *sl.slice(l.start_offset()..).device_ptr() as *const core::ffi::c_void
+        }
+        _ => unreachable!(),
+    };
+    let output = unsafe { dev.alloc::<u8>(num_elements) }.w()?;
+    let output_ptr = *output.device_ptr() as *mut core::ffi::c_void;
+    let scale_buf = unsafe { dev.alloc::<f32>(num_heads) }.w()?;
+    let scale_ptr = *scale_buf.device_ptr() as *mut f32;
+    let fs = fixed_scale.unwrap_or(-1.0f32);
+    unsafe {
+        kernels::ffi::call_convert_to_fp8(
+            input_ptr,
+            output_ptr,
+            scale_ptr,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_dim as c_int,
+            internal_type,
+            fs,
+            *dev.cu_stream() as i64,
+        );
+    }
+    let output_storage = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
+    let fp8_tensor = Tensor::from_storage(Storage::Cuda(output_storage), l.shape().clone())?;
+    let scale_storage = candle::CudaStorage::wrap_cuda_slice(scale_buf, dev.clone());
+    let scale_tensor = Tensor::from_storage(Storage::Cuda(scale_storage), (num_heads,))?;
+    Ok((fp8_tensor, scale_tensor))
 }

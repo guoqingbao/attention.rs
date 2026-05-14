@@ -10,6 +10,8 @@ pub mod scale_update;
 #[cfg(feature = "cuda")]
 pub mod workspace;
 use candle_core::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+pub use paged_attention::convert_to_fp8;
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
 pub mod fused_rope;
@@ -423,7 +425,15 @@ impl PagedAttention {
         let softcap = Some(softcapping.unwrap_or(0.0f64) as f32);
         let window_size_right = self.sliding_window.map(|_| 0);
 
-        self.maybe_update_kv_scales(&key, &value)?;
+        let is_fp8_kv = self.k_scale.is_some();
+
+        // FA3 native FP8: skip dynamic AMAX scale updates, keep K/V scales at 1.0.
+        // FA3 kernel only applies q/k descales in the softcap path; with softcap=0
+        // (typical for most models), non-1.0 scales would cause incorrect softmax
+        // temperature. Scale=1.0 matches vLLM's approach for uncalibrated models.
+        if !is_fp8_kv {
+            self.maybe_update_kv_scales(&key, &value)?;
+        }
 
         reshape_and_cache(
             &key,
@@ -440,14 +450,40 @@ impl PagedAttention {
             return self.flash_var_len(&query, &key, &value, input_metadata, softcapping);
         }
 
+        let block_tables = input_metadata.block_tables.as_ref().unwrap();
+        let context_lens = input_metadata.context_lens.as_ref().unwrap();
+
         if input_metadata.is_prefill {
-            // prefill with kvcache
+            #[cfg(feature = "cuda")]
+            if is_fp8_kv {
+                let (q_fp8, _q_descale) = convert_to_fp8(&query, Some(1.0))?;
+                return flashattn_rs::flash_attn_with_kvcache_advanced(
+                    &q_fp8,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    context_lens,
+                    block_tables,
+                    input_metadata.cu_seqlens_q.as_ref(),
+                    Some(input_metadata.max_seqlen_q),
+                    self.scale as f32,
+                    true,
+                    self.sliding_window,
+                    window_size_right,
+                    None,
+                    softcap,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
             return flashattn_rs::flash_attn_with_kvcache_advanced(
                 &query,
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
-                input_metadata.context_lens.as_ref().unwrap(),
-                input_metadata.block_tables.as_ref().unwrap(),
+                context_lens,
+                block_tables,
                 input_metadata.cu_seqlens_q.as_ref(),
                 Some(input_metadata.max_seqlen_q),
                 self.scale as f32,
@@ -458,15 +494,39 @@ impl PagedAttention {
                 softcap,
                 0,
                 None,
+                None,
+                None,
+                None,
             );
         }
 
-        // Decoding with kvcache
-        let block_tables = input_metadata.block_tables.as_ref().unwrap();
-        let context_lens = input_metadata.context_lens.as_ref().unwrap();
+        #[cfg(feature = "cuda")]
+        if is_fp8_kv {
+            let (q_fp8, _q_descale) = convert_to_fp8(&query.unsqueeze(1)?, Some(1.0))?;
+            return flashattn_rs::flash_attn_with_kvcache_advanced(
+                &q_fp8,
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                context_lens,
+                block_tables,
+                None,
+                None,
+                self.scale as f32,
+                false,
+                self.sliding_window,
+                window_size_right,
+                None,
+                softcap,
+                0,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
 
         flashattn_rs::flash_attn_with_kvcache_advanced(
-            &query.unsqueeze(1)?, //(batch_size, seqlen_q, num_heads_q, head_size)
+            &query.unsqueeze(1)?,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
             context_lens,
@@ -480,6 +540,9 @@ impl PagedAttention {
             None,
             softcap,
             0,
+            None,
+            None,
+            None,
             None,
         )
     }

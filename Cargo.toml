@@ -24,15 +24,15 @@ rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.5.5", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.2.0", optional = true}
-flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.0", rev = "7b2fbbd", optional = true }
+flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "fb341e0", optional = true }
 ureq = { version = "2.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
 graph = ["cuda", "candle-core/graph"]
-flashattn = ["dep:flashattn-rs", "flashattn-rs/flash-context", "kernels/no-fp8-kvcache"]
-flash-decoding = ["dep:flashattn-rs", "flashattn-rs/flash-decoding", "kernels/no-fp8-kvcache"]
+flashattn = ["dep:flashattn-rs", "flashattn-rs/flash-context"]
+flash-decoding = ["dep:flashattn-rs", "flashattn-rs/flash-decoding"]
 no-marlin = ["dep:kernels", "kernels/no-marlin"]
 no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]

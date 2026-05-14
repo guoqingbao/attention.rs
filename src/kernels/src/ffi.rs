@@ -21,6 +21,18 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn call_convert_to_fp8(
+        input: *const c_void,
+        output: *mut c_void,
+        scales_out: *mut f32,
+        num_tokens: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        dtype: u32,
+        fixed_scale: f32,
+        stream: i64,
+    );
+
     pub fn call_reshape_and_cache_flash(
         key: *const c_void,         // [num_tokens, num_heads, head_size]
         value: *const c_void,       // [num_tokens, num_heads, head_size]

@@ -1,5 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#ifndef NO_HARDWARE_FP8
+#include <cuda_fp8.h>
+#endif
 #include <stdint.h>
 
 #include "cuda_compat.h"
@@ -199,6 +202,94 @@ extern "C" void call_reshape_and_cache(
   }
 }
 
+template <typename scalar_t>
+__global__ void convert_to_fp8_per_head_kernel(
+    const scalar_t* __restrict__ input,
+    uint8_t* __restrict__ output,
+    float* __restrict__ scales_out,
+    const int num_tokens,
+    const int num_heads,
+    const int head_dim,
+    const float fixed_scale) {
+  const int head_idx = blockIdx.x;
+  if (head_idx >= num_heads) return;
+
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int head_elements = num_tokens * head_dim;
+
+  float scale;
+  if (fixed_scale > 0.0f) {
+    scale = fixed_scale;
+  } else {
+    float local_max = 0.0f;
+    for (int i = tid; i < head_elements; i += nthreads) {
+      int token = i / head_dim;
+      int d = i % head_dim;
+      int src_idx = token * num_heads * head_dim + head_idx * head_dim + d;
+      float val = fabsf(static_cast<float>(input[src_idx]));
+      local_max = fmaxf(local_max, val);
+    }
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+        smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+      }
+      __syncthreads();
+    }
+    scale = fmaxf(smem[0] / 448.0f, 1e-12f);
+  }
+
+  if (tid == 0) {
+    scales_out[head_idx] = scale;
+  }
+  __syncthreads();
+
+  float inv_scale = 1.0f / scale;
+  for (int i = tid; i < head_elements; i += nthreads) {
+    int token = i / head_dim;
+    int d = i % head_dim;
+    int idx = token * num_heads * head_dim + head_idx * head_dim + d;
+    float val = static_cast<float>(input[idx]) * inv_scale;
+#ifndef NO_HARDWARE_FP8
+// Do not use raw cast, use cuda api to convert it!
+    output[idx] = vllm::fp8::dispatch_float_to_fp8(val);
+#else
+    output[idx] = vllm::fp8::softmax_float_to_fp8_e4m3(val);
+#endif
+  }
+}
+
+extern "C" void call_convert_to_fp8(
+  void *input,
+  void *output,
+  float *scales_out,
+  int32_t num_tokens,
+  int32_t num_heads,
+  int32_t head_dim,
+  uint32_t dtype,      // 0 => f16; 1 => bf16
+  float fixed_scale,   // >0 to use fixed scale, <=0 for dynamic AMAX
+  int64_t stream_)
+{
+  const int threads = 256;
+  const int smem_bytes = (fixed_scale > 0.0f) ? 0 : threads * sizeof(float);
+  const cudaStream_t stream = (cudaStream_t)stream_;
+
+  if (dtype == 0) {
+    convert_to_fp8_per_head_kernel<uint16_t><<<num_heads, threads, smem_bytes, stream>>>(
+        reinterpret_cast<uint16_t*>(input),
+        reinterpret_cast<uint8_t*>(output),
+        scales_out, num_tokens, num_heads, head_dim, fixed_scale);
+  } else {
+    convert_to_fp8_per_head_kernel<__nv_bfloat16><<<num_heads, threads, smem_bytes, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(input),
+        reinterpret_cast<uint8_t*>(output),
+        scales_out, num_tokens, num_heads, head_dim, fixed_scale);
+  }
+}
+
 extern "C" void call_reshape_and_cache_flash(
   void *key,              // [num_tokens, num_heads, head_size]
   void *value,            // [num_tokens, num_heads, head_size]
@@ -247,3 +338,4 @@ extern "C" void call_reshape_and_cache_flash(
     }
   }
 }
+
