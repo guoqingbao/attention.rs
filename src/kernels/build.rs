@@ -56,6 +56,12 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/silu_and_mul.cu");
     println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_instantiate.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode_paged.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode_paged_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_reshape_cache.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -70,8 +76,16 @@ fn main() -> Result<()> {
         .arg("-std=c++17")
         .arg("-O3");
 
+    let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
+
     if !trtllm_enabled {
         builder = builder.exclude(&["trtllm/*"]);
+    }
+
+    if !flash_enabled {
+        builder = builder.exclude(&["flash/*"]);
+    } else {
+        builder = builder.arg("-Isrc/flash");
     }
 
     let compute_cap = builder.get_compute_cap().unwrap_or(80);

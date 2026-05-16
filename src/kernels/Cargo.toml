@@ -18,5 +18,6 @@ ureq = { version = "2.10", default-features = true }
 no-marlin = []
 no-fp8-kvcache = []
 cutlass = []
+flash = []
 flashinfer = []
 trtllm = ["flashinfer"]

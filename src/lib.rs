@@ -37,6 +37,9 @@ pub mod ops;
 pub mod silu_and_mul;
 pub mod swiglu;
 
+#[cfg(feature = "flash")]
+pub mod flash;
+
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
@@ -162,7 +165,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash", feature = "flashattn", feature = "flashinfer"))]
     fn packed_qkv(
         query: &Tensor,
         key: &Tensor,
@@ -676,6 +679,81 @@ impl PagedAttention {
                 }
             }
         } // end if !use_paged_for_large_head (flashinfer)
+
+        #[cfg(feature = "flash")]
+        if !input_metadata.disable_flash_attn.unwrap_or(false) {
+            let (query_p, key_p, value_p, attention_heads_p, key_value_heads_p, head_size_p) =
+                Self::packed_qkv(query, key, value)?;
+
+            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+
+            if !input_metadata.is_prefill {
+                self.maybe_update_kv_scales(&key_p, &value_p)?;
+            }
+
+            if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
+                crate::flash::flash_reshape_and_cache(
+                    &key_p,
+                    &value_p,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    &slot_mapping,
+                )?;
+            }
+
+            if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
+                return self.sdp_prefill(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    input_metadata,
+                    softcapping,
+                );
+            }
+
+            let block_tables = input_metadata.block_tables.as_ref().unwrap();
+            let context_lens = input_metadata.context_lens.as_ref().unwrap();
+
+            if input_metadata.is_prefill {
+                return crate::flash::flash_prefill(
+                    &query_p,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    block_tables,
+                    context_lens,
+                    attention_heads_p,
+                    key_value_heads_p,
+                    head_size_p,
+                    self.scale,
+                    softcapping.unwrap_or(0.0) as f32,
+                    self.sliding_window,
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    input_metadata.cu_seqlens_q.as_ref(),
+                );
+            }
+
+            let output = query_p.zeros_like()?;
+            return crate::flash::flash_decode(
+                &query_p,
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                block_tables,
+                context_lens,
+                &output,
+                attention_heads_p,
+                key_value_heads_p,
+                head_size_p,
+                self.scale,
+                softcapping.unwrap_or(0.0) as f32,
+                self.sliding_window,
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
+            );
+        }
 
         #[cfg(feature = "flashattn")]
         if !use_paged_for_large_head && !input_metadata.disable_flash_attn.unwrap_or(false) {

@@ -2933,4 +2933,184 @@ extern "C" {
 
     #[cfg(feature = "trtllm")]
     pub fn FlashInferSetCurrentCubin(binary: *const std::ffi::c_char, size: std::ffi::c_int);
+
+    // =========================================================================
+    // Native flash attention (flash feature)
+    // =========================================================================
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_prefill_paged(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_table: *const c_int,
+        q_len: u32,
+        kv_len: u32,
+        q_offset: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        sliding_window: u32,
+        causal: u32,
+        inv_sqrt_d: f32,
+        softcap: f32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_prefill_paged_fp8(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_table: *const c_int,
+        q_len: u32,
+        kv_len: u32,
+        q_offset: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        sliding_window: u32,
+        causal: u32,
+        inv_sqrt_d: f32,
+        softcap: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        fp8_cache_stride: u64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        q_stride: u32,
+        sliding_window: u32,
+        softcap: f32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_splitk(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        workspace: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        num_splits: u32,
+        q_stride: u32,
+        softcap: f32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_reduce(
+        workspace: *const c_void,
+        o: *mut c_void,
+        num_q_heads: u32,
+        head_dim: u32,
+        num_splits: u32,
+        num_seqs: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_fp8(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        q_stride: u32,
+        sliding_window: u32,
+        softcap: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        fp8_cache_stride: u64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_splitk_fp8(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        workspace: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        num_splits: u32,
+        q_stride: u32,
+        softcap: f32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        fp8_cache_stride: u64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_reshape_and_cache_bf16(
+        key: *const c_void,
+        value: *const c_void,
+        key_cache: *mut c_void,
+        value_cache: *mut c_void,
+        slot_mapping: *const i64,
+        num_tokens: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_reshape_and_cache_fp8_kv(
+        key: *const c_void,
+        value: *const c_void,
+        key_cache: *mut c_void,
+        value_cache: *mut c_void,
+        slot_mapping: *const i64,
+        num_tokens: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        k_scale_ptr: *const f32,
+        v_scale_ptr: *const f32,
+        stream: i64,
+    );
 }
