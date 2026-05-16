@@ -32,13 +32,26 @@
 #define BC 4
 #endif
 
-// fp8_to_f32_d is unique to this file.
-// unpack2_bf16_d is already defined in flash_decode_paged.cu (included before us
-// in flash_instantiate.cu) with the same per-HDIM rename.
+#ifndef FP8_DEQUANT_HELPERS_DEFINED
+#define FP8_DEQUANT_HELPERS_DEFINED
 
 __device__ __forceinline__ float fp8_to_f32_d(__nv_fp8_storage_t b, float scale) {
     return __half2float(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)) * scale;
 }
+
+__device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
+                                                float &f0, float &f1, float &f2, float &f3) {
+    __nv_fp8_storage_t b0 = (__nv_fp8_storage_t)(packed & 0xFF);
+    __nv_fp8_storage_t b1 = (__nv_fp8_storage_t)((packed >> 8) & 0xFF);
+    __nv_fp8_storage_t b2 = (__nv_fp8_storage_t)((packed >> 16) & 0xFF);
+    __nv_fp8_storage_t b3 = (__nv_fp8_storage_t)((packed >> 24) & 0xFF);
+    f0 = __half2float(__nv_cvt_fp8_to_halfraw(b0, __NV_E4M3)) * scale;
+    f1 = __half2float(__nv_cvt_fp8_to_halfraw(b1, __NV_E4M3)) * scale;
+    f2 = __half2float(__nv_cvt_fp8_to_halfraw(b2, __NV_E4M3)) * scale;
+    f3 = __half2float(__nv_cvt_fp8_to_halfraw(b3, __NV_E4M3)) * scale;
+}
+
+#endif
 
 extern "C" __global__ void flash_decode_paged_fp8(
     const __nv_bfloat16* __restrict__ Q,
@@ -107,17 +120,44 @@ extern "C" __global__ void flash_decode_paged_fp8(
         unsigned int block_offset = pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
-        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache
-            + (unsigned long long)physical_block * page_stride
+        unsigned long long kv_base = (unsigned long long)physical_block * page_stride
             + (unsigned long long)block_offset * head_stride_kv
             + (unsigned long long)kv_head * head_dim + vec_offset;
 
+        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache + kv_base;
+
         float dot = 0.f;
-        #pragma unroll
-        for (int i = 0; i < VEC_FP8; i++) {
-            float kv = fp8_to_f32_d(k_ptr[i], k_scale);
-            dot += q_reg[i] * kv;
+#if VEC_FP8 == 4
+        {
+            unsigned int k_packed = *(const unsigned int*)k_ptr;
+            float kf0, kf1, kf2, kf3;
+            fp8x4_to_f32x4(k_packed, k_scale, kf0, kf1, kf2, kf3);
+            dot = q_reg[0]*kf0 + q_reg[1]*kf1 + q_reg[2]*kf2 + q_reg[3]*kf3;
         }
+#elif VEC_FP8 == 8
+        {
+            const unsigned int* k32 = (const unsigned int*)k_ptr;
+            float kf[8];
+            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
+            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) dot += q_reg[i] * kf[i];
+        }
+#elif VEC_FP8 == 16
+        {
+            const unsigned int* k32 = (const unsigned int*)k_ptr;
+            float kf[16];
+            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
+            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
+            fp8x4_to_f32x4(k32[2], k_scale, kf[8], kf[9], kf[10], kf[11]);
+            fp8x4_to_f32x4(k32[3], k_scale, kf[12], kf[13], kf[14], kf[15]);
+            #pragma unroll
+            for (int i = 0; i < 16; i++) dot += q_reg[i] * kf[i];
+        }
+#else
+        #pragma unroll
+        for (int i = 0; i < VEC_FP8; i++) dot += q_reg[i] * fp8_to_f32_d(k_ptr[i], k_scale);
+#endif
         #pragma unroll
         for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1)
             dot += __shfl_xor_sync(0xffffffff, dot, offset);
@@ -128,15 +168,45 @@ extern "C" __global__ void flash_decode_paged_fp8(
         float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
         l_val = l_val * exp_old + exp_new;
 
-        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache
-            + (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset;
+        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache + kv_base;
+
+#if VEC_FP8 == 4
+        {
+            unsigned int v_packed = *(const unsigned int*)v_ptr;
+            float vf0, vf1, vf2, vf3;
+            fp8x4_to_f32x4(v_packed, v_scale, vf0, vf1, vf2, vf3);
+            o_reg[0] = o_reg[0] * exp_old + exp_new * vf0;
+            o_reg[1] = o_reg[1] * exp_old + exp_new * vf1;
+            o_reg[2] = o_reg[2] * exp_old + exp_new * vf2;
+            o_reg[3] = o_reg[3] * exp_old + exp_new * vf3;
+        }
+#elif VEC_FP8 == 8
+        {
+            const unsigned int* v32 = (const unsigned int*)v_ptr;
+            float vf[8];
+            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
+            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+        }
+#elif VEC_FP8 == 16
+        {
+            const unsigned int* v32 = (const unsigned int*)v_ptr;
+            float vf[16];
+            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
+            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
+            fp8x4_to_f32x4(v32[2], v_scale, vf[8], vf[9], vf[10], vf[11]);
+            fp8x4_to_f32x4(v32[3], v_scale, vf[12], vf[13], vf[14], vf[15]);
+            #pragma unroll
+            for (int i = 0; i < 16; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+        }
+#else
         #pragma unroll
         for (int i = 0; i < VEC_FP8; i++) {
             float vv = fp8_to_f32_d(v_ptr[i], v_scale);
             o_reg[i] = o_reg[i] * exp_old + exp_new * vv;
         }
+#endif
         m_val = m_new;
     }
 
@@ -258,14 +328,44 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
         unsigned int block_offset = pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
-        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache
-            + (unsigned long long)physical_block * page_stride
+        unsigned long long kv_base = (unsigned long long)physical_block * page_stride
             + (unsigned long long)block_offset * head_stride_kv
             + (unsigned long long)kv_head * head_dim + vec_offset;
 
+        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache + kv_base;
+
         float dot = 0.f;
+#if VEC_FP8 == 4
+        {
+            unsigned int k_packed = *(const unsigned int*)k_ptr;
+            float kf0, kf1, kf2, kf3;
+            fp8x4_to_f32x4(k_packed, k_scale, kf0, kf1, kf2, kf3);
+            dot = q_reg[0]*kf0 + q_reg[1]*kf1 + q_reg[2]*kf2 + q_reg[3]*kf3;
+        }
+#elif VEC_FP8 == 8
+        {
+            const unsigned int* k32 = (const unsigned int*)k_ptr;
+            float kf[8];
+            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
+            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) dot += q_reg[i] * kf[i];
+        }
+#elif VEC_FP8 == 16
+        {
+            const unsigned int* k32 = (const unsigned int*)k_ptr;
+            float kf[16];
+            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
+            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
+            fp8x4_to_f32x4(k32[2], k_scale, kf[8], kf[9], kf[10], kf[11]);
+            fp8x4_to_f32x4(k32[3], k_scale, kf[12], kf[13], kf[14], kf[15]);
+            #pragma unroll
+            for (int i = 0; i < 16; i++) dot += q_reg[i] * kf[i];
+        }
+#else
         #pragma unroll
         for (int i = 0; i < VEC_FP8; i++) dot += q_reg[i] * fp8_to_f32_d(k_ptr[i], k_scale);
+#endif
         #pragma unroll
         for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1)
             dot += __shfl_xor_sync(0xffffffff, dot, offset);
@@ -276,14 +376,44 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
         float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
         l_val = l_val * exp_old + exp_new;
 
-        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache
-            + (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset;
+        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache + kv_base;
+
+#if VEC_FP8 == 4
+        {
+            unsigned int v_packed = *(const unsigned int*)v_ptr;
+            float vf0, vf1, vf2, vf3;
+            fp8x4_to_f32x4(v_packed, v_scale, vf0, vf1, vf2, vf3);
+            o_reg[0] = o_reg[0] * exp_old + exp_new * vf0;
+            o_reg[1] = o_reg[1] * exp_old + exp_new * vf1;
+            o_reg[2] = o_reg[2] * exp_old + exp_new * vf2;
+            o_reg[3] = o_reg[3] * exp_old + exp_new * vf3;
+        }
+#elif VEC_FP8 == 8
+        {
+            const unsigned int* v32 = (const unsigned int*)v_ptr;
+            float vf[8];
+            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
+            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+        }
+#elif VEC_FP8 == 16
+        {
+            const unsigned int* v32 = (const unsigned int*)v_ptr;
+            float vf[16];
+            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
+            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
+            fp8x4_to_f32x4(v32[2], v_scale, vf[8], vf[9], vf[10], vf[11]);
+            fp8x4_to_f32x4(v32[3], v_scale, vf[12], vf[13], vf[14], vf[15]);
+            #pragma unroll
+            for (int i = 0; i < 16; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+        }
+#else
         #pragma unroll
         for (int i = 0; i < VEC_FP8; i++) {
             o_reg[i] = o_reg[i] * exp_old + exp_new * fp8_to_f32_d(v_ptr[i], v_scale);
         }
+#endif
         m_val = m_new;
     }
 

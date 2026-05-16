@@ -269,6 +269,9 @@ pub fn flash_prefill(
     Ok(o)
 }
 
+const SPLIT_K_THRESHOLD: usize = 1024;
+pub const NUM_SPLITS: u32 = 8;
+
 #[cfg(feature = "cuda")]
 pub fn flash_decode(
     query: &Tensor,
@@ -277,6 +280,7 @@ pub fn flash_decode(
     block_tables: &Tensor,
     context_lens: &Tensor,
     output: &Tensor,
+    max_context_len: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -285,6 +289,7 @@ pub fn flash_decode(
     sliding_window: Option<usize>,
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
+    workspace: Option<&Tensor>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -321,57 +326,131 @@ pub fn flash_decode(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let sw = sliding_window.unwrap_or(0) as u32;
     let is_fp8 = key_cache.dtype() == DType::U8;
+    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
     if is_fp8 {
         let fp8_cache_stride = (block_size * num_kv_heads * head_dim) as u64;
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
 
-        unsafe {
-            kernels::ffi::call_flash_decode_paged_fp8(
-                q_ptr,
-                kc_ptr,
-                vc_ptr,
-                o_ptr,
-                bt_ptr,
-                cl_ptr,
-                max_blocks_per_seq,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
-                scale,
-                num_seqs as u32,
-                q_stride,
-                sw,
-                softcap,
-                ks_ptr,
-                vs_ptr,
-                fp8_cache_stride,
-                stream,
-            );
+        if use_splitk {
+            let ws = workspace.unwrap();
+            let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+            unsafe {
+                kernels::ffi::call_flash_decode_paged_splitk_fp8(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    ws_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    NUM_SPLITS,
+                    q_stride,
+                    softcap,
+                    ks_ptr,
+                    vs_ptr,
+                    fp8_cache_stride,
+                    stream,
+                );
+                kernels::ffi::call_flash_decode_paged_reduce(
+                    ws_ptr as *const std::ffi::c_void,
+                    o_ptr,
+                    num_q_heads as u32,
+                    head_dim as u32,
+                    NUM_SPLITS,
+                    num_seqs as u32,
+                    stream,
+                );
+            }
+        } else {
+            unsafe {
+                kernels::ffi::call_flash_decode_paged_fp8(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    o_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    q_stride,
+                    sw,
+                    softcap,
+                    ks_ptr,
+                    vs_ptr,
+                    fp8_cache_stride,
+                    stream,
+                );
+            }
         }
     } else {
-        unsafe {
-            kernels::ffi::call_flash_decode_paged(
-                q_ptr,
-                kc_ptr,
-                vc_ptr,
-                o_ptr,
-                bt_ptr,
-                cl_ptr,
-                max_blocks_per_seq,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
-                scale,
-                num_seqs as u32,
-                q_stride,
-                sw,
-                softcap,
-                stream,
-            );
+        if use_splitk {
+            let ws = workspace.unwrap();
+            let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+            unsafe {
+                kernels::ffi::call_flash_decode_paged_splitk(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    ws_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    NUM_SPLITS,
+                    q_stride,
+                    softcap,
+                    stream,
+                );
+                kernels::ffi::call_flash_decode_paged_reduce(
+                    ws_ptr as *const std::ffi::c_void,
+                    o_ptr,
+                    num_q_heads as u32,
+                    head_dim as u32,
+                    NUM_SPLITS,
+                    num_seqs as u32,
+                    stream,
+                );
+            }
+        } else {
+            unsafe {
+                kernels::ffi::call_flash_decode_paged(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    o_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    q_stride,
+                    sw,
+                    softcap,
+                    stream,
+                );
+            }
         }
     }
 

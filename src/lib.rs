@@ -95,6 +95,8 @@ pub struct PagedAttention {
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
     kv_updated_times: AtomicI32,
+    #[cfg(feature = "flash")]
+    flash_splitk_workspace: std::sync::OnceLock<Tensor>,
 }
 
 impl PagedAttention {
@@ -277,6 +279,8 @@ impl PagedAttention {
                 None
             },
             kv_updated_times: AtomicI32::new(0),
+            #[cfg(feature = "flash")]
+            flash_splitk_workspace: std::sync::OnceLock::new(),
         })
     }
 
@@ -737,6 +741,17 @@ impl PagedAttention {
             }
 
             let output = query_p.zeros_like()?;
+            let ws = self.flash_splitk_workspace.get_or_init(|| {
+                let max_seqs = 64;
+                let num_splits = crate::flash::NUM_SPLITS as usize;
+                let ws_stride = head_size_p + 2;
+                Tensor::zeros(
+                    (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                    candle_core::DType::F32,
+                    query_p.device(),
+                )
+                .unwrap()
+            });
             return crate::flash::flash_decode(
                 &query_p,
                 key_cache.as_ref().unwrap(),
@@ -744,6 +759,7 @@ impl PagedAttention {
                 block_tables,
                 context_lens,
                 &output,
+                input_metadata.max_context_len,
                 attention_heads_p,
                 key_value_heads_p,
                 head_size_p,
@@ -752,6 +768,7 @@ impl PagedAttention {
                 self.sliding_window,
                 self.k_scale.as_ref(),
                 self.v_scale.as_ref(),
+                Some(ws),
             );
         }
 
