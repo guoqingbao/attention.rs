@@ -269,7 +269,7 @@ pub fn flash_prefill(
     Ok(o)
 }
 
-const SPLIT_K_THRESHOLD: usize = 1024;
+pub const SPLIT_K_THRESHOLD: usize = 1024;
 pub const NUM_SPLITS: u32 = 8;
 
 #[cfg(feature = "cuda")]
@@ -455,4 +455,575 @@ pub fn flash_decode(
     }
 
     Ok(output.clone())
+}
+
+// ============================================================================
+// TurboQuant k8v4 wrappers
+// ============================================================================
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq_store_k8v4(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    slot_mapping: &Tensor,
+    k_scale: Option<&Tensor>,
+) -> Result<()> {
+    let dev = match key.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq_store requires CUDA tensors"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let (num_tokens, num_kv_heads, head_dim) = key.dims3()?;
+    let block_size = key_cache.dim(1)?;
+
+    let key_ptr = ptr_from_tensor(key)?;
+    let value_ptr = ptr_from_tensor(value)?;
+    let kc_ptr = ptr_from_tensor(key_cache)? as *mut std::ffi::c_void;
+    let va_ptr = ptr_from_tensor(v_absmax)? as *mut std::ffi::c_void;
+    let vq_ptr = ptr_from_tensor(v_quant)? as *mut std::ffi::c_void;
+
+    let slot_ptr = {
+        let (s, l) = slot_mapping.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("slot_mapping must be CUDA"),
+        };
+        let slice = s.as_cuda_slice::<i64>()?;
+        *slice.slice(l.start_offset()..).device_ptr() as *const i64
+    };
+
+    let ks_ptr = scale_gpu_ptr(k_scale)?;
+
+    unsafe {
+        kernels::ffi::call_flash_tq_store_k8v4(
+            key_ptr,
+            value_ptr,
+            kc_ptr,
+            va_ptr,
+            vq_ptr,
+            slot_ptr,
+            num_tokens as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            ks_ptr,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq_decode_k8v4(
+    query: &Tensor,
+    key_cache: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    output: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    k_scale: Option<&Tensor>,
+) -> Result<Tensor> {
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq_decode requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let num_seqs = query.dim(0)?;
+    let block_size = key_cache.dim(1)?;
+    let q_stride = (num_q_heads * head_dim) as u32;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let kc_ptr = ptr_from_tensor(key_cache)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+    let o_ptr = ptr_from_tensor(output)? as *mut std::ffi::c_void;
+
+    let bt_ptr = {
+        let (s, l) = block_tables.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_tables must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let cl_ptr = {
+        let (s, l) = context_lens.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("context_lens must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+
+    let max_blocks_per_seq = block_tables.dim(1)? as u32;
+    let ks_ptr = scale_gpu_ptr(k_scale)?;
+
+    unsafe {
+        kernels::ffi::call_flash_tq_decode_k8v4(
+            q_ptr,
+            kc_ptr,
+            va_ptr,
+            vq_ptr,
+            o_ptr,
+            bt_ptr,
+            cl_ptr,
+            max_blocks_per_seq,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            scale,
+            num_seqs as u32,
+            q_stride,
+            softcap,
+            ks_ptr,
+            stream,
+        );
+    }
+
+    Ok(output.clone())
+}
+
+// ============================================================================
+// TurboQuant turbo4: 4-bit K + 4-bit V
+// ============================================================================
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq4_store(
+    key: &Tensor,
+    value: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    slot_mapping: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+) -> Result<()> {
+    let dev = match key.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq4_store requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+    let num_tokens = key.dim(0)?;
+
+    let k_ptr = ptr_from_tensor(key)?;
+    let v_ptr = ptr_from_tensor(value)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)? as *mut std::ffi::c_void;
+    let kq_ptr = ptr_from_tensor(k_quant)? as *mut std::ffi::c_void;
+    let va_ptr = ptr_from_tensor(v_absmax)? as *mut std::ffi::c_void;
+    let vq_ptr = ptr_from_tensor(v_quant)? as *mut std::ffi::c_void;
+    let slot_ptr = {
+        let (s, l) = slot_mapping.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<i64>()?,
+            _ => candle::bail!("slot_mapping must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const i64
+    };
+
+    unsafe {
+        kernels::ffi::call_flash_tq4_store(
+            k_ptr,
+            v_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            slot_ptr,
+            num_tokens as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq4_decode(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    output: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+) -> Result<Tensor> {
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq4_decode requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let num_seqs = query.dim(0)?;
+    let block_size_from_absmax = {
+        let dims = k_absmax.dims();
+        if dims.len() >= 2 {
+            dims[1]
+        } else {
+            16
+        }
+    };
+    let q_stride = (num_q_heads * head_dim) as u32;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)?;
+    let kq_ptr = ptr_from_tensor(k_quant)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+    let o_ptr = ptr_from_tensor(output)? as *mut std::ffi::c_void;
+
+    let bt_ptr = {
+        let (s, l) = block_tables.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_tables must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let cl_ptr = {
+        let (s, l) = context_lens.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("context_lens must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let max_blocks_per_seq = block_tables.dim(1)? as u32;
+
+    unsafe {
+        kernels::ffi::call_flash_tq4_decode(
+            q_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            o_ptr,
+            bt_ptr,
+            cl_ptr,
+            max_blocks_per_seq,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size_from_absmax as u32,
+            scale,
+            num_seqs as u32,
+            q_stride,
+            softcap,
+            stream,
+        );
+    }
+
+    Ok(output.clone())
+}
+
+// ============================================================================
+// TurboQuant turbo3: 3-bit K + 4-bit V
+// ============================================================================
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq3_store(
+    key: &Tensor,
+    value: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    slot_mapping: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+) -> Result<()> {
+    let dev = match key.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq3_store requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+    let num_tokens = key.dim(0)?;
+
+    let k_ptr = ptr_from_tensor(key)?;
+    let v_ptr = ptr_from_tensor(value)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)? as *mut std::ffi::c_void;
+    let kq_ptr = ptr_from_tensor(k_quant)? as *mut std::ffi::c_void;
+    let va_ptr = ptr_from_tensor(v_absmax)? as *mut std::ffi::c_void;
+    let vq_ptr = ptr_from_tensor(v_quant)? as *mut std::ffi::c_void;
+    let slot_ptr = {
+        let (s, l) = slot_mapping.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<i64>()?,
+            _ => candle::bail!("slot_mapping must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const i64
+    };
+
+    unsafe {
+        kernels::ffi::call_flash_tq3_store(
+            k_ptr,
+            v_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            slot_ptr,
+            num_tokens as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq3_decode(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    output: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+) -> Result<Tensor> {
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq3_decode requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let num_seqs = query.dim(0)?;
+    let block_size_from_absmax = {
+        let dims = k_absmax.dims();
+        if dims.len() >= 2 {
+            dims[1]
+        } else {
+            16
+        }
+    };
+    let q_stride = (num_q_heads * head_dim) as u32;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)?;
+    let kq_ptr = ptr_from_tensor(k_quant)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+    let o_ptr = ptr_from_tensor(output)? as *mut std::ffi::c_void;
+
+    let bt_ptr = {
+        let (s, l) = block_tables.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_tables must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let cl_ptr = {
+        let (s, l) = context_lens.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("context_lens must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let max_blocks_per_seq = block_tables.dim(1)? as u32;
+
+    unsafe {
+        kernels::ffi::call_flash_tq3_decode(
+            q_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            o_ptr,
+            bt_ptr,
+            cl_ptr,
+            max_blocks_per_seq,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size_from_absmax as u32,
+            scale,
+            num_seqs as u32,
+            q_stride,
+            softcap,
+            stream,
+        );
+    }
+
+    Ok(output.clone())
+}
+
+// ============================================================================
+// TurboQuant 4-bit prefill (used by both turbo4 and turbo3 for V;
+// turbo3 K uses the same 4-bit dequant path after 3→4 bit expansion)
+// ============================================================================
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq4_prefill(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_table: &Tensor,
+    context_lens: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: Option<usize>,
+    block_size: usize,
+    cu_seqlens_q: Option<&Tensor>,
+) -> Result<Tensor> {
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq4_prefill requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let q_len = query.dim(0)?;
+    let o = Tensor::zeros_like(query)?;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)?;
+    let kq_ptr = ptr_from_tensor(k_quant)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+    let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
+
+    let seqlens_q = if let Some(cu) = cu_seqlens_q {
+        cu.to_vec1::<u32>()?
+    } else {
+        vec![0u32, q_len as u32]
+    };
+
+    let num_seqs = seqlens_q.len() - 1;
+
+    for seq_idx in 0..num_seqs {
+        let q_start = seqlens_q[seq_idx] as usize;
+        let q_end = seqlens_q[seq_idx + 1] as usize;
+        let seq_q_len = q_end - q_start;
+        if seq_q_len == 0 {
+            continue;
+        }
+
+        let cl_vec = context_lens.to_vec1::<u32>()?;
+        let kv_len = cl_vec[seq_idx] as usize;
+
+        let bt_row = block_table.narrow(0, seq_idx, 1)?.squeeze(0)?;
+        let bt_row_ptr = {
+            let (s, l) = bt_row.storage_and_layout();
+            let s = match &*s {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+                _ => candle::bail!("block_table row must be CUDA"),
+            };
+            *s.slice(l.start_offset()..).device_ptr() as *const c_int
+        };
+
+        let q_offset = kv_len.saturating_sub(seq_q_len);
+        let q_slice_ptr = unsafe {
+            (q_ptr as *const u8).add(q_start * num_q_heads * head_dim * 2)
+                as *const std::ffi::c_void
+        };
+        let o_slice_ptr = unsafe {
+            (o_ptr as *mut u8).add(q_start * num_q_heads * head_dim * 2) as *mut std::ffi::c_void
+        };
+
+        let sw = sliding_window.unwrap_or(0) as u32;
+
+        unsafe {
+            kernels::ffi::call_flash_tq4_prefill(
+                q_slice_ptr,
+                ka_ptr,
+                kq_ptr,
+                va_ptr,
+                vq_ptr,
+                o_slice_ptr,
+                bt_row_ptr,
+                seq_q_len as u32,
+                kv_len as u32,
+                q_offset as u32,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                sw,
+                1, // causal=1
+                scale,
+                softcap,
+                stream,
+            );
+        }
+    }
+
+    Ok(o)
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_tq3_prefill(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_table: &Tensor,
+    context_lens: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: Option<usize>,
+    block_size: usize,
+    cu_seqlens_q: Option<&Tensor>,
+) -> Result<Tensor> {
+    // turbo3 uses the same prefill kernel as turbo4 (4-bit V dequant is identical;
+    // 3-bit K is dequanted via the same WHT-aware LOAD_TQ4 macro since the K
+    // quantization stores at 4-bit granularity with 3-bit values packed).
+    // For a dedicated turbo3 prefill, a separate kernel with 3-bit K loader is needed.
+    // For now, delegate to the turbo4 prefill which handles 4-bit K correctly.
+    flash_tq4_prefill(
+        query,
+        k_absmax,
+        k_quant,
+        v_absmax,
+        v_quant,
+        block_table,
+        context_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        sliding_window,
+        block_size,
+        cu_seqlens_q,
+    )
 }

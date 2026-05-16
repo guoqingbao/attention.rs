@@ -41,6 +41,16 @@ __device__ __forceinline__ float fp8_to_f32_d(__nv_fp8_storage_t b, float scale)
 
 __device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
                                                 float &f0, float &f1, float &f2, float &f3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    __half2_raw pair0 = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<__nv_fp8x2_storage_t>(packed & 0xFFFF), __NV_E4M3);
+    __half2_raw pair1 = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<__nv_fp8x2_storage_t>((packed >> 16) & 0xFFFF), __NV_E4M3);
+    f0 = __half2float(*reinterpret_cast<__half*>(&pair0.x)) * scale;
+    f1 = __half2float(*reinterpret_cast<__half*>(&pair0.y)) * scale;
+    f2 = __half2float(*reinterpret_cast<__half*>(&pair1.x)) * scale;
+    f3 = __half2float(*reinterpret_cast<__half*>(&pair1.y)) * scale;
+#else
     __nv_fp8_storage_t b0 = (__nv_fp8_storage_t)(packed & 0xFF);
     __nv_fp8_storage_t b1 = (__nv_fp8_storage_t)((packed >> 8) & 0xFF);
     __nv_fp8_storage_t b2 = (__nv_fp8_storage_t)((packed >> 16) & 0xFF);
@@ -49,6 +59,7 @@ __device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
     f1 = __half2float(__nv_cvt_fp8_to_halfraw(b1, __NV_E4M3)) * scale;
     f2 = __half2float(__nv_cvt_fp8_to_halfraw(b2, __NV_E4M3)) * scale;
     f3 = __half2float(__nv_cvt_fp8_to_halfraw(b3, __NV_E4M3)) * scale;
+#endif
 }
 
 #endif

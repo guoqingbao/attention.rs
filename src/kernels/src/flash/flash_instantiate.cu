@@ -26,17 +26,44 @@
 #define flash_reshape_and_cache flash_reshape_and_cache_128
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_128
 #define flash_bf16_absmax flash_bf16_absmax_128
+#define flash_tq_store_k8v4 flash_tq_store_k8v4_128
+#define flash_tq_decode_k8v4 flash_tq_decode_k8v4_128
 
 // Need to also rename helper to avoid ODR violations
 #define fp8_to_bf16_s fp8_to_bf16_s_128
+#define fp8x4_to_bf16x4 fp8x4_to_bf16x4_128
 #define fp8_to_f32_d fp8_to_f32_d_128
+#define fp8x4_to_f32x4 fp8x4_to_f32x4_128
 #define unpack2_bf16_d unpack2_bf16_d_128
+#define unpack2_bf16_tq unpack2_bf16_tq_128
+#define wht_intra_thread wht_intra_thread_128
+#define wht_cross_thread wht_cross_thread_128
+#define wht_transform wht_transform_128
+#define get_sign_flip get_sign_flip_128
+#define quantize_4bit quantize_4bit_128
+#define dequantize_4bit dequantize_4bit_128
+#define pack_4bit pack_4bit_128
+#define unpack_4bit_lo unpack_4bit_lo_128
+#define unpack_4bit_hi unpack_4bit_hi_128
+#define flash_tq4_store flash_tq4_store_128
+#define flash_tq4_decode flash_tq4_decode_128
+#define flash_tq4_prefill flash_tq4_prefill_128
+#define unpack2_bf16_tq4 unpack2_bf16_tq4_128
+#define flash_tq3_store flash_tq3_store_128
+#define flash_tq3_decode flash_tq3_decode_128
+#define quantize_3bit quantize_3bit_128
+#define dequantize_3bit dequantize_3bit_128
+#define pack_3bit_x8 pack_3bit_x8_128
+#define unpack_3bit_x8 unpack_3bit_x8_128
 
 #include "flash_prefill_paged.cuh"
 #include "flash_prefill_paged_fp8.cuh"
 #include "flash_decode_paged.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
+#include "flash_turboquant.cuh"
+#include "flash_turboquant_lowbit.cuh"
+#include "flash_prefill_tq4.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -49,9 +76,23 @@
 #undef flash_reshape_and_cache
 #undef flash_reshape_and_cache_fp8
 #undef flash_bf16_absmax
+#undef flash_tq_store_k8v4
+#undef flash_tq_decode_k8v4
 #undef fp8_to_bf16_s
+#undef fp8x4_to_bf16x4
 #undef fp8_to_f32_d
+#undef fp8x4_to_f32x4
 #undef unpack2_bf16_d
+#undef unpack2_bf16_tq
+#undef wht_intra_thread
+#undef wht_cross_thread
+#undef wht_transform
+#undef get_sign_flip
+#undef quantize_4bit
+#undef dequantize_4bit
+#undef pack_4bit
+#undef unpack_4bit_lo
+#undef unpack_4bit_hi
 // Cleanup per-HDIM defines
 #undef BR
 #undef BC
@@ -70,6 +111,28 @@
 #undef FLASH_DECODE_UNPACK_DEFINED
 #undef LOAD_KV_TILE_BF16
 #undef LOAD_KV_TILE_FP8
+#undef FP8_DEQUANT_HELPERS_DEFINED
+#undef TQ_VEC
+#undef TQ_NUM_WARPS
+#undef TQ_BC
+#undef TQ_VEC_U32
+#undef flash_tq4_store
+#undef flash_tq4_decode
+#undef flash_tq4_prefill
+#undef unpack2_bf16_tq4
+#undef TQ4_VEC
+#undef TQ4_NUM_WARPS
+#undef TQ4_BC
+#undef TQ4_VEC_U32
+#undef UNPACK2_BF16_TQ4_DEFINED
+#undef flash_tq3_store
+#undef flash_tq3_decode
+#undef quantize_3bit
+#undef dequantize_3bit
+#undef pack_3bit_x8
+#undef unpack_3bit_x8
+#undef TQ3_K_BYTES_PER_HEAD
+#undef TQ3_QUANT_HELPERS_DEFINED
 
 // ============================================================================
 // HDIM=256 variants
@@ -85,15 +148,42 @@
 #define flash_reshape_and_cache flash_reshape_and_cache_256
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_256
 #define flash_bf16_absmax flash_bf16_absmax_256
+#define flash_tq_store_k8v4 flash_tq_store_k8v4_256
+#define flash_tq_decode_k8v4 flash_tq_decode_k8v4_256
 #define fp8_to_bf16_s fp8_to_bf16_s_256
+#define fp8x4_to_bf16x4 fp8x4_to_bf16x4_256
 #define fp8_to_f32_d fp8_to_f32_d_256
+#define fp8x4_to_f32x4 fp8x4_to_f32x4_256
 #define unpack2_bf16_d unpack2_bf16_d_256
+#define unpack2_bf16_tq unpack2_bf16_tq_256
+#define wht_intra_thread wht_intra_thread_256
+#define wht_cross_thread wht_cross_thread_256
+#define wht_transform wht_transform_256
+#define get_sign_flip get_sign_flip_256
+#define quantize_4bit quantize_4bit_256
+#define dequantize_4bit dequantize_4bit_256
+#define pack_4bit pack_4bit_256
+#define unpack_4bit_lo unpack_4bit_lo_256
+#define unpack_4bit_hi unpack_4bit_hi_256
+#define flash_tq4_store flash_tq4_store_256
+#define flash_tq4_decode flash_tq4_decode_256
+#define flash_tq4_prefill flash_tq4_prefill_256
+#define unpack2_bf16_tq4 unpack2_bf16_tq4_256
+#define flash_tq3_store flash_tq3_store_256
+#define flash_tq3_decode flash_tq3_decode_256
+#define quantize_3bit quantize_3bit_256
+#define dequantize_3bit dequantize_3bit_256
+#define pack_3bit_x8 pack_3bit_x8_256
+#define unpack_3bit_x8 unpack_3bit_x8_256
 
 #include "flash_prefill_paged.cuh"
 #include "flash_prefill_paged_fp8.cuh"
 #include "flash_decode_paged.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
+#include "flash_turboquant.cuh"
+#include "flash_turboquant_lowbit.cuh"
+#include "flash_prefill_tq4.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -106,9 +196,23 @@
 #undef flash_reshape_and_cache
 #undef flash_reshape_and_cache_fp8
 #undef flash_bf16_absmax
+#undef flash_tq_store_k8v4
+#undef flash_tq_decode_k8v4
 #undef fp8_to_bf16_s
+#undef fp8x4_to_bf16x4
 #undef fp8_to_f32_d
+#undef fp8x4_to_f32x4
 #undef unpack2_bf16_d
+#undef unpack2_bf16_tq
+#undef wht_intra_thread
+#undef wht_cross_thread
+#undef wht_transform
+#undef get_sign_flip
+#undef quantize_4bit
+#undef dequantize_4bit
+#undef pack_4bit
+#undef unpack_4bit_lo
+#undef unpack_4bit_hi
 #undef BR
 #undef BC
 #undef PAD_KV
@@ -126,6 +230,28 @@
 #undef FLASH_DECODE_UNPACK_DEFINED
 #undef LOAD_KV_TILE_BF16
 #undef LOAD_KV_TILE_FP8
+#undef FP8_DEQUANT_HELPERS_DEFINED
+#undef TQ_VEC
+#undef TQ_NUM_WARPS
+#undef TQ_BC
+#undef TQ_VEC_U32
+#undef flash_tq4_store
+#undef flash_tq4_decode
+#undef flash_tq4_prefill
+#undef unpack2_bf16_tq4
+#undef TQ4_VEC
+#undef TQ4_NUM_WARPS
+#undef TQ4_BC
+#undef TQ4_VEC_U32
+#undef UNPACK2_BF16_TQ4_DEFINED
+#undef flash_tq3_store
+#undef flash_tq3_decode
+#undef quantize_3bit
+#undef dequantize_3bit
+#undef pack_3bit_x8
+#undef unpack_3bit_x8
+#undef TQ3_K_BYTES_PER_HEAD
+#undef TQ3_QUANT_HELPERS_DEFINED
 
 // ============================================================================
 // HDIM=512 variants
@@ -141,9 +267,33 @@
 #define flash_reshape_and_cache flash_reshape_and_cache_512
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_512
 #define flash_bf16_absmax flash_bf16_absmax_512
+#define flash_tq_store_k8v4 flash_tq_store_k8v4_512
+#define flash_tq_decode_k8v4 flash_tq_decode_k8v4_512
 #define fp8_to_bf16_s fp8_to_bf16_s_512
+#define fp8x4_to_bf16x4 fp8x4_to_bf16x4_512
 #define fp8_to_f32_d fp8_to_f32_d_512
+#define fp8x4_to_f32x4 fp8x4_to_f32x4_512
 #define unpack2_bf16_d unpack2_bf16_d_512
+#define unpack2_bf16_tq unpack2_bf16_tq_512
+#define wht_intra_thread wht_intra_thread_512
+#define wht_cross_thread wht_cross_thread_512
+#define wht_transform wht_transform_512
+#define get_sign_flip get_sign_flip_512
+#define quantize_4bit quantize_4bit_512
+#define dequantize_4bit dequantize_4bit_512
+#define pack_4bit pack_4bit_512
+#define unpack_4bit_lo unpack_4bit_lo_512
+#define unpack_4bit_hi unpack_4bit_hi_512
+#define flash_tq4_store flash_tq4_store_512
+#define flash_tq4_decode flash_tq4_decode_512
+#define flash_tq4_prefill flash_tq4_prefill_512
+#define unpack2_bf16_tq4 unpack2_bf16_tq4_512
+#define flash_tq3_store flash_tq3_store_512
+#define flash_tq3_decode flash_tq3_decode_512
+#define quantize_3bit quantize_3bit_512
+#define dequantize_3bit dequantize_3bit_512
+#define pack_3bit_x8 pack_3bit_x8_512
+#define unpack_3bit_x8 unpack_3bit_x8_512
 
 // For 512, we need the specific defines
 #define BR_512 32
@@ -158,6 +308,9 @@
 #include "flash_decode_paged.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
+#include "flash_turboquant.cuh"
+#include "flash_turboquant_lowbit.cuh"
+#include "flash_prefill_tq4.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -170,9 +323,33 @@
 #undef flash_reshape_and_cache
 #undef flash_reshape_and_cache_fp8
 #undef flash_bf16_absmax
+#undef flash_tq_store_k8v4
+#undef flash_tq_decode_k8v4
+#undef flash_tq4_store
+#undef flash_tq4_decode
+#undef flash_tq4_prefill
 #undef fp8_to_bf16_s
 #undef fp8_to_f32_d
 #undef unpack2_bf16_d
+#undef unpack2_bf16_tq
+#undef unpack2_bf16_tq4
+#undef wht_intra_thread
+#undef wht_cross_thread
+#undef wht_transform
+#undef get_sign_flip
+#undef quantize_4bit
+#undef dequantize_4bit
+#undef pack_4bit
+#undef unpack_4bit_lo
+#undef unpack_4bit_hi
+#undef flash_tq3_store
+#undef flash_tq3_decode
+#undef quantize_3bit
+#undef dequantize_3bit
+#undef pack_3bit_x8
+#undef unpack_3bit_x8
+#undef TQ3_K_BYTES_PER_HEAD
+#undef TQ3_QUANT_HELPERS_DEFINED
 
 // ============================================================================
 // Dispatch launchers — called from Rust FFI
@@ -456,4 +633,233 @@ extern "C" void call_flash_reshape_and_cache_fp8_kv(
     else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
     else { LAUNCH_CACHE_FP8(512); }
     #undef LAUNCH_CACHE_FP8
+}
+
+// ============================================================================
+// TurboQuant k8v4 launchers
+// ============================================================================
+
+// TurboQuant store: K → WHT rotate → FP8, V → 4-bit uniform
+extern "C" void call_flash_tq_store_k8v4(
+    const void* K, const void* V,
+    void* K_cache, void* V_absmax, void* V_quant,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    const float* k_scale_ptr,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_tokens, num_kv_heads);
+    unsigned int threads = 32; // single warp per head
+
+    #define LAUNCH_TQ_STORE(HD) \
+        flash_tq_store_k8v4_##HD<<<grid, threads, 0, s>>>( \
+            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
+            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, \
+            k_scale_ptr)
+
+    if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
+    else { LAUNCH_TQ_STORE(512); }
+    #undef LAUNCH_TQ_STORE
+}
+
+// TurboQuant decode: FP8 keys + 4-bit values → attention output
+extern "C" void call_flash_tq_decode_k8v4(
+    const void* Q, const void* K_cache,
+    const void* V_absmax, const void* V_quant,
+    void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    const float* k_scale_ptr,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_seqs);
+    unsigned int threads = 8 * 32; // TQ_NUM_WARPS * WARP_SIZE
+
+    #define LAUNCH_TQ_DECODE(HD) \
+        flash_tq_decode_k8v4_##HD<<<grid, threads, 0, s>>>( \
+            (const __nv_bfloat16*)Q, K_cache, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (__nv_bfloat16*)O, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr)
+
+    if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
+    else { LAUNCH_TQ_DECODE(512); }
+    #undef LAUNCH_TQ_DECODE
+}
+
+// TurboQuant turbo4 store: K → WHT → 4-bit, V → 4-bit
+extern "C" void call_flash_tq4_store(
+    const void* K, const void* V,
+    void* K_absmax, void* K_quant,
+    void* V_absmax, void* V_quant,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_tokens, num_kv_heads);
+
+    #define LAUNCH_TQ4_STORE(HD) \
+        flash_tq4_store_##HD<<<grid, 32, 0, s>>>( \
+            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            (float*)K_absmax, (unsigned char*)K_quant, \
+            (float*)V_absmax, (unsigned char*)V_quant, \
+            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+
+    if (head_dim <= 128) { LAUNCH_TQ4_STORE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ4_STORE(256); }
+    else { LAUNCH_TQ4_STORE(512); }
+    #undef LAUNCH_TQ4_STORE
+}
+
+// TurboQuant turbo4 decode: 4-bit K + 4-bit V → attention
+extern "C" void call_flash_tq4_decode(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_seqs);
+
+    #define LAUNCH_TQ4_DECODE(HD) \
+        flash_tq4_decode_##HD<<<grid, 256, 0, s>>>( \
+            (const __nv_bfloat16*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (__nv_bfloat16*)O, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_seqs, q_stride, softcap)
+
+    if (head_dim <= 128) { LAUNCH_TQ4_DECODE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ4_DECODE(256); }
+    else { LAUNCH_TQ4_DECODE(512); }
+    #undef LAUNCH_TQ4_DECODE
+}
+
+// TurboQuant turbo3 store: K → WHT → 3-bit, V → 4-bit
+extern "C" void call_flash_tq3_store(
+    const void* K, const void* V,
+    void* K_absmax, void* K_quant,
+    void* V_absmax, void* V_quant,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_tokens, num_kv_heads);
+
+    #define LAUNCH_TQ3_STORE(HD) \
+        flash_tq3_store_##HD<<<grid, 32, 0, s>>>( \
+            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            (float*)K_absmax, (unsigned char*)K_quant, \
+            (float*)V_absmax, (unsigned char*)V_quant, \
+            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+
+    if (head_dim <= 128) { LAUNCH_TQ3_STORE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ3_STORE(256); }
+    else { LAUNCH_TQ3_STORE(512); }
+    #undef LAUNCH_TQ3_STORE
+}
+
+// TurboQuant turbo3 decode: 3-bit K + 4-bit V → attention
+extern "C" void call_flash_tq3_decode(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_seqs);
+
+    #define LAUNCH_TQ3_DECODE(HD) \
+        flash_tq3_decode_##HD<<<grid, 256, 0, s>>>( \
+            (const __nv_bfloat16*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (__nv_bfloat16*)O, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_seqs, q_stride, softcap)
+
+    if (head_dim <= 128) { LAUNCH_TQ3_DECODE(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ3_DECODE(256); }
+    else { LAUNCH_TQ3_DECODE(512); }
+    #undef LAUNCH_TQ3_DECODE
+}
+
+// TurboQuant 4-bit prefill: reads K/V from 4-bit TQ buffers, dequant to BF16 in smem
+extern "C" void call_flash_tq4_prefill(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* O,
+    const int* block_table,
+    unsigned int q_len, unsigned int kv_len, unsigned int q_offset,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int cache_block_size,
+    unsigned int sliding_window, unsigned int causal,
+    float inv_sqrt_d, float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    unsigned int br = 32;
+    dim3 grid(num_q_heads, (q_len + br - 1) / br);
+
+    #define LAUNCH_TQ4_PREFILL(HD, THREADS, SMEM) \
+        flash_tq4_prefill_##HD<<<grid, THREADS, SMEM, s>>>( \
+            (const __nv_bfloat16*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (__nv_bfloat16*)O, \
+            block_table, q_len, kv_len, q_offset, num_q_heads, num_kv_heads, \
+            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
+
+    if (head_dim <= 128) {
+        LAUNCH_TQ4_PREFILL(128, 128, 0);
+    } else if (head_dim <= 256) {
+        LAUNCH_TQ4_PREFILL(256, 128, 0);
+    } else {
+        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_tq4_prefill_512,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_TQ4_PREFILL(512, 256, smem);
+    }
+    #undef LAUNCH_TQ4_PREFILL
 }

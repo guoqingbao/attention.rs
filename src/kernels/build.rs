@@ -62,6 +62,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_decode_paged.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_decode_paged_fp8.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_reshape_cache.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_turboquant.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_turboquant_lowbit.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
