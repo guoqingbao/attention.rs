@@ -595,6 +595,119 @@ pub fn flash_tq_decode_k8v4(
     Ok(output.clone())
 }
 
+#[cfg(feature = "cuda")]
+pub fn flash_tq_decode_k8v4_splitk(
+    query: &Tensor,
+    key_cache: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    output: &Tensor,
+    max_context_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    k_scale: Option<&Tensor>,
+    workspace: Option<&Tensor>,
+) -> Result<Tensor> {
+    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+
+    if !use_splitk {
+        return flash_tq_decode_k8v4(
+            query,
+            key_cache,
+            v_absmax,
+            v_quant,
+            block_tables,
+            context_lens,
+            output,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            softcap,
+            k_scale,
+        );
+    }
+
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq_decode_k8v4_splitk requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let num_seqs = query.dim(0)?;
+    let block_size = key_cache.dim(1)?;
+    let q_stride = (num_q_heads * head_dim) as u32;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let kc_ptr = ptr_from_tensor(key_cache)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+
+    let bt_ptr = {
+        let (s, l) = block_tables.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_tables must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+    let cl_ptr = {
+        let (s, l) = context_lens.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("context_lens must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+
+    let max_blocks_per_seq = block_tables.dim(1)? as u32;
+    let ks_ptr = scale_gpu_ptr(k_scale)?;
+    let o_ptr = ptr_from_tensor(output)? as *mut std::ffi::c_void;
+
+    let ws = workspace.unwrap();
+    let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+
+    unsafe {
+        kernels::ffi::call_flash_tq_decode_k8v4_splitk(
+            q_ptr,
+            kc_ptr,
+            va_ptr,
+            vq_ptr,
+            ws_ptr,
+            bt_ptr,
+            cl_ptr,
+            max_blocks_per_seq,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            scale,
+            NUM_SPLITS,
+            num_seqs as u32,
+            q_stride,
+            softcap,
+            ks_ptr,
+            stream,
+        );
+        kernels::ffi::call_flash_decode_paged_reduce(
+            ws_ptr as *const std::ffi::c_void,
+            o_ptr,
+            num_q_heads as u32,
+            head_dim as u32,
+            NUM_SPLITS,
+            num_seqs as u32,
+            stream,
+        );
+    }
+
+    Ok(output.clone())
+}
+
 // ============================================================================
 // TurboQuant turbo4: 4-bit K + 4-bit V
 // ============================================================================

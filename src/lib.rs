@@ -963,8 +963,19 @@ impl PagedAttention {
 
             match tq_mode {
                 Some(TurboquantMode::Turbo8) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
-                        crate::flash::flash_tq_decode_k8v4(
+                        crate::flash::flash_tq_decode_k8v4_splitk(
                             &query_p,
                             key_cache.as_ref().unwrap(),
                             &tq.v_absmax,
@@ -972,12 +983,14 @@ impl PagedAttention {
                             block_tables,
                             context_lens,
                             &output,
+                            input_metadata.max_context_len,
                             attention_heads_p,
                             key_value_heads_p,
                             head_size_p,
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
                             self.k_scale.as_ref(),
+                            Some(ws),
                         )
                     }) {
                         return r;

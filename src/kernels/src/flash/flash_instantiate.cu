@@ -28,6 +28,7 @@
 #define flash_bf16_absmax flash_bf16_absmax_128
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_128
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_128
+#define flash_tq_decode_k8v4_splitk flash_tq_decode_k8v4_splitk_128
 
 // Need to also rename helper to avoid ODR violations
 #define fp8_to_bf16_s fp8_to_bf16_s_128
@@ -80,6 +81,7 @@
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
 #undef flash_tq_decode_k8v4
+#undef flash_tq_decode_k8v4_splitk
 #undef fp8_to_bf16_s
 #undef fp8x4_to_bf16x4
 #undef fp8_to_f32_d
@@ -154,6 +156,7 @@
 #define flash_bf16_absmax flash_bf16_absmax_256
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_256
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_256
+#define flash_tq_decode_k8v4_splitk flash_tq_decode_k8v4_splitk_256
 #define fp8_to_bf16_s fp8_to_bf16_s_256
 #define fp8x4_to_bf16x4 fp8x4_to_bf16x4_256
 #define fp8_to_f32_d fp8_to_f32_d_256
@@ -204,6 +207,7 @@
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
 #undef flash_tq_decode_k8v4
+#undef flash_tq_decode_k8v4_splitk
 #undef fp8_to_bf16_s
 #undef fp8x4_to_bf16x4
 #undef fp8_to_f32_d
@@ -277,6 +281,7 @@
 #define flash_bf16_absmax flash_bf16_absmax_512
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_512
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_512
+#define flash_tq_decode_k8v4_splitk flash_tq_decode_k8v4_splitk_512
 #define fp8_to_bf16_s fp8_to_bf16_s_512
 #define fp8x4_to_bf16x4 fp8x4_to_bf16x4_512
 #define fp8_to_f32_d fp8_to_f32_d_512
@@ -335,6 +340,7 @@
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
 #undef flash_tq_decode_k8v4
+#undef flash_tq_decode_k8v4_splitk
 #undef flash_tq4_store
 #undef flash_tq4_decode
 #undef flash_tq4_decode_splitk
@@ -719,6 +725,42 @@ extern "C" void call_flash_tq_decode_k8v4(
     else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
     else { LAUNCH_TQ_DECODE(512); }
     #undef LAUNCH_TQ_DECODE
+}
+
+// TurboQuant k8v4 decode split-K: long sequences
+extern "C" void call_flash_tq_decode_k8v4_splitk(
+    const void* Q, const void* K_cache,
+    const void* V_absmax, const void* V_quant,
+    void* workspace,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_splits,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    const float* k_scale_ptr,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    unsigned int threads = 8 * 32; // TQ_NUM_WARPS * WARP_SIZE
+    dim3 grid(num_q_heads, num_splits, num_seqs);
+
+    #define LAUNCH_TQ_DECODE_SK(HD) \
+        flash_tq_decode_k8v4_splitk_##HD<<<grid, threads, 0, s>>>( \
+            (const __nv_bfloat16*)Q, K_cache, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (float*)workspace, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr)
+
+    if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
+    else { LAUNCH_TQ_DECODE_SK(512); }
+    #undef LAUNCH_TQ_DECODE_SK
 }
 
 // TurboQuant turbo4 store: K → WHT → 4-bit, V → 4-bit
