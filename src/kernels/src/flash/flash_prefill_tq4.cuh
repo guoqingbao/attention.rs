@@ -76,7 +76,17 @@
 
 #if TQ4P_HDIM <= 256
 
-extern "C" __global__ void flash_tq4_prefill(
+#if TQ4P_HDIM > 128
+#define TQ4P_USE_DYNAMIC_SMEM 1
+#else
+#define TQ4P_USE_DYNAMIC_SMEM 0
+#endif
+
+extern "C" __global__ void
+#if TQ4P_USE_DYNAMIC_SMEM
+__launch_bounds__(TQ4P_NUM_THREADS)
+#endif
+flash_tq4_prefill(
     const __nv_bfloat16* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
@@ -110,11 +120,22 @@ extern "C" __global__ void flash_tq4_prefill(
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 
+#if TQ4P_USE_DYNAMIC_SMEM
+    extern __shared__ __align__(16) unsigned char tq4p_smem_dyn[];
+    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(tq4p_smem_dyn);
+    __nv_bfloat16* smem_K_flat = smem_Q + TQ4P_BR * TQ4P_HDIM_PAD;
+    __nv_bfloat16* smem_V = smem_K_flat + 2 * TQ4P_BC * TQ4P_HDIM_PAD;
+    __nv_bfloat16* smem_P = smem_V + TQ4P_BC * TQ4P_HDIM_PAD;
+    float* smem_ml = reinterpret_cast<float*>(smem_P + TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P));
+    #define SMEM_K_TQ4P(buf, idx) smem_K_flat[(buf) * TQ4P_BC * TQ4P_HDIM_PAD + (idx)]
+#else
     __shared__ __nv_bfloat16 smem_Q[TQ4P_BR * TQ4P_HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K[2][TQ4P_BC * TQ4P_HDIM_PAD];
+    __shared__ __nv_bfloat16 smem_K_arr[2][TQ4P_BC * TQ4P_HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V[TQ4P_BC * TQ4P_HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P[TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P)];
     __shared__ float smem_ml[TQ4P_BR * 2];
+    #define SMEM_K_TQ4P(buf, idx) smem_K_arr[buf][idx]
+#endif
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -181,7 +202,7 @@ extern "C" __global__ void flash_tq4_prefill(
 
     // Load K[0] from TQ4 buffers
     if (num_kv_blocks > 0) {
-        LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, smem_K[0], 0, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
+        LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(0, 0)), 0, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
     }
     __syncthreads();
 
@@ -205,7 +226,7 @@ extern "C" __global__ void flash_tq4_prefill(
             }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K[buf];
+            const unsigned short* sK = (const unsigned short*)(&SMEM_K_TQ4P(buf, 0));
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (TQ4P_HDIM / 16); ks++) {
@@ -351,7 +372,7 @@ extern "C" __global__ void flash_tq4_prefill(
 
         // Preload K[i+1] from TQ4
         if (kv_block + 1 < num_kv_blocks) {
-            LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, smem_K[1 - buf],
+            LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(1 - buf, 0)),
                 (kv_block + 1) * TQ4P_BC, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
         }
 
@@ -423,6 +444,9 @@ extern "C" __global__ void flash_tq4_prefill(
         }
     }
 }
+
+#undef SMEM_K_TQ4P
+#undef TQ4P_USE_DYNAMIC_SMEM
 
 #else // TQ4P_HDIM == 512
 
