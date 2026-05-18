@@ -383,6 +383,208 @@ extern "C" __global__ void flash_tq4_decode(
 }
 
 // ============================================================================
+// Split-K TQ4 decode for long sequences
+// Grid: (num_q_heads, num_splits, num_seqs)  Block: (256,1,1)
+// ============================================================================
+
+extern "C" __global__ void flash_tq4_decode_splitk(
+    const __nv_bfloat16* __restrict__ Q,
+    const float* __restrict__ K_absmax,
+    const unsigned char* __restrict__ K_quant,
+    const float* __restrict__ V_absmax,
+    const unsigned char* __restrict__ V_quant,
+    float* __restrict__ workspace,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const unsigned int num_splits,
+    const unsigned int num_seqs,
+    const unsigned int q_stride,
+    const float softcap
+) {
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int split_id = blockIdx.y;
+    const unsigned int seq_idx = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane_id = tid % WARP_SIZE;
+
+    if (q_head >= num_q_heads || seq_idx >= num_seqs) return;
+    const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
+    if (seq_len == 0) return;
+
+    unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
+    unsigned int kv_start = split_id * split_size;
+    unsigned int kv_end = kv_start + split_size;
+    if (kv_end > seq_len) kv_end = seq_len;
+    if (kv_start >= seq_len) kv_start = kv_end;
+
+    const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa_ratio;
+
+    const unsigned int bf16_vec_off = lane_id * TQ4_VEC;
+    const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
+                                                       + (unsigned long long)q_head * head_dim + bf16_vec_off);
+    float q_reg[TQ4_VEC];
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) {
+        unsigned int ch = lane_id * TQ4_VEC + i;
+        q_reg[i] *= get_sign_flip(kv_head, ch);
+    }
+    wht_transform(q_reg, lane_id);
+
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    unsigned int local_len = kv_end - kv_start;
+    unsigned int chunk_size = (local_len + TQ4_NUM_WARPS - 1) / TQ4_NUM_WARPS;
+    unsigned int my_start = kv_start + warp_id * chunk_size;
+    unsigned int my_end = my_start + chunk_size;
+    if (my_end > kv_end) my_end = kv_end;
+    if (my_start > kv_end) my_start = kv_end;
+
+    float m_val = -1e30f, l_val = 0.f;
+    float o_reg[TQ4_VEC];
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) o_reg[i] = 0.f;
+
+    const unsigned int hd_half = head_dim / 2;
+    const unsigned long long am_stride = (unsigned long long)block_size * num_kv_heads;
+    const unsigned long long qv_stride = (unsigned long long)block_size * num_kv_heads * hd_half;
+
+    unsigned int pos = my_start;
+    while (pos < my_end) {
+        unsigned int logical_block = pos / block_size;
+        unsigned int block_offset = pos % block_size;
+        unsigned int physical_block = (unsigned int)my_block_table[logical_block];
+        unsigned int remaining_in_block = block_size - block_offset;
+        unsigned int remaining_total = my_end - pos;
+        unsigned int batch_count = (remaining_in_block < remaining_total) ? remaining_in_block : remaining_total;
+
+        unsigned long long am_block_base = (unsigned long long)physical_block * am_stride
+            + (unsigned long long)kv_head;
+        unsigned long long qv_block_base = (unsigned long long)physical_block * qv_stride
+            + (unsigned long long)kv_head * hd_half;
+
+        unsigned int processed = 0;
+        unsigned int aligned = (batch_count / TQ4_BC) * TQ4_BC;
+
+        for (; processed < aligned; processed += TQ4_BC) {
+            float scores[TQ4_BC];
+            unsigned long long am[TQ4_BC], qv[TQ4_BC];
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                unsigned int bo = block_offset + processed + b;
+                am[b] = am_block_base + (unsigned long long)bo * num_kv_heads;
+                qv[b] = qv_block_base + (unsigned long long)bo * num_kv_heads * hd_half;
+            }
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                float ka = __ldg(K_absmax + am[b]);
+                float _s;
+                TQ4_K_DOT(q_reg, K_quant, qv[b], ka, lane_id, _s);
+                scores[b] = _s * inv_sqrt_d;
+                if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
+            }
+
+            float m_new = m_val;
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) m_new = fmaxf(m_new, scores[b]);
+
+            float exp_old = __expf(m_val - m_new);
+            #pragma unroll
+            for (int i = 0; i < TQ4_VEC; i++) o_reg[i] *= exp_old;
+            l_val *= exp_old;
+
+            float exp_factors[TQ4_BC];
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                exp_factors[b] = __expf(scores[b] - m_new);
+                l_val += exp_factors[b];
+            }
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                float va = __ldg(V_absmax + am[b]);
+                TQ4_V_ACCUM(o_reg, V_quant, qv[b], va, exp_factors[b], lane_id);
+            }
+            m_val = m_new;
+        }
+
+        for (; processed < batch_count; processed++) {
+            unsigned int bo = block_offset + processed;
+            unsigned long long am_s = am_block_base + (unsigned long long)bo * num_kv_heads;
+            unsigned long long qv_s = qv_block_base + (unsigned long long)bo * num_kv_heads * hd_half;
+
+            float ka = __ldg(K_absmax + am_s);
+            float s;
+            TQ4_K_DOT(q_reg, K_quant, qv_s, ka, lane_id, s);
+            s *= inv_sqrt_d;
+            if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+
+            float m_new = fmaxf(m_val, s);
+            float exp_old = __expf(m_val - m_new), e = __expf(s - m_new);
+            l_val = l_val * exp_old + e;
+            #pragma unroll
+            for (int i = 0; i < TQ4_VEC; i++) o_reg[i] *= exp_old;
+
+            float va = __ldg(V_absmax + am_s);
+            TQ4_V_ACCUM(o_reg, V_quant, qv_s, va, e, lane_id);
+            m_val = m_new;
+        }
+
+        pos += batch_count;
+    }
+
+    __shared__ float smem_m[TQ4_NUM_WARPS];
+    __shared__ float smem_l[TQ4_NUM_WARPS];
+    __shared__ float smem_o[TQ4_NUM_WARPS][HDIM];
+
+    if (lane_id == 0) { smem_m[warp_id] = m_val; smem_l[warp_id] = l_val; }
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) smem_o[warp_id][bf16_vec_off + i] = o_reg[i];
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = TQ4_NUM_WARPS/2; stride > 0; stride >>= 1) {
+        if (warp_id < (unsigned int)stride) {
+            unsigned int other = warp_id + stride;
+            float lw = smem_l[other];
+            if (lw > 0.f) {
+                float mw = smem_m[other], my_m = smem_m[warp_id], my_l = smem_l[warp_id];
+                float mn = fmaxf(my_m, mw);
+                float scale_me = __expf(my_m - mn), scale_w = __expf(mw - mn);
+                smem_l[warp_id] = my_l * scale_me + lw * scale_w;
+                smem_m[warp_id] = mn;
+                #pragma unroll
+                for (int i = 0; i < TQ4_VEC; i++)
+                    smem_o[warp_id][bf16_vec_off + i] =
+                        smem_o[warp_id][bf16_vec_off + i] * scale_me +
+                        smem_o[other][bf16_vec_off + i] * scale_w;
+            }
+        }
+        __syncthreads();
+    }
+
+    unsigned int ws_stride = head_dim + 2;
+    float* ws_base = workspace + ((unsigned long long)seq_idx * num_q_heads + q_head) * num_splits * ws_stride
+                   + split_id * ws_stride;
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int i = 0; i < TQ4_VEC; i++) ws_base[bf16_vec_off + i] = smem_o[0][bf16_vec_off + i];
+        if (lane_id == 0) { ws_base[head_dim] = smem_m[0]; ws_base[head_dim + 1] = smem_l[0]; }
+    }
+}
+
+// ============================================================================
 // turbo3: 3-bit keys + 4-bit values
 // ============================================================================
 //
@@ -802,5 +1004,211 @@ extern "C" __global__ void flash_tq3_decode(
             unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
             o32[i] = lo | (hi << 16);
         }
+    }
+}
+
+// ============================================================================
+// Split-K TQ3 decode for long sequences
+// Grid: (num_q_heads, num_splits, num_seqs)  Block: (256,1,1)
+// ============================================================================
+
+extern "C" __global__ void flash_tq3_decode_splitk(
+    const __nv_bfloat16* __restrict__ Q,
+    const float* __restrict__ K_absmax,
+    const unsigned char* __restrict__ K_quant,
+    const float* __restrict__ V_absmax,
+    const unsigned char* __restrict__ V_quant,
+    float* __restrict__ workspace,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const unsigned int num_splits,
+    const unsigned int num_seqs,
+    const unsigned int q_stride,
+    const float softcap
+) {
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int split_id = blockIdx.y;
+    const unsigned int seq_idx = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane_id = tid % WARP_SIZE;
+
+    if (q_head >= num_q_heads || seq_idx >= num_seqs) return;
+    const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
+    if (seq_len == 0) return;
+
+    unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
+    unsigned int kv_start = split_id * split_size;
+    unsigned int kv_end = kv_start + split_size;
+    if (kv_end > seq_len) kv_end = seq_len;
+    if (kv_start >= seq_len) kv_start = kv_end;
+
+    const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa_ratio;
+
+    const unsigned int bf16_vec_off = lane_id * TQ4_VEC;
+    const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
+                                                       + (unsigned long long)q_head * head_dim + bf16_vec_off);
+    float q_reg[TQ4_VEC];
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) {
+        unsigned int ch = lane_id * TQ4_VEC + i;
+        q_reg[i] *= get_sign_flip(kv_head, ch);
+    }
+    wht_transform(q_reg, lane_id);
+
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    unsigned int local_len = kv_end - kv_start;
+    unsigned int chunk_size = (local_len + TQ4_NUM_WARPS - 1) / TQ4_NUM_WARPS;
+    unsigned int my_start = kv_start + warp_id * chunk_size;
+    unsigned int my_end = my_start + chunk_size;
+    if (my_end > kv_end) my_end = kv_end;
+    if (my_start > kv_end) my_start = kv_end;
+
+    float m_val = -1e30f, l_val = 0.f;
+    float o_reg[TQ4_VEC];
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) o_reg[i] = 0.f;
+
+    const unsigned long long am_stride = (unsigned long long)block_size * num_kv_heads;
+    const unsigned long long kq_stride = (unsigned long long)block_size * num_kv_heads * TQ3_K_BYTES_PER_HEAD;
+    const unsigned int hd_half = head_dim / 2;
+    const unsigned long long vq_stride = (unsigned long long)block_size * num_kv_heads * hd_half;
+
+    unsigned int pos = my_start;
+    while (pos < my_end) {
+        unsigned int logical_block = pos / block_size;
+        unsigned int block_offset = pos % block_size;
+        unsigned int physical_block = (unsigned int)my_block_table[logical_block];
+        unsigned int remaining_in_block = block_size - block_offset;
+        unsigned int remaining_total = my_end - pos;
+        unsigned int batch_count = (remaining_in_block < remaining_total) ? remaining_in_block : remaining_total;
+
+        unsigned long long am_block_base = (unsigned long long)physical_block * am_stride + kv_head;
+        unsigned long long kq_block_base = (unsigned long long)physical_block * kq_stride
+            + (unsigned long long)kv_head * TQ3_K_BYTES_PER_HEAD;
+        unsigned long long vq_block_base = (unsigned long long)physical_block * vq_stride
+            + (unsigned long long)kv_head * hd_half;
+
+        unsigned int processed = 0;
+        unsigned int aligned = (batch_count / TQ4_BC) * TQ4_BC;
+
+        for (; processed < aligned; processed += TQ4_BC) {
+            float scores[TQ4_BC];
+            unsigned long long am[TQ4_BC], kq[TQ4_BC], vq[TQ4_BC];
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                unsigned int bo = block_offset + processed + b;
+                am[b] = am_block_base + (unsigned long long)bo * num_kv_heads;
+                kq[b] = kq_block_base + (unsigned long long)bo * num_kv_heads * TQ3_K_BYTES_PER_HEAD;
+                vq[b] = vq_block_base + (unsigned long long)bo * num_kv_heads * hd_half;
+            }
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                float ka = __ldg(K_absmax + am[b]);
+                float _s;
+                TQ3_K_DOT(q_reg, K_quant, kq[b], ka, lane_id, _s);
+                scores[b] = _s * inv_sqrt_d;
+                if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
+            }
+
+            float m_new = m_val;
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) m_new = fmaxf(m_new, scores[b]);
+
+            float exp_old = __expf(m_val - m_new);
+            #pragma unroll
+            for (int i = 0; i < TQ4_VEC; i++) o_reg[i] *= exp_old;
+            l_val *= exp_old;
+
+            float exp_factors[TQ4_BC];
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                exp_factors[b] = __expf(scores[b] - m_new);
+                l_val += exp_factors[b];
+            }
+
+            #pragma unroll
+            for (int b = 0; b < TQ4_BC; b++) {
+                float va = __ldg(V_absmax + am[b]);
+                TQ4_V_ACCUM(o_reg, V_quant, vq[b], va, exp_factors[b], lane_id);
+            }
+            m_val = m_new;
+        }
+
+        for (; processed < batch_count; processed++) {
+            unsigned int bo = block_offset + processed;
+            unsigned long long am_r = am_block_base + (unsigned long long)bo * num_kv_heads;
+            unsigned long long kq_r = kq_block_base + (unsigned long long)bo * num_kv_heads * TQ3_K_BYTES_PER_HEAD;
+            unsigned long long vq_r = vq_block_base + (unsigned long long)bo * num_kv_heads * hd_half;
+
+            float ka = __ldg(K_absmax + am_r);
+            float s;
+            TQ3_K_DOT(q_reg, K_quant, kq_r, ka, lane_id, s);
+            s *= inv_sqrt_d;
+            if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+
+            float m_new = fmaxf(m_val, s);
+            float exp_old = __expf(m_val - m_new), e = __expf(s - m_new);
+            l_val = l_val * exp_old + e;
+            #pragma unroll
+            for (int i = 0; i < TQ4_VEC; i++) o_reg[i] *= exp_old;
+
+            float va = __ldg(V_absmax + am_r);
+            TQ4_V_ACCUM(o_reg, V_quant, vq_r, va, e, lane_id);
+            m_val = m_new;
+        }
+
+        pos += batch_count;
+    }
+
+    __shared__ float smem_m[TQ4_NUM_WARPS];
+    __shared__ float smem_l[TQ4_NUM_WARPS];
+    __shared__ float smem_o[TQ4_NUM_WARPS][HDIM];
+
+    if (lane_id == 0) { smem_m[warp_id] = m_val; smem_l[warp_id] = l_val; }
+    #pragma unroll
+    for (int i = 0; i < TQ4_VEC; i++) smem_o[warp_id][bf16_vec_off + i] = o_reg[i];
+    __syncthreads();
+
+    #pragma unroll
+    for (int stride = TQ4_NUM_WARPS/2; stride > 0; stride >>= 1) {
+        if (warp_id < (unsigned int)stride) {
+            unsigned int other = warp_id + stride;
+            float lw = smem_l[other];
+            if (lw > 0.f) {
+                float mw = smem_m[other], my_m = smem_m[warp_id], my_l = smem_l[warp_id];
+                float mn = fmaxf(my_m, mw);
+                float scale_me = __expf(my_m - mn), scale_w = __expf(mw - mn);
+                smem_l[warp_id] = my_l * scale_me + lw * scale_w;
+                smem_m[warp_id] = mn;
+                #pragma unroll
+                for (int i = 0; i < TQ4_VEC; i++)
+                    smem_o[warp_id][bf16_vec_off + i] =
+                        smem_o[warp_id][bf16_vec_off + i] * scale_me +
+                        smem_o[other][bf16_vec_off + i] * scale_w;
+            }
+        }
+        __syncthreads();
+    }
+
+    unsigned int ws_stride = head_dim + 2;
+    float* ws_base = workspace + ((unsigned long long)seq_idx * num_q_heads + q_head) * num_splits * ws_stride
+                   + split_id * ws_stride;
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int i = 0; i < TQ4_VEC; i++) ws_base[bf16_vec_off + i] = smem_o[0][bf16_vec_off + i];
+        if (lane_id == 0) { ws_base[head_dim] = smem_m[0]; ws_base[head_dim + 1] = smem_l[0]; }
     }
 }

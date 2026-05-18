@@ -47,10 +47,12 @@
 #define unpack_4bit_hi unpack_4bit_hi_128
 #define flash_tq4_store flash_tq4_store_128
 #define flash_tq4_decode flash_tq4_decode_128
+#define flash_tq4_decode_splitk flash_tq4_decode_splitk_128
 #define flash_tq4_prefill flash_tq4_prefill_128
 #define unpack2_bf16_tq4 unpack2_bf16_tq4_128
 #define flash_tq3_store flash_tq3_store_128
 #define flash_tq3_decode flash_tq3_decode_128
+#define flash_tq3_decode_splitk flash_tq3_decode_splitk_128
 #define quantize_3bit quantize_3bit_128
 #define dequantize_3bit dequantize_3bit_128
 #define pack_3bit_x8 pack_3bit_x8_128
@@ -118,6 +120,7 @@
 #undef TQ_VEC_U32
 #undef flash_tq4_store
 #undef flash_tq4_decode
+#undef flash_tq4_decode_splitk
 #undef flash_tq4_prefill
 #undef unpack2_bf16_tq4
 #undef TQ4_VEC
@@ -127,6 +130,7 @@
 #undef UNPACK2_BF16_TQ4_DEFINED
 #undef flash_tq3_store
 #undef flash_tq3_decode
+#undef flash_tq3_decode_splitk
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -167,10 +171,12 @@
 #define unpack_4bit_hi unpack_4bit_hi_256
 #define flash_tq4_store flash_tq4_store_256
 #define flash_tq4_decode flash_tq4_decode_256
+#define flash_tq4_decode_splitk flash_tq4_decode_splitk_256
 #define flash_tq4_prefill flash_tq4_prefill_256
 #define unpack2_bf16_tq4 unpack2_bf16_tq4_256
 #define flash_tq3_store flash_tq3_store_256
 #define flash_tq3_decode flash_tq3_decode_256
+#define flash_tq3_decode_splitk flash_tq3_decode_splitk_256
 #define quantize_3bit quantize_3bit_256
 #define dequantize_3bit dequantize_3bit_256
 #define pack_3bit_x8 pack_3bit_x8_256
@@ -237,6 +243,7 @@
 #undef TQ_VEC_U32
 #undef flash_tq4_store
 #undef flash_tq4_decode
+#undef flash_tq4_decode_splitk
 #undef flash_tq4_prefill
 #undef unpack2_bf16_tq4
 #undef TQ4_VEC
@@ -246,6 +253,7 @@
 #undef UNPACK2_BF16_TQ4_DEFINED
 #undef flash_tq3_store
 #undef flash_tq3_decode
+#undef flash_tq3_decode_splitk
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -286,10 +294,12 @@
 #define unpack_4bit_hi unpack_4bit_hi_512
 #define flash_tq4_store flash_tq4_store_512
 #define flash_tq4_decode flash_tq4_decode_512
+#define flash_tq4_decode_splitk flash_tq4_decode_splitk_512
 #define flash_tq4_prefill flash_tq4_prefill_512
 #define unpack2_bf16_tq4 unpack2_bf16_tq4_512
 #define flash_tq3_store flash_tq3_store_512
 #define flash_tq3_decode flash_tq3_decode_512
+#define flash_tq3_decode_splitk flash_tq3_decode_splitk_512
 #define quantize_3bit quantize_3bit_512
 #define dequantize_3bit dequantize_3bit_512
 #define pack_3bit_x8 pack_3bit_x8_512
@@ -327,6 +337,7 @@
 #undef flash_tq_decode_k8v4
 #undef flash_tq4_store
 #undef flash_tq4_decode
+#undef flash_tq4_decode_splitk
 #undef flash_tq4_prefill
 #undef fp8_to_bf16_s
 #undef fp8_to_f32_d
@@ -344,6 +355,7 @@
 #undef unpack_4bit_hi
 #undef flash_tq3_store
 #undef flash_tq3_decode
+#undef flash_tq3_decode_splitk
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -770,6 +782,42 @@ extern "C" void call_flash_tq4_decode(
     #undef LAUNCH_TQ4_DECODE
 }
 
+// TurboQuant turbo4 decode split-K: long sequences
+extern "C" void call_flash_tq4_decode_splitk(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* workspace,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_splits,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_splits, num_seqs);
+
+    #define LAUNCH_TQ4_DECODE_SK(HD) \
+        flash_tq4_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
+            (const __nv_bfloat16*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (float*)workspace, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap)
+
+    if (head_dim <= 128) { LAUNCH_TQ4_DECODE_SK(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ4_DECODE_SK(256); }
+    else { LAUNCH_TQ4_DECODE_SK(512); }
+    #undef LAUNCH_TQ4_DECODE_SK
+}
+
 // TurboQuant turbo3 store: K → WHT → 3-bit, V → 4-bit
 extern "C" void call_flash_tq3_store(
     const void* K, const void* V,
@@ -829,6 +877,42 @@ extern "C" void call_flash_tq3_decode(
     else if (head_dim <= 256) { LAUNCH_TQ3_DECODE(256); }
     else { LAUNCH_TQ3_DECODE(512); }
     #undef LAUNCH_TQ3_DECODE
+}
+
+// TurboQuant turbo3 decode split-K: long sequences
+extern "C" void call_flash_tq3_decode_splitk(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* workspace,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d,
+    unsigned int num_splits,
+    unsigned int num_seqs,
+    unsigned int q_stride,
+    float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_splits, num_seqs);
+
+    #define LAUNCH_TQ3_DECODE_SK(HD) \
+        flash_tq3_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
+            (const __nv_bfloat16*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (float*)workspace, \
+            block_tables, seq_lens, max_blocks_per_seq, \
+            num_q_heads, num_kv_heads, head_dim, block_size, \
+            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap)
+
+    if (head_dim <= 128) { LAUNCH_TQ3_DECODE_SK(128); }
+    else if (head_dim <= 256) { LAUNCH_TQ3_DECODE_SK(256); }
+    else { LAUNCH_TQ3_DECODE_SK(512); }
+    #undef LAUNCH_TQ3_DECODE_SK
 }
 
 // TurboQuant 4-bit prefill: reads K/V from 4-bit TQ buffers, dequant to BF16 in smem

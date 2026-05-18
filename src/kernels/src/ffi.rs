@@ -3191,6 +3191,29 @@ extern "C" {
     );
 
     #[cfg(feature = "flash")]
+    pub fn call_flash_tq4_decode_splitk(
+        q: *const c_void,
+        k_absmax: *const c_void,
+        k_quant: *const c_void,
+        v_absmax: *const c_void,
+        v_quant: *const c_void,
+        workspace: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_splits: u32,
+        num_seqs: u32,
+        q_stride: u32,
+        softcap: f32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
     pub fn call_flash_tq3_store(
         key: *const c_void,
         value: *const c_void,
@@ -3222,6 +3245,29 @@ extern "C" {
         head_dim: u32,
         block_size: u32,
         inv_sqrt_d: f32,
+        num_seqs: u32,
+        q_stride: u32,
+        softcap: f32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_tq3_decode_splitk(
+        q: *const c_void,
+        k_absmax: *const c_void,
+        k_quant: *const c_void,
+        v_absmax: *const c_void,
+        v_quant: *const c_void,
+        workspace: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_splits: u32,
         num_seqs: u32,
         q_stride: u32,
         softcap: f32,

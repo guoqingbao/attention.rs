@@ -979,6 +979,17 @@ impl PagedAttention {
                     }
                 }
                 Some(TurboquantMode::Turbo4) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::flash::flash_tq4_decode(
                             &query_p,
@@ -992,14 +1003,27 @@ impl PagedAttention {
                             attention_heads_p,
                             key_value_heads_p,
                             head_size_p,
+                            input_metadata.max_context_len,
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
+                            Some(ws),
                         )
                     }) {
                         return r;
                     }
                 }
                 Some(TurboquantMode::Turbo3) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::flash::flash_tq3_decode(
                             &query_p,
@@ -1013,8 +1037,10 @@ impl PagedAttention {
                             attention_heads_p,
                             key_value_heads_p,
                             head_size_p,
+                            input_metadata.max_context_len,
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
+                            Some(ws),
                         )
                     }) {
                         return r;

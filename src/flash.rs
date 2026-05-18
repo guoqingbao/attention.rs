@@ -666,8 +666,10 @@ pub fn flash_tq4_decode(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    max_context_len: usize,
     scale: f32,
     softcap: f32,
+    workspace: Option<&Tensor>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -711,27 +713,66 @@ pub fn flash_tq4_decode(
     };
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
 
-    unsafe {
-        kernels::ffi::call_flash_tq4_decode(
-            q_ptr,
-            ka_ptr,
-            kq_ptr,
-            va_ptr,
-            vq_ptr,
-            o_ptr,
-            bt_ptr,
-            cl_ptr,
-            max_blocks_per_seq,
-            num_q_heads as u32,
-            num_kv_heads as u32,
-            head_dim as u32,
-            block_size_from_absmax as u32,
-            scale,
-            num_seqs as u32,
-            q_stride,
-            softcap,
-            stream,
-        );
+    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+
+    if use_splitk {
+        let ws = workspace.unwrap();
+        let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+        unsafe {
+            kernels::ffi::call_flash_tq4_decode_splitk(
+                q_ptr,
+                ka_ptr,
+                kq_ptr,
+                va_ptr,
+                vq_ptr,
+                ws_ptr,
+                bt_ptr,
+                cl_ptr,
+                max_blocks_per_seq,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size_from_absmax as u32,
+                scale,
+                NUM_SPLITS,
+                num_seqs as u32,
+                q_stride,
+                softcap,
+                stream,
+            );
+            kernels::ffi::call_flash_decode_paged_reduce(
+                ws_ptr as *const std::ffi::c_void,
+                o_ptr,
+                num_q_heads as u32,
+                head_dim as u32,
+                NUM_SPLITS,
+                num_seqs as u32,
+                stream,
+            );
+        }
+    } else {
+        unsafe {
+            kernels::ffi::call_flash_tq4_decode(
+                q_ptr,
+                ka_ptr,
+                kq_ptr,
+                va_ptr,
+                vq_ptr,
+                o_ptr,
+                bt_ptr,
+                cl_ptr,
+                max_blocks_per_seq,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size_from_absmax as u32,
+                scale,
+                num_seqs as u32,
+                q_stride,
+                softcap,
+                stream,
+            );
+        }
     }
 
     Ok(output.clone())
@@ -808,8 +849,10 @@ pub fn flash_tq3_decode(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    max_context_len: usize,
     scale: f32,
     softcap: f32,
+    workspace: Option<&Tensor>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -853,27 +896,66 @@ pub fn flash_tq3_decode(
     };
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
 
-    unsafe {
-        kernels::ffi::call_flash_tq3_decode(
-            q_ptr,
-            ka_ptr,
-            kq_ptr,
-            va_ptr,
-            vq_ptr,
-            o_ptr,
-            bt_ptr,
-            cl_ptr,
-            max_blocks_per_seq,
-            num_q_heads as u32,
-            num_kv_heads as u32,
-            head_dim as u32,
-            block_size_from_absmax as u32,
-            scale,
-            num_seqs as u32,
-            q_stride,
-            softcap,
-            stream,
-        );
+    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+
+    if use_splitk {
+        let ws = workspace.unwrap();
+        let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+        unsafe {
+            kernels::ffi::call_flash_tq3_decode_splitk(
+                q_ptr,
+                ka_ptr,
+                kq_ptr,
+                va_ptr,
+                vq_ptr,
+                ws_ptr,
+                bt_ptr,
+                cl_ptr,
+                max_blocks_per_seq,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size_from_absmax as u32,
+                scale,
+                NUM_SPLITS,
+                num_seqs as u32,
+                q_stride,
+                softcap,
+                stream,
+            );
+            kernels::ffi::call_flash_decode_paged_reduce(
+                ws_ptr as *const std::ffi::c_void,
+                o_ptr,
+                num_q_heads as u32,
+                head_dim as u32,
+                NUM_SPLITS,
+                num_seqs as u32,
+                stream,
+            );
+        }
+    } else {
+        unsafe {
+            kernels::ffi::call_flash_tq3_decode(
+                q_ptr,
+                ka_ptr,
+                kq_ptr,
+                va_ptr,
+                vq_ptr,
+                o_ptr,
+                bt_ptr,
+                cl_ptr,
+                max_blocks_per_seq,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size_from_absmax as u32,
+                scale,
+                num_seqs as u32,
+                q_stride,
+                softcap,
+                stream,
+            );
+        }
     }
 
     Ok(output.clone())
