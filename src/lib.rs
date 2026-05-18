@@ -163,7 +163,6 @@ pub struct PagedAttention {
     #[cfg(feature = "flash")]
     flash_splitk_workspace: std::sync::OnceLock<Tensor>,
     layer_idx: usize,
-    tq_block_size: usize,
 }
 
 static PAGED_ATTENTION_LAYER_COUNTER: std::sync::atomic::AtomicUsize =
@@ -360,7 +359,6 @@ impl PagedAttention {
             #[cfg(feature = "flash")]
             flash_splitk_workspace: std::sync::OnceLock::new(),
             layer_idx,
-            tq_block_size: get_turboquant_block_size(),
         })
     }
 
@@ -772,6 +770,7 @@ impl PagedAttention {
             let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
 
             let tq_mode = get_turboquant_mode();
+            let tq_bs = get_turboquant_block_size();
 
             let tq_uses_std_cache = matches!(tq_mode, None | Some(TurboquantMode::Turbo8));
             if !input_metadata.is_prefill && tq_uses_std_cache {
@@ -818,7 +817,7 @@ impl PagedAttention {
                                 &slot_mapping,
                                 key_value_heads_p,
                                 head_size_p,
-                                self.tq_block_size,
+                                tq_bs,
                             )
                         }) {
                             r?;
@@ -837,7 +836,7 @@ impl PagedAttention {
                                 &slot_mapping,
                                 key_value_heads_p,
                                 head_size_p,
-                                self.tq_block_size,
+                                tq_bs,
                             )
                         }) {
                             r?;
@@ -889,7 +888,7 @@ impl PagedAttention {
                                 self.scale,
                                 softcapping.unwrap_or(0.0) as f32,
                                 self.sliding_window,
-                                self.tq_block_size,
+                                tq_bs,
                                 input_metadata.cu_seqlens_q.as_ref(),
                             )
                         });
@@ -913,7 +912,7 @@ impl PagedAttention {
                                 self.scale,
                                 softcapping.unwrap_or(0.0) as f32,
                                 self.sliding_window,
-                                self.tq_block_size,
+                                tq_bs,
                                 input_metadata.cu_seqlens_q.as_ref(),
                             )
                         });

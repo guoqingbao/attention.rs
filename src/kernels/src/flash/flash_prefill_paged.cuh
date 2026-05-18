@@ -85,7 +85,17 @@
 
 #if HDIM <= 256
 
-extern "C" __global__ void flash_prefill_paged(
+#if HDIM > 128
+#define PREFILL_USE_DYNAMIC_SMEM 1
+#else
+#define PREFILL_USE_DYNAMIC_SMEM 0
+#endif
+
+extern "C" __global__ void
+#if PREFILL_USE_DYNAMIC_SMEM
+__launch_bounds__(NUM_THREADS)
+#endif
+flash_prefill_paged(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K_cache,
     const __nv_bfloat16* __restrict__ V_cache,
@@ -117,11 +127,22 @@ extern "C" __global__ void flash_prefill_paged(
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 
+#if PREFILL_USE_DYNAMIC_SMEM
+    extern __shared__ __align__(16) unsigned char prefill_smem_dyn[];
+    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(prefill_smem_dyn);
+    __nv_bfloat16* smem_K_flat = smem_Q + BR * HDIM_PAD;
+    __nv_bfloat16* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
+    __nv_bfloat16* smem_P = smem_V + BC * HDIM_PAD;
+    float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
+    #define SMEM_K_PAGED(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
+#else
     __shared__ __nv_bfloat16 smem_Q[BR * HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K[2][BC * HDIM_PAD];
+    __shared__ __nv_bfloat16 smem_K_arr[2][BC * HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V[BC * HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P[BR * (BC + PAD_P)];
     __shared__ float smem_ml[BR * 2];
+    #define SMEM_K_PAGED(buf, idx) smem_K_arr[buf][idx]
+#endif
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -159,7 +180,7 @@ extern "C" __global__ void flash_prefill_paged(
             }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, smem_K[0], 0, kv_len, kv_head, tid, NUM_THREADS);
+            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(0, 0)), 0, kv_len, kv_head, tid, NUM_THREADS);
         }
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_group 0;");
@@ -186,7 +207,7 @@ extern "C" __global__ void flash_prefill_paged(
             }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K[buf];
+            const unsigned short* sK = (const unsigned short*)(&SMEM_K_PAGED(buf, 0));
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM / 16); ks++) {
@@ -340,7 +361,7 @@ extern "C" __global__ void flash_prefill_paged(
 
         // Preload K[i+1]
         if (kv_block + 1 < num_kv_blocks) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, smem_K[1 - buf],
+            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(1 - buf, 0)),
                 (kv_block + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
             asm volatile("cp.async.commit_group;");
         }
@@ -416,6 +437,8 @@ extern "C" __global__ void flash_prefill_paged(
         }
     }
 }
+#undef SMEM_K_PAGED
+#undef PREFILL_USE_DYNAMIC_SMEM
 
 #else // HDIM == 512
 

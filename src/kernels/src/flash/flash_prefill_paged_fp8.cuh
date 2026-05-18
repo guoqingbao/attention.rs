@@ -98,7 +98,17 @@ __device__ __forceinline__ void fp8x4_to_bf16x4(unsigned int packed, float scale
 
 #if HDIM <= 256
 
-extern "C" __global__ void flash_prefill_paged_fp8(
+#if HDIM > 128
+#define PREFILL_FP8_USE_DYNAMIC_SMEM 1
+#else
+#define PREFILL_FP8_USE_DYNAMIC_SMEM 0
+#endif
+
+extern "C" __global__ void
+#if PREFILL_FP8_USE_DYNAMIC_SMEM
+__launch_bounds__(NUM_THREADS)
+#endif
+flash_prefill_paged_fp8(
     const __nv_bfloat16* __restrict__ Q,
     const void* __restrict__ K_cache,
     const void* __restrict__ V_cache,
@@ -135,11 +145,22 @@ extern "C" __global__ void flash_prefill_paged_fp8(
     const float k_scale = k_scale_ptr[kv_head];
     const float v_scale = v_scale_ptr[kv_head];
 
+#if PREFILL_FP8_USE_DYNAMIC_SMEM
+    extern __shared__ __align__(16) unsigned char prefill_fp8_smem_dyn[];
+    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(prefill_fp8_smem_dyn);
+    __nv_bfloat16* smem_K_flat = smem_Q + BR * HDIM_PAD;
+    __nv_bfloat16* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
+    __nv_bfloat16* smem_P = smem_V + BC * HDIM_PAD;
+    float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
+    #define SMEM_K_FP8(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
+#else
     __shared__ __nv_bfloat16 smem_Q[BR * HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K[2][BC * HDIM_PAD];
+    __shared__ __nv_bfloat16 smem_K_arr[2][BC * HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V[BC * HDIM_PAD];
     __shared__ __nv_bfloat16 smem_P[BR * (BC + PAD_P)];
     __shared__ float smem_ml[BR * 2];
+    #define SMEM_K_FP8(buf, idx) smem_K_arr[buf][idx]
+#endif
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
@@ -180,7 +201,7 @@ extern "C" __global__ void flash_prefill_paged_fp8(
     }
 
     if (num_kv_blocks > 0) {
-        LOAD_KV_TILE_FP8(K_cache, block_table, smem_K[0], 0, kv_len, kv_head, tid, NUM_THREADS, k_scale);
+        LOAD_KV_TILE_FP8(K_cache, block_table, (&SMEM_K_FP8(0, 0)), 0, kv_len, kv_head, tid, NUM_THREADS, k_scale);
     }
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
@@ -201,7 +222,7 @@ extern "C" __global__ void flash_prefill_paged_fp8(
             for (int i = 0; i < 4; i++) { acc_s[i][0]=0; acc_s[i][1]=0; acc_s[i][2]=0; acc_s[i][3]=0; }
 
             const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K[buf];
+            const unsigned short* sK = (const unsigned short*)(&SMEM_K_FP8(buf, 0));
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (HDIM / 16); ks++) {
@@ -336,7 +357,7 @@ extern "C" __global__ void flash_prefill_paged_fp8(
 
         // Preload K[i+1] (FP8 dequant)
         if (kv_block + 1 < num_kv_blocks) {
-            LOAD_KV_TILE_FP8(K_cache, block_table, smem_K[1 - buf],
+            LOAD_KV_TILE_FP8(K_cache, block_table, (&SMEM_K_FP8(1 - buf, 0)),
                 (kv_block + 1) * BC, kv_len, kv_head, tid, NUM_THREADS, k_scale);
         }
 
@@ -408,6 +429,8 @@ extern "C" __global__ void flash_prefill_paged_fp8(
         }
     }
 }
+#undef SMEM_K_FP8
+#undef PREFILL_FP8_USE_DYNAMIC_SMEM
 
 #else // HDIM == 512 FP8 variant
 

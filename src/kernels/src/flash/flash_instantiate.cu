@@ -388,7 +388,11 @@ extern "C" void call_flash_prefill_paged(
     if (head_dim <= 128) {
         LAUNCH_PREFILL(128, 128, 0);
     } else if (head_dim <= 256) {
-        LAUNCH_PREFILL(256, 128, 0);
+        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_prefill_paged_256,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_PREFILL(256, 128, smem);
     } else {
         // HDIM=512: dynamic smem
         // Q[32*512] + K[32*512] + V[32*512] + P[32*40] + ml[32*2] in bf16/f32
@@ -427,7 +431,11 @@ extern "C" void call_flash_prefill_paged_fp8(
     if (head_dim <= 128) {
         LAUNCH_PREFILL_FP8(128, 128, 0);
     } else if (head_dim <= 256) {
-        LAUNCH_PREFILL_FP8(256, 128, 0);
+        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_prefill_paged_fp8_256,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_PREFILL_FP8(256, 128, smem);
     } else {
         unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
         smem = (smem + 255) & ~255u;
@@ -853,7 +861,11 @@ extern "C" void call_flash_tq4_prefill(
     if (head_dim <= 128) {
         LAUNCH_TQ4_PREFILL(128, 128, 0);
     } else if (head_dim <= 256) {
-        LAUNCH_TQ4_PREFILL(256, 128, 0);
+        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_tq4_prefill_256,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_TQ4_PREFILL(256, 128, smem);
     } else {
         unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
         smem = (smem + 255) & ~255u;
