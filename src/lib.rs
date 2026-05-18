@@ -648,12 +648,17 @@ impl PagedAttention {
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
         // head_dim > 256: FlashAttn/FlashInfer don't support it.
-        // These layers use paged attention format KV cache, so skip flash paths
-        // and fall through to the standard paged attention path below.
+        // TurboQuant: only native flash path supports turbo KV cache.
+        // Both cases force use of native flash path below.
         let use_paged_for_large_head = self.head_dim > 256;
 
+        #[cfg(feature = "flash")]
+        let force_native_flash = use_paged_for_large_head || get_turboquant_mode().is_some();
+        #[cfg(not(feature = "flash"))]
+        let force_native_flash = false;
+
         #[cfg(feature = "flashinfer")]
-        if !use_paged_for_large_head {
+        if !force_native_flash {
             if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
                 let (query, key, value, attention_heads, key_value_heads, head_size) =
                     Self::packed_qkv(query, key, value)?;
@@ -760,7 +765,7 @@ impl PagedAttention {
                 );
                 }
             }
-        } // end if !use_paged_for_large_head (flashinfer)
+        } // end if !force_native_flash (flashinfer)
 
         #[cfg(feature = "flash")]
         if !input_metadata.disable_flash_attn.unwrap_or(false) {
@@ -1081,7 +1086,7 @@ impl PagedAttention {
         }
 
         #[cfg(feature = "flashattn")]
-        if !use_paged_for_large_head && !input_metadata.disable_flash_attn.unwrap_or(false) {
+        if !force_native_flash && !input_metadata.disable_flash_attn.unwrap_or(false) {
             return self.flash_forward(
                 query,
                 key,
