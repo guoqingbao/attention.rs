@@ -1,7 +1,29 @@
-// Native Flash Decode Attention — Paged FP8 E4M3 KV cache, SM80+.
-//
-// Same algorithm as flash_decode_paged.cu but KV stored as FP8 E4M3.
-// Dequantizes to float32 on-the-fly in registers.
+/**
+ * @brief Native flash decode attention — paged FP8 E4M3 KV cache, SM80+.
+ *
+ * This CUDA kernel is developed for vLLM.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode_paged_fp8.cuh
+ * 
+ * Copyright (c) 2026, Guoqing Bao.  All rights reserved.
+ *
+ * @details
+ * Per-Q-head paged decode with FP8 E4M3 key/value cache. Dequantizes
+ * FP8 to float32 on-the-fly using hardware intrinsics (SM89+ fast pairwise,
+ * SM80 per-element fallback). Batched (BC=4) score/V accumulation for
+ * better ILP. Includes main decode and split-K variants.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -30,6 +52,18 @@
 #endif
 #ifndef BC
 #define BC 4
+#endif
+
+#ifndef FLASH_DECODE_UNPACK_DEFINED
+#define FLASH_DECODE_UNPACK_DEFINED
+__device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, float& v1) {
+    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
+    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+}
+#endif
+
+#ifndef LDG_VEC_DEFINED
+#define LDG_VEC_DEFINED
 #endif
 
 #ifndef FP8_DEQUANT_HELPERS_DEFINED
@@ -108,8 +142,13 @@ extern "C" __global__ void flash_decode_paged_fp8(
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[VEC_BF16];
-    #pragma unroll
-    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    {
+        unsigned int qp[VEC_U32];
+        #pragma unroll
+        for (int i = 0; i < VEC_U32; i++) qp[i] = __ldg(q32 + i);
+        #pragma unroll
+        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(qp[i], q_reg[2*i], q_reg[2*i+1]);
+    }
 
     const unsigned int attended = seq_len - window_start;
     unsigned int chunk_size = (attended + NUM_WARPS - 1) / NUM_WARPS;
@@ -126,99 +165,109 @@ extern "C" __global__ void flash_decode_paged_fp8(
     unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
     unsigned long long page_stride = (unsigned long long)block_size * head_stride_kv;
 
-    for (unsigned int pos = my_start; pos < my_end; pos++) {
+    // Batched decode: process BC positions at a time for better ILP and reduced exp calls
+    unsigned int pos = my_start;
+    while (pos < my_end) {
         unsigned int logical_block = pos / block_size;
-        unsigned int block_offset = pos % block_size;
+        unsigned int block_offset_start = pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
+        unsigned int remaining_in_block = block_size - block_offset_start;
+        unsigned int remaining_total = my_end - pos;
+        unsigned int batch_count = (remaining_in_block < remaining_total) ? remaining_in_block : remaining_total;
 
-        unsigned long long kv_base = (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
+        unsigned long long page_base = (unsigned long long)physical_block * page_stride
             + (unsigned long long)kv_head * head_dim + vec_offset;
 
-        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache + kv_base;
+        unsigned int processed = 0;
+        unsigned int aligned = (batch_count / BC) * BC;
 
-        float dot = 0.f;
-#if VEC_FP8 == 4
-        {
-            unsigned int k_packed = *(const unsigned int*)k_ptr;
-            float kf0, kf1, kf2, kf3;
-            fp8x4_to_f32x4(k_packed, k_scale, kf0, kf1, kf2, kf3);
-            dot = q_reg[0]*kf0 + q_reg[1]*kf1 + q_reg[2]*kf2 + q_reg[3]*kf3;
-        }
-#elif VEC_FP8 == 8
-        {
-            const unsigned int* k32 = (const unsigned int*)k_ptr;
-            float kf[8];
-            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
-            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
-            #pragma unroll
-            for (int i = 0; i < 8; i++) dot += q_reg[i] * kf[i];
-        }
-#elif VEC_FP8 == 16
-        {
-            const unsigned int* k32 = (const unsigned int*)k_ptr;
-            float kf[16];
-            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
-            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
-            fp8x4_to_f32x4(k32[2], k_scale, kf[8], kf[9], kf[10], kf[11]);
-            fp8x4_to_f32x4(k32[3], k_scale, kf[12], kf[13], kf[14], kf[15]);
-            #pragma unroll
-            for (int i = 0; i < 16; i++) dot += q_reg[i] * kf[i];
-        }
-#else
-        #pragma unroll
-        for (int i = 0; i < VEC_FP8; i++) dot += q_reg[i] * fp8_to_f32_d(k_ptr[i], k_scale);
-#endif
-        #pragma unroll
-        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, offset);
-        float score = dot * inv_sqrt_d;
-        if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+        for (; processed < aligned; processed += BC) {
+            float scores[BC];
+            unsigned long long kv_off[BC];
 
-        float m_new = fmaxf(m_val, score);
-        float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
-        l_val = l_val * exp_old + exp_new;
-
-        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache + kv_base;
-
-#if VEC_FP8 == 4
-        {
-            unsigned int v_packed = *(const unsigned int*)v_ptr;
-            float vf0, vf1, vf2, vf3;
-            fp8x4_to_f32x4(v_packed, v_scale, vf0, vf1, vf2, vf3);
-            o_reg[0] = o_reg[0] * exp_old + exp_new * vf0;
-            o_reg[1] = o_reg[1] * exp_old + exp_new * vf1;
-            o_reg[2] = o_reg[2] * exp_old + exp_new * vf2;
-            o_reg[3] = o_reg[3] * exp_old + exp_new * vf3;
-        }
-#elif VEC_FP8 == 8
-        {
-            const unsigned int* v32 = (const unsigned int*)v_ptr;
-            float vf[8];
-            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
-            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
             #pragma unroll
-            for (int i = 0; i < 8; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
-        }
-#elif VEC_FP8 == 16
-        {
-            const unsigned int* v32 = (const unsigned int*)v_ptr;
-            float vf[16];
-            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
-            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
-            fp8x4_to_f32x4(v32[2], v_scale, vf[8], vf[9], vf[10], vf[11]);
-            fp8x4_to_f32x4(v32[3], v_scale, vf[12], vf[13], vf[14], vf[15]);
+            for (int b = 0; b < BC; b++)
+                kv_off[b] = page_base + (unsigned long long)(block_offset_start + processed + b) * head_stride_kv;
+
             #pragma unroll
-            for (int i = 0; i < 16; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+            for (int b = 0; b < BC; b++) {
+                const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
+                float dot = 0.f;
+                #pragma unroll
+                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                    float kf0, kf1, kf2, kf3;
+                    fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
+                    dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+                }
+                #pragma unroll
+                for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xffffffff, dot, off);
+                scores[b] = dot * inv_sqrt_d;
+                if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
+            }
+
+            float m_new = m_val;
+            #pragma unroll
+            for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[b]);
+
+            float exp_old = __expf(m_val - m_new);
+            #pragma unroll
+            for (int i = 0; i < VEC_BF16; i++) o_reg[i] *= exp_old;
+            l_val *= exp_old;
+
+            #pragma unroll
+            for (int b = 0; b < BC; b++) {
+                float w = __expf(scores[b] - m_new);
+                l_val += w;
+                const unsigned int* v32 = (const unsigned int*)((const __nv_fp8_storage_t*)V_cache + kv_off[b]);
+                float ws = w * v_scale;
+                #pragma unroll
+                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                    float vf0, vf1, vf2, vf3;
+                    fp8x4_to_f32x4(__ldg(v32 + g), 1.0f, vf0, vf1, vf2, vf3);
+                    o_reg[g*4]   += ws * vf0;
+                    o_reg[g*4+1] += ws * vf1;
+                    o_reg[g*4+2] += ws * vf2;
+                    o_reg[g*4+3] += ws * vf3;
+                }
+            }
+            m_val = m_new;
         }
-#else
-        #pragma unroll
-        for (int i = 0; i < VEC_FP8; i++) {
-            float vv = fp8_to_f32_d(v_ptr[i], v_scale);
-            o_reg[i] = o_reg[i] * exp_old + exp_new * vv;
+
+        for (; processed < batch_count; processed++) {
+            unsigned long long kv_base = page_base + (unsigned long long)(block_offset_start + processed) * head_stride_kv;
+            const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_base);
+            float dot = 0.f;
+            #pragma unroll
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
+                float kf0, kf1, kf2, kf3;
+                fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
+                dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+            }
+            #pragma unroll
+            for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xffffffff, dot, off);
+            float score = dot * inv_sqrt_d;
+            if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+
+            float m_new = fmaxf(m_val, score);
+            float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
+            l_val = l_val * exp_old + exp_new;
+            const unsigned int* v32 = (const unsigned int*)((const __nv_fp8_storage_t*)V_cache + kv_base);
+            float ew_vs = exp_new * v_scale;
+            #pragma unroll
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
+                float vf0, vf1, vf2, vf3;
+                fp8x4_to_f32x4(__ldg(v32 + g), 1.0f, vf0, vf1, vf2, vf3);
+                o_reg[g*4]   = o_reg[g*4]   * exp_old + ew_vs * vf0;
+                o_reg[g*4+1] = o_reg[g*4+1] * exp_old + ew_vs * vf1;
+                o_reg[g*4+2] = o_reg[g*4+2] * exp_old + ew_vs * vf2;
+                o_reg[g*4+3] = o_reg[g*4+3] * exp_old + ew_vs * vf3;
+            }
+            m_val = m_new;
         }
-#endif
-        m_val = m_new;
+
+        pos += batch_count;
     }
 
     __shared__ float smem_m[NUM_WARPS];
@@ -286,7 +335,8 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
     const float softcap,
     const float* __restrict__ k_scale_ptr,
     const float* __restrict__ v_scale_ptr,
-    const unsigned long long fp8_cache_stride
+    const unsigned long long fp8_cache_stride,
+    const unsigned int sliding_window
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int split_id = blockIdx.y;
@@ -299,8 +349,11 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
 
-    unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
-    unsigned int kv_start = split_id * split_size;
+    const unsigned int window_start =
+        (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0u;
+    const unsigned int attended = seq_len - window_start;
+    unsigned int split_size = (attended + num_splits - 1) / num_splits;
+    unsigned int kv_start = window_start + split_id * split_size;
     unsigned int kv_end = kv_start + split_size;
     if (kv_end > seq_len) kv_end = seq_len;
     if (kv_start >= seq_len) kv_start = kv_end;
@@ -316,8 +369,13 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[VEC_BF16];
-    #pragma unroll
-    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    {
+        unsigned int qp[VEC_U32];
+        #pragma unroll
+        for (int i = 0; i < VEC_U32; i++) qp[i] = __ldg(q32 + i);
+        #pragma unroll
+        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(qp[i], q_reg[2*i], q_reg[2*i+1]);
+    }
 
     unsigned int local_len = kv_end - kv_start;
     unsigned int chunk_size = (local_len + NUM_WARPS - 1) / NUM_WARPS;
@@ -334,98 +392,106 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
     unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
     unsigned long long page_stride = (unsigned long long)block_size * head_stride_kv;
 
-    for (unsigned int pos = my_start; pos < my_end; pos++) {
+    unsigned int pos = my_start;
+    while (pos < my_end) {
         unsigned int logical_block = pos / block_size;
-        unsigned int block_offset = pos % block_size;
+        unsigned int block_offset_start = pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
+        unsigned int remaining_in_block = block_size - block_offset_start;
+        unsigned int remaining_total = my_end - pos;
+        unsigned int batch_count = (remaining_in_block < remaining_total) ? remaining_in_block : remaining_total;
 
-        unsigned long long kv_base = (unsigned long long)physical_block * page_stride
-            + (unsigned long long)block_offset * head_stride_kv
+        unsigned long long page_base = (unsigned long long)physical_block * page_stride
             + (unsigned long long)kv_head * head_dim + vec_offset;
 
-        const __nv_fp8_storage_t* k_ptr = (const __nv_fp8_storage_t*)K_cache + kv_base;
+        unsigned int processed = 0;
+        unsigned int aligned = (batch_count / BC) * BC;
 
-        float dot = 0.f;
-#if VEC_FP8 == 4
-        {
-            unsigned int k_packed = *(const unsigned int*)k_ptr;
-            float kf0, kf1, kf2, kf3;
-            fp8x4_to_f32x4(k_packed, k_scale, kf0, kf1, kf2, kf3);
-            dot = q_reg[0]*kf0 + q_reg[1]*kf1 + q_reg[2]*kf2 + q_reg[3]*kf3;
-        }
-#elif VEC_FP8 == 8
-        {
-            const unsigned int* k32 = (const unsigned int*)k_ptr;
-            float kf[8];
-            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
-            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
+        for (; processed < aligned; processed += BC) {
+            float scores[BC];
+            unsigned long long kv_off[BC];
             #pragma unroll
-            for (int i = 0; i < 8; i++) dot += q_reg[i] * kf[i];
-        }
-#elif VEC_FP8 == 16
-        {
-            const unsigned int* k32 = (const unsigned int*)k_ptr;
-            float kf[16];
-            fp8x4_to_f32x4(k32[0], k_scale, kf[0], kf[1], kf[2], kf[3]);
-            fp8x4_to_f32x4(k32[1], k_scale, kf[4], kf[5], kf[6], kf[7]);
-            fp8x4_to_f32x4(k32[2], k_scale, kf[8], kf[9], kf[10], kf[11]);
-            fp8x4_to_f32x4(k32[3], k_scale, kf[12], kf[13], kf[14], kf[15]);
-            #pragma unroll
-            for (int i = 0; i < 16; i++) dot += q_reg[i] * kf[i];
-        }
-#else
-        #pragma unroll
-        for (int i = 0; i < VEC_FP8; i++) dot += q_reg[i] * fp8_to_f32_d(k_ptr[i], k_scale);
-#endif
-        #pragma unroll
-        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, offset);
-        float score = dot * inv_sqrt_d;
-        if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+            for (int b = 0; b < BC; b++)
+                kv_off[b] = page_base + (unsigned long long)(block_offset_start + processed + b) * head_stride_kv;
 
-        float m_new = fmaxf(m_val, score);
-        float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
-        l_val = l_val * exp_old + exp_new;
-
-        const __nv_fp8_storage_t* v_ptr = (const __nv_fp8_storage_t*)V_cache + kv_base;
-
-#if VEC_FP8 == 4
-        {
-            unsigned int v_packed = *(const unsigned int*)v_ptr;
-            float vf0, vf1, vf2, vf3;
-            fp8x4_to_f32x4(v_packed, v_scale, vf0, vf1, vf2, vf3);
-            o_reg[0] = o_reg[0] * exp_old + exp_new * vf0;
-            o_reg[1] = o_reg[1] * exp_old + exp_new * vf1;
-            o_reg[2] = o_reg[2] * exp_old + exp_new * vf2;
-            o_reg[3] = o_reg[3] * exp_old + exp_new * vf3;
-        }
-#elif VEC_FP8 == 8
-        {
-            const unsigned int* v32 = (const unsigned int*)v_ptr;
-            float vf[8];
-            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
-            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
             #pragma unroll
-            for (int i = 0; i < 8; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
-        }
-#elif VEC_FP8 == 16
-        {
-            const unsigned int* v32 = (const unsigned int*)v_ptr;
-            float vf[16];
-            fp8x4_to_f32x4(v32[0], v_scale, vf[0], vf[1], vf[2], vf[3]);
-            fp8x4_to_f32x4(v32[1], v_scale, vf[4], vf[5], vf[6], vf[7]);
-            fp8x4_to_f32x4(v32[2], v_scale, vf[8], vf[9], vf[10], vf[11]);
-            fp8x4_to_f32x4(v32[3], v_scale, vf[12], vf[13], vf[14], vf[15]);
+            for (int b = 0; b < BC; b++) {
+                const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
+                float dot = 0.f;
+                #pragma unroll
+                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                    float kf0, kf1, kf2, kf3;
+                    fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
+                    dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+                }
+                #pragma unroll
+                for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xffffffff, dot, off);
+                scores[b] = dot * inv_sqrt_d;
+                if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
+            }
+
+            float m_new = m_val;
             #pragma unroll
-            for (int i = 0; i < 16; i++) o_reg[i] = o_reg[i] * exp_old + exp_new * vf[i];
+            for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[b]);
+            float exp_old = __expf(m_val - m_new);
+            #pragma unroll
+            for (int i = 0; i < VEC_BF16; i++) o_reg[i] *= exp_old;
+            l_val *= exp_old;
+
+            #pragma unroll
+            for (int b = 0; b < BC; b++) {
+                float w = __expf(scores[b] - m_new);
+                l_val += w;
+                const unsigned int* v32 = (const unsigned int*)((const __nv_fp8_storage_t*)V_cache + kv_off[b]);
+                float ws = w * v_scale;
+                #pragma unroll
+                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                    float vf0, vf1, vf2, vf3;
+                    fp8x4_to_f32x4(__ldg(v32 + g), 1.0f, vf0, vf1, vf2, vf3);
+                    o_reg[g*4]   += ws * vf0;
+                    o_reg[g*4+1] += ws * vf1;
+                    o_reg[g*4+2] += ws * vf2;
+                    o_reg[g*4+3] += ws * vf3;
+                }
+            }
+            m_val = m_new;
         }
-#else
-        #pragma unroll
-        for (int i = 0; i < VEC_FP8; i++) {
-            o_reg[i] = o_reg[i] * exp_old + exp_new * fp8_to_f32_d(v_ptr[i], v_scale);
+
+        for (; processed < batch_count; processed++) {
+            unsigned long long kv_base = page_base + (unsigned long long)(block_offset_start + processed) * head_stride_kv;
+            const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_base);
+            float dot = 0.f;
+            #pragma unroll
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
+                float kf0, kf1, kf2, kf3;
+                fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
+                dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+            }
+            #pragma unroll
+            for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xffffffff, dot, off);
+            float score = dot * inv_sqrt_d;
+            if (softcap > 0.f) score = softcap * tanhf(score / softcap);
+
+            float m_new = fmaxf(m_val, score);
+            float exp_old = __expf(m_val - m_new), exp_new = __expf(score - m_new);
+            l_val = l_val * exp_old + exp_new;
+            const unsigned int* v32 = (const unsigned int*)((const __nv_fp8_storage_t*)V_cache + kv_base);
+            float ew_vs = exp_new * v_scale;
+            #pragma unroll
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
+                float vf0, vf1, vf2, vf3;
+                fp8x4_to_f32x4(__ldg(v32 + g), 1.0f, vf0, vf1, vf2, vf3);
+                o_reg[g*4]   = o_reg[g*4]   * exp_old + ew_vs * vf0;
+                o_reg[g*4+1] = o_reg[g*4+1] * exp_old + ew_vs * vf1;
+                o_reg[g*4+2] = o_reg[g*4+2] * exp_old + ew_vs * vf2;
+                o_reg[g*4+3] = o_reg[g*4+3] * exp_old + ew_vs * vf3;
+            }
+            m_val = m_new;
         }
-#endif
-        m_val = m_new;
+
+        pos += batch_count;
     }
 
     __shared__ float smem_m[NUM_WARPS];
@@ -467,3 +533,5 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
         if (lane_id == 0) { ws_base[head_dim] = smem_m[0]; ws_base[head_dim + 1] = smem_l[0]; }
     }
 }
+
+#undef FP8_LOAD_DEQUANT

@@ -370,21 +370,6 @@ void flashinfer_prefill_run_wrapper(
     const int64_t* plan_data = plan_info_vec + 1;
 
     if (data_type == 2) {
-#if defined(SM_90_PASS) && defined(FLASHINFER_ENABLE_FP8_E4M3)
-        if (head_dim < 256) {
-            extern void flashinfer_prefill_run_fp8(
-                void*, void*, int32_t, void*, void*, int32_t*,
-                int32_t, int32_t, int32_t, int32_t, float,
-                const float*, const float*, void*, int32_t,
-                const int64_t*, cudaStream_t);
-            flashinfer_prefill_run_fp8(
-                out_ptr, q_ptr, total_num_rows, k_data, v_data, indices,
-                num_qo_heads, num_kv_heads, head_dim, page_size, sm_scale,
-                k_scale_ptr, v_scale_ptr, workspace_int, out_data_type,
-                plan_info_vec, stream);
-            return;
-        }
-#endif
 #if defined(FLASHINFER_ENABLE_FP8_E4M3)
         extern void flashinfer_prefill_run_fp8_fa2(
             void*, void*, int32_t*, int32_t,

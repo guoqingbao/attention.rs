@@ -23,6 +23,17 @@ fn scale_gpu_ptr(scale: Option<&Tensor>) -> Result<*const f32> {
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_ptr_u32(t: &Tensor) -> Result<*const u32> {
+    let (s, l) = t.storage_and_layout();
+    let s = match &*s {
+        candle::Storage::Cuda(c) => c,
+        _ => candle::bail!("tensor must be CUDA"),
+    };
+    let slice = s.as_cuda_slice::<u32>()?;
+    Ok(*slice.slice(l.start_offset()..).device_ptr() as *const u32)
+}
+
+#[cfg(feature = "cuda")]
 fn get_cuda_stream(dev: &candle::CudaDevice) -> i64 {
     use candle::cuda_backend::cudarc::driver::sys;
     let stream: sys::CUstream = *dev.cu_stream();
@@ -153,6 +164,7 @@ pub fn flash_prefill(
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
     cu_seqlens_q: Option<&Tensor>,
+    max_seqlen_q: usize,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -171,98 +183,89 @@ pub fn flash_prefill(
     let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
 
     let is_fp8 = key_cache.dtype() == DType::U8;
+    let sw = sliding_window.unwrap_or(0) as u32;
 
-    let seqlens_q = if let Some(cu) = cu_seqlens_q {
-        cu.to_vec1::<u32>()?
-    } else {
-        vec![0u32, q_len as u32]
+    let block_table_stride = block_table.dim(1)? as u32;
+    let bt_ptr = {
+        let (s, l) = block_table.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_table must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
-    let num_seqs = seqlens_q.len() - 1;
+    let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
+        let ns = cu.dim(0)? - 1;
+        (
+            gpu_ptr_u32(cu)?,
+            gpu_ptr_u32(context_lens)?,
+            ns,
+            max_seqlen_q,
+        )
+    } else {
+        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
+        (
+            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(context_lens)?,
+            1usize,
+            q_len,
+        )
+    };
 
-    for seq_idx in 0..num_seqs {
-        let q_start = seqlens_q[seq_idx] as usize;
-        let q_end = seqlens_q[seq_idx + 1] as usize;
-        let seq_q_len = q_end - q_start;
-        if seq_q_len == 0 {
-            continue;
+    if is_fp8 {
+        let ks_ptr = scale_gpu_ptr(k_scale)?;
+        let vs_ptr = scale_gpu_ptr(v_scale)?;
+        let fp8_cache_stride = (key_cache.dim(1)? * key_cache.dim(2)? * key_cache.dim(3)?) as u64;
+        unsafe {
+            kernels::ffi::call_flash_prefill_paged_fp8(
+                q_ptr,
+                kc_ptr,
+                vc_ptr,
+                o_ptr,
+                bt_ptr,
+                block_table_stride,
+                cu_ptr,
+                cl_ptr,
+                num_seqs as u32,
+                actual_max_q_len as u32,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                sw,
+                1,
+                scale,
+                softcap,
+                ks_ptr,
+                vs_ptr,
+                fp8_cache_stride,
+                stream,
+            );
         }
-
-        let cl_vec = context_lens.to_vec1::<u32>()?;
-        let kv_len = cl_vec[seq_idx] as usize;
-
-        let bt_row = block_table.narrow(0, seq_idx, 1)?.squeeze(0)?;
-        let bt_row_ptr = {
-            let (s, l) = bt_row.storage_and_layout();
-            let s = match &*s {
-                candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                _ => candle::bail!("block_table row must be CUDA"),
-            };
-            *s.slice(l.start_offset()..).device_ptr() as *const c_int
-        };
-
-        let q_offset = kv_len.saturating_sub(seq_q_len);
-        let q_slice_ptr = unsafe {
-            (q_ptr as *const u8).add(q_start * num_q_heads * head_dim * 2)
-                as *const std::ffi::c_void
-        };
-        let o_slice_ptr = unsafe {
-            (o_ptr as *mut u8).add(q_start * num_q_heads * head_dim * 2) as *mut std::ffi::c_void
-        };
-
-        let sw = sliding_window.unwrap_or(0) as u32;
-
-        if is_fp8 {
-            let ks_ptr = scale_gpu_ptr(k_scale)?;
-            let vs_ptr = scale_gpu_ptr(v_scale)?;
-            let fp8_cache_stride =
-                (key_cache.dim(1)? * key_cache.dim(2)? * key_cache.dim(3)?) as u64;
-            unsafe {
-                kernels::ffi::call_flash_prefill_paged_fp8(
-                    q_slice_ptr,
-                    kc_ptr,
-                    vc_ptr,
-                    o_slice_ptr,
-                    bt_row_ptr,
-                    seq_q_len as u32,
-                    kv_len as u32,
-                    q_offset as u32,
-                    num_q_heads as u32,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    block_size as u32,
-                    sw,
-                    1,
-                    scale,
-                    softcap,
-                    ks_ptr,
-                    vs_ptr,
-                    fp8_cache_stride,
-                    stream,
-                );
-            }
-        } else {
-            unsafe {
-                kernels::ffi::call_flash_prefill_paged(
-                    q_slice_ptr,
-                    kc_ptr,
-                    vc_ptr,
-                    o_slice_ptr,
-                    bt_row_ptr,
-                    seq_q_len as u32,
-                    kv_len as u32,
-                    q_offset as u32,
-                    num_q_heads as u32,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    block_size as u32,
-                    sw,
-                    1,
-                    scale,
-                    softcap,
-                    stream,
-                );
-            }
+    } else {
+        unsafe {
+            kernels::ffi::call_flash_prefill_paged(
+                q_ptr,
+                kc_ptr,
+                vc_ptr,
+                o_ptr,
+                bt_ptr,
+                block_table_stride,
+                cu_ptr,
+                cl_ptr,
+                num_seqs as u32,
+                actual_max_q_len as u32,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                sw,
+                1,
+                scale,
+                softcap,
+                stream,
+            );
         }
     }
 
@@ -271,6 +274,7 @@ pub fn flash_prefill(
 
 pub const SPLIT_K_THRESHOLD: usize = 1024;
 pub const NUM_SPLITS: u32 = 8;
+pub const TQ_NUM_SPLITS: u32 = 16;
 
 #[cfg(feature = "cuda")]
 pub fn flash_decode(
@@ -328,6 +332,11 @@ pub fn flash_decode(
     let is_fp8 = key_cache.dtype() == DType::U8;
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
+    // GQA disabled for native flash path: shared memory overflow at higher ratios
+    // (e.g. GQA=8 with HDIM=256 needs 64KB smem, exceeding 48KB limit).
+    // Each CTA handles one Q head; kv_head = q_head / gqa_ratio is computed inside kernel.
+    let effective_gqa: usize = 1;
+
     if is_fp8 {
         let fp8_cache_stride = (block_size * num_kv_heads * head_dim) as u64;
         let ks_ptr = scale_gpu_ptr(k_scale)?;
@@ -357,6 +366,8 @@ pub fn flash_decode(
                     ks_ptr,
                     vs_ptr,
                     fp8_cache_stride,
+                    sw,
+                    effective_gqa as u32,
                     stream,
                 );
                 kernels::ffi::call_flash_decode_paged_reduce(
@@ -391,6 +402,7 @@ pub fn flash_decode(
                     ks_ptr,
                     vs_ptr,
                     fp8_cache_stride,
+                    effective_gqa as u32,
                     stream,
                 );
             }
@@ -417,6 +429,8 @@ pub fn flash_decode(
                     NUM_SPLITS,
                     q_stride,
                     softcap,
+                    sw,
+                    effective_gqa as u32,
                     stream,
                 );
                 kernels::ffi::call_flash_decode_paged_reduce(
@@ -448,6 +462,7 @@ pub fn flash_decode(
                     q_stride,
                     sw,
                     softcap,
+                    effective_gqa as u32,
                     stream,
                 );
             }
@@ -532,6 +547,7 @@ pub fn flash_tq_decode_k8v4(
     scale: f32,
     softcap: f32,
     k_scale: Option<&Tensor>,
+    sliding_window: Option<usize>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -568,6 +584,7 @@ pub fn flash_tq_decode_k8v4(
 
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let ks_ptr = scale_gpu_ptr(k_scale)?;
+    let sw = sliding_window.unwrap_or(0) as u32;
 
     unsafe {
         kernels::ffi::call_flash_tq_decode_k8v4(
@@ -588,6 +605,7 @@ pub fn flash_tq_decode_k8v4(
             q_stride,
             softcap,
             ks_ptr,
+            sw,
             stream,
         );
     }
@@ -612,6 +630,7 @@ pub fn flash_tq_decode_k8v4_splitk(
     softcap: f32,
     k_scale: Option<&Tensor>,
     workspace: Option<&Tensor>,
+    sliding_window: Option<usize>,
 ) -> Result<Tensor> {
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
@@ -630,6 +649,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             scale,
             softcap,
             k_scale,
+            sliding_window,
         );
     }
 
@@ -667,6 +687,7 @@ pub fn flash_tq_decode_k8v4_splitk(
 
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let ks_ptr = scale_gpu_ptr(k_scale)?;
+    let sw = sliding_window.unwrap_or(0) as u32;
     let o_ptr = ptr_from_tensor(output)? as *mut std::ffi::c_void;
 
     let ws = workspace.unwrap();
@@ -687,11 +708,12 @@ pub fn flash_tq_decode_k8v4_splitk(
             head_dim as u32,
             block_size as u32,
             scale,
-            NUM_SPLITS,
+            TQ_NUM_SPLITS,
             num_seqs as u32,
             q_stride,
             softcap,
             ks_ptr,
+            sw,
             stream,
         );
         kernels::ffi::call_flash_decode_paged_reduce(
@@ -699,7 +721,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             o_ptr,
             num_q_heads as u32,
             head_dim as u32,
-            NUM_SPLITS,
+            TQ_NUM_SPLITS,
             num_seqs as u32,
             stream,
         );
@@ -782,6 +804,7 @@ pub fn flash_tq4_decode(
     max_context_len: usize,
     scale: f32,
     softcap: f32,
+    sliding_window: Option<usize>,
     workspace: Option<&Tensor>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
@@ -825,6 +848,7 @@ pub fn flash_tq4_decode(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
+    let sw = sliding_window.unwrap_or(0) as u32;
 
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
@@ -847,10 +871,11 @@ pub fn flash_tq4_decode(
                 head_dim as u32,
                 block_size_from_absmax as u32,
                 scale,
-                NUM_SPLITS,
+                TQ_NUM_SPLITS,
                 num_seqs as u32,
                 q_stride,
                 softcap,
+                sw,
                 stream,
             );
             kernels::ffi::call_flash_decode_paged_reduce(
@@ -858,7 +883,7 @@ pub fn flash_tq4_decode(
                 o_ptr,
                 num_q_heads as u32,
                 head_dim as u32,
-                NUM_SPLITS,
+                TQ_NUM_SPLITS,
                 num_seqs as u32,
                 stream,
             );
@@ -883,6 +908,7 @@ pub fn flash_tq4_decode(
                 num_seqs as u32,
                 q_stride,
                 softcap,
+                sw,
                 stream,
             );
         }
@@ -965,6 +991,7 @@ pub fn flash_tq3_decode(
     max_context_len: usize,
     scale: f32,
     softcap: f32,
+    sliding_window: Option<usize>,
     workspace: Option<&Tensor>,
 ) -> Result<Tensor> {
     let dev = match query.device() {
@@ -1008,6 +1035,7 @@ pub fn flash_tq3_decode(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
+    let sw = sliding_window.unwrap_or(0) as u32;
 
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
@@ -1030,10 +1058,11 @@ pub fn flash_tq3_decode(
                 head_dim as u32,
                 block_size_from_absmax as u32,
                 scale,
-                NUM_SPLITS,
+                TQ_NUM_SPLITS,
                 num_seqs as u32,
                 q_stride,
                 softcap,
+                sw,
                 stream,
             );
             kernels::ffi::call_flash_decode_paged_reduce(
@@ -1041,7 +1070,7 @@ pub fn flash_tq3_decode(
                 o_ptr,
                 num_q_heads as u32,
                 head_dim as u32,
-                NUM_SPLITS,
+                TQ_NUM_SPLITS,
                 num_seqs as u32,
                 stream,
             );
@@ -1066,6 +1095,7 @@ pub fn flash_tq3_decode(
                 num_seqs as u32,
                 q_stride,
                 softcap,
+                sw,
                 stream,
             );
         }
@@ -1096,6 +1126,7 @@ pub fn flash_tq4_prefill(
     sliding_window: Option<usize>,
     block_size: usize,
     cu_seqlens_q: Option<&Tensor>,
+    max_seqlen_q: usize,
 ) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
@@ -1113,69 +1144,60 @@ pub fn flash_tq4_prefill(
     let vq_ptr = ptr_from_tensor(v_quant)?;
     let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
 
-    let seqlens_q = if let Some(cu) = cu_seqlens_q {
-        cu.to_vec1::<u32>()?
-    } else {
-        vec![0u32, q_len as u32]
+    let sw = sliding_window.unwrap_or(0) as u32;
+
+    let block_table_stride = block_table.dim(1)? as u32;
+    let bt_ptr = {
+        let (s, l) = block_table.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_table must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
-    let num_seqs = seqlens_q.len() - 1;
+    let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
+        let ns = cu.dim(0)? - 1;
+        (
+            gpu_ptr_u32(cu)?,
+            gpu_ptr_u32(context_lens)?,
+            ns,
+            max_seqlen_q,
+        )
+    } else {
+        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
+        (
+            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(context_lens)?,
+            1usize,
+            q_len,
+        )
+    };
 
-    for seq_idx in 0..num_seqs {
-        let q_start = seqlens_q[seq_idx] as usize;
-        let q_end = seqlens_q[seq_idx + 1] as usize;
-        let seq_q_len = q_end - q_start;
-        if seq_q_len == 0 {
-            continue;
-        }
-
-        let cl_vec = context_lens.to_vec1::<u32>()?;
-        let kv_len = cl_vec[seq_idx] as usize;
-
-        let bt_row = block_table.narrow(0, seq_idx, 1)?.squeeze(0)?;
-        let bt_row_ptr = {
-            let (s, l) = bt_row.storage_and_layout();
-            let s = match &*s {
-                candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                _ => candle::bail!("block_table row must be CUDA"),
-            };
-            *s.slice(l.start_offset()..).device_ptr() as *const c_int
-        };
-
-        let q_offset = kv_len.saturating_sub(seq_q_len);
-        let q_slice_ptr = unsafe {
-            (q_ptr as *const u8).add(q_start * num_q_heads * head_dim * 2)
-                as *const std::ffi::c_void
-        };
-        let o_slice_ptr = unsafe {
-            (o_ptr as *mut u8).add(q_start * num_q_heads * head_dim * 2) as *mut std::ffi::c_void
-        };
-
-        let sw = sliding_window.unwrap_or(0) as u32;
-
-        unsafe {
-            kernels::ffi::call_flash_tq4_prefill(
-                q_slice_ptr,
-                ka_ptr,
-                kq_ptr,
-                va_ptr,
-                vq_ptr,
-                o_slice_ptr,
-                bt_row_ptr,
-                seq_q_len as u32,
-                kv_len as u32,
-                q_offset as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
-                sw,
-                1, // causal=1
-                scale,
-                softcap,
-                stream,
-            );
-        }
+    unsafe {
+        kernels::ffi::call_flash_tq4_prefill(
+            q_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            o_ptr,
+            bt_ptr,
+            block_table_stride,
+            cu_ptr,
+            cl_ptr,
+            num_seqs as u32,
+            actual_max_q_len as u32,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            sw,
+            1,
+            scale,
+            softcap,
+            stream,
+        );
     }
 
     Ok(o)
@@ -1198,12 +1220,8 @@ pub fn flash_tq3_prefill(
     sliding_window: Option<usize>,
     block_size: usize,
     cu_seqlens_q: Option<&Tensor>,
+    max_seqlen_q: usize,
 ) -> Result<Tensor> {
-    // turbo3 uses the same prefill kernel as turbo4 (4-bit V dequant is identical;
-    // 3-bit K is dequanted via the same WHT-aware LOAD_TQ4 macro since the K
-    // quantization stores at 4-bit granularity with 3-bit values packed).
-    // For a dedicated turbo3 prefill, a separate kernel with 3-bit K loader is needed.
-    // For now, delegate to the turbo4 prefill which handles 4-bit K correctly.
     flash_tq4_prefill(
         query,
         k_absmax,
@@ -1220,5 +1238,6 @@ pub fn flash_tq3_prefill(
         sliding_window,
         block_size,
         cu_seqlens_q,
+        max_seqlen_q,
     )
 }

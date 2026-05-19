@@ -57,6 +57,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_instantiate.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged_fp8.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_decode_paged.cuh");
@@ -74,7 +75,7 @@ fn main() -> Result<()> {
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
-        .nvcc_thread_patterns(&["flash_api", "cutlass", "flashinfer"], 2)
+        .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");

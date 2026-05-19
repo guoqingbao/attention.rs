@@ -2944,10 +2944,12 @@ extern "C" {
         k_cache: *const c_void,
         v_cache: *const c_void,
         o: *mut c_void,
-        block_table: *const c_int,
-        q_len: u32,
-        kv_len: u32,
-        q_offset: u32,
+        block_tables: *const c_int,
+        block_table_stride: u32,
+        cu_seqlens_q: *const u32,
+        context_lens: *const u32,
+        num_seqs: u32,
+        max_q_len: u32,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -2965,10 +2967,12 @@ extern "C" {
         k_cache: *const c_void,
         v_cache: *const c_void,
         o: *mut c_void,
-        block_table: *const c_int,
-        q_len: u32,
-        kv_len: u32,
-        q_offset: u32,
+        block_tables: *const c_int,
+        block_table_stride: u32,
+        cu_seqlens_q: *const u32,
+        context_lens: *const u32,
+        num_seqs: u32,
+        max_q_len: u32,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -3001,6 +3005,7 @@ extern "C" {
         q_stride: u32,
         sliding_window: u32,
         softcap: f32,
+        gqa_ratio: u32,
         stream: i64,
     );
 
@@ -3022,6 +3027,8 @@ extern "C" {
         num_splits: u32,
         q_stride: u32,
         softcap: f32,
+        sliding_window: u32,
+        gqa_ratio: u32,
         stream: i64,
     );
 
@@ -3057,6 +3064,7 @@ extern "C" {
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
+        gqa_ratio: u32,
         stream: i64,
     );
 
@@ -3081,6 +3089,8 @@ extern "C" {
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
+        sliding_window: u32,
+        gqa_ratio: u32,
         stream: i64,
     );
 
@@ -3149,6 +3159,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         k_scale_ptr: *const f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3172,6 +3183,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         k_scale_ptr: *const f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3210,6 +3222,7 @@ extern "C" {
         num_seqs: u32,
         q_stride: u32,
         softcap: f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3233,6 +3246,7 @@ extern "C" {
         num_seqs: u32,
         q_stride: u32,
         softcap: f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3271,6 +3285,7 @@ extern "C" {
         num_seqs: u32,
         q_stride: u32,
         softcap: f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3294,6 +3309,7 @@ extern "C" {
         num_seqs: u32,
         q_stride: u32,
         softcap: f32,
+        sliding_window: u32,
         stream: i64,
     );
 
@@ -3305,10 +3321,12 @@ extern "C" {
         v_absmax: *const c_void,
         v_quant: *const c_void,
         o: *mut c_void,
-        block_table: *const c_int,
-        q_len: u32,
-        kv_len: u32,
-        q_offset: u32,
+        block_tables: *const c_int,
+        block_table_stride: u32,
+        cu_seqlens_q: *const u32,
+        context_lens: *const u32,
+        num_seqs: u32,
+        max_q_len: u32,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,

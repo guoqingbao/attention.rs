@@ -1,7 +1,33 @@
-// TurboQuant KV Cache Compression — k8v4 preset (FP8 keys + 4-bit values)
-//
+/**
+ * @brief TurboQuant KV cache — k8v4 preset (FP8 keys + 4-bit values), SM80+.
+ *
+ * This CUDA kernel is developed for vLLM.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_turboquant.cuh
+ * 
+ * Copyright (c) 2026, Guoqing Bao.  All rights reserved.
+ *
+ * @details
+ * Implements TurboQuant k8v4 mode: keys stored as FP8 E4M3 in the standard
+ * cache (no WHT rotation), values compressed to 4-bit with per-position
+ * absmax scaling. Store kernel writes V to TQ buffers. Decode kernels use
+ * hardware FP8 dequant for K and 4-bit uniform dequant for V. Based on
+ * TurboQuant (Zandieh et al., ICLR 2026). Includes main + split-K decode
+ * and split-K reduce kernels.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 // Based on TurboQuant (Zandieh et al., ICLR 2026):
-//   - Keys: Walsh-Hadamard Transform rotation → FP8 E4M3 quantization
+//   - Keys: FP8 E4M3 in standard cache (no WHT rotation)
 //   - Values: Uniform 4-bit quantization (per-head absmax scaling)
 //   - ~2.6x compression ratio, 79-100% baseline throughput
 //
@@ -155,40 +181,8 @@ extern "C" __global__ void flash_tq_store_k8v4(
     unsigned int block_idx = (unsigned int)(slot / block_size);
     unsigned int block_off = (unsigned int)(slot % block_size);
 
-    // Load K values into registers
-    const unsigned int k_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim;
-    float k_reg[TQ_VEC];
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC; i++) {
-        unsigned int ch = lane_id * TQ_VEC + i;
-        k_reg[i] = __bfloat162float(K[k_offset + ch]);
-    }
-
-    // Apply random sign flips to K
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC; i++) {
-        unsigned int ch = lane_id * TQ_VEC + i;
-        k_reg[i] *= get_sign_flip(head_idx, ch);
-    }
-
-    // Apply WHT to K
-    wht_transform(k_reg, lane_id);
-
-    // Convert K to FP8 E4M3 and store to K cache
-    float ks = k_scale_ptr[head_idx];  // reciprocal scale
-    unsigned long long k_cache_off = (unsigned long long)block_idx * block_size * num_kv_heads * head_dim
-        + (unsigned long long)block_off * num_kv_heads * head_dim
-        + (unsigned long long)head_idx * head_dim;
-    __nv_fp8_storage_t* k_out = (__nv_fp8_storage_t*)K_cache + k_cache_off;
-
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC; i++) {
-        unsigned int ch = lane_id * TQ_VEC + i;
-        // Scale then convert to FP8
-        float scaled = k_reg[i] * ks;
-        __nv_fp8_storage_t fp8_val = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
-        k_out[ch] = fp8_val;
-    }
+    // K is already written to FP8 cache by flash_reshape_and_cache (no WHT rotation).
+    // This kernel only handles the 4-bit V quantization for TQ8.
 
     // Load V values into registers
     const unsigned int v_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim;
@@ -249,7 +243,7 @@ extern "C" __global__ void flash_tq_store_k8v4(
 #ifndef TQ_NUM_WARPS
 #define TQ_NUM_WARPS 8
 #endif
-#define TQ_BC 4
+#define TQ_BC 8
 #define TQ_VEC_U32 (HDIM / (WARP_SIZE * 2))
 
 #ifndef FP8_DEQUANT_HELPERS_DEFINED
@@ -304,7 +298,8 @@ extern "C" __global__ void flash_tq_decode_k8v4(
     const unsigned int num_seqs,
     const unsigned int q_stride,
     const float softcap,
-    const float* __restrict__ k_scale_ptr      // [num_kv_heads] FP8 dequant scale
+    const float* __restrict__ k_scale_ptr,     // [num_kv_heads] FP8 dequant scale
+    const unsigned int sliding_window
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
@@ -316,36 +311,49 @@ extern "C" __global__ void flash_tq_decode_k8v4(
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
 
+    const unsigned int window_start =
+        (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0u;
+
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
     const float k_scale = k_scale_ptr[kv_head];
 
-    // Load query into registers
+    // Load query into registers (vectorized)
     const unsigned int bf16_vec_off = lane_id * (HDIM / WARP_SIZE);
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ_VEC];
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC / 2; i++) {
-        unpack2_bf16_tq(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    {
+#if TQ_VEC >= 4
+        uint2 qv = __ldg((const uint2*)q32);
+        unpack2_bf16_tq(qv.x, q_reg[0], q_reg[1]);
+        unpack2_bf16_tq(qv.y, q_reg[2], q_reg[3]);
+#if TQ_VEC >= 8
+        uint2 qv2 = __ldg(((const uint2*)q32) + 1);
+        unpack2_bf16_tq(qv2.x, q_reg[4], q_reg[5]);
+        unpack2_bf16_tq(qv2.y, q_reg[6], q_reg[7]);
+#if TQ_VEC >= 16
+        uint4 qv3 = __ldg(((const uint4*)q32) + 1);
+        unpack2_bf16_tq(qv3.x, q_reg[8], q_reg[9]);
+        unpack2_bf16_tq(qv3.y, q_reg[10], q_reg[11]);
+        unpack2_bf16_tq(qv3.z, q_reg[12], q_reg[13]);
+        unpack2_bf16_tq(qv3.w, q_reg[14], q_reg[15]);
+#endif
+#endif
+#else
+        #pragma unroll
+        for (int i = 0; i < TQ_VEC / 2; i++) {
+            unpack2_bf16_tq(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
+        }
+#endif
     }
 
-    // Apply sign flip and WHT to query (so dot product with WHT(key) equals original Q·K)
-    // Since WHT is self-inverse and orthonormal: Q · WHT(K) = WHT(Q) · K after WHT rotation
-    // We need to rotate Q by WHT and apply sign flips so that:
-    //   Q_rotated · K_stored = Q_original · K_original
-    // Since K_stored = WHT(sign * K_original), and WHT is self-inverse:
-    //   Q_rotated = WHT(sign * Q_original)
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC; i++) {
-        unsigned int ch = lane_id * TQ_VEC + i;
-        q_reg[i] *= get_sign_flip(kv_head, ch);
-    }
-    wht_transform(q_reg, lane_id);
+    // No WHT rotation on Q for TQ8 — K is stored as plain FP8 (no rotation), so Q·K is direct.
 
     const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
-    unsigned int chunk_size = (seq_len + TQ_NUM_WARPS - 1) / TQ_NUM_WARPS;
-    unsigned int my_start = warp_id * chunk_size;
+    const unsigned int attended = seq_len - window_start;
+    unsigned int chunk_size = (attended + TQ_NUM_WARPS - 1) / TQ_NUM_WARPS;
+    unsigned int my_start = window_start + warp_id * chunk_size;
     unsigned int my_end = my_start + chunk_size;
     if (my_end > seq_len) my_end = seq_len;
     if (my_start > seq_len) my_start = seq_len;
@@ -380,18 +388,40 @@ extern "C" __global__ void flash_tq_decode_k8v4(
             (dot_out) = _dot; \
         } while(0)
 
-    // Inline helper: accumulate 4-bit V into o_reg
     #define TQ8_V_ACCUM(vq_base_arg, va, weight) \
         do { \
+            float _vs = (va) * 0.13333333f * (weight); \
             const unsigned char* vp = V_quant + (vq_base_arg); \
-            _Pragma("unroll") \
-            for (int _i = 0; _i < TQ_VEC; _i += 2) { \
-                unsigned int _bi = (lane_id * TQ_VEC + _i) / 2; \
-                unsigned char _pk = __ldg(vp + _bi); \
-                float _vf0 = dequantize_4bit(unpack_4bit_lo(_pk), (va)); \
-                float _vf1 = dequantize_4bit(unpack_4bit_hi(_pk), (va)); \
-                o_reg[_i]   += (weight) * _vf0; \
-                o_reg[_i+1] += (weight) * _vf1; \
+            unsigned int _byte_off = (lane_id * TQ_VEC) / 2; \
+            unsigned int _num_bytes = TQ_VEC / 2; \
+            if (_num_bytes >= 4) { \
+                const unsigned int* _vp32 = (const unsigned int*)(vp + _byte_off); \
+                _Pragma("unroll") \
+                for (unsigned int _g = 0; _g < _num_bytes / 4; _g++) { \
+                    unsigned int _pk4 = __ldg(_vp32 + _g); \
+                    _Pragma("unroll") \
+                    for (int _b = 0; _b < 4; _b++) { \
+                        unsigned int _byte = (_pk4 >> (_b * 8)) & 0xFF; \
+                        int _vi = _g * 8 + _b * 2; \
+                        o_reg[_vi]   += ((float)(_byte & 0xF) - 7.5f) * _vs; \
+                        o_reg[_vi+1] += ((float)(_byte >> 4)  - 7.5f) * _vs; \
+                    } \
+                } \
+            } else if (_num_bytes >= 2) { \
+                unsigned short _pk2 = __ldg((const unsigned short*)(vp + _byte_off)); \
+                unsigned int _b0 = _pk2 & 0xFF, _b1 = (_pk2 >> 8) & 0xFF; \
+                o_reg[0] += ((float)(_b0 & 0xF) - 7.5f) * _vs; \
+                o_reg[1] += ((float)(_b0 >> 4)  - 7.5f) * _vs; \
+                o_reg[2] += ((float)(_b1 & 0xF) - 7.5f) * _vs; \
+                o_reg[3] += ((float)(_b1 >> 4)  - 7.5f) * _vs; \
+            } else { \
+                _Pragma("unroll") \
+                for (int _i = 0; _i < TQ_VEC; _i += 2) { \
+                    unsigned int _bi = (lane_id * TQ_VEC + _i) / 2; \
+                    unsigned int _pk = __ldg(vp + _bi); \
+                    o_reg[_i]   += ((float)(_pk & 0xF) - 7.5f) * _vs; \
+                    o_reg[_i+1] += ((float)(_pk >> 4)  - 7.5f) * _vs; \
+                } \
             } \
         } while(0)
 
@@ -555,7 +585,8 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
     const unsigned int num_seqs,
     const unsigned int q_stride,
     const float softcap,
-    const float* __restrict__ k_scale_ptr
+    const float* __restrict__ k_scale_ptr,
+    const unsigned int sliding_window
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int split_id = blockIdx.y;
@@ -568,8 +599,11 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
 
-    unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
-    unsigned int kv_start = split_id * split_size;
+    const unsigned int window_start =
+        (sliding_window > 0 && seq_len > sliding_window) ? (seq_len - sliding_window) : 0u;
+    const unsigned int attended = seq_len - window_start;
+    unsigned int split_size = (attended + num_splits - 1) / num_splits;
+    unsigned int kv_start = window_start + split_id * split_size;
     unsigned int kv_end = kv_start + split_size;
     if (kv_end > seq_len) kv_end = seq_len;
     if (kv_start >= seq_len) kv_start = kv_end;
@@ -582,17 +616,32 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ_VEC];
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC / 2; i++) {
-        unpack2_bf16_tq(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    {
+#if TQ_VEC >= 4
+        uint2 qv = __ldg((const uint2*)q32);
+        unpack2_bf16_tq(qv.x, q_reg[0], q_reg[1]);
+        unpack2_bf16_tq(qv.y, q_reg[2], q_reg[3]);
+#if TQ_VEC >= 8
+        uint2 qv2 = __ldg(((const uint2*)q32) + 1);
+        unpack2_bf16_tq(qv2.x, q_reg[4], q_reg[5]);
+        unpack2_bf16_tq(qv2.y, q_reg[6], q_reg[7]);
+#if TQ_VEC >= 16
+        uint4 qv3 = __ldg(((const uint4*)q32) + 1);
+        unpack2_bf16_tq(qv3.x, q_reg[8], q_reg[9]);
+        unpack2_bf16_tq(qv3.y, q_reg[10], q_reg[11]);
+        unpack2_bf16_tq(qv3.z, q_reg[12], q_reg[13]);
+        unpack2_bf16_tq(qv3.w, q_reg[14], q_reg[15]);
+#endif
+#endif
+#else
+        #pragma unroll
+        for (int i = 0; i < TQ_VEC / 2; i++) {
+            unpack2_bf16_tq(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
+        }
+#endif
     }
 
-    #pragma unroll
-    for (int i = 0; i < TQ_VEC; i++) {
-        unsigned int ch = lane_id * TQ_VEC + i;
-        q_reg[i] *= get_sign_flip(kv_head, ch);
-    }
-    wht_transform(q_reg, lane_id);
+    // No WHT rotation on Q for TQ8 — K is stored as plain FP8 (no rotation).
 
     const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
     unsigned int local_len = kv_end - kv_start;
@@ -633,15 +682,38 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
 
     #define TQ8SK_V_ACCUM(vq_base_arg, va, weight) \
         do { \
+            float _vs = (va) * 0.13333333f * (weight); \
             const unsigned char* vp = V_quant + (vq_base_arg); \
-            _Pragma("unroll") \
-            for (int _i = 0; _i < TQ_VEC; _i += 2) { \
-                unsigned int _bi = (lane_id * TQ_VEC + _i) / 2; \
-                unsigned char _pk = __ldg(vp + _bi); \
-                float _vf0 = dequantize_4bit(unpack_4bit_lo(_pk), (va)); \
-                float _vf1 = dequantize_4bit(unpack_4bit_hi(_pk), (va)); \
-                o_reg[_i]   += (weight) * _vf0; \
-                o_reg[_i+1] += (weight) * _vf1; \
+            unsigned int _byte_off = (lane_id * TQ_VEC) / 2; \
+            unsigned int _num_bytes = TQ_VEC / 2; \
+            if (_num_bytes >= 4) { \
+                const unsigned int* _vp32 = (const unsigned int*)(vp + _byte_off); \
+                _Pragma("unroll") \
+                for (unsigned int _g = 0; _g < _num_bytes / 4; _g++) { \
+                    unsigned int _pk4 = __ldg(_vp32 + _g); \
+                    _Pragma("unroll") \
+                    for (int _b = 0; _b < 4; _b++) { \
+                        unsigned int _byte = (_pk4 >> (_b * 8)) & 0xFF; \
+                        int _vi = _g * 8 + _b * 2; \
+                        o_reg[_vi]   += ((float)(_byte & 0xF) - 7.5f) * _vs; \
+                        o_reg[_vi+1] += ((float)(_byte >> 4)  - 7.5f) * _vs; \
+                    } \
+                } \
+            } else if (_num_bytes >= 2) { \
+                unsigned short _pk2 = __ldg((const unsigned short*)(vp + _byte_off)); \
+                unsigned int _b0 = _pk2 & 0xFF, _b1 = (_pk2 >> 8) & 0xFF; \
+                o_reg[0] += ((float)(_b0 & 0xF) - 7.5f) * _vs; \
+                o_reg[1] += ((float)(_b0 >> 4)  - 7.5f) * _vs; \
+                o_reg[2] += ((float)(_b1 & 0xF) - 7.5f) * _vs; \
+                o_reg[3] += ((float)(_b1 >> 4)  - 7.5f) * _vs; \
+            } else { \
+                _Pragma("unroll") \
+                for (int _i = 0; _i < TQ_VEC; _i += 2) { \
+                    unsigned int _bi = (lane_id * TQ_VEC + _i) / 2; \
+                    unsigned int _pk = __ldg(vp + _bi); \
+                    o_reg[_i]   += ((float)(_pk & 0xF) - 7.5f) * _vs; \
+                    o_reg[_i+1] += ((float)(_pk >> 4)  - 7.5f) * _vs; \
+                } \
             } \
         } while(0)
 

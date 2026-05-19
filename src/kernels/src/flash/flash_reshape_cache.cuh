@@ -1,11 +1,27 @@
-// Flash-layout reshape & cache kernels.
-//
-// Write K/V tensors from model output into the paged NHD-layout cache.
-//   Input K/V:  [num_tokens, num_kv_heads, head_dim] BF16
-//   Cache:      [num_blocks, block_size, num_kv_heads, head_dim] BF16 or FP8
-//   Slot mapping: [num_tokens] -> absolute slot index
-//
-// Contains: BF16→BF16, BF16→FP8 variants, and an absmax scale kernel.
+/**
+ * @brief Reshape-and-cache kernels for writing K/V into paged NHD-layout cache.
+ *
+ * This CUDA kernel is developed for vLLM.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_reshape_cache.cuh
+ *
+ * @details
+ * Writes K/V tensors [num_tokens, num_kv_heads, head_dim] from model output
+ * into the paged cache [num_blocks, block_size, num_kv_heads, head_dim].
+ * Contains BF16→BF16, BF16→FP8 E4M3 store variants with per-head scales,
+ * and an absmax scale computation kernel for dynamic FP8 quantization.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

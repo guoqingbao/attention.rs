@@ -496,9 +496,7 @@ impl FlashInferDecodeWithPlan {
                 candle::bail!("flashinfer fp8 decode requires sm80+, got sm{}", sm);
             }
         }
-        // For FP8 with head_dim >= 256, use the generic (non-SM90) path to avoid
-        // kernel launch failures in the SM90 FP8 attention kernel with large head dims.
-        let use_sm90_fp8 = data_type == 2 && sm == 90 && self.head_dim < 256;
+        let use_sm90_fp8 = false;
         let effective_data_type = data_type;
         let effective_sm = if use_sm90_fp8 {
             sm
@@ -722,8 +720,7 @@ pub fn decode_plan(
         candle::bail!("decode_plan requires kv_len_arr_host in metadata");
     };
     let qo_indptr_host = Some(qo_indptr);
-    // For FP8 with head_dim >= 256, use the generic decode plan (not SM90-specific)
-    let use_sm90_fp8 = data_type == 2 && sm == 90 && head_dim < 256;
+    let use_sm90_fp8 = false;
     let mut plan_info = vec![0i64; if use_sm90_fp8 { 9 } else { 10 }];
     unsafe {
         if use_sm90_fp8 {
@@ -847,9 +844,7 @@ pub fn prefill_plan(
         get_plan_workspace(dev, false)?;
 
     let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
-    let use_fp8_fa2_plan = is_fp8 && sm >= 90 && head_dim >= 256;
-    // SM90 always uses the 10-element SM90 plan for BF16/F16 KV cache (all head_dims).
-    // FP8 KV cache with head_dim >= 256 uses the 16-element FA2 plan.
+    let use_fp8_fa2_plan = is_fp8 && sm >= 90;
     let use_sm90_plan = sm == 90 && !use_fp8_fa2_plan;
     let mut plan_info = vec![0i64; if use_sm90_plan { 10 } else { 16 }];
     unsafe {

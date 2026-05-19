@@ -432,8 +432,7 @@ impl PagedAttention {
                 }
 
                 if let Some(mask) = &attention_mask {
-                    //mask needs to be chunked
-                    let q_chunk_mask = mask[i].narrow(2, offset, len)?; // shape: [1, 1, chunk_len, K_len]
+                    let q_chunk_mask = mask[i].narrow(2, offset, len)?;
                     att = att.broadcast_add(&q_chunk_mask)?;
                 }
 
@@ -778,14 +777,21 @@ impl PagedAttention {
             let tq_bs = get_turboquant_block_size();
 
             let tq_uses_std_cache = matches!(tq_mode, None | Some(TurboquantMode::Turbo8));
-            if !input_metadata.is_prefill && tq_uses_std_cache {
+            // Native flash FP8 path: skip dynamic AMAX scale updates, keep K/V scales at 1.0.
+            // All data stored in FP8 cache uses scale=1.0 (raw BF16→FP8 cast). If we update
+            // scales during decode, previously-stored prefill data would be read with wrong
+            // scale, producing garbage. This matches FlashInfer/FlashAttn behavior.
+            if !input_metadata.is_prefill && tq_uses_std_cache && self.k_scale.is_none() {
                 self.maybe_update_kv_scales(&key_p, &value_p)?;
             }
 
             if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
                 match tq_mode {
                     Some(TurboquantMode::Turbo8) => {
-                        // Turbo8: K stored as FP8 in standard cache, V as 4-bit in TQ
+                        // Turbo8: K as FP8 in standard cache, V as FP8 in standard cache
+                        // (for prefill, which uses standard FP8 attention) + V as 4-bit
+                        // in TQ buffers (for decode). flash_tq_store_k8v4 writes K and
+                        // 4-bit V; flash_reshape_and_cache writes FP8 V for prefill use.
                         crate::flash::flash_reshape_and_cache(
                             &key_p,
                             &value_p,
@@ -895,6 +901,7 @@ impl PagedAttention {
                                 self.sliding_window,
                                 tq_bs,
                                 input_metadata.cu_seqlens_q.as_ref(),
+                                input_metadata.max_seqlen_q,
                             )
                         });
                         if let Some(r) = r {
@@ -919,6 +926,7 @@ impl PagedAttention {
                                 self.sliding_window,
                                 tq_bs,
                                 input_metadata.cu_seqlens_q.as_ref(),
+                                input_metadata.max_seqlen_q,
                             )
                         });
                         if let Some(r) = r {
@@ -941,6 +949,7 @@ impl PagedAttention {
                             self.k_scale.as_ref(),
                             self.v_scale.as_ref(),
                             input_metadata.cu_seqlens_q.as_ref(),
+                            input_metadata.max_seqlen_q,
                         );
                     }
                 }
@@ -965,7 +974,7 @@ impl PagedAttention {
                 Some(TurboquantMode::Turbo8) => {
                     let ws = self.flash_splitk_workspace.get_or_init(|| {
                         let max_seqs = 64;
-                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
                         let ws_stride = head_size_p + 2;
                         Tensor::zeros(
                             (max_seqs * attention_heads_p * num_splits * ws_stride,),
@@ -991,6 +1000,7 @@ impl PagedAttention {
                             softcapping.unwrap_or(0.0) as f32,
                             self.k_scale.as_ref(),
                             Some(ws),
+                            self.sliding_window,
                         )
                     }) {
                         return r;
@@ -999,7 +1009,7 @@ impl PagedAttention {
                 Some(TurboquantMode::Turbo4) => {
                     let ws = self.flash_splitk_workspace.get_or_init(|| {
                         let max_seqs = 64;
-                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
                         let ws_stride = head_size_p + 2;
                         Tensor::zeros(
                             (max_seqs * attention_heads_p * num_splits * ws_stride,),
@@ -1024,6 +1034,7 @@ impl PagedAttention {
                             input_metadata.max_context_len,
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
                             Some(ws),
                         )
                     }) {
@@ -1033,7 +1044,7 @@ impl PagedAttention {
                 Some(TurboquantMode::Turbo3) => {
                     let ws = self.flash_splitk_workspace.get_or_init(|| {
                         let max_seqs = 64;
-                        let num_splits = crate::flash::NUM_SPLITS as usize;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
                         let ws_stride = head_size_p + 2;
                         Tensor::zeros(
                             (max_seqs * attention_heads_p * num_splits * ws_stride,),
@@ -1058,6 +1069,7 @@ impl PagedAttention {
                             input_metadata.max_context_len,
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
                             Some(ws),
                         )
                     }) {

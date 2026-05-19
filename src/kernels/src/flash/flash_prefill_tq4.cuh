@@ -1,5 +1,30 @@
-// TurboQuant-4bit aware Flash Attention v2 Paged Prefill, SM80+.
-//
+/**
+ * @brief TurboQuant-4bit aware Flash Attention v2 paged prefill, SM80+.
+ *
+ * This CUDA kernel is developed for vLLM.rs project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_prefill_tq4.cuh
+ * 
+ * Copyright (c) 2026, Guoqing Bao.  All rights reserved.
+ *
+ * @details
+ * Same tiled prefill algorithm as flash_prefill_paged.cuh but reads K/V
+ * from 4-bit TurboQuant buffers. Applies WHT rotation to Q before K·Q
+ * computation to match the WHT-rotated K stored during turbo4/turbo3
+ * quantization. Dequantizes 4-bit K and V tiles in shared memory.
+ * Supports sliding window attention and softcapping.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 // Same algorithm as flash_prefill_paged.cuh but reads K/V from 4-bit
 // TurboQuant buffers instead of BF16 paged cache.
 //
@@ -42,29 +67,32 @@
     do { \
         const unsigned int _hd_half = TQ4P_HDIM / 2; \
         const unsigned int _cpr = TQ4P_HDIM / 8; \
+        const unsigned int _bs_shift = __ffs(cache_block_size) - 1; \
+        const unsigned int _bs_mask  = cache_block_size - 1; \
         for (unsigned int _i = (t); _i < TQ4P_TILE_CHUNKS; _i += (stride)) { \
             unsigned int _row = _i / _cpr; \
             unsigned int _col = (_i % _cpr) * 8; \
             unsigned int _pos = (kv_s) + _row; \
             if (_pos < (kv_l)) { \
-                unsigned int _lb = _pos / cache_block_size; \
-                unsigned int _bo = _pos % cache_block_size; \
-                unsigned int _pb = (unsigned int)(bt)[_lb]; \
+                unsigned int _lb = _pos >> _bs_shift; \
+                unsigned int _bo = _pos & _bs_mask; \
+                unsigned int _pb = __ldg(&(bt)[_lb]); \
                 unsigned long long _am_off = (unsigned long long)_pb * cache_block_size * num_kv_heads \
                     + (unsigned long long)_bo * num_kv_heads + (kvh); \
-                float _scale = (absmax_buf)[_am_off]; \
+                float _scale = (absmax_buf)[_am_off] * 0.13333333f; \
                 unsigned long long _q_base = (unsigned long long)_pb * cache_block_size * num_kv_heads * _hd_half \
                     + (unsigned long long)_bo * num_kv_heads * _hd_half \
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
                 __nv_bfloat16 _tmp[8]; \
+                const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
+                unsigned int _pk4 = *_qp32; \
+                _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
-                    unsigned char _packed = _qp[_byte_off + _b]; \
-                    float _lo_val = (((float)(_packed & 0xF) - 7.5f) / 7.5f) * _scale; \
-                    float _hi_val = (((float)(_packed >> 4) - 7.5f) / 7.5f) * _scale; \
-                    _tmp[_b * 2]     = __float2bfloat16(_lo_val); \
-                    _tmp[_b * 2 + 1] = __float2bfloat16(_hi_val); \
+                    unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
+                    _tmp[_b * 2]     = __float2bfloat16(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = __float2bfloat16(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(smem)[_row * TQ4P_HDIM_PAD + _col]) = *((uint4*)_tmp); \
             } else { \
@@ -93,10 +121,10 @@ flash_tq4_prefill(
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
     __nv_bfloat16* __restrict__ O,
-    const int* __restrict__ block_table,
-    const unsigned int q_len,
-    const unsigned int kv_len,
-    const unsigned int q_offset,
+    const int* __restrict__ block_tables,
+    const unsigned int block_table_stride,
+    const unsigned int* __restrict__ cu_seqlens_q,
+    const unsigned int* __restrict__ context_lens,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -108,17 +136,28 @@ flash_tq4_prefill(
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
+    const unsigned int seq_idx = blockIdx.z;
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
     const unsigned int lane_id = tid % 32;
 
     if (q_head >= num_q_heads) return;
+
+    const unsigned int q_seq_start = cu_seqlens_q[seq_idx];
+    const unsigned int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+    const unsigned int kv_len = context_lens[seq_idx];
+    const unsigned int q_offset = kv_len > q_len ? kv_len - q_len : 0;
+    const int* block_table = block_tables + seq_idx * block_table_stride;
+
     const unsigned int q_start = q_block * TQ4P_BR;
     if (q_start >= q_len) return;
     const unsigned int q_tile_end = min(q_start + TQ4P_BR, q_len);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
+
+    Q += q_seq_start * q_seq_stride;
+    O += q_seq_start * q_seq_stride;
 
 #if TQ4P_USE_DYNAMIC_SMEM
     extern __shared__ __align__(16) unsigned char tq4p_smem_dyn[];
@@ -140,6 +179,7 @@ flash_tq4_prefill(
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
     const unsigned int qk_warp_m = (warp_id & 1) * 16;
+    const unsigned int qk_n_start = (warp_id >> 1) * 2;
     const unsigned int pv_warp_m = (warp_id & 1) * 16;
     const unsigned int pv_n_start = (warp_id >> 1) * TQ4P_N_TILES_PER_WARP;
     const unsigned int p_stride = TQ4P_BC + TQ4P_PAD_P;
@@ -154,9 +194,15 @@ flash_tq4_prefill(
     float l_r0 = 0.f, l_r1 = 0.f;
 
     unsigned int num_kv_blocks = (kv_len + TQ4P_BC - 1) / TQ4P_BC;
+    unsigned int kv_block_start = 0;
     if (causal) {
         unsigned int mx = (q_offset + q_tile_end - 1) / TQ4P_BC;
         num_kv_blocks = min(num_kv_blocks, mx + 1);
+    }
+    if (sliding_window > 0) {
+        unsigned int earliest_q = q_offset + q_start;
+        unsigned int earliest_visible = (earliest_q >= sliding_window) ? (earliest_q - sliding_window + 1) : 0u;
+        kv_block_start = earliest_visible / TQ4P_BC;
     }
 
     // Load Q (BF16 from model output, cp.async)
@@ -201,12 +247,12 @@ flash_tq4_prefill(
     __syncthreads();
 
     // Load K[0] from TQ4 buffers
-    if (num_kv_blocks > 0) {
-        LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(0, 0)), 0, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
+    if (kv_block_start < num_kv_blocks) {
+        LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(0, 0)), kv_block_start * TQ4P_BC, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_start; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * TQ4P_BC;
         unsigned int kv_end = min(kv_start + TQ4P_BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
@@ -216,43 +262,36 @@ flash_tq4_prefill(
         LOAD_TQ4_KV_TILE(V_absmax, V_quant, block_table, smem_V, kv_start, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
         __syncthreads();
 
-        // QK^T (warps 0-1)
-        float acc_s[4][4];
-        if (warp_id < 2) {
+        // QK^T: ALL 4 warps, N-split by warp_id>>1
+        float acc_s[2][4];
+        {
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 2; i++) {
                 acc_s[i][0] = 0.f; acc_s[i][1] = 0.f;
                 acc_s[i][2] = 0.f; acc_s[i][3] = 0.f;
             }
 
-            const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)(&SMEM_K_TQ4P(buf, 0));
+            const unsigned int* sQ32 = (const unsigned int*)smem_Q;
+            const unsigned int* sK32 = (const unsigned int*)(&SMEM_K_TQ4P(buf, 0));
+            const unsigned int tq4_hdim_pad_u32 = TQ4P_HDIM_PAD / 2;
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (TQ4P_HDIM / 16); ks++) {
-                unsigned int kb = ks * 16;
+                unsigned int kb_u32 = ks * 8;
                 unsigned int ar0 = qk_warp_m + group_id, ar1 = ar0 + 8;
-                unsigned int ac0 = kb + tid_in_group * 2, ac1 = ac0 + 8;
+                unsigned int aq_off = tid_in_group + kb_u32;
 
-                unsigned int sa_q0 = __cvta_generic_to_shared(&sQ[(ar0 * TQ4P_HDIM_PAD + ac0)]);
-                unsigned int sa_q1 = __cvta_generic_to_shared(&sQ[(ar1 * TQ4P_HDIM_PAD + ac0)]);
-                unsigned int sa_q2 = __cvta_generic_to_shared(&sQ[(ar0 * TQ4P_HDIM_PAD + ac1)]);
-                unsigned int sa_q3 = __cvta_generic_to_shared(&sQ[(ar1 * TQ4P_HDIM_PAD + ac1)]);
-
-                unsigned int a0, a1, a2, a3;
-                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(a0) : "r"(sa_q0));
-                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(a1) : "r"(sa_q1));
-                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(a2) : "r"(sa_q2));
-                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(a3) : "r"(sa_q3));
+                unsigned int a0 = sQ32[ar0 * tq4_hdim_pad_u32 + aq_off];
+                unsigned int a1 = sQ32[ar1 * tq4_hdim_pad_u32 + aq_off];
+                unsigned int a2 = sQ32[ar0 * tq4_hdim_pad_u32 + aq_off + 4];
+                unsigned int a3 = sQ32[ar1 * tq4_hdim_pad_u32 + aq_off + 4];
 
                 #pragma unroll
-                for (int nt = 0; nt < 4; nt++) {
-                    unsigned int nc = nt * 8 + group_id;
-                    unsigned int k0 = kb + tid_in_group * 2, k1 = k0 + 8;
-                    unsigned int b0 = ((unsigned int)sK[nc * TQ4P_HDIM_PAD + k0 + 1] << 16) |
-                                      (unsigned int)sK[nc * TQ4P_HDIM_PAD + k0];
-                    unsigned int b1 = ((unsigned int)sK[nc * TQ4P_HDIM_PAD + k1 + 1] << 16) |
-                                      (unsigned int)sK[nc * TQ4P_HDIM_PAD + k1];
+                for (int nt = 0; nt < 2; nt++) {
+                    unsigned int nc = (qk_n_start + nt) * 8 + group_id;
+                    unsigned int bk_off = tid_in_group + kb_u32;
+                    unsigned int b0 = sK32[nc * tq4_hdim_pad_u32 + bk_off];
+                    unsigned int b1 = sK32[nc * tq4_hdim_pad_u32 + bk_off + 4];
 
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -265,110 +304,99 @@ flash_tq4_prefill(
                           "f"(acc_s[nt][2]), "f"(acc_s[nt][3]));
                 }
             }
+        }
 
-            // Scale, softcap, mask, softmax
-            unsigned int row0 = qk_warp_m + group_id, row1 = row0 + 8;
-            #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                acc_s[nt][0] *= inv_sqrt_d; acc_s[nt][1] *= inv_sqrt_d;
-                acc_s[nt][2] *= inv_sqrt_d; acc_s[nt][3] *= inv_sqrt_d;
+        unsigned int row0 = qk_warp_m + group_id, row1 = row0 + 8;
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            acc_s[nt][0] *= inv_sqrt_d; acc_s[nt][1] *= inv_sqrt_d;
+            acc_s[nt][2] *= inv_sqrt_d; acc_s[nt][3] *= inv_sqrt_d;
 
-                if (softcap > 0.f) {
-                    acc_s[nt][0] = softcap * tanhf(acc_s[nt][0] / softcap);
-                    acc_s[nt][1] = softcap * tanhf(acc_s[nt][1] / softcap);
-                    acc_s[nt][2] = softcap * tanhf(acc_s[nt][2] / softcap);
-                    acc_s[nt][3] = softcap * tanhf(acc_s[nt][3] / softcap);
-                }
-
-                unsigned int c0 = nt * 8 + tid_in_group * 2, c1 = c0 + 1;
-                unsigned int qr0 = q_offset + q_start + row0, qr1 = q_offset + q_start + row1;
-
-                if (causal) {
-                    if (kv_start + c0 > qr0) acc_s[nt][0] = -1e30f;
-                    if (kv_start + c1 > qr0) acc_s[nt][1] = -1e30f;
-                    if (kv_start + c0 > qr1) acc_s[nt][2] = -1e30f;
-                    if (kv_start + c1 > qr1) acc_s[nt][3] = -1e30f;
-                }
-                if (sliding_window > 0) {
-                    if (qr0 >= kv_start + c0 && qr0 - (kv_start + c0) >= sliding_window) acc_s[nt][0] = -1e30f;
-                    if (qr0 >= kv_start + c1 && qr0 - (kv_start + c1) >= sliding_window) acc_s[nt][1] = -1e30f;
-                    if (qr1 >= kv_start + c0 && qr1 - (kv_start + c0) >= sliding_window) acc_s[nt][2] = -1e30f;
-                    if (qr1 >= kv_start + c1 && qr1 - (kv_start + c1) >= sliding_window) acc_s[nt][3] = -1e30f;
-                }
-                if (c0 >= kv_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][2] = -1e30f; }
-                if (c1 >= kv_tile_len) { acc_s[nt][1] = -1e30f; acc_s[nt][3] = -1e30f; }
-                if (row0 >= q_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][1] = -1e30f; }
-                if (row1 >= q_tile_len) { acc_s[nt][2] = -1e30f; acc_s[nt][3] = -1e30f; }
+            if (softcap > 0.f) {
+                acc_s[nt][0] = softcap * tanhf(acc_s[nt][0] / softcap);
+                acc_s[nt][1] = softcap * tanhf(acc_s[nt][1] / softcap);
+                acc_s[nt][2] = softcap * tanhf(acc_s[nt][2] / softcap);
+                acc_s[nt][3] = softcap * tanhf(acc_s[nt][3] / softcap);
             }
 
-            float rmax0 = -1e30f, rmax1 = -1e30f;
-            #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                rmax0 = fmaxf(rmax0, fmaxf(acc_s[nt][0], acc_s[nt][1]));
-                rmax1 = fmaxf(rmax1, fmaxf(acc_s[nt][2], acc_s[nt][3]));
-            }
-            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
-            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
-            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
-            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
+            unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2, c1 = c0 + 1;
+            unsigned int qr0 = q_offset + q_start + row0, qr1 = q_offset + q_start + row1;
 
-            float mn0 = fmaxf(m_r0, rmax0);
-            if (mn0 != m_r0) {
-                float eo0 = __expf(m_r0 - mn0); l_r0 *= eo0;
-                #pragma unroll
-                for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][0] *= eo0; acc_o[i][1] *= eo0; }
-                m_r0 = mn0;
+            if (causal) {
+                if (kv_start + c0 > qr0) acc_s[nt][0] = -1e30f;
+                if (kv_start + c1 > qr0) acc_s[nt][1] = -1e30f;
+                if (kv_start + c0 > qr1) acc_s[nt][2] = -1e30f;
+                if (kv_start + c1 > qr1) acc_s[nt][3] = -1e30f;
             }
-            float mn1 = fmaxf(m_r1, rmax1);
-            if (mn1 != m_r1) {
-                float eo1 = __expf(m_r1 - mn1); l_r1 *= eo1;
-                #pragma unroll
-                for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][2] *= eo1; acc_o[i][3] *= eo1; }
-                m_r1 = mn1;
+            if (sliding_window > 0) {
+                if (qr0 >= kv_start + c0 && qr0 - (kv_start + c0) >= sliding_window) acc_s[nt][0] = -1e30f;
+                if (qr0 >= kv_start + c1 && qr0 - (kv_start + c1) >= sliding_window) acc_s[nt][1] = -1e30f;
+                if (qr1 >= kv_start + c0 && qr1 - (kv_start + c0) >= sliding_window) acc_s[nt][2] = -1e30f;
+                if (qr1 >= kv_start + c1 && qr1 - (kv_start + c1) >= sliding_window) acc_s[nt][3] = -1e30f;
             }
+            if (c0 >= kv_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][2] = -1e30f; }
+            if (c1 >= kv_tile_len) { acc_s[nt][1] = -1e30f; acc_s[nt][3] = -1e30f; }
+            if (row0 >= q_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][1] = -1e30f; }
+            if (row1 >= q_tile_len) { acc_s[nt][2] = -1e30f; acc_s[nt][3] = -1e30f; }
+        }
 
-            float sum0 = 0.f, sum1 = 0.f;
-            #pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                float p00 = __expf(acc_s[nt][0] - m_r0), p01 = __expf(acc_s[nt][1] - m_r0);
-                float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
-                sum0 += p00 + p01; sum1 += p10 + p11;
-                unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride + c0]     = __float2bfloat16(p00);
-                smem_P[row0 * p_stride + c0 + 1] = __float2bfloat16(p01);
-                smem_P[row1 * p_stride + c0]     = __float2bfloat16(p10);
-                smem_P[row1 * p_stride + c0 + 1] = __float2bfloat16(p11);
-            }
-            sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
-            sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
-            sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 1);
-            sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 2);
-            l_r0 += sum0; l_r1 += sum1;
+        float rmax0 = fmaxf(fmaxf(acc_s[0][0], acc_s[0][1]), fmaxf(acc_s[1][0], acc_s[1][1]));
+        float rmax1 = fmaxf(fmaxf(acc_s[0][2], acc_s[0][3]), fmaxf(acc_s[1][2], acc_s[1][3]));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
 
-            if (tid_in_group == 0) {
-                smem_ml[row0 * 2] = m_r0; smem_ml[row0 * 2 + 1] = l_r0;
-                smem_ml[row1 * 2] = m_r1; smem_ml[row1 * 2 + 1] = l_r1;
-            }
+        if (tid_in_group == 0) {
+            smem_ml[row0 * 2 + (warp_id >> 1)] = rmax0;
+            smem_ml[row1 * 2 + (warp_id >> 1)] = rmax1;
         }
         __syncthreads();
-
-        // Warps 2-3: rescale accumulators
-        if (warp_id >= 2) {
-            unsigned int r0 = pv_warp_m + group_id, r1 = r0 + 8;
-            float cm0 = smem_ml[r0 * 2], cm1 = smem_ml[r1 * 2];
-            if (cm0 != m_r0) {
-                float er0 = __expf(m_r0 - cm0);
-                #pragma unroll
-                for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][0] *= er0; acc_o[i][1] *= er0; }
-                m_r0 = cm0;
-            }
-            if (cm1 != m_r1) {
-                float er1 = __expf(m_r1 - cm1);
-                #pragma unroll
-                for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][2] *= er1; acc_o[i][3] *= er1; }
-                m_r1 = cm1;
-            }
+        {
+            unsigned int half = warp_id >> 1;
+            rmax0 = fmaxf(rmax0, smem_ml[row0 * 2 + (1 - half)]);
+            rmax1 = fmaxf(rmax1, smem_ml[row1 * 2 + (1 - half)]);
         }
+
+        float mn0 = fmaxf(m_r0, rmax0);
+        if (mn0 != m_r0) {
+            float eo0 = __expf(m_r0 - mn0); l_r0 *= eo0;
+            #pragma unroll
+            for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][0] *= eo0; acc_o[i][1] *= eo0; }
+            m_r0 = mn0;
+        }
+        float mn1 = fmaxf(m_r1, rmax1);
+        if (mn1 != m_r1) {
+            float eo1 = __expf(m_r1 - mn1); l_r1 *= eo1;
+            #pragma unroll
+            for (int i = 0; i < TQ4P_N_TILES_PER_WARP; i++) { acc_o[i][2] *= eo1; acc_o[i][3] *= eo1; }
+            m_r1 = mn1;
+        }
+
+        float sum0 = 0.f, sum1 = 0.f;
+        #pragma unroll
+        for (int nt = 0; nt < 2; nt++) {
+            float p00 = __expf(acc_s[nt][0] - m_r0), p01 = __expf(acc_s[nt][1] - m_r0);
+            float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
+            sum0 += p00 + p01; sum1 += p10 + p11;
+            unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
+            smem_P[row0 * p_stride + c0]     = __float2bfloat16(p00);
+            smem_P[row0 * p_stride + c0 + 1] = __float2bfloat16(p01);
+            smem_P[row1 * p_stride + c0]     = __float2bfloat16(p10);
+            smem_P[row1 * p_stride + c0 + 1] = __float2bfloat16(p11);
+        }
+        sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
+        sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
+        sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 1);
+        sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 2);
+
+        if (tid_in_group == 0) {
+            smem_ml[row0 * 2 + (warp_id >> 1)] = sum0;
+            smem_ml[row1 * 2 + (warp_id >> 1)] = sum1;
+        }
+        __syncthreads();
+        l_r0 += smem_ml[row0 * 2] + smem_ml[row0 * 2 + 1];
+        l_r1 += smem_ml[row1 * 2] + smem_ml[row1 * 2 + 1];
 
         // Preload K[i+1] from TQ4
         if (kv_block + 1 < num_kv_blocks) {
@@ -378,21 +406,21 @@ flash_tq4_prefill(
 
         // PV MMA (all 4 warps)
         {
-            const unsigned short* sP = (const unsigned short*)smem_P;
+            const unsigned int* sP32 = (const unsigned int*)smem_P;
             const unsigned short* sV = (const unsigned short*)smem_V;
+            const unsigned int tq4_p_stride_u32 = p_stride / 2;
             #pragma unroll
             for (unsigned int ks = 0; ks < 2; ks++) {
-                unsigned int ko = ks * 16;
+                unsigned int pk_off = ks * 8 + tid_in_group;
                 unsigned int ar0 = pv_warp_m + group_id, ar1 = ar0 + 8;
-                unsigned int ac0 = ko + tid_in_group * 2, ac1 = ac0 + 8;
-                unsigned int a0 = *(const unsigned int*)&sP[ar0 * p_stride + ac0];
-                unsigned int a1 = *(const unsigned int*)&sP[ar1 * p_stride + ac0];
-                unsigned int a2 = *(const unsigned int*)&sP[ar0 * p_stride + ac1];
-                unsigned int a3 = *(const unsigned int*)&sP[ar1 * p_stride + ac1];
+                unsigned int a0 = sP32[ar0 * tq4_p_stride_u32 + pk_off];
+                unsigned int a1 = sP32[ar1 * tq4_p_stride_u32 + pk_off];
+                unsigned int a2 = sP32[ar0 * tq4_p_stride_u32 + pk_off + 4];
+                unsigned int a3 = sP32[ar1 * tq4_p_stride_u32 + pk_off + 4];
                 #pragma unroll
                 for (int nt = 0; nt < TQ4P_N_TILES_PER_WARP; nt++) {
                     unsigned int nc = (pv_n_start + nt) * 8 + group_id;
-                    unsigned int k0 = ko + tid_in_group * 2, k1 = k0 + 8;
+                    unsigned int k0 = ks * 16 + tid_in_group * 2, k1 = k0 + 8;
                     unsigned int b0 = ((unsigned int)sV[(k0 + 1) * TQ4P_HDIM_PAD + nc] << 16) |
                                       (unsigned int)sV[k0 * TQ4P_HDIM_PAD + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * TQ4P_HDIM_PAD + nc] << 16) |
@@ -416,15 +444,8 @@ flash_tq4_prefill(
     // Final normalization and store
     {
         unsigned int r0 = pv_warp_m + group_id, r1 = r0 + 8;
-        float il0, il1;
-        if (warp_id < 2) {
-            il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
-            il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
-        } else {
-            float lv0 = smem_ml[r0 * 2 + 1], lv1 = smem_ml[r1 * 2 + 1];
-            il0 = (lv0 > 0.f) ? (1.f / lv0) : 0.f;
-            il1 = (lv1 > 0.f) ? (1.f / lv1) : 0.f;
-        }
+        float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
+        float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
         __nv_bfloat16* ob = O + q_head * head_dim;
         #pragma unroll
@@ -462,29 +483,32 @@ flash_tq4_prefill(
     do { \
         const unsigned int _hd_half = 256; \
         const unsigned int _cpr = 64; \
+        const unsigned int _bs_shift = __ffs(cache_block_size) - 1; \
+        const unsigned int _bs_mask  = cache_block_size - 1; \
         for (unsigned int _i = (t); _i < TQ4P_TILE_CHUNKS_512; _i += (stride)) { \
             unsigned int _row = _i / _cpr; \
             unsigned int _col = (_i % _cpr) * 8; \
             unsigned int _pos = (kv_s) + _row; \
             if (_pos < (kv_l)) { \
-                unsigned int _lb = _pos / cache_block_size; \
-                unsigned int _bo = _pos % cache_block_size; \
-                unsigned int _pb = (unsigned int)(bt)[_lb]; \
+                unsigned int _lb = _pos >> _bs_shift; \
+                unsigned int _bo = _pos & _bs_mask; \
+                unsigned int _pb = __ldg(&(bt)[_lb]); \
                 unsigned long long _am_off = (unsigned long long)_pb * cache_block_size * num_kv_heads \
                     + (unsigned long long)_bo * num_kv_heads + (kvh); \
-                float _scale = (absmax_buf)[_am_off]; \
+                float _scale = (absmax_buf)[_am_off] * 0.13333333f; \
                 unsigned long long _q_base = (unsigned long long)_pb * cache_block_size * num_kv_heads * _hd_half \
                     + (unsigned long long)_bo * num_kv_heads * _hd_half \
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
                 __nv_bfloat16 _tmp[8]; \
+                const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
+                unsigned int _pk4 = *_qp32; \
+                _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
-                    unsigned char _packed = _qp[_byte_off + _b]; \
-                    float _lo_val = (((float)(_packed & 0xF) - 7.5f) / 7.5f) * _scale; \
-                    float _hi_val = (((float)(_packed >> 4) - 7.5f) / 7.5f) * _scale; \
-                    _tmp[_b * 2]     = __float2bfloat16(_lo_val); \
-                    _tmp[_b * 2 + 1] = __float2bfloat16(_hi_val); \
+                    unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
+                    _tmp[_b * 2]     = __float2bfloat16(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = __float2bfloat16(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(dst)[_row * 512 + _col]) = *((uint4*)_tmp); \
             } else { *((uint4*)&(dst)[_row * 512 + _col]) = make_uint4(0,0,0,0); } \
@@ -498,10 +522,10 @@ extern "C" __global__ void flash_tq4_prefill(
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
     __nv_bfloat16* __restrict__ O,
-    const int* __restrict__ block_table,
-    const unsigned int q_len,
-    const unsigned int kv_len,
-    const unsigned int q_offset,
+    const int* __restrict__ block_tables,
+    const unsigned int block_table_stride,
+    const unsigned int* __restrict__ cu_seqlens_q,
+    const unsigned int* __restrict__ context_lens,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -513,16 +537,27 @@ extern "C" __global__ void flash_tq4_prefill(
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
+    const unsigned int seq_idx = blockIdx.z;
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
     const unsigned int lane_id = tid % 32;
 
     if (q_head >= num_q_heads) return;
+
+    const unsigned int q_seq_start = cu_seqlens_q[seq_idx];
+    const unsigned int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+    const unsigned int kv_len = context_lens[seq_idx];
+    const unsigned int q_offset = kv_len > q_len ? kv_len - q_len : 0;
+    const int* block_table = block_tables + seq_idx * block_table_stride;
+
     const unsigned int q_start = q_block * TQ4P_BR_512;
     if (q_start >= q_len) return;
     const unsigned int q_tile_end = min(q_start + TQ4P_BR_512, q_len);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
+
+    Q += q_seq_start * q_seq_stride;
+    O += q_seq_start * q_seq_stride;
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 
     extern __shared__ __align__(16) unsigned char smem_dyn[];
@@ -549,9 +584,15 @@ extern "C" __global__ void flash_tq4_prefill(
     float l_r0 = 0.f, l_r1 = 0.f;
 
     unsigned int num_kv_blocks = (kv_len + TQ4P_BC_512 - 1) / TQ4P_BC_512;
+    unsigned int kv_block_start = 0;
     if (causal) {
         unsigned int mx = (q_offset + q_tile_end - 1) / TQ4P_BC_512;
         num_kv_blocks = min(num_kv_blocks, mx + 1);
+    }
+    if (sliding_window > 0) {
+        unsigned int earliest_q = q_offset + q_start;
+        unsigned int earliest_visible = (earliest_q >= sliding_window) ? (earliest_q - sliding_window + 1) : 0u;
+        kv_block_start = earliest_visible / TQ4P_BC_512;
     }
 
     // Load Q (cp.async)
@@ -594,12 +635,12 @@ extern "C" __global__ void flash_tq4_prefill(
     }
     __syncthreads();
 
-    if (num_kv_blocks > 0) {
-        LOAD_TQ4_KV_512(K_absmax, K_quant, block_table, smem_K, 0, kv_len, kv_head, tid, TQ4P_NUM_THREADS_512);
+    if (kv_block_start < num_kv_blocks) {
+        LOAD_TQ4_KV_512(K_absmax, K_quant, block_table, smem_K, kv_block_start * TQ4P_BC_512, kv_len, kv_head, tid, TQ4P_NUM_THREADS_512);
     }
     __syncthreads();
 
-    for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+    for (unsigned int kv_block = kv_block_start; kv_block < num_kv_blocks; kv_block++) {
         unsigned int kv_start = kv_block * TQ4P_BC_512;
         unsigned int kv_end = min(kv_start + TQ4P_BC_512, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
@@ -608,26 +649,24 @@ extern "C" __global__ void flash_tq4_prefill(
         if (warp_id < 2) {
             #pragma unroll
             for (int i = 0; i < 4; i++) { acc_s[i][0]=0; acc_s[i][1]=0; acc_s[i][2]=0; acc_s[i][3]=0; }
-            const unsigned short* sQ = (const unsigned short*)smem_Q;
-            const unsigned short* sK = (const unsigned short*)smem_K;
+            const unsigned int* sQ32 = (const unsigned int*)smem_Q;
+            const unsigned int* sK32 = (const unsigned int*)smem_K;
 
             #pragma unroll
             for (unsigned int ks = 0; ks < (512/16); ks++) {
-                unsigned int kb = ks * 16;
+                unsigned int kb_u32 = ks * 8;
                 unsigned int ar0 = qk_warp_m + group_id, ar1 = ar0 + 8;
-                unsigned int ac0 = kb + tid_in_group * 2, ac1 = ac0 + 8;
-                unsigned int a0 = *(const unsigned int*)&sQ[ar0 * 512 + ac0];
-                unsigned int a1 = *(const unsigned int*)&sQ[ar1 * 512 + ac0];
-                unsigned int a2 = *(const unsigned int*)&sQ[ar0 * 512 + ac1];
-                unsigned int a3 = *(const unsigned int*)&sQ[ar1 * 512 + ac1];
+                unsigned int aq_off = tid_in_group + kb_u32;
+                unsigned int a0 = sQ32[ar0 * 256 + aq_off];
+                unsigned int a1 = sQ32[ar1 * 256 + aq_off];
+                unsigned int a2 = sQ32[ar0 * 256 + aq_off + 4];
+                unsigned int a3 = sQ32[ar1 * 256 + aq_off + 4];
                 #pragma unroll
                 for (int nt = 0; nt < 4; nt++) {
                     unsigned int nc = nt * 8 + group_id;
-                    unsigned int k0 = kb + tid_in_group * 2, k1 = k0 + 8;
-                    unsigned int b0 = ((unsigned int)sK[nc * 512 + k0 + 1] << 16) |
-                                      (unsigned int)sK[nc * 512 + k0];
-                    unsigned int b1 = ((unsigned int)sK[nc * 512 + k1 + 1] << 16) |
-                                      (unsigned int)sK[nc * 512 + k1];
+                    unsigned int bk_off = tid_in_group + kb_u32;
+                    unsigned int b0 = sK32[nc * 256 + bk_off];
+                    unsigned int b1 = sK32[nc * 256 + bk_off + 4];
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
@@ -746,21 +785,21 @@ extern "C" __global__ void flash_tq4_prefill(
 
         // PV MMA (all 8 warps)
         {
-            const unsigned short* sP = (const unsigned short*)smem_P;
+            const unsigned int* sP32 = (const unsigned int*)smem_P;
             const unsigned short* sV = (const unsigned short*)smem_V;
+            const unsigned int p_stride_u32_512 = p_stride_512 / 2;
             #pragma unroll
             for (unsigned int ks = 0; ks < 2; ks++) {
-                unsigned int ko = ks * 16;
+                unsigned int pk_off = ks * 8 + tid_in_group;
                 unsigned int ar0 = pv_warp_m + group_id, ar1 = ar0 + 8;
-                unsigned int ac0 = ko + tid_in_group * 2, ac1 = ac0 + 8;
-                unsigned int a0 = *(const unsigned int*)&sP[ar0 * p_stride_512 + ac0];
-                unsigned int a1 = *(const unsigned int*)&sP[ar1 * p_stride_512 + ac0];
-                unsigned int a2 = *(const unsigned int*)&sP[ar0 * p_stride_512 + ac1];
-                unsigned int a3 = *(const unsigned int*)&sP[ar1 * p_stride_512 + ac1];
+                unsigned int a0 = sP32[ar0 * p_stride_u32_512 + pk_off];
+                unsigned int a1 = sP32[ar1 * p_stride_u32_512 + pk_off];
+                unsigned int a2 = sP32[ar0 * p_stride_u32_512 + pk_off + 4];
+                unsigned int a3 = sP32[ar1 * p_stride_u32_512 + pk_off + 4];
                 #pragma unroll
                 for (int nt = 0; nt < TQ4P_N_TILES_PER_WARP_512; nt++) {
                     unsigned int nc = (pv_n_start + nt) * 8 + group_id;
-                    unsigned int k0 = ko + tid_in_group * 2, k1 = k0 + 8;
+                    unsigned int k0 = ks * 16 + tid_in_group * 2, k1 = k0 + 8;
                     unsigned int b0 = ((unsigned int)sV[(k0 + 1) * 512 + nc] << 16) |
                                       (unsigned int)sV[k0 * 512 + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * 512 + nc] << 16) |
