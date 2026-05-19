@@ -145,8 +145,11 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
-            if compute_cap >= 80 {
+            println!("cargo::rustc-check-cfg=cfg(flashinfer_fp8_kvcache)");
+            let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
+            if compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8) {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
+                println!("cargo:rustc-cfg=flashinfer_fp8_kvcache");
             }
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
