@@ -1378,7 +1378,7 @@ extern "C" {
         stream: i64,
     );
 
-    #[cfg(feature = "flashinfer")]
+    #[cfg(flashinfer_fp8_kvcache)]
     pub fn flashinfer_prefill_plan_fp8_fa2(
         q_cu_seqlens_host: *const i32,
         indptr_host: *const i32,
@@ -1402,7 +1402,7 @@ extern "C" {
         stream: i64,
     );
 
-    #[cfg(feature = "flashinfer")]
+    #[cfg(flashinfer_fp8_kvcache)]
     pub fn flashinfer_prefill_run_fp8_fa2(
         out_ptr: *mut c_void,
         q_ptr: *mut c_void,

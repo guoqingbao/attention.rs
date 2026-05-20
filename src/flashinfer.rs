@@ -844,10 +844,11 @@ pub fn prefill_plan(
         get_plan_workspace(dev, false)?;
 
     let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
-    let use_fp8_fa2_plan = is_fp8 && sm >= 90;
+    let use_fp8_fa2_plan = is_fp8 && sm >= 90 && kernels::HAS_FLASHINFER_FP8_KVCACHE;
     let use_sm90_plan = sm == 90 && !use_fp8_fa2_plan;
     let mut plan_info = vec![0i64; if use_sm90_plan { 10 } else { 16 }];
     unsafe {
+        #[cfg(flashinfer_fp8_kvcache)]
         if use_fp8_fa2_plan {
             kernels::ffi::flashinfer_prefill_plan_fp8_fa2(
                 q_cu_seqlens_host.as_ptr() as *const i32,
@@ -871,7 +872,8 @@ pub fn prefill_plan(
                 plan_info.as_mut_ptr(),
                 *dev.cu_stream() as i64,
             );
-        } else {
+        }
+        if !use_fp8_fa2_plan {
             kernels::ffi::flashinfer_prefill_plan_wrapper(
                 q_cu_seqlens_host.as_ptr() as *const i32,
                 indptr_host.as_ptr() as *const i32,
