@@ -154,7 +154,6 @@ pub struct InputMetadata {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
-    pub disable_flash_attn: Option<bool>,
     pub seqlens: Option<Vec<u32>>,
     pub flashinfer_metadata: Option<FlashInferMetadata>,
 }
@@ -663,11 +662,8 @@ impl PagedAttention {
         let use_paged_for_large_head = self.head_dim > 256;
 
         #[cfg(feature = "flash")]
-        let force_native_flash = use_paged_for_large_head
-            || get_turboquant_mode().is_some()
-            || (key_cache.is_some()
-                && key_cache.as_ref().unwrap().dtype() == candle_core::DType::U8
-                && !has_flashinfer_fp8_e4m3());
+        let force_native_flash =
+            use_paged_for_large_head || input_metadata.flashinfer_metadata.is_none();
         #[cfg(not(feature = "flash"))]
         let force_native_flash = false;
 
@@ -782,7 +778,7 @@ impl PagedAttention {
         } // end if !force_native_flash (flashinfer)
 
         #[cfg(feature = "flash")]
-        if !input_metadata.disable_flash_attn.unwrap_or(false) {
+        {
             let (query_p, key_p, value_p, attention_heads_p, key_value_heads_p, head_size_p) =
                 Self::packed_qkv(query, key, value)?;
 
@@ -1126,7 +1122,7 @@ impl PagedAttention {
         }
 
         #[cfg(feature = "flashattn")]
-        if !force_native_flash && !input_metadata.disable_flash_attn.unwrap_or(false) {
+        if !force_native_flash {
             return self.flash_forward(
                 query,
                 key,
