@@ -1105,8 +1105,7 @@ pub fn flash_tq3_decode(
 }
 
 // ============================================================================
-// TurboQuant 4-bit prefill (used by both turbo4 and turbo3 for V;
-// turbo3 K uses the same 4-bit dequant path after 3→4 bit expansion)
+// TurboQuant 4-bit prefill (turbo4 only: 4-bit K + 4-bit V)
 // ============================================================================
 
 #[cfg(feature = "cuda")]
@@ -1222,22 +1221,77 @@ pub fn flash_tq3_prefill(
     cu_seqlens_q: Option<&Tensor>,
     max_seqlen_q: usize,
 ) -> Result<Tensor> {
-    flash_tq4_prefill(
-        query,
-        k_absmax,
-        k_quant,
-        v_absmax,
-        v_quant,
-        block_table,
-        context_lens,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        scale,
-        softcap,
-        sliding_window,
-        block_size,
-        cu_seqlens_q,
-        max_seqlen_q,
-    )
+    let dev = match query.device() {
+        candle::Device::Cuda(d) => d,
+        _ => candle::bail!("flash_tq3_prefill requires CUDA"),
+    };
+    let stream = get_cuda_stream(dev);
+
+    let q_len = query.dim(0)?;
+    let o = Tensor::zeros_like(query)?;
+
+    let q_ptr = ptr_from_tensor(query)?;
+    let ka_ptr = ptr_from_tensor(k_absmax)?;
+    let kq_ptr = ptr_from_tensor(k_quant)?;
+    let va_ptr = ptr_from_tensor(v_absmax)?;
+    let vq_ptr = ptr_from_tensor(v_quant)?;
+    let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
+
+    let sw = sliding_window.unwrap_or(0) as u32;
+
+    let block_table_stride = block_table.dim(1)? as u32;
+    let bt_ptr = {
+        let (s, l) = block_table.storage_and_layout();
+        let s = match &*s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("block_table must be CUDA"),
+        };
+        *s.slice(l.start_offset()..).device_ptr() as *const c_int
+    };
+
+    let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
+        let ns = cu.dim(0)? - 1;
+        (
+            gpu_ptr_u32(cu)?,
+            gpu_ptr_u32(context_lens)?,
+            ns,
+            max_seqlen_q,
+        )
+    } else {
+        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
+        (
+            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(context_lens)?,
+            1usize,
+            q_len,
+        )
+    };
+
+    unsafe {
+        kernels::ffi::call_flash_tq3_prefill(
+            q_ptr,
+            ka_ptr,
+            kq_ptr,
+            va_ptr,
+            vq_ptr,
+            o_ptr,
+            bt_ptr,
+            block_table_stride,
+            cu_ptr,
+            cl_ptr,
+            num_seqs as u32,
+            actual_max_q_len as u32,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            sw,
+            1,
+            scale,
+            softcap,
+            stream,
+        );
+    }
+
+    Ok(o)
 }

@@ -80,6 +80,7 @@
 #define flash_tq3_store flash_tq3_store_128
 #define flash_tq3_decode flash_tq3_decode_128
 #define flash_tq3_decode_splitk flash_tq3_decode_splitk_128
+#define flash_tq3_prefill flash_tq3_prefill_128
 #define quantize_3bit quantize_3bit_128
 #define dequantize_3bit dequantize_3bit_128
 #define pack_3bit_x8 pack_3bit_x8_128
@@ -92,6 +93,7 @@
 #include "flash_turboquant.cuh"
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
+#include "flash_prefill_tq3.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -156,6 +158,7 @@
 #undef flash_tq3_store
 #undef flash_tq3_decode
 #undef flash_tq3_decode_splitk
+#undef flash_tq3_prefill
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -201,6 +204,7 @@
 #define flash_tq3_store flash_tq3_store_256
 #define flash_tq3_decode flash_tq3_decode_256
 #define flash_tq3_decode_splitk flash_tq3_decode_splitk_256
+#define flash_tq3_prefill flash_tq3_prefill_256
 #define quantize_3bit quantize_3bit_256
 #define dequantize_3bit dequantize_3bit_256
 #define pack_3bit_x8 pack_3bit_x8_256
@@ -213,6 +217,7 @@
 #include "flash_turboquant.cuh"
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
+#include "flash_prefill_tq3.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -276,6 +281,7 @@
 #undef flash_tq3_store
 #undef flash_tq3_decode
 #undef flash_tq3_decode_splitk
+#undef flash_tq3_prefill
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -321,6 +327,7 @@
 #define flash_tq3_store flash_tq3_store_512
 #define flash_tq3_decode flash_tq3_decode_512
 #define flash_tq3_decode_splitk flash_tq3_decode_splitk_512
+#define flash_tq3_prefill flash_tq3_prefill_512
 #define quantize_3bit quantize_3bit_512
 #define dequantize_3bit dequantize_3bit_512
 #define pack_3bit_x8 pack_3bit_x8_512
@@ -341,6 +348,7 @@
 #include "flash_turboquant.cuh"
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
+#include "flash_prefill_tq3.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -375,6 +383,7 @@
 #undef flash_tq3_store
 #undef flash_tq3_decode
 #undef flash_tq3_decode_splitk
+#undef flash_tq3_prefill
 #undef quantize_3bit
 #undef dequantize_3bit
 #undef pack_3bit_x8
@@ -949,4 +958,51 @@ extern "C" void call_flash_tq4_prefill(
         LAUNCH_TQ4_PREFILL(512, 256, smem);
     }
     #undef LAUNCH_TQ4_PREFILL
+}
+
+// TurboQuant 3-bit-K prefill: reads K from 3-bit TQ buffers, V from 4-bit
+extern "C" void call_flash_tq3_prefill(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant,
+    void* O,
+    const int* block_tables, unsigned int block_table_stride,
+    const unsigned int* cu_seqlens_q, const unsigned int* context_lens,
+    unsigned int num_seqs, unsigned int max_q_len,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int cache_block_size,
+    unsigned int sliding_window, unsigned int causal,
+    float inv_sqrt_d, float softcap,
+    int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    unsigned int br = 32;
+    dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+
+    #define LAUNCH_TQ3_PREFILL(HD, THREADS, SMEM) \
+        flash_tq3_prefill_##HD<<<grid, THREADS, SMEM, s>>>( \
+            (const flash_half_t*)Q, \
+            (const float*)K_absmax, (const unsigned char*)K_quant, \
+            (const float*)V_absmax, (const unsigned char*)V_quant, \
+            (flash_half_t*)O, \
+            block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+            num_q_heads, num_kv_heads, \
+            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
+
+    if (head_dim <= 128) {
+        LAUNCH_TQ3_PREFILL(128, 128, 0);
+    } else if (head_dim <= 256) {
+        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_tq3_prefill_256,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_TQ3_PREFILL(256, 128, smem);
+    } else {
+        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+        smem = (smem + 255) & ~255u;
+        cudaFuncSetAttribute(flash_tq3_prefill_512,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        LAUNCH_TQ3_PREFILL(512, 256, smem);
+    }
+    #undef LAUNCH_TQ3_PREFILL
 }

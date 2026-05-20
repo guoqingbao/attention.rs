@@ -92,16 +92,16 @@ fn main() -> Result<()> {
         builder = builder.exclude(&["flash/*"]);
     } else {
         builder = builder.arg("-Isrc/flash");
-        if compute_cap >= 75 {
-            println!(
-                "cargo:warning=Native flash kernels using FP16 fallback for SM{}. \
-                 m16n8k8 MMA will be used (SM80+ uses BF16 m16n8k16 for best performance).",
-                compute_cap
-            );
-        } else {
+        if compute_cap <= 70 {
             println!(
                 "cargo:warning=Native flash kernels using scalar fallback for SM{}. \
                  Performance will be limited; legacy paged attention recommended for SM70.",
+                compute_cap
+            );
+        } else if compute_cap <= 75 {
+            println!(
+                "cargo:warning=Native flash kernels using FP16 fallback for SM{}. \
+                 m16n8k8 MMA will be used (SM80+ uses BF16 m16n8k16 for best performance).",
                 compute_cap
             );
         }
