@@ -1198,6 +1198,8 @@ extern "C" {
     );
 
     // FlashInfer wrappers
+    pub fn has_flashinfer_fp8_e4m3() -> bool;
+
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_append_kv_cache(
         k_data_ptr: *const c_void,
@@ -1378,7 +1380,7 @@ extern "C" {
         stream: i64,
     );
 
-    #[cfg(flashinfer_fp8_kvcache)]
+    #[cfg(feature = "flashinfer")]
     pub fn flashinfer_prefill_plan_fp8_fa2(
         q_cu_seqlens_host: *const i32,
         indptr_host: *const i32,
@@ -1402,7 +1404,7 @@ extern "C" {
         stream: i64,
     );
 
-    #[cfg(flashinfer_fp8_kvcache)]
+    #[cfg(feature = "flashinfer")]
     pub fn flashinfer_prefill_run_fp8_fa2(
         out_ptr: *mut c_void,
         q_ptr: *mut c_void,

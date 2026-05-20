@@ -33,9 +33,9 @@
  * limitations under the License.
  */
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include "flash_sm_compat.cuh"
+#include <cuda_fp8.h>
 
 // Helper to force unique kernel names per HDIM
 // We undef FLASH_HDIM before each include and rename via preprocessor
@@ -413,8 +413,8 @@ extern "C" void call_flash_prefill_paged(
 
     #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
         flash_prefill_paged_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K_cache, \
-            (const __nv_bfloat16*)V_cache, (__nv_bfloat16*)O, \
+            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
+            (const flash_half_t*)V_cache, (flash_half_t*)O, \
             block_tables, block_table_stride, cu_seqlens_q, context_lens, \
             num_q_heads, num_kv_heads, \
             head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
@@ -456,7 +456,7 @@ extern "C" void call_flash_prefill_paged_fp8(
 
     #define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
         flash_prefill_paged_fp8_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const __nv_bfloat16*)Q, K_cache, V_cache, (__nv_bfloat16*)O, \
+            (const flash_half_t*)Q, K_cache, V_cache, (flash_half_t*)O, \
             block_tables, block_table_stride, cu_seqlens_q, context_lens, \
             num_q_heads, num_kv_heads, \
             head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap, \
@@ -503,7 +503,7 @@ extern "C" void call_flash_decode_paged_fp8(
 
     #define LAUNCH_DECODE_FP8(HD) \
         flash_decode_paged_fp8_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, K_cache, V_cache, (__nv_bfloat16*)O, \
+            (const flash_half_t*)Q, K_cache, V_cache, (flash_half_t*)O, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, q_stride, sliding_window, softcap, \
@@ -536,7 +536,7 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
 
     #define LAUNCH_DECODE_SK_FP8(HD) \
         flash_decode_paged_splitk_fp8_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, K_cache, V_cache, (float*)workspace, \
+            (const flash_half_t*)Q, K_cache, V_cache, (float*)workspace, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, num_splits, q_stride, softcap, \
@@ -564,8 +564,8 @@ extern "C" void call_flash_reshape_and_cache_bf16(
 
     #define LAUNCH_CACHE(HD) \
         flash_reshape_and_cache_##HD<<<grid, threads, 0, s>>>( \
-            (const __nv_bfloat16*)key, (const __nv_bfloat16*)value, \
-            (__nv_bfloat16*)key_cache, (__nv_bfloat16*)value_cache, \
+            (const flash_half_t*)key, (const flash_half_t*)value, \
+            (flash_half_t*)key_cache, (flash_half_t*)value_cache, \
             slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
 
     if (head_dim <= 128) { LAUNCH_CACHE(128); }
@@ -591,7 +591,7 @@ extern "C" void call_flash_reshape_and_cache_fp8_kv(
 
     #define LAUNCH_CACHE_FP8(HD) \
         flash_reshape_and_cache_fp8_##HD<<<grid, threads, 0, s>>>( \
-            (const __nv_bfloat16*)key, (const __nv_bfloat16*)value, \
+            (const flash_half_t*)key, (const flash_half_t*)value, \
             key_cache, value_cache, slot_mapping, \
             num_tokens, num_kv_heads, head_dim, cache_block_size, \
             k_scale_ptr, v_scale_ptr)
@@ -622,7 +622,7 @@ extern "C" void call_flash_tq_store_k8v4(
 
     #define LAUNCH_TQ_STORE(HD) \
         flash_tq_store_k8v4_##HD<<<grid, threads, 0, s>>>( \
-            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            (const flash_half_t*)K, (const flash_half_t*)V, \
             K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
             slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, \
             k_scale_ptr)
@@ -656,9 +656,9 @@ extern "C" void call_flash_tq_decode_k8v4(
 
     #define LAUNCH_TQ_DECODE(HD) \
         flash_tq_decode_k8v4_##HD<<<grid, threads, 0, s>>>( \
-            (const __nv_bfloat16*)Q, K_cache, \
+            (const flash_half_t*)Q, K_cache, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (__nv_bfloat16*)O, \
+            (flash_half_t*)O, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
@@ -693,7 +693,7 @@ extern "C" void call_flash_tq_decode_k8v4_splitk(
 
     #define LAUNCH_TQ_DECODE_SK(HD) \
         flash_tq_decode_k8v4_splitk_##HD<<<grid, threads, 0, s>>>( \
-            (const __nv_bfloat16*)Q, K_cache, \
+            (const flash_half_t*)Q, K_cache, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
             (float*)workspace, \
             block_tables, seq_lens, max_blocks_per_seq, \
@@ -721,7 +721,7 @@ extern "C" void call_flash_tq4_store(
 
     #define LAUNCH_TQ4_STORE(HD) \
         flash_tq4_store_##HD<<<grid, 32, 0, s>>>( \
-            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            (const flash_half_t*)K, (const flash_half_t*)V, \
             (float*)K_absmax, (unsigned char*)K_quant, \
             (float*)V_absmax, (unsigned char*)V_quant, \
             slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
@@ -754,10 +754,10 @@ extern "C" void call_flash_tq4_decode(
 
     #define LAUNCH_TQ4_DECODE(HD) \
         flash_tq4_decode_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, \
+            (const flash_half_t*)Q, \
             (const float*)K_absmax, (const unsigned char*)K_quant, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (__nv_bfloat16*)O, \
+            (flash_half_t*)O, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
@@ -791,7 +791,7 @@ extern "C" void call_flash_tq4_decode_splitk(
 
     #define LAUNCH_TQ4_DECODE_SK(HD) \
         flash_tq4_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, \
+            (const flash_half_t*)Q, \
             (const float*)K_absmax, (const unsigned char*)K_quant, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
             (float*)workspace, \
@@ -820,7 +820,7 @@ extern "C" void call_flash_tq3_store(
 
     #define LAUNCH_TQ3_STORE(HD) \
         flash_tq3_store_##HD<<<grid, 32, 0, s>>>( \
-            (const __nv_bfloat16*)K, (const __nv_bfloat16*)V, \
+            (const flash_half_t*)K, (const flash_half_t*)V, \
             (float*)K_absmax, (unsigned char*)K_quant, \
             (float*)V_absmax, (unsigned char*)V_quant, \
             slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
@@ -853,10 +853,10 @@ extern "C" void call_flash_tq3_decode(
 
     #define LAUNCH_TQ3_DECODE(HD) \
         flash_tq3_decode_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, \
+            (const flash_half_t*)Q, \
             (const float*)K_absmax, (const unsigned char*)K_quant, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (__nv_bfloat16*)O, \
+            (flash_half_t*)O, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
@@ -890,7 +890,7 @@ extern "C" void call_flash_tq3_decode_splitk(
 
     #define LAUNCH_TQ3_DECODE_SK(HD) \
         flash_tq3_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, \
+            (const flash_half_t*)Q, \
             (const float*)K_absmax, (const unsigned char*)K_quant, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
             (float*)workspace, \
@@ -925,10 +925,10 @@ extern "C" void call_flash_tq4_prefill(
 
     #define LAUNCH_TQ4_PREFILL(HD, THREADS, SMEM) \
         flash_tq4_prefill_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const __nv_bfloat16*)Q, \
+            (const flash_half_t*)Q, \
             (const float*)K_absmax, (const unsigned char*)K_quant, \
             (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (__nv_bfloat16*)O, \
+            (flash_half_t*)O, \
             block_tables, block_table_stride, cu_seqlens_q, context_lens, \
             num_q_heads, num_kv_heads, \
             head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
@@ -950,4 +950,3 @@ extern "C" void call_flash_tq4_prefill(
     }
     #undef LAUNCH_TQ4_PREFILL
 }
-

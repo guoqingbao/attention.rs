@@ -11,6 +11,14 @@ void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* v_in,
 
 extern "C" {
 
+bool has_flashinfer_fp8_e4m3() {
+    #if defined(FLASHINFER_ENABLE_FP8_E4M3)
+    return true;
+    #else
+    return false;
+    #endif
+}
+
 void flashinfer_append_kv_cache(
     void* k_data_ptr,
     void* v_data_ptr,

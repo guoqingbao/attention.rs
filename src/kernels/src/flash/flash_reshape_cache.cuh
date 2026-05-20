@@ -23,7 +23,7 @@
  * limitations under the License.
  */
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 #include <cuda_fp8.h>
 
 #ifndef FLASH_HDIM
@@ -39,10 +39,10 @@
 
 // BF16 → BF16 cache write
 extern "C" __global__ void flash_reshape_and_cache(
-    const __nv_bfloat16* __restrict__ key,
-    const __nv_bfloat16* __restrict__ value,
-    __nv_bfloat16* __restrict__ key_cache,
-    __nv_bfloat16* __restrict__ value_cache,
+    const flash_half_t* __restrict__ key,
+    const flash_half_t* __restrict__ value,
+    flash_half_t* __restrict__ key_cache,
+    flash_half_t* __restrict__ value_cache,
     const long long* __restrict__ slot_mapping,
     const unsigned int num_tokens,
     const unsigned int num_kv_heads,
@@ -83,8 +83,8 @@ extern "C" __global__ void flash_reshape_and_cache(
 
 // BF16 → FP8 E4M3 cache write (with per-head GPU scale pointers)
 extern "C" __global__ void flash_reshape_and_cache_fp8(
-    const __nv_bfloat16* __restrict__ key,
-    const __nv_bfloat16* __restrict__ value,
+    const flash_half_t* __restrict__ key,
+    const flash_half_t* __restrict__ value,
     void* __restrict__ key_cache,
     void* __restrict__ value_cache,
     const long long* __restrict__ slot_mapping,
@@ -122,8 +122,8 @@ extern "C" __global__ void flash_reshape_and_cache_fp8(
     float inv_v = (vs > 0.f) ? (1.f / vs) : 1.f;
 
     for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        float kf = __bfloat162float(key[src_offset + d]) * inv_k;
-        float vf = __bfloat162float(value[src_offset + d]) * inv_v;
+        float kf = FLASH_HALF2FLOAT(key[src_offset + d]) * inv_k;
+        float vf = FLASH_HALF2FLOAT(value[src_offset + d]) * inv_v;
         k_dst[d] = __nv_cvt_float_to_fp8(kf, __NV_SATFINITE, __NV_E4M3);
         v_dst[d] = __nv_cvt_float_to_fp8(vf, __NV_SATFINITE, __NV_E4M3);
     }
@@ -133,7 +133,7 @@ extern "C" __global__ void flash_reshape_and_cache_fp8(
 // Processes a [num_tokens, num_kv_heads, head_dim] BF16 tensor
 // and writes a single float scale = max(absmax, 1e-12) / 448.0
 extern "C" __global__ void flash_bf16_absmax(
-    const __nv_bfloat16* __restrict__ data,
+    const flash_half_t* __restrict__ data,
     float* __restrict__ scale_out,
     const unsigned int total_elements
 ) {
@@ -144,7 +144,7 @@ extern "C" __global__ void flash_bf16_absmax(
 
     float local_max = 0.f;
     for (unsigned int i = gid; i < total_elements; i += stride) {
-        float val = fabsf(__bfloat162float(data[i]));
+        float val = fabsf(FLASH_HALF2FLOAT(data[i]));
         local_max = fmaxf(local_max, val);
     }
 

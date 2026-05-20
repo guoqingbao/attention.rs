@@ -42,7 +42,7 @@
 //   V_absmax: [num_blocks, block_size, num_kv_heads] as float
 //   V_quant:  [num_blocks, block_size, num_kv_heads, head_dim/2] as uint8 (packed 4-bit)
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 
 #ifndef FLASH_HDIM
 #define FLASH_HDIM 128
@@ -66,8 +66,8 @@
 // ============================================================================
 
 extern "C" __global__ void flash_tq4_store(
-    const __nv_bfloat16* __restrict__ K,
-    const __nv_bfloat16* __restrict__ V,
+    const flash_half_t* __restrict__ K,
+    const flash_half_t* __restrict__ V,
     float* __restrict__ K_absmax,
     unsigned char* __restrict__ K_quant,
     float* __restrict__ V_absmax,
@@ -96,7 +96,7 @@ extern "C" __global__ void flash_tq4_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        k_reg[i] = __bfloat162float(K[base + ch]);
+        k_reg[i] = FLASH_HALF2FLOAT(K[base + ch]);
         k_reg[i] *= get_sign_flip(head_idx, ch);
     }
     wht_transform(k_reg, lane_id);
@@ -132,7 +132,7 @@ extern "C" __global__ void flash_tq4_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        v_reg[i] = __bfloat162float(V[base + ch]);
+        v_reg[i] = FLASH_HALF2FLOAT(V[base + ch]);
     }
 
     // V absmax
@@ -172,9 +172,10 @@ extern "C" __global__ void flash_tq4_store(
 #ifndef UNPACK2_BF16_TQ4_DEFINED
 #define UNPACK2_BF16_TQ4_DEFINED
 __device__ __forceinline__ void unpack2_bf16_tq4(unsigned int packed, float &a, float &b) {
-    __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&packed);
-    a = __bfloat162float(bf2.x);
-    b = __bfloat162float(bf2.y);
+    const unsigned short lo = (unsigned short)(packed & 0xFFFF);
+    const unsigned short hi = (unsigned short)(packed >> 16);
+    a = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
+    b = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
 }
 #endif
 
@@ -263,12 +264,12 @@ __device__ __forceinline__ void unpack2_bf16_tq4(unsigned int packed, float &a, 
     } while(0)
 
 extern "C" __global__ void flash_tq4_decode(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -457,8 +458,8 @@ extern "C" __global__ void flash_tq4_decode(
         for (int i = 0; i < TQ4_VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-            unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
+            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -470,7 +471,7 @@ extern "C" __global__ void flash_tq4_decode(
 // ============================================================================
 
 extern "C" __global__ void flash_tq4_decode_splitk(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
@@ -727,8 +728,8 @@ __device__ __forceinline__ void unpack_3bit_x8(
 
 // turbo3 store: K → WHT → 3-bit, V → 4-bit
 extern "C" __global__ void flash_tq3_store(
-    const __nv_bfloat16* __restrict__ K,
-    const __nv_bfloat16* __restrict__ V,
+    const flash_half_t* __restrict__ K,
+    const flash_half_t* __restrict__ V,
     float* __restrict__ K_absmax,
     unsigned char* __restrict__ K_quant,
     float* __restrict__ V_absmax,
@@ -757,7 +758,7 @@ extern "C" __global__ void flash_tq3_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        k_reg[i] = __bfloat162float(K[base + ch]);
+        k_reg[i] = FLASH_HALF2FLOAT(K[base + ch]);
         k_reg[i] *= get_sign_flip(head_idx, ch);
     }
     wht_transform(k_reg, lane_id);
@@ -836,7 +837,7 @@ extern "C" __global__ void flash_tq3_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        v_reg[i] = __bfloat162float(V[base + ch]);
+        v_reg[i] = FLASH_HALF2FLOAT(V[base + ch]);
     }
 
     float v_absmax = 0.f;
@@ -899,12 +900,12 @@ extern "C" __global__ void flash_tq3_store(
     } while(0)
 
 extern "C" __global__ void flash_tq3_decode(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -1094,8 +1095,8 @@ extern "C" __global__ void flash_tq3_decode(
         for (int i = 0; i < TQ4_VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-            unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
+            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -1107,7 +1108,7 @@ extern "C" __global__ void flash_tq3_decode(
 // ============================================================================
 
 extern "C" __global__ void flash_tq3_decode_splitk(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,

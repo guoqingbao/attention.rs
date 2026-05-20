@@ -39,7 +39,7 @@
 // V layout: V_quant [num_blocks, block_size, num_kv_heads, head_dim/2] U8
 //           V_absmax [num_blocks, block_size, num_kv_heads] F32
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 
 #ifndef FLASH_HDIM
 #define FLASH_HDIM 128
@@ -85,14 +85,14 @@
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
-                __nv_bfloat16 _tmp[8]; \
+                flash_half_t _tmp[8]; \
                 const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
                 unsigned int _pk4 = *_qp32; \
                 _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
                     unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
-                    _tmp[_b * 2]     = __float2bfloat16(((float)(_packed & 0xF) - 7.5f) * _scale); \
-                    _tmp[_b * 2 + 1] = __float2bfloat16(((float)(_packed >> 4) - 7.5f) * _scale); \
+                    _tmp[_b * 2]     = FLASH_FLOAT2HALF(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = FLASH_FLOAT2HALF(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(smem)[_row * TQ4P_HDIM_PAD + _col]) = *((uint4*)_tmp); \
             } else { \
@@ -115,12 +115,12 @@ extern "C" __global__ void
 __launch_bounds__(TQ4P_NUM_THREADS)
 #endif
 flash_tq4_prefill(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -161,17 +161,17 @@ flash_tq4_prefill(
 
 #if TQ4P_USE_DYNAMIC_SMEM
     extern __shared__ __align__(16) unsigned char tq4p_smem_dyn[];
-    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(tq4p_smem_dyn);
-    __nv_bfloat16* smem_K_flat = smem_Q + TQ4P_BR * TQ4P_HDIM_PAD;
-    __nv_bfloat16* smem_V = smem_K_flat + 2 * TQ4P_BC * TQ4P_HDIM_PAD;
-    __nv_bfloat16* smem_P = smem_V + TQ4P_BC * TQ4P_HDIM_PAD;
+    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(tq4p_smem_dyn);
+    flash_half_t* smem_K_flat = smem_Q + TQ4P_BR * TQ4P_HDIM_PAD;
+    flash_half_t* smem_V = smem_K_flat + 2 * TQ4P_BC * TQ4P_HDIM_PAD;
+    flash_half_t* smem_P = smem_V + TQ4P_BC * TQ4P_HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P));
     #define SMEM_K_TQ4P(buf, idx) smem_K_flat[(buf) * TQ4P_BC * TQ4P_HDIM_PAD + (idx)]
 #else
-    __shared__ __nv_bfloat16 smem_Q[TQ4P_BR * TQ4P_HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K_arr[2][TQ4P_BC * TQ4P_HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_V[TQ4P_BC * TQ4P_HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_P[TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P)];
+    __shared__ flash_half_t smem_Q[TQ4P_BR * TQ4P_HDIM_PAD];
+    __shared__ flash_half_t smem_K_arr[2][TQ4P_BC * TQ4P_HDIM_PAD];
+    __shared__ flash_half_t smem_V[TQ4P_BC * TQ4P_HDIM_PAD];
+    __shared__ flash_half_t smem_P[TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P)];
     __shared__ float smem_ml[TQ4P_BR * 2];
     #define SMEM_K_TQ4P(buf, idx) smem_K_arr[buf][idx]
 #endif
@@ -213,13 +213,13 @@ flash_tq4_prefill(
             unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * TQ4P_HDIM_PAD + col]);
             if (q_start + row < q_len) {
                 const void* gm = (const void*)&Q[(q_start + row) * q_seq_stride + q_head * head_dim + col];
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                FLASH_CP_ASYNC(sa, gm);
             } else {
                 *((uint4*)&smem_Q[row * TQ4P_HDIM_PAD + col]) = make_uint4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_COMMIT();
+        FLASH_ASYNC_WAIT();
     }
     __syncthreads();
 
@@ -233,14 +233,14 @@ flash_tq4_prefill(
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                qr[i] = __bfloat162float(smem_Q[row * TQ4P_HDIM_PAD + ch]);
+                qr[i] = FLASH_HALF2FLOAT(smem_Q[row * TQ4P_HDIM_PAD + ch]);
                 qr[i] *= get_sign_flip(kv_head, ch);
             }
             wht_transform(qr, lane_id);
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                smem_Q[row * TQ4P_HDIM_PAD + ch] = __float2bfloat16(qr[i]);
+                smem_Q[row * TQ4P_HDIM_PAD + ch] = FLASH_FLOAT2HALF(qr[i]);
             }
         }
     }
@@ -293,15 +293,9 @@ flash_tq4_prefill(
                     unsigned int b0 = sK32[nc * tq4_hdim_pad_u32 + bk_off];
                     unsigned int b1 = sK32[nc * tq4_hdim_pad_u32 + bk_off + 4];
 
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_s[nt][0]), "=f"(acc_s[nt][1]),
-                          "=f"(acc_s[nt][2]), "=f"(acc_s[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_s[nt][0]), "f"(acc_s[nt][1]),
-                          "f"(acc_s[nt][2]), "f"(acc_s[nt][3]));
+                    FLASH_MMA_K16(acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3]);
                 }
             }
         }
@@ -380,10 +374,10 @@ flash_tq4_prefill(
             float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
-            smem_P[row0 * p_stride + c0]     = __float2bfloat16(p00);
-            smem_P[row0 * p_stride + c0 + 1] = __float2bfloat16(p01);
-            smem_P[row1 * p_stride + c0]     = __float2bfloat16(p10);
-            smem_P[row1 * p_stride + c0 + 1] = __float2bfloat16(p11);
+            smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
+            smem_P[row0 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p01);
+            smem_P[row1 * p_stride + c0]     = FLASH_FLOAT2HALF(p10);
+            smem_P[row1 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p11);
         }
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -425,15 +419,9 @@ flash_tq4_prefill(
                                       (unsigned int)sV[k0 * TQ4P_HDIM_PAD + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * TQ4P_HDIM_PAD + nc] << 16) |
                                       (unsigned int)sV[k1 * TQ4P_HDIM_PAD + nc];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_o[nt][0]), "=f"(acc_o[nt][1]),
-                          "=f"(acc_o[nt][2]), "=f"(acc_o[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_o[nt][0]), "f"(acc_o[nt][1]),
-                          "f"(acc_o[nt][2]), "f"(acc_o[nt][3]));
+                    FLASH_MMA_K16(acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3]);
                 }
             }
         }
@@ -447,19 +435,19 @@ flash_tq4_prefill(
         float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
         float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
-        __nv_bfloat16* ob = O + q_head * head_dim;
+        flash_half_t* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < TQ4P_N_TILES_PER_WARP; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }
@@ -501,14 +489,14 @@ flash_tq4_prefill(
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
-                __nv_bfloat16 _tmp[8]; \
+                flash_half_t _tmp[8]; \
                 const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
                 unsigned int _pk4 = *_qp32; \
                 _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
                     unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
-                    _tmp[_b * 2]     = __float2bfloat16(((float)(_packed & 0xF) - 7.5f) * _scale); \
-                    _tmp[_b * 2 + 1] = __float2bfloat16(((float)(_packed >> 4) - 7.5f) * _scale); \
+                    _tmp[_b * 2]     = FLASH_FLOAT2HALF(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = FLASH_FLOAT2HALF(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(dst)[_row * 512 + _col]) = *((uint4*)_tmp); \
             } else { *((uint4*)&(dst)[_row * 512 + _col]) = make_uint4(0,0,0,0); } \
@@ -516,12 +504,12 @@ flash_tq4_prefill(
     } while(0)
 
 extern "C" __global__ void flash_tq4_prefill(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -561,10 +549,10 @@ extern "C" __global__ void flash_tq4_prefill(
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 
     extern __shared__ __align__(16) unsigned char smem_dyn[];
-    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(smem_dyn);
-    __nv_bfloat16* smem_K = smem_Q + TQ4P_BR_512 * 512;
-    __nv_bfloat16* smem_V = smem_K + TQ4P_BC_512 * 512;
-    __nv_bfloat16* smem_P = smem_V + TQ4P_BC_512 * 512;
+    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(smem_dyn);
+    flash_half_t* smem_K = smem_Q + TQ4P_BR_512 * 512;
+    flash_half_t* smem_V = smem_K + TQ4P_BC_512 * 512;
+    flash_half_t* smem_P = smem_V + TQ4P_BC_512 * 512;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ4P_BR_512 * (TQ4P_BC_512 + TQ4P_PAD_P_512));
 
     const unsigned int group_id = lane_id >> 2;
@@ -603,13 +591,13 @@ extern "C" __global__ void flash_tq4_prefill(
             unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * 512 + col]);
             if (q_start + row < q_len) {
                 const void* gm = (const void*)&Q[(q_start + row) * q_seq_stride + q_head * head_dim + col];
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                FLASH_CP_ASYNC(sa, gm);
             } else {
                 *((uint4*)&smem_Q[row * 512 + col]) = make_uint4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_COMMIT();
+        FLASH_ASYNC_WAIT();
     }
     __syncthreads();
 
@@ -622,14 +610,14 @@ extern "C" __global__ void flash_tq4_prefill(
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                qr[i] = __bfloat162float(smem_Q[row * 512 + ch]);
+                qr[i] = FLASH_HALF2FLOAT(smem_Q[row * 512 + ch]);
                 qr[i] *= get_sign_flip(kv_head, ch);
             }
             wht_transform(qr, lane_id);
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                smem_Q[row * 512 + ch] = __float2bfloat16(qr[i]);
+                smem_Q[row * 512 + ch] = FLASH_FLOAT2HALF(qr[i]);
             }
         }
     }
@@ -667,15 +655,9 @@ extern "C" __global__ void flash_tq4_prefill(
                     unsigned int bk_off = tid_in_group + kb_u32;
                     unsigned int b0 = sK32[nc * 256 + bk_off];
                     unsigned int b1 = sK32[nc * 256 + bk_off + 4];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_s[nt][0]), "=f"(acc_s[nt][1]),
-                          "=f"(acc_s[nt][2]), "=f"(acc_s[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_s[nt][0]), "f"(acc_s[nt][1]),
-                          "f"(acc_s[nt][2]), "f"(acc_s[nt][3]));
+                    FLASH_MMA_K16(acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3]);
                 }
             }
 
@@ -743,10 +725,10 @@ extern "C" __global__ void flash_tq4_prefill(
                 float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride_512 + c0]     = __float2bfloat16(p00);
-                smem_P[row0 * p_stride_512 + c0 + 1] = __float2bfloat16(p01);
-                smem_P[row1 * p_stride_512 + c0]     = __float2bfloat16(p10);
-                smem_P[row1 * p_stride_512 + c0 + 1] = __float2bfloat16(p11);
+                smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
+                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p01);
+                smem_P[row1 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p10);
+                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p11);
             }
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -757,13 +739,13 @@ extern "C" __global__ void flash_tq4_prefill(
                 smem_ml[row0 * 2] = m_r0; smem_ml[row0 * 2 + 1] = l_r0;
                 smem_ml[row1 * 2] = m_r1; smem_ml[row1 * 2 + 1] = l_r1;
             }
-            asm volatile("cp.async.commit_group;");
+            FLASH_ASYNC_COMMIT();
         } else {
             LOAD_TQ4_KV_512(V_absmax, V_quant, block_table, smem_V, kv_start, kv_len, kv_head, tid - 64, 192);
-            asm volatile("cp.async.commit_group;");
+            FLASH_ASYNC_COMMIT();
         }
 
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_WAIT();
         __syncthreads();
 
         if (warp_id >= 2) {
@@ -804,15 +786,9 @@ extern "C" __global__ void flash_tq4_prefill(
                                       (unsigned int)sV[k0 * 512 + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * 512 + nc] << 16) |
                                       (unsigned int)sV[k1 * 512 + nc];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_o[nt][0]), "=f"(acc_o[nt][1]),
-                          "=f"(acc_o[nt][2]), "=f"(acc_o[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_o[nt][0]), "f"(acc_o[nt][1]),
-                          "f"(acc_o[nt][2]), "f"(acc_o[nt][3]));
+                    FLASH_MMA_K16(acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3]);
                 }
             }
         }
@@ -821,8 +797,8 @@ extern "C" __global__ void flash_tq4_prefill(
 
         if (kv_block + 1 < num_kv_blocks) {
             LOAD_TQ4_KV_512(K_absmax, K_quant, block_table, smem_K, (kv_block + 1) * TQ4P_BC_512, kv_len, kv_head, tid, TQ4P_NUM_THREADS_512);
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 0;");
+            FLASH_ASYNC_COMMIT();
+            FLASH_ASYNC_WAIT();
             __syncthreads();
         }
     }
@@ -840,19 +816,19 @@ extern "C" __global__ void flash_tq4_prefill(
             il1 = (lv1 > 0.f) ? (1.f / lv1) : 0.f;
         }
 
-        __nv_bfloat16* ob = O + q_head * head_dim;
+        flash_half_t* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < TQ4P_N_TILES_PER_WARP_512; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }

@@ -80,10 +80,10 @@ pub fn init_turboquant_cache(
     });
 }
 
-pub fn has_flashinfer_fp8_kvcache() -> bool {
+pub fn has_flashinfer_fp8_e4m3() -> bool {
     #[cfg(feature = "cuda")]
     {
-        kernels::HAS_FLASHINFER_FP8_KVCACHE
+        unsafe { kernels::ffi::has_flashinfer_fp8_e4m3() }
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -665,7 +665,9 @@ impl PagedAttention {
         #[cfg(feature = "flash")]
         let force_native_flash = use_paged_for_large_head
             || get_turboquant_mode().is_some()
-            || (self.k_scale.is_some() && !has_flashinfer_fp8_kvcache());
+            || (key_cache.is_some()
+                && key_cache.as_ref().unwrap().dtype() == candle_core::DType::U8
+                && !has_flashinfer_fp8_e4m3());
         #[cfg(not(feature = "flash"))]
         let force_native_flash = false;
 

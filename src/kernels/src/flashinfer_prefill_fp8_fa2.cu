@@ -62,7 +62,7 @@ static inline bool ValidatePrefillPlanInfoBounds(
 }
 #endif
 
-#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
+#if defined(USE_FLASHINFER)
 
 extern "C" {
 
@@ -91,6 +91,7 @@ void flashinfer_prefill_run_fp8_fa2(
     const int64_t* plan_info_vec,
     cudaStream_t stream)
 {
+    #if defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (plan_info_vec == nullptr) {
         fprintf(stderr, "[flashinfer][prefill_fp8_fa2] plan_info is null\n");
         return;
@@ -174,6 +175,7 @@ void flashinfer_prefill_run_fp8_fa2(
     } else {
         run_fp8_fa2(half{});
     }
+    #endif //FLASHINFER_ENABLE_FP8_E4M3
 }
 
 void flashinfer_prefill_plan_fp8_fa2(
@@ -195,6 +197,7 @@ void flashinfer_prefill_plan_fp8_fa2(
     int64_t* plan_info_out,
     int64_t stream_i64)
 {
+    #if defined(FLASHINFER_ENABLE_FP8_E4M3)
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
 
     PrefillPlanInfo plan_info;
@@ -227,7 +230,8 @@ void flashinfer_prefill_plan_fp8_fa2(
             plan_info_out[1 + i] = vec[i];
         }
     }
+    #endif //FLASHINFER_ENABLE_FP8_E4M3
 }
 
 } // extern "C"
-#endif // USE_FLASHINFER && FLASHINFER_ENABLE_FP8_E4M3
+#endif // USE_FLASHINFER 

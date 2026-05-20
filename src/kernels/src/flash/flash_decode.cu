@@ -24,9 +24,9 @@
  * limitations under the License.
  */
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include "flash_sm_compat.cuh"
+#include <cuda_fp8.h>
 
 // ============================================================================
 // HDIM=128, GQA_RATIO=1 (per-Q-head; kv_head computed inside kernel)
@@ -127,8 +127,8 @@ extern "C" void call_flash_decode_paged(
 
     #define DO_LAUNCH(HD) \
         flash_decode_paged_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K_cache, \
-            (const __nv_bfloat16*)V_cache, (__nv_bfloat16*)O, \
+            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
+            (const flash_half_t*)V_cache, (flash_half_t*)O, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, q_stride, sliding_window, softcap)
@@ -158,8 +158,8 @@ extern "C" void call_flash_decode_paged_splitk(
 
     #define DO_LAUNCH_SK(HD) \
         flash_decode_paged_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const __nv_bfloat16*)Q, (const __nv_bfloat16*)K_cache, \
-            (const __nv_bfloat16*)V_cache, (float*)workspace, \
+            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
+            (const flash_half_t*)V_cache, (float*)workspace, \
             block_tables, seq_lens, max_blocks_per_seq, \
             num_q_heads, num_kv_heads, head_dim, block_size, \
             inv_sqrt_d, num_splits, q_stride, softcap, sliding_window)
@@ -179,7 +179,7 @@ extern "C" void call_flash_decode_paged_reduce(
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     dim3 grid(num_q_heads, num_seqs);
 
-    if (head_dim <= 128)      flash_decode_paged_reduce_128<<<grid, 32, 0, s>>>((const float*)workspace, (__nv_bfloat16*)O, num_q_heads, head_dim, num_splits);
-    else if (head_dim <= 256) flash_decode_paged_reduce_256<<<grid, 32, 0, s>>>((const float*)workspace, (__nv_bfloat16*)O, num_q_heads, head_dim, num_splits);
-    else                      flash_decode_paged_reduce_512<<<grid, 32, 0, s>>>((const float*)workspace, (__nv_bfloat16*)O, num_q_heads, head_dim, num_splits);
+    if (head_dim <= 128)      flash_decode_paged_reduce_128<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
+    else if (head_dim <= 256) flash_decode_paged_reduce_256<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
+    else                      flash_decode_paged_reduce_512<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
 }

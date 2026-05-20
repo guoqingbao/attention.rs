@@ -25,7 +25,7 @@
  * limitations under the License.
  */
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 #include <cuda_fp8.h>
 
 #ifndef FLASH_HDIM
@@ -57,8 +57,10 @@
 #ifndef FLASH_DECODE_UNPACK_DEFINED
 #define FLASH_DECODE_UNPACK_DEFINED
 __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, float& v1) {
-    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
-    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+    const unsigned short lo = (unsigned short)(packed & 0xFFFF);
+    const unsigned short hi = (unsigned short)(packed >> 16);
+    v0 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
+    v1 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
 }
 #endif
 
@@ -99,10 +101,10 @@ __device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
 #endif
 
 extern "C" __global__ void flash_decode_paged_fp8(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const void* __restrict__ K_cache,
     const void* __restrict__ V_cache,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -309,8 +311,8 @@ extern "C" __global__ void flash_decode_paged_fp8(
         for (int i = 0; i < VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-            unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
+            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -318,7 +320,7 @@ extern "C" __global__ void flash_decode_paged_fp8(
 
 // Split-K variant
 extern "C" __global__ void flash_decode_paged_splitk_fp8(
-    const __nv_bfloat16* __restrict__ Q,
+    const flash_half_t* __restrict__ Q,
     const void* __restrict__ K_cache,
     const void* __restrict__ V_cache,
     float* __restrict__ workspace,

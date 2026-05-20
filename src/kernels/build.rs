@@ -86,13 +86,26 @@ fn main() -> Result<()> {
         builder = builder.exclude(&["trtllm/*"]);
     }
 
+    let compute_cap = builder.get_compute_cap().unwrap_or(80);
+
     if !flash_enabled {
         builder = builder.exclude(&["flash/*"]);
     } else {
         builder = builder.arg("-Isrc/flash");
+        if compute_cap >= 75 {
+            println!(
+                "cargo:warning=Native flash kernels using FP16 fallback for SM{}. \
+                 m16n8k8 MMA will be used (SM80+ uses BF16 m16n8k16 for best performance).",
+                compute_cap
+            );
+        } else {
+            println!(
+                "cargo:warning=Native flash kernels using scalar fallback for SM{}. \
+                 Performance will be limited; legacy paged attention recommended for SM70.",
+                compute_cap
+            );
+        }
     }
-
-    let compute_cap = builder.get_compute_cap().unwrap_or(80);
 
     println!("cargo:info=compute capability: {:?}", compute_cap);
 
@@ -145,11 +158,9 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
-            println!("cargo::rustc-check-cfg=cfg(flashinfer_fp8_kvcache)");
             let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
             if compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8) {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
-                println!("cargo:rustc-cfg=flashinfer_fp8_kvcache");
             }
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");

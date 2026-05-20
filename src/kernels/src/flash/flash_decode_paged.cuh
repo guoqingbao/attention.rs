@@ -1,5 +1,5 @@
 /**
- * @brief Native flash decode attention — paged BF16 KV cache, SM80+.
+ * @brief Native flash decode attention — paged half KV cache, SM75+ (FP16) / SM80+ (BF16).
  *
  * This CUDA kernel is developed for vLLM.rs project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode_paged.cuh
@@ -26,7 +26,7 @@
  * limitations under the License.
  */
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 
 #ifndef FLASH_HDIM
 #define FLASH_HDIM 128
@@ -45,8 +45,10 @@
 #ifndef FLASH_DECODE_UNPACK_DEFINED
 #define FLASH_DECODE_UNPACK_DEFINED
 __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, float& v1) {
-    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
-    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+    const unsigned short lo = (unsigned short)(packed & 0xFFFF);
+    const unsigned short hi = (unsigned short)(packed >> 16);
+    v0 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
+    v1 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
 }
 #endif
 
@@ -67,10 +69,10 @@ __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, f
 // ============================================================================
 
 extern "C" __global__ void flash_decode_paged(
-    const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ K_cache,
-    const __nv_bfloat16* __restrict__ V_cache,
-    __nv_bfloat16* __restrict__ O,
+    const flash_half_t* __restrict__ Q,
+    const flash_half_t* __restrict__ K_cache,
+    const flash_half_t* __restrict__ V_cache,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -149,10 +151,10 @@ extern "C" __global__ void flash_decode_paged(
         unsigned int batch_count = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
-        const __nv_bfloat16* k_block_base = K_cache + (unsigned long long)physical_block * page_stride
+        const flash_half_t* k_block_base = K_cache + (unsigned long long)physical_block * page_stride
                                                      + (unsigned long long)block_offset * head_stride_kv
                                                      + (unsigned long long)kv_head * head_dim;
-        const __nv_bfloat16* v_block_base = V_cache + (unsigned long long)physical_block * page_stride
+        const flash_half_t* v_block_base = V_cache + (unsigned long long)physical_block * page_stride
                                                      + (unsigned long long)block_offset * head_stride_kv
                                                      + (unsigned long long)kv_head * head_dim;
 
@@ -308,8 +310,8 @@ extern "C" __global__ void flash_decode_paged(
             for (int i = 0; i < VEC_U32; i++) {
                 float v0 = smem_o[g][0][vec_offset + 2*i]     * inv_l;
                 float v1 = smem_o[g][0][vec_offset + 2*i + 1] * inv_l;
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
                 o32[i] = lo | (hi << 16);
             }
         }
@@ -324,9 +326,9 @@ extern "C" __global__ void flash_decode_paged(
 // ============================================================================
 
 extern "C" __global__ void flash_decode_paged_splitk(
-    const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ K_cache,
-    const __nv_bfloat16* __restrict__ V_cache,
+    const flash_half_t* __restrict__ Q,
+    const flash_half_t* __restrict__ K_cache,
+    const flash_half_t* __restrict__ V_cache,
     float* __restrict__ workspace,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
@@ -415,10 +417,10 @@ extern "C" __global__ void flash_decode_paged_splitk(
             unsigned int remaining_total = my_end_pos - pos;
             unsigned int bc = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
 
-            const __nv_bfloat16* k_base = K_cache + (unsigned long long)physical_block * page_stride
+            const flash_half_t* k_base = K_cache + (unsigned long long)physical_block * page_stride
                 + (unsigned long long)block_offset_s * head_stride_kv
                 + (unsigned long long)kv_head * head_dim;
-            const __nv_bfloat16* v_base = V_cache + (unsigned long long)physical_block * page_stride
+            const flash_half_t* v_base = V_cache + (unsigned long long)physical_block * page_stride
                 + (unsigned long long)block_offset_s * head_stride_kv
                 + (unsigned long long)kv_head * head_dim;
 
@@ -578,7 +580,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
 
 extern "C" __global__ void flash_decode_paged_reduce(
     const float* __restrict__ workspace,
-    __nv_bfloat16* __restrict__ O,
+    flash_half_t* __restrict__ O,
     const unsigned int num_q_heads,
     const unsigned int head_dim,
     const unsigned int num_splits
@@ -619,8 +621,8 @@ extern "C" __global__ void flash_decode_paged_reduce(
     #pragma unroll
     for (int i = 0; i < VEC_U32; i++) {
         float v0 = o_reg[2*i] * inv_l, v1 = o_reg[2*i + 1] * inv_l;
-        unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-        unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+        unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
+        unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
         o32[i] = lo | (hi << 16);
     }
 }

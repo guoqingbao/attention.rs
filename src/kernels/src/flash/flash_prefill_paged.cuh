@@ -43,7 +43,7 @@
 //
 // HDIM set via -DFLASH_HDIM={128,256,512} at compile time.
 
-#include <cuda_bf16.h>
+#include "flash_sm_compat.cuh"
 
 #ifndef FLASH_HDIM
 #define FLASH_HDIM 128
@@ -85,8 +85,7 @@
                 const void* _gm = (const void*)( \
                     (cache) + (unsigned long long)_pb * _ps + (unsigned long long)_bo * _rs \
                     + (unsigned long long)(kvh) * head_dim + _col); \
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" \
-                             :: "r"(_sa), "l"(_gm)); \
+                FLASH_CP_ASYNC(_sa, _gm); \
             } else { \
                 *((uint4*)&(smem)[_row * HDIM_PAD + _col]) = make_uint4(0,0,0,0); \
             } \
@@ -123,10 +122,10 @@ extern "C" __global__ void
 __launch_bounds__(NUM_THREADS)
 #endif
 flash_prefill_paged(
-    const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ K_cache,
-    const __nv_bfloat16* __restrict__ V_cache,
-    __nv_bfloat16* __restrict__ O,
+    const flash_half_t* __restrict__ Q,
+    const flash_half_t* __restrict__ K_cache,
+    const flash_half_t* __restrict__ V_cache,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -167,17 +166,17 @@ flash_prefill_paged(
 
 #if PREFILL_USE_DYNAMIC_SMEM
     extern __shared__ __align__(16) unsigned char prefill_smem_dyn[];
-    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(prefill_smem_dyn);
-    __nv_bfloat16* smem_K_flat = smem_Q + BR * HDIM_PAD;
-    __nv_bfloat16* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
-    __nv_bfloat16* smem_P = smem_V + BC * HDIM_PAD;
+    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(prefill_smem_dyn);
+    flash_half_t* smem_K_flat = smem_Q + BR * HDIM_PAD;
+    flash_half_t* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
+    flash_half_t* smem_P = smem_V + BC * HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
     #define SMEM_K_PAGED(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
 #else
-    __shared__ __nv_bfloat16 smem_Q[BR * HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_K_arr[2][BC * HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_V[BC * HDIM_PAD];
-    __shared__ __nv_bfloat16 smem_P[BR * (BC + PAD_P)];
+    __shared__ flash_half_t smem_Q[BR * HDIM_PAD];
+    __shared__ flash_half_t smem_K_arr[2][BC * HDIM_PAD];
+    __shared__ flash_half_t smem_V[BC * HDIM_PAD];
+    __shared__ flash_half_t smem_P[BR * (BC + PAD_P)];
     __shared__ float smem_ml[BR * 2];
     #define SMEM_K_PAGED(buf, idx) smem_K_arr[buf][idx]
 #endif
@@ -219,7 +218,7 @@ flash_prefill_paged(
             unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * HDIM_PAD + col]);
             if (q_start + row < q_len) {
                 const void* gm = (const void*)&Q[(q_start + row) * q_seq_stride + q_head * head_dim + col];
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                FLASH_CP_ASYNC(sa, gm);
             } else {
                 *((uint4*)&smem_Q[row * HDIM_PAD + col]) = make_uint4(0, 0, 0, 0);
             }
@@ -227,12 +226,12 @@ flash_prefill_paged(
         if (kv_block_start < num_kv_blocks) {
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(0, 0)), kv_block_start * BC, kv_len, kv_head, tid, NUM_THREADS);
         }
-        asm volatile("cp.async.commit_group;"); // group 0: Q + K[0]
+        FLASH_ASYNC_COMMIT(); // group 0: Q + K[0]
         if (kv_block_start + 1 < num_kv_blocks) {
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(1, 0)), (kv_block_start + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
-            asm volatile("cp.async.commit_group;"); // group 1: K[1]
+            FLASH_ASYNC_COMMIT(); // group 1: K[1]
         }
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_WAIT();
     }
     __syncthreads();
 
@@ -244,7 +243,7 @@ flash_prefill_paged(
 
         // Async V load (overlaps with QK^T)
         LOAD_KV_TILE_BF16(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
-        asm volatile("cp.async.commit_group;");
+        FLASH_ASYNC_COMMIT();
 
         // QK^T: ALL 4 warps, N-split by warp_id>>1 (2 N-tiles each)
         float acc_s[2][4];
@@ -277,15 +276,9 @@ flash_prefill_paged(
                     unsigned int b0 = sK32[nc * hdim_pad_u32 + bk_off];
                     unsigned int b1 = sK32[nc * hdim_pad_u32 + bk_off + 4];
 
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_s[nt][0]), "=f"(acc_s[nt][1]),
-                          "=f"(acc_s[nt][2]), "=f"(acc_s[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_s[nt][0]), "f"(acc_s[nt][1]),
-                          "f"(acc_s[nt][2]), "f"(acc_s[nt][3]));
+                    FLASH_MMA_K16(acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3]);
                 }
             }
         }
@@ -374,10 +367,10 @@ flash_prefill_paged(
             float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
-            smem_P[row0 * p_stride + c0]     = __float2bfloat16(p00);
-            smem_P[row0 * p_stride + c0 + 1] = __float2bfloat16(p01);
-            smem_P[row1 * p_stride + c0]     = __float2bfloat16(p10);
-            smem_P[row1 * p_stride + c0 + 1] = __float2bfloat16(p11);
+            smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
+            smem_P[row0 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p01);
+            smem_P[row1 * p_stride + c0]     = FLASH_FLOAT2HALF(p10);
+            smem_P[row1 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p11);
         }
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -397,14 +390,14 @@ flash_prefill_paged(
         }
 
         // Wait for V
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_WAIT();
         __syncthreads();
 
         // Preload K[i+2] into the next-next buffer (overlaps with PV compute)
         if (kv_block + 2 < num_kv_blocks) {
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(kv_block & 1, 0)),
                 (kv_block + 2) * BC, kv_len, kv_head, tid, NUM_THREADS);
-            asm volatile("cp.async.commit_group;");
+            FLASH_ASYNC_COMMIT();
         }
 
         // PV MMA (all 4 warps)
@@ -428,21 +421,15 @@ flash_prefill_paged(
                                       (unsigned int)sV[k0 * HDIM_PAD + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * HDIM_PAD + nc] << 16) |
                                       (unsigned int)sV[k1 * HDIM_PAD + nc];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_o[nt][0]), "=f"(acc_o[nt][1]),
-                          "=f"(acc_o[nt][2]), "=f"(acc_o[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_o[nt][0]), "f"(acc_o[nt][1]),
-                          "f"(acc_o[nt][2]), "f"(acc_o[nt][3]));
+                    FLASH_MMA_K16(acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3]);
                 }
             }
         }
 
         if (kv_block + 1 < num_kv_blocks) {
-            asm volatile("cp.async.wait_group 0;");
+            FLASH_ASYNC_WAIT();
         }
         __syncthreads();
     }
@@ -453,19 +440,19 @@ flash_prefill_paged(
         float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
         float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
-        __nv_bfloat16* ob = O + q_head * head_dim;
+        flash_half_t* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }
@@ -492,10 +479,10 @@ flash_prefill_paged(
 #define NUM_THREADS_512 256
 
 extern "C" __global__ void flash_prefill_paged(
-    const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ K_cache,
-    const __nv_bfloat16* __restrict__ V_cache,
-    __nv_bfloat16* __restrict__ O,
+    const flash_half_t* __restrict__ Q,
+    const flash_half_t* __restrict__ K_cache,
+    const flash_half_t* __restrict__ V_cache,
+    flash_half_t* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -535,10 +522,10 @@ extern "C" __global__ void flash_prefill_paged(
     O += q_seq_start * q_seq_stride;
 
     extern __shared__ __align__(16) unsigned char smem_dyn[];
-    __nv_bfloat16* smem_Q = reinterpret_cast<__nv_bfloat16*>(smem_dyn);
-    __nv_bfloat16* smem_K = smem_Q + BR_512 * 512;
-    __nv_bfloat16* smem_V = smem_K + BC_512 * 512;
-    __nv_bfloat16* smem_P = smem_V + BC_512 * 512;
+    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(smem_dyn);
+    flash_half_t* smem_K = smem_Q + BR_512 * 512;
+    flash_half_t* smem_V = smem_K + BC_512 * 512;
+    flash_half_t* smem_P = smem_V + BC_512 * 512;
     float* smem_ml = reinterpret_cast<float*>(smem_P + BR_512 * (BC_512 + PAD_P_512));
 
     const unsigned int group_id = lane_id >> 2;
@@ -588,7 +575,7 @@ extern "C" __global__ void flash_prefill_paged(
                 const void* _gm = (const void*)( \
                     (cache) + (unsigned long long)_pb * _ps + (unsigned long long)_bo * _rs \
                     + (unsigned long long)(kvh) * head_dim + _col); \
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(_sa), "l"(_gm)); \
+                FLASH_CP_ASYNC(_sa, _gm); \
             } else { *((uint4*)&(dst)[_row * 512 + _col]) = make_uint4(0,0,0,0); } \
         } \
     } while(0)
@@ -601,7 +588,7 @@ extern "C" __global__ void flash_prefill_paged(
             unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * 512 + col]);
             if (q_start + row < q_len) {
                 const void* gm = (const void*)&Q[(q_start + row) * q_seq_stride + q_head * head_dim + col];
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(gm));
+                FLASH_CP_ASYNC(sa, gm);
             } else {
                 *((uint4*)&smem_Q[row * 512 + col]) = make_uint4(0, 0, 0, 0);
             }
@@ -609,8 +596,8 @@ extern "C" __global__ void flash_prefill_paged(
         if (kv_block_start < num_kv_blocks) {
             LOAD_KV_512(K_cache, block_table, smem_K, kv_block_start * BC_512, kv_len, kv_head, tid, NUM_THREADS_512);
         }
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_COMMIT();
+        FLASH_ASYNC_WAIT();
     }
     __syncthreads();
 
@@ -642,15 +629,9 @@ extern "C" __global__ void flash_prefill_paged(
                     unsigned int bk_off = tid_in_group + kb_u32;
                     unsigned int b0 = sK32[nc * 256 + bk_off];
                     unsigned int b1 = sK32[nc * 256 + bk_off + 4];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_s[nt][0]), "=f"(acc_s[nt][1]),
-                          "=f"(acc_s[nt][2]), "=f"(acc_s[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_s[nt][0]), "f"(acc_s[nt][1]),
-                          "f"(acc_s[nt][2]), "f"(acc_s[nt][3]));
+                    FLASH_MMA_K16(acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_s[nt][0], acc_s[nt][1], acc_s[nt][2], acc_s[nt][3]);
                 }
             }
 
@@ -718,10 +699,10 @@ extern "C" __global__ void flash_prefill_paged(
                 float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride_512 + c0]     = __float2bfloat16(p00);
-                smem_P[row0 * p_stride_512 + c0 + 1] = __float2bfloat16(p01);
-                smem_P[row1 * p_stride_512 + c0]     = __float2bfloat16(p10);
-                smem_P[row1 * p_stride_512 + c0 + 1] = __float2bfloat16(p11);
+                smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
+                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p01);
+                smem_P[row1 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p10);
+                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p11);
             }
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -732,14 +713,14 @@ extern "C" __global__ void flash_prefill_paged(
                 smem_ml[row0 * 2] = m_r0; smem_ml[row0 * 2 + 1] = l_r0;
                 smem_ml[row1 * 2] = m_r1; smem_ml[row1 * 2 + 1] = l_r1;
             }
-            asm volatile("cp.async.commit_group;");
+            FLASH_ASYNC_COMMIT();
         } else {
             // Warps 2-7: cooperative V tile load
             LOAD_KV_512(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid - 64, 192);
-            asm volatile("cp.async.commit_group;");
+            FLASH_ASYNC_COMMIT();
         }
 
-        asm volatile("cp.async.wait_group 0;");
+        FLASH_ASYNC_WAIT();
         __syncthreads();
 
         // Warps 2-7 rescale
@@ -781,15 +762,9 @@ extern "C" __global__ void flash_prefill_paged(
                                       (unsigned int)sV[k0 * 512 + nc];
                     unsigned int b1 = ((unsigned int)sV[(k1 + 1) * 512 + nc] << 16) |
                                       (unsigned int)sV[k1 * 512 + nc];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc_o[nt][0]), "=f"(acc_o[nt][1]),
-                          "=f"(acc_o[nt][2]), "=f"(acc_o[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                          "r"(b0), "r"(b1),
-                          "f"(acc_o[nt][0]), "f"(acc_o[nt][1]),
-                          "f"(acc_o[nt][2]), "f"(acc_o[nt][3]));
+                    FLASH_MMA_K16(acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3],
+                                  a0, a1, a2, a3, b0, b1,
+                                  acc_o[nt][0], acc_o[nt][1], acc_o[nt][2], acc_o[nt][3]);
                 }
             }
         }
@@ -799,8 +774,8 @@ extern "C" __global__ void flash_prefill_paged(
         // Single-buffered K: sequential load for next tile
         if (kv_block + 1 < num_kv_blocks) {
             LOAD_KV_512(K_cache, block_table, smem_K, (kv_block + 1) * BC_512, kv_len, kv_head, tid, NUM_THREADS_512);
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 0;");
+            FLASH_ASYNC_COMMIT();
+            FLASH_ASYNC_WAIT();
             __syncthreads();
         }
     }
@@ -818,19 +793,19 @@ extern "C" __global__ void flash_prefill_paged(
             il1 = (lv1 > 0.f) ? (1.f / lv1) : 0.f;
         }
 
-        __nv_bfloat16* ob = O + q_head * head_dim;
+        flash_half_t* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP_512; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }
