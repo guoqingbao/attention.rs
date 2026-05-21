@@ -1,4 +1,3 @@
-/* ldg_vec fix v2: inline loads for correct HDIM > 128 decode */
 /**
  * @brief Master instantiation file for native flash attention kernels.
  *
@@ -16,6 +15,7 @@
  * - TurboQuant k8v4 decode + store (flash_turboquant.cuh)
  * - TurboQuant 4-bit/3-bit decode + store (flash_turboquant_lowbit.cuh)
  * - TurboQuant 4-bit prefill (flash_prefill_tq4.cuh)
+ * - TurboQuant 3-bit prefill (flash_prefill_tq3.cuh)
  *
  * Each HDIM variant compiles to uniquely-named kernel symbols via preprocessor
  * renaming. C-interface launcher functions dispatch based on runtime head_dim.

@@ -53,8 +53,8 @@ using flash_half_t = __half;
 #define FLASH_ASYNC_COMMIT()
 #define FLASH_ASYNC_WAIT()      __syncthreads()
 
-// MMA dispatch: m16n8k8.f32.f16.f16.f32 on SM75+, scalar fallback on SM70.
-// The m16n8k8 uses 2 A-regs (vs 4 for k16) and 1 B-reg (vs 2 for k16).
+// MMA dispatch: m16n8k8 on SM75+, m8n8k4 TC MMA on SM70.
+// SM75: m16n8k8 uses 2 A-regs (vs 4 for k16) and 1 B-reg (vs 2 for k16).
 // To match the k16 iteration, each MMA_K16 call performs TWO m16n8k8 ops.
 //
 // Register layout for m16n8k8.f32.f16.f16.f32:
