@@ -4,6 +4,9 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 
+#[cfg(all(feature = "flashinfer", feature = "flashattn"))]
+compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
+
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
@@ -659,13 +662,36 @@ impl PagedAttention {
         // head_dim > 256: FlashAttn/FlashInfer don't support it.
         // TurboQuant: only native flash path supports turbo KV cache.
         // Both cases force use of native flash path below.
-        let use_paged_for_large_head = self.head_dim > 256;
 
         #[cfg(feature = "flash")]
         let force_native_flash =
-            use_paged_for_large_head || input_metadata.flashinfer_metadata.is_none();
+            self.head_dim > 256 || input_metadata.flashinfer_metadata.is_none();
         #[cfg(not(feature = "flash"))]
         let force_native_flash = false;
+
+        #[cfg(feature = "flashattn")]
+        let skip_flashattn = {
+            let tq = get_turboquant_mode().is_some();
+            let fp8_on_non_sm90 = if self.k_scale.is_some() {
+                #[cfg(feature = "cuda")]
+                {
+                    let sm = query
+                        .device()
+                        .as_cuda_device()
+                        .ok()
+                        .and_then(|d| crate::cuda_utils::sm_version(d))
+                        .unwrap_or(0);
+                    sm != 90 // FP8 kvcache only works on sm90
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    true
+                }
+            } else {
+                false
+            };
+            self.head_dim > 256 || tq || fp8_on_non_sm90
+        };
 
         #[cfg(feature = "flashinfer")]
         if !force_native_flash {
@@ -776,6 +802,19 @@ impl PagedAttention {
                 }
             }
         } // end if !force_native_flash (flashinfer)
+
+        #[cfg(feature = "flashattn")]
+        if !skip_flashattn {
+            return self.flash_forward(
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                input_metadata,
+                softcapping,
+            );
+        }
 
         #[cfg(feature = "flash")]
         {
@@ -1118,19 +1157,6 @@ impl PagedAttention {
                 self.k_scale.as_ref(),
                 self.v_scale.as_ref(),
                 Some(ws),
-            );
-        }
-
-        #[cfg(feature = "flashattn")]
-        if !force_native_flash {
-            return self.flash_forward(
-                query,
-                key,
-                value,
-                key_cache,
-                value_cache,
-                input_metadata,
-                softcapping,
             );
         }
 

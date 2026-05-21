@@ -443,20 +443,11 @@ void paged_attention_prefill_launcher(
     case 64:
       LAUNCH_PAGED_ATTENTION_PREFILL(64, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
-    case 96:
-      LAUNCH_PAGED_ATTENTION_PREFILL(96, TOKEN_CHUNK_SIZE_DEFAULT);
-      break;
     case 128:
       LAUNCH_PAGED_ATTENTION_PREFILL(128, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
-    case 192:
-      LAUNCH_PAGED_ATTENTION_PREFILL(192, TOKEN_CHUNK_SIZE_DEFAULT);
-      break;
     case 256:
       LAUNCH_PAGED_ATTENTION_PREFILL(256, TOKEN_CHUNK_SIZE_DEFAULT);
-      break;
-    case 512:
-      LAUNCH_PAGED_ATTENTION_PREFILL(512, TOKEN_CHUNK_SIZE_LARGE_HEAD);
       break;
     default:
       break;
