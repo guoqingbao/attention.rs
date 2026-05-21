@@ -805,8 +805,8 @@ __global__ void nvfp4_wmma_matmul_kernel(
     for (int j = 0; j < 2; j++)
       fill_fragment(acc[i][j], 0.0f);
 
-  __shared__ T s_a[BM][WMMA_BK + 4];
-  __shared__ T s_b[BN][WMMA_BK + 4];
+  __shared__ T s_a[BM][WMMA_BK + 8];
+  __shared__ T s_b[BN][WMMA_BK + 8];
 
   for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
 
@@ -879,8 +879,8 @@ __global__ void nvfp4_wmma_matmul_kernel(
     for (int fi = 0; fi < 2; fi++) {
       #pragma unroll
       for (int fj = 0; fj < 2; fj++) {
-        load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][0], WMMA_BK + 4);
-        load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][0], WMMA_BK + 4);
+        load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][0], WMMA_BK + 8);
+        load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][0], WMMA_BK + 8);
         mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
       }
     }
@@ -1134,9 +1134,10 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
     const int warp_n_idx = warp_id % 2;
 
     extern __shared__ uint8_t smem_raw[];
+    constexpr int MOE_B_PAD = 8;
     T* s_a = reinterpret_cast<T*>(smem_raw);                       // [M_BLK, K_BLK]
-    T* s_b = s_a + MOE_M_BLK * MOE_WMMA_K;                        // [N_BLK, K_BLK + 4]
-    float* s_c = reinterpret_cast<float*>(s_b + MOE_N_BLK * (MOE_WMMA_K + 4));  // [M_BLK, N_BLK]
+    T* s_b = s_a + MOE_M_BLK * MOE_WMMA_K;                        // [N_BLK, K_BLK + PAD]
+    float* s_c = reinterpret_cast<float*>(s_b + MOE_N_BLK * (MOE_WMMA_K + MOE_B_PAD));
 
     for (int m_base = 0; m_base < num_rows; m_base += MOE_M_BLK) {
         fragment<accumulator, 16, 16, 16, float> c_frag;
@@ -1163,7 +1164,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
             }
 
             constexpr int B_ROWS = MOE_N_BLK;
-            constexpr int B_STRIDE = MOE_WMMA_K + 4;
+            constexpr int B_STRIDE = MOE_WMMA_K + MOE_B_PAD;
             for (int i = tid; i < B_ROWS * 2; i += MOE_THREADS) {
                 int row = i / 2;
                 int sub = i & 1;
@@ -1270,7 +1271,7 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
   dim3 grid(num_experts, CEILDIV(size_n, MOE_N_BLK));
   dim3 block(MOE_THREADS);
   size_t smem = MOE_M_BLK * MOE_WMMA_K * sizeof(__half)
-              + MOE_N_BLK * (MOE_WMMA_K + 4) * sizeof(__half)
+              + MOE_N_BLK * (MOE_WMMA_K + 8) * sizeof(__half)
               + MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__half><<<grid, block, smem, stream>>>(
       input, weights, weight_scales, weight_global_scales,
@@ -1293,7 +1294,7 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
   dim3 grid(num_experts, CEILDIV(size_n, MOE_N_BLK));
   dim3 block(MOE_THREADS);
   size_t smem = MOE_M_BLK * MOE_WMMA_K * sizeof(__nv_bfloat16)
-              + MOE_N_BLK * (MOE_WMMA_K + 4) * sizeof(__nv_bfloat16)
+              + MOE_N_BLK * (MOE_WMMA_K + 8) * sizeof(__nv_bfloat16)
               + MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__nv_bfloat16><<<grid, block, smem, stream>>>(
       input, weights, weight_scales, weight_global_scales,
