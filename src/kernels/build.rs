@@ -66,6 +66,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant_lowbit.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -99,7 +101,8 @@ fn main() -> Result<()> {
             );
         } else if compute_cap <= 75 {
             println!(
-                "cargo:warning=Native flash kernels using FP16 fallback for SM{}.",
+                "cargo:warning=Native flash kernels using FP16 fallback for SM{}. \
+                 m16n8k8 MMA will be used (SM80+ uses BF16 m16n8k16 for best performance).",
                 compute_cap
             );
         }

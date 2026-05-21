@@ -2,8 +2,8 @@
  * @brief SM compatibility layer for native flash attention kernels.
  *
  * Provides macros to abstract SM-specific features so kernels can compile
- * and run on SM75 (Turing) with FP16 fallback, in addition to SM80+ (Ampere+)
- * with BF16.
+ * and run across SM70 (Volta), SM75 (Turing), and SM80+ (Ampere/Hopper/Blackwell)
+ * using the best available Tensor Core MMA instructions for each architecture.
  *
  * SM80+ path (NO_BF16_KERNEL not defined):
  *   - __nv_bfloat16 (BF16) as the half-precision type
