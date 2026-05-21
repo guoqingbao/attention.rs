@@ -19,7 +19,8 @@
  *
  * SM70 path (NO_BF16_KERNEL defined, __CUDA_ARCH__ < 750):
  *   - __half (FP16) as the half-precision type
- *   - Scalar FMA with warp-shuffle B redistribution to emulate m16n8k16
+ *   - Scalar FMA with warp-shuffle A+B redistribution to emulate m16n8k16
+ *     (iterates over all 4 group members for full 16-element K-reduction)
  *   - Direct LDG+STS for global→shared copy (same as SM75)
  *   - __syncthreads() replaces async pipeline barriers
  */
@@ -81,63 +82,71 @@ using flash_half_t = __half;
     } while(0)
 
 #else
-// SM70 (Volta): scalar FMA emulation with warp-shuffle B redistribution.
-//
-// In the m16n8k8/k16 MMA, each thread loads B for K-column = group_id,
-// but the output columns are tid_in_group*2 and tid_in_group*2+1. The
-// hardware redistributes B across threads internally; we do this explicitly
-// via __shfl_sync.
+// SM70 (Volta): scalar FMA emulation of m16n8k16 MMA.
 //
 // Thread layout: group_id = lane_id/4, tid_in_group = lane_id & 3
-// A regs: a0/a2 = Q[group_id, k..], a1/a3 = Q[group_id+8, k..]
-// B regs: b0/b1 = K[group_id, k..] (loaded for this thread's group_id)
+// A regs: a0/a2 = Q[group_id, k_subset], a1/a3 = Q[group_id+8, k_subset]
+//   Each thread holds 4 of 16 K-elements (determined by tid_in_group).
+// B regs: b0/b1 = K[group_id, k_subset] (same K-positions as A).
 // D regs: d0 = S[group_id, tid_in_group*2],
 //         d1 = S[group_id, tid_in_group*2+1],
 //         d2 = S[group_id+8, tid_in_group*2],
 //         d3 = S[group_id+8, tid_in_group*2+1]
 //
-// For d0/d2 we need B from the thread with group_id = tid_in_group*2,
-// i.e. lane = tid_in_group*2*4 + tid_in_group = tid_in_group*9.
-// For d1/d3 we need group_id = tid_in_group*2+1,
-// i.e. lane = (tid_in_group*2+1)*4 + tid_in_group = tid_in_group*9 + 4.
+// The hardware MMA internally reduces across all 4 threads in a group to
+// accumulate all 16 K-elements per output. We replicate this by iterating
+// over all 4 group members (s=0..3), shuffling A from each to pair with
+// the correctly-sourced B values for each output column.
+//
+// For output col c0 = tid_in_group*2: B comes from thread with
+//   group_id = c0, i.e. lane = c0*4 + s (for each member s).
+// For output col c1 = tid_in_group*2+1: lane = c1*4 + s.
 #define FLASH_MMA_K16(d0,d1,d2,d3, a0,a1,a2,a3, b0,b1, c0,c1,c2,c3) \
     do { \
         const unsigned int _lane = threadIdx.x & 31; \
+        const unsigned int _gid  = _lane >> 2; \
         const unsigned int _tig  = _lane & 3; \
-        const unsigned int _src0 = _tig * 9; \
-        const unsigned int _src1 = _src0 + 4; \
-        unsigned int _sb0_0 = __shfl_sync(0xFFFFFFFF, (b0), _src0); \
-        unsigned int _sb1_0 = __shfl_sync(0xFFFFFFFF, (b1), _src0); \
-        unsigned int _sb0_1 = __shfl_sync(0xFFFFFFFF, (b0), _src1); \
-        unsigned int _sb1_1 = __shfl_sync(0xFFFFFFFF, (b1), _src1); \
-        const __half* _ap0 = reinterpret_cast<const __half*>(&(a0)); \
-        const __half* _ap1 = reinterpret_cast<const __half*>(&(a1)); \
-        const __half* _ap2 = reinterpret_cast<const __half*>(&(a2)); \
-        const __half* _ap3 = reinterpret_cast<const __half*>(&(a3)); \
-        const __half* _be0 = reinterpret_cast<const __half*>(&_sb0_0); \
-        const __half* _bf0 = reinterpret_cast<const __half*>(&_sb1_0); \
-        const __half* _be1 = reinterpret_cast<const __half*>(&_sb0_1); \
-        const __half* _bf1 = reinterpret_cast<const __half*>(&_sb1_1); \
         float _r0=(c0), _r1=(c1), _r2=(c2), _r3=(c3); \
-        for (int _k = 0; _k < 2; _k++) { \
-            float _av0 = __half2float(_ap0[_k]); \
-            float _av1 = __half2float(_ap1[_k]); \
-            float _bv_e = __half2float(_be0[_k]); \
-            float _bv_o = __half2float(_be1[_k]); \
-            _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
-            _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
-            _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
-            _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
-        } \
-        for (int _k = 0; _k < 2; _k++) { \
-            float _av0 = __half2float(_ap2[_k]); \
-            float _av1 = __half2float(_ap3[_k]); \
-            float _bv_e = __half2float(_bf0[_k]); \
-            float _bv_o = __half2float(_bf1[_k]); \
-            _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
-            _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
-            _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
-            _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
+        for (int _s = 0; _s < 4; _s++) { \
+            unsigned int _src_a = _gid * 4 + _s; \
+            unsigned int _sa0 = __shfl_sync(0xFFFFFFFF, (a0), _src_a); \
+            unsigned int _sa1 = __shfl_sync(0xFFFFFFFF, (a1), _src_a); \
+            unsigned int _sa2 = __shfl_sync(0xFFFFFFFF, (a2), _src_a); \
+            unsigned int _sa3 = __shfl_sync(0xFFFFFFFF, (a3), _src_a); \
+            unsigned int _src_b0 = _tig * 2 * 4 + _s; \
+            unsigned int _src_b1 = (_tig * 2 + 1) * 4 + _s; \
+            unsigned int _sb0_e = __shfl_sync(0xFFFFFFFF, (b0), _src_b0); \
+            unsigned int _sb1_e = __shfl_sync(0xFFFFFFFF, (b1), _src_b0); \
+            unsigned int _sb0_o = __shfl_sync(0xFFFFFFFF, (b0), _src_b1); \
+            unsigned int _sb1_o = __shfl_sync(0xFFFFFFFF, (b1), _src_b1); \
+            const __half* _ap0 = reinterpret_cast<const __half*>(&_sa0); \
+            const __half* _ap1 = reinterpret_cast<const __half*>(&_sa1); \
+            const __half* _ap2 = reinterpret_cast<const __half*>(&_sa2); \
+            const __half* _ap3 = reinterpret_cast<const __half*>(&_sa3); \
+            const __half* _be0 = reinterpret_cast<const __half*>(&_sb0_e); \
+            const __half* _bf0 = reinterpret_cast<const __half*>(&_sb1_e); \
+            const __half* _be1 = reinterpret_cast<const __half*>(&_sb0_o); \
+            const __half* _bf1 = reinterpret_cast<const __half*>(&_sb1_o); \
+            for (int _k = 0; _k < 2; _k++) { \
+                float _av0 = __half2float(_ap0[_k]); \
+                float _av1 = __half2float(_ap1[_k]); \
+                float _bv_e = __half2float(_be0[_k]); \
+                float _bv_o = __half2float(_be1[_k]); \
+                _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
+                _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
+                _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
+                _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
+            } \
+            for (int _k = 0; _k < 2; _k++) { \
+                float _av0 = __half2float(_ap2[_k]); \
+                float _av1 = __half2float(_ap3[_k]); \
+                float _bv_e = __half2float(_bf0[_k]); \
+                float _bv_o = __half2float(_bf1[_k]); \
+                _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
+                _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
+                _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
+                _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
+            } \
         } \
         (d0) = _r0; (d1) = _r1; (d2) = _r2; (d3) = _r3; \
     } while(0)
