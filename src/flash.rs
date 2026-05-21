@@ -55,6 +55,11 @@ fn ptr_from_tensor(t: &Tensor) -> Result<*const std::ffi::c_void> {
             let slice = slice.slice(offset..);
             Ok(*slice.device_ptr() as *const std::ffi::c_void)
         }
+        DType::F16 => {
+            let slice = cuda_storage.as_cuda_slice::<half::f16>()?;
+            let slice = slice.slice(offset..);
+            Ok(*slice.device_ptr() as *const std::ffi::c_void)
+        }
         DType::U8 => {
             let slice = cuda_storage.as_cuda_slice::<u8>()?;
             let slice = slice.slice(offset..);
