@@ -19,8 +19,9 @@
  *
  * SM70 path (NO_BF16_KERNEL defined, __CUDA_ARCH__ < 750):
  *   - __half (FP16) as the half-precision type
- *   - Scalar FMA with warp-shuffle A+B redistribution to emulate m16n8k16
- *     (iterates over all 4 group members for full 16-element K-reduction)
+ *   - mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 Tensor Core MMA
+ *     with warp-shuffle redistribution to emulate m16n8k16 layout
+ *     (8 m8n8k4 ops: 2 M-halves × 4 K-slices, then output remap)
  *   - Direct LDG+STS for global→shared copy (same as SM75)
  *   - __syncthreads() replaces async pipeline barriers
  */
@@ -82,16 +83,23 @@ using flash_half_t = __half;
     } while(0)
 
 #else
-// SM70 (Volta): scalar FMA emulation of m16n8k16 MMA.
+// SM70 (Volta): m8n8k4 Tensor Core implementation of m16n8k16 MMA.
 //
-// Converted from macro to inline function to improve compilation speed.
-// The function emulates the m16n8k16 MMA output layout using scalar FMA
-// with warp-shuffle redistribution of A and B register fragments.
+// Uses Volta's native mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32
+// to replace scalar FMA emulation. Input A/B registers arrive in m16n8k16
+// fragment layout; we redistribute via warp shuffles to m8n8k4 quadpair
+// layout, issue 8 m8n8k4 ops (2 M-halves × 4 K-slices), then remap
+// outputs back to m16n8k16 D layout.
 //
-// Thread layout: group_id = lane_id/4, tid_in_group = lane_id & 3
-// Each thread holds 4 of 16 K-elements. The function iterates over all
-// 4 group members, shuffling A and B values to accumulate the full
-// 16-element K-reduction per output element.
+// m16n8k16 caller layout (groupID = lane/4, tid = lane & 3):
+//   A: a0..a3 (4 u32 = 8 f16), rows {gid, gid+8}, K cols via tid
+//   B: b0..b1 (2 u32 = 4 f16), K rows via tid, col = gid
+//   D: d0..d3 (4 f32), rows {gid, gid+8}, cols {tid*2, tid*2+1}
+//
+// m8n8k4 hardware layout (quadpair: 4 low + 4 high lanes):
+//   A: 2 u32 (row-major), row = lane%4 [+4 if hi], K = i (0..3)
+//   B: 2 u32 (col-major), row = i (0..3), col = lane%4 [+4 if hi]
+//   D: 8 f32, row = (lane&1)+(i&2) [+4 hi], col = (i&4)+(lane&2)+(i&1)
 
 __device__ __forceinline__ void flash_mma_k16_sm70(
     float &d0, float &d1, float &d2, float &d3,
@@ -99,59 +107,133 @@ __device__ __forceinline__ void flash_mma_k16_sm70(
     unsigned int b0, unsigned int b1,
     float c0, float c1, float c2, float c3
 ) {
-    const unsigned int lane = threadIdx.x & 31;
-    const unsigned int gid  = lane >> 2;
-    const unsigned int tig  = lane & 3;
-    float r0 = c0, r1 = c1, r2 = c2, r3 = c3;
+    const unsigned int lane  = threadIdx.x & 31;
+    const unsigned int gid   = lane >> 2;
+    const unsigned int tig   = lane & 3;
+    const unsigned int is_hi = lane >> 4;
+    const unsigned int qp    = (lane >> 2) & 3;
+    const unsigned int lt    = lane & 3;
+
+    // Row this thread computes in m8n8k4 (0..7 within each M-half)
+    const unsigned int my_row = is_hi ? (lt + 4) : lt;
+
+    // m8n8k4 accumulators: zero-initialized, MMA accumulates into these
+    float d_lo[8] = {0,0,0,0,0,0,0,0};
+    float d_hi[8] = {0,0,0,0,0,0,0,0};
 
     #pragma unroll
-    for (int s = 0; s < 4; s++) {
-        unsigned int src_a = gid * 4 + s;
-        unsigned int sa0 = __shfl_sync(0xFFFFFFFF, a0, src_a);
-        unsigned int sa1 = __shfl_sync(0xFFFFFFFF, a1, src_a);
-        unsigned int sa2 = __shfl_sync(0xFFFFFFFF, a2, src_a);
-        unsigned int sa3 = __shfl_sync(0xFFFFFFFF, a3, src_a);
+    for (int ks = 0; ks < 4; ks++) {
+        // Source tid indices for K-slice ks
+        // K cols [ks*4..ks*4+3]: tid_01 holds cols ks*4,ks*4+1; tid_23 holds ks*4+2,ks*4+3
+        const unsigned int t01 = (ks & 1) * 2;       // 0 or 2
+        const unsigned int t23 = (ks & 1) * 2 + 1;   // 1 or 3
+        const unsigned int src01 = my_row * 4 + t01;
+        const unsigned int src23 = my_row * 4 + t23;
 
-        unsigned int src_b0 = tig * 2 * 4 + s;
-        unsigned int src_b1 = (tig * 2 + 1) * 4 + s;
-        unsigned int sb0_e = __shfl_sync(0xFFFFFFFF, b0, src_b0);
-        unsigned int sb1_e = __shfl_sync(0xFFFFFFFF, b1, src_b0);
-        unsigned int sb0_o = __shfl_sync(0xFFFFFFFF, b0, src_b1);
-        unsigned int sb1_o = __shfl_sync(0xFFFFFFFF, b1, src_b1);
+        // Get A fragments: low-M uses a0/a2, high-M uses a1/a3
+        const unsigned int a_lo_reg = (ks < 2) ? a0 : a2;
+        const unsigned int a_hi_reg = (ks < 2) ? a1 : a3;
 
-        const __half* ap0 = reinterpret_cast<const __half*>(&sa0);
-        const __half* ap1 = reinterpret_cast<const __half*>(&sa1);
-        const __half* ap2 = reinterpret_cast<const __half*>(&sa2);
-        const __half* ap3 = reinterpret_cast<const __half*>(&sa3);
-        const __half* be0 = reinterpret_cast<const __half*>(&sb0_e);
-        const __half* bf0 = reinterpret_cast<const __half*>(&sb1_e);
-        const __half* be1 = reinterpret_cast<const __half*>(&sb0_o);
-        const __half* bf1 = reinterpret_cast<const __half*>(&sb1_o);
+        unsigned int mma_a0_lo = __shfl_sync(0xFFFFFFFF, a_lo_reg, src01);
+        unsigned int mma_a1_lo = __shfl_sync(0xFFFFFFFF, a_lo_reg, src23);
+        unsigned int mma_a0_hi = __shfl_sync(0xFFFFFFFF, a_hi_reg, src01);
+        unsigned int mma_a1_hi = __shfl_sync(0xFFFFFFFF, a_hi_reg, src23);
 
-        #pragma unroll
-        for (int k = 0; k < 2; k++) {
-            float av0 = __half2float(ap0[k]);
-            float av1 = __half2float(ap1[k]);
-            float bv_e = __half2float(be0[k]);
-            float bv_o = __half2float(be1[k]);
-            r0 = __fmaf_rn(av0, bv_e, r0);
-            r1 = __fmaf_rn(av0, bv_o, r1);
-            r2 = __fmaf_rn(av1, bv_e, r2);
-            r3 = __fmaf_rn(av1, bv_o, r3);
-        }
-        #pragma unroll
-        for (int k = 0; k < 2; k++) {
-            float av0 = __half2float(ap2[k]);
-            float av1 = __half2float(ap3[k]);
-            float bv_e = __half2float(bf0[k]);
-            float bv_o = __half2float(bf1[k]);
-            r0 = __fmaf_rn(av0, bv_e, r0);
-            r1 = __fmaf_rn(av0, bv_o, r1);
-            r2 = __fmaf_rn(av1, bv_e, r2);
-            r3 = __fmaf_rn(av1, bv_o, r3);
-        }
+        // Get B fragment: col = lt (low half) or lt+4 (high half)
+        const unsigned int b_col = is_hi ? (lt + 4) : lt;
+        const unsigned int b_reg = (ks < 2) ? b0 : b1;
+        const unsigned int bt01 = b_col * 4 + t01;
+        const unsigned int bt23 = b_col * 4 + t23;
+        unsigned int mma_b0 = __shfl_sync(0xFFFFFFFF, b_reg, bt01);
+        unsigned int mma_b1 = __shfl_sync(0xFFFFFFFF, b_reg, bt23);
+
+        // Issue m8n8k4 for low-M half (rows 0-7)
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7},"
+            "{%8,%9},{%10,%11},"
+            "{%12,%13,%14,%15,%16,%17,%18,%19};"
+            : "=f"(d_lo[0]), "=f"(d_lo[1]), "=f"(d_lo[2]), "=f"(d_lo[3]),
+              "=f"(d_lo[4]), "=f"(d_lo[5]), "=f"(d_lo[6]), "=f"(d_lo[7])
+            : "r"(mma_a0_lo), "r"(mma_a1_lo), "r"(mma_b0), "r"(mma_b1),
+              "f"(d_lo[0]), "f"(d_lo[1]), "f"(d_lo[2]), "f"(d_lo[3]),
+              "f"(d_lo[4]), "f"(d_lo[5]), "f"(d_lo[6]), "f"(d_lo[7]));
+
+        // Issue m8n8k4 for high-M half (rows 8-15)
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7},"
+            "{%8,%9},{%10,%11},"
+            "{%12,%13,%14,%15,%16,%17,%18,%19};"
+            : "=f"(d_hi[0]), "=f"(d_hi[1]), "=f"(d_hi[2]), "=f"(d_hi[3]),
+              "=f"(d_hi[4]), "=f"(d_hi[5]), "=f"(d_hi[6]), "=f"(d_hi[7])
+            : "r"(mma_a0_hi), "r"(mma_a1_hi), "r"(mma_b0), "r"(mma_b1),
+              "f"(d_hi[0]), "f"(d_hi[1]), "f"(d_hi[2]), "f"(d_hi[3]),
+              "f"(d_hi[4]), "f"(d_hi[5]), "f"(d_hi[6]), "f"(d_hi[7]));
     }
-    d0 = r0; d1 = r1; d2 = r2; d3 = r3;
+
+    // Remap m8n8k4 D → m16n8k16 D layout via warp shuffles.
+    //
+    // m8n8k4 D[i] (f32) at thread with lt, is_hi, within quadpair qp:
+    //   row = (lt&1) + (i&2) + (is_hi ? 4 : 0)
+    //   col = (i&4) + (lt&2) + (i&1)
+    //
+    // m16n8k16 D layout:
+    //   d0: (row=gid, col=tig*2)      from low-M  result
+    //   d1: (row=gid, col=tig*2+1)    from low-M  result
+    //   d2: (row=gid+8, col=tig*2)    from high-M result (= d2 in m16n8k16 maps to row gid = gid in high-M 8×8)
+    //   d3: (row=gid+8, col=tig*2+1)  from high-M result
+    //
+    // To find which m8n8k4 thread holds (row=r, col=c):
+    //   r_adj = r & 3;  is_hi_src = r >= 4
+    //   src lane_bit0 = r_adj & 1;  src i_bit2 = r_adj & 2
+    //   if c < 4: i_bit4=0, lane_bit2 = c & ~1, i_bit1 = c & 1
+    //   else:     i_bit4=4, lane_bit2 = (c-4) & ~1, i_bit1 = (c-4) & 1
+    //   src_i = i_bit4 | i_bit2 | i_bit1
+    //   src_lane = qp*4 + (is_hi_src ? 16 : 0) + lane_bit2 + lane_bit0
+
+    // Compute source (lane, reg_index) for d0 target: (gid, tig*2)
+    const unsigned int r0 = gid;
+    const unsigned int c0_t = tig * 2;
+    const unsigned int r0_adj = r0 & 3;
+    const unsigned int r0_hi = r0 >> 2;
+    const unsigned int lb0_0 = r0_adj & 1;
+    const unsigned int ib_2  = r0_adj & 2;
+    const unsigned int ib4_0 = (c0_t >= 4) ? 4u : 0u;
+    const unsigned int c0_a  = (c0_t >= 4) ? (c0_t - 4) : c0_t;
+    const unsigned int lb2_0 = c0_a & ~1u;
+    const unsigned int ib1_0 = c0_a & 1;
+    const unsigned int si_0  = ib4_0 | ib_2 | ib1_0;
+    const unsigned int sl_0  = qp * 4 + (r0_hi ? 16u : 0u) + lb2_0 + lb0_0;
+
+    // For d1 target: (gid, tig*2+1)
+    const unsigned int c1_t = tig * 2 + 1;
+    const unsigned int ib4_1 = (c1_t >= 4) ? 4u : 0u;
+    const unsigned int c1_a  = (c1_t >= 4) ? (c1_t - 4) : c1_t;
+    const unsigned int lb2_1 = c1_a & ~1u;
+    const unsigned int ib1_1 = c1_a & 1;
+    const unsigned int si_1  = ib4_1 | ib_2 | ib1_1;
+    const unsigned int sl_1  = qp * 4 + (r0_hi ? 16u : 0u) + lb2_1 + lb0_0;
+
+    // Extract values using 8-round shuffle: each round broadcasts d[j],
+    // receiver captures when j matches its target register index.
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+    #pragma unroll
+    for (unsigned int j = 0; j < 8; j++) {
+        float bl = __shfl_sync(0xFFFFFFFF, d_lo[j], sl_0);
+        if (j == si_0) v0 = bl;
+        float bl1 = __shfl_sync(0xFFFFFFFF, d_lo[j], sl_1);
+        if (j == si_1) v1 = bl1;
+        float bh = __shfl_sync(0xFFFFFFFF, d_hi[j], sl_0);
+        if (j == si_0) v2 = bh;
+        float bh1 = __shfl_sync(0xFFFFFFFF, d_hi[j], sl_1);
+        if (j == si_1) v3 = bh1;
+    }
+
+    d0 = v0 + c0;
+    d1 = v1 + c1;
+    d2 = v2 + c2;
+    d3 = v3 + c3;
 }
 
 #define FLASH_MMA_K16(d0,d1,d2,d3, a0,a1,a2,a3, b0,b1, c0,c1,c2,c3) \
