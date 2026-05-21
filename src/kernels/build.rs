@@ -65,6 +65,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_reshape_cache.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant_lowbit.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_wmma_sm70.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
@@ -93,9 +94,10 @@ fn main() -> Result<()> {
     } else {
         builder = builder.arg("-Isrc/flash");
         if compute_cap <= 70 {
+            builder = builder.arg("-DFLASH_SM70_WMMA");
             println!(
-                "cargo:warning=Native flash kernels using scalar fallback for SM{}. \
-                 Performance will be limited; legacy paged attention recommended for SM70.",
+                "cargo:warning=Native flash kernels using WMMA Tensor Core path for SM{}. \
+                 m16n16k16 WMMA for prefill, scalar fallback for decode.",
                 compute_cap
             );
         } else if compute_cap <= 75 {

@@ -45,6 +45,7 @@
 // ============================================================================
 #define FLASH_HDIM 128
 #define flash_prefill_paged flash_prefill_paged_128
+#define flash_prefill_paged_wmma flash_prefill_paged_wmma_128
 #define flash_prefill_paged_fp8 flash_prefill_paged_fp8_128
 // BF16 decode moved to flash_decode.cu
 #define flash_decode_paged_fp8 flash_decode_paged_fp8_128
@@ -87,6 +88,7 @@
 #define unpack_3bit_x8 unpack_3bit_x8_128
 
 #include "flash_prefill_paged.cuh"
+#include "flash_prefill_wmma_sm70.cuh"
 #include "flash_prefill_paged_fp8.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
@@ -97,6 +99,7 @@
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
+#undef flash_prefill_paged_wmma
 #undef flash_prefill_paged_fp8
 #undef flash_decode_paged_fp8
 #undef flash_decode_paged_splitk_fp8
@@ -172,6 +175,7 @@
 // ============================================================================
 #define FLASH_HDIM 256
 #define flash_prefill_paged flash_prefill_paged_256
+#define flash_prefill_paged_wmma flash_prefill_paged_wmma_256
 #define flash_prefill_paged_fp8 flash_prefill_paged_fp8_256
 #define flash_decode_paged_fp8 flash_decode_paged_fp8_256
 #define flash_decode_paged_splitk_fp8 flash_decode_paged_splitk_fp8_256
@@ -211,6 +215,7 @@
 #define unpack_3bit_x8 unpack_3bit_x8_256
 
 #include "flash_prefill_paged.cuh"
+#include "flash_prefill_wmma_sm70.cuh"
 #include "flash_prefill_paged_fp8.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
@@ -221,6 +226,7 @@
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
+#undef flash_prefill_paged_wmma
 #undef flash_prefill_paged_fp8
 #undef flash_decode_paged_fp8
 #undef flash_decode_paged_splitk_fp8
@@ -295,6 +301,7 @@
 // ============================================================================
 #define FLASH_HDIM 512
 #define flash_prefill_paged flash_prefill_paged_512
+#define flash_prefill_paged_wmma flash_prefill_paged_wmma_512
 #define flash_prefill_paged_fp8 flash_prefill_paged_fp8_512
 #define flash_decode_paged_fp8 flash_decode_paged_fp8_512
 #define flash_decode_paged_splitk_fp8 flash_decode_paged_splitk_fp8_512
@@ -342,6 +349,7 @@
 #define NUM_THREADS_512 256
 
 #include "flash_prefill_paged.cuh"
+#include "flash_prefill_wmma_sm70.cuh"
 #include "flash_prefill_paged_fp8.cuh"
 #include "flash_decode_paged_fp8.cuh"
 #include "flash_reshape_cache.cuh"
@@ -352,6 +360,7 @@
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
+#undef flash_prefill_paged_wmma
 #undef flash_prefill_paged_fp8
 #undef flash_decode_paged_fp8
 #undef flash_decode_paged_splitk_fp8
@@ -404,7 +413,9 @@
 #define DISPATCH_DECODE_FP8(HDIM_VAL, ...) flash_decode_paged_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
 #define DISPATCH_DECODE_SPLITK_FP8(HDIM_VAL, ...) flash_decode_paged_splitk_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
 
-// Prefill BF16 launcher
+// (SM version detection removed — SM70 WMMA dispatch is compile-time via FLASH_SM70_WMMA)
+
+// Prefill BF16 launcher — dispatches to WMMA kernel on SM70
 extern "C" void call_flash_prefill_paged(
     const void* Q, const void* K_cache, const void* V_cache, void* O,
     const int* block_tables, unsigned int block_table_stride,
@@ -417,6 +428,42 @@ extern "C" void call_flash_prefill_paged(
     int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+
+#ifdef FLASH_SM70_WMMA
+    {
+        // SM70 (V100): use WMMA m16n16k16 Tensor Core prefill kernel
+        // BR_W=16, NUM_THREADS_W=128
+        unsigned int br_w = 16;
+        dim3 grid(num_q_heads, (max_q_len + br_w - 1) / br_w, num_seqs);
+
+        #define WMMA_SMEM(HD) \
+            (16*(HD+8)*2 + 16*(HD+8)*2 + 16*(HD+8)*2 \
+            + 16*24*4 + 16*24*2 + 16*2*4 \
+            + 16*(HD+8)*4 + 4*16*16*4)
+
+        #define LAUNCH_WMMA(HD) do { \
+            unsigned int smem = WMMA_SMEM(HD); \
+            smem = (smem + 255) & ~255u; \
+            cudaFuncSetAttribute(flash_prefill_paged_wmma_##HD, \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+            flash_prefill_paged_wmma_##HD<<<grid, 128, smem, s>>>( \
+                (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
+                (const flash_half_t*)V_cache, (flash_half_t*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, \
+                head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap); \
+        } while(0)
+
+        if (head_dim <= 128)       { LAUNCH_WMMA(128); }
+        else if (head_dim <= 256)  { LAUNCH_WMMA(256); }
+        else                       { LAUNCH_WMMA(512); }
+
+        #undef LAUNCH_WMMA
+        #undef WMMA_SMEM
+        return;
+    }
+#endif
+
     unsigned int br = 32;
     dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 

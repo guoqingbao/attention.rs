@@ -84,72 +84,78 @@ using flash_half_t = __half;
 #else
 // SM70 (Volta): scalar FMA emulation of m16n8k16 MMA.
 //
+// Converted from macro to inline function to improve compilation speed.
+// The function emulates the m16n8k16 MMA output layout using scalar FMA
+// with warp-shuffle redistribution of A and B register fragments.
+//
 // Thread layout: group_id = lane_id/4, tid_in_group = lane_id & 3
-// A regs: a0/a2 = Q[group_id, k_subset], a1/a3 = Q[group_id+8, k_subset]
-//   Each thread holds 4 of 16 K-elements (determined by tid_in_group).
-// B regs: b0/b1 = K[group_id, k_subset] (same K-positions as A).
-// D regs: d0 = S[group_id, tid_in_group*2],
-//         d1 = S[group_id, tid_in_group*2+1],
-//         d2 = S[group_id+8, tid_in_group*2],
-//         d3 = S[group_id+8, tid_in_group*2+1]
-//
-// The hardware MMA internally reduces across all 4 threads in a group to
-// accumulate all 16 K-elements per output. We replicate this by iterating
-// over all 4 group members (s=0..3), shuffling A from each to pair with
-// the correctly-sourced B values for each output column.
-//
-// For output col c0 = tid_in_group*2: B comes from thread with
-//   group_id = c0, i.e. lane = c0*4 + s (for each member s).
-// For output col c1 = tid_in_group*2+1: lane = c1*4 + s.
+// Each thread holds 4 of 16 K-elements. The function iterates over all
+// 4 group members, shuffling A and B values to accumulate the full
+// 16-element K-reduction per output element.
+
+__device__ __forceinline__ void flash_mma_k16_sm70(
+    float &d0, float &d1, float &d2, float &d3,
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1,
+    float c0, float c1, float c2, float c3
+) {
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int gid  = lane >> 2;
+    const unsigned int tig  = lane & 3;
+    float r0 = c0, r1 = c1, r2 = c2, r3 = c3;
+
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        unsigned int src_a = gid * 4 + s;
+        unsigned int sa0 = __shfl_sync(0xFFFFFFFF, a0, src_a);
+        unsigned int sa1 = __shfl_sync(0xFFFFFFFF, a1, src_a);
+        unsigned int sa2 = __shfl_sync(0xFFFFFFFF, a2, src_a);
+        unsigned int sa3 = __shfl_sync(0xFFFFFFFF, a3, src_a);
+
+        unsigned int src_b0 = tig * 2 * 4 + s;
+        unsigned int src_b1 = (tig * 2 + 1) * 4 + s;
+        unsigned int sb0_e = __shfl_sync(0xFFFFFFFF, b0, src_b0);
+        unsigned int sb1_e = __shfl_sync(0xFFFFFFFF, b1, src_b0);
+        unsigned int sb0_o = __shfl_sync(0xFFFFFFFF, b0, src_b1);
+        unsigned int sb1_o = __shfl_sync(0xFFFFFFFF, b1, src_b1);
+
+        const __half* ap0 = reinterpret_cast<const __half*>(&sa0);
+        const __half* ap1 = reinterpret_cast<const __half*>(&sa1);
+        const __half* ap2 = reinterpret_cast<const __half*>(&sa2);
+        const __half* ap3 = reinterpret_cast<const __half*>(&sa3);
+        const __half* be0 = reinterpret_cast<const __half*>(&sb0_e);
+        const __half* bf0 = reinterpret_cast<const __half*>(&sb1_e);
+        const __half* be1 = reinterpret_cast<const __half*>(&sb0_o);
+        const __half* bf1 = reinterpret_cast<const __half*>(&sb1_o);
+
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            float av0 = __half2float(ap0[k]);
+            float av1 = __half2float(ap1[k]);
+            float bv_e = __half2float(be0[k]);
+            float bv_o = __half2float(be1[k]);
+            r0 = __fmaf_rn(av0, bv_e, r0);
+            r1 = __fmaf_rn(av0, bv_o, r1);
+            r2 = __fmaf_rn(av1, bv_e, r2);
+            r3 = __fmaf_rn(av1, bv_o, r3);
+        }
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            float av0 = __half2float(ap2[k]);
+            float av1 = __half2float(ap3[k]);
+            float bv_e = __half2float(bf0[k]);
+            float bv_o = __half2float(bf1[k]);
+            r0 = __fmaf_rn(av0, bv_e, r0);
+            r1 = __fmaf_rn(av0, bv_o, r1);
+            r2 = __fmaf_rn(av1, bv_e, r2);
+            r3 = __fmaf_rn(av1, bv_o, r3);
+        }
+    }
+    d0 = r0; d1 = r1; d2 = r2; d3 = r3;
+}
+
 #define FLASH_MMA_K16(d0,d1,d2,d3, a0,a1,a2,a3, b0,b1, c0,c1,c2,c3) \
-    do { \
-        const unsigned int _lane = threadIdx.x & 31; \
-        const unsigned int _gid  = _lane >> 2; \
-        const unsigned int _tig  = _lane & 3; \
-        float _r0=(c0), _r1=(c1), _r2=(c2), _r3=(c3); \
-        for (int _s = 0; _s < 4; _s++) { \
-            unsigned int _src_a = _gid * 4 + _s; \
-            unsigned int _sa0 = __shfl_sync(0xFFFFFFFF, (a0), _src_a); \
-            unsigned int _sa1 = __shfl_sync(0xFFFFFFFF, (a1), _src_a); \
-            unsigned int _sa2 = __shfl_sync(0xFFFFFFFF, (a2), _src_a); \
-            unsigned int _sa3 = __shfl_sync(0xFFFFFFFF, (a3), _src_a); \
-            unsigned int _src_b0 = _tig * 2 * 4 + _s; \
-            unsigned int _src_b1 = (_tig * 2 + 1) * 4 + _s; \
-            unsigned int _sb0_e = __shfl_sync(0xFFFFFFFF, (b0), _src_b0); \
-            unsigned int _sb1_e = __shfl_sync(0xFFFFFFFF, (b1), _src_b0); \
-            unsigned int _sb0_o = __shfl_sync(0xFFFFFFFF, (b0), _src_b1); \
-            unsigned int _sb1_o = __shfl_sync(0xFFFFFFFF, (b1), _src_b1); \
-            const __half* _ap0 = reinterpret_cast<const __half*>(&_sa0); \
-            const __half* _ap1 = reinterpret_cast<const __half*>(&_sa1); \
-            const __half* _ap2 = reinterpret_cast<const __half*>(&_sa2); \
-            const __half* _ap3 = reinterpret_cast<const __half*>(&_sa3); \
-            const __half* _be0 = reinterpret_cast<const __half*>(&_sb0_e); \
-            const __half* _bf0 = reinterpret_cast<const __half*>(&_sb1_e); \
-            const __half* _be1 = reinterpret_cast<const __half*>(&_sb0_o); \
-            const __half* _bf1 = reinterpret_cast<const __half*>(&_sb1_o); \
-            for (int _k = 0; _k < 2; _k++) { \
-                float _av0 = __half2float(_ap0[_k]); \
-                float _av1 = __half2float(_ap1[_k]); \
-                float _bv_e = __half2float(_be0[_k]); \
-                float _bv_o = __half2float(_be1[_k]); \
-                _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
-                _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
-                _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
-                _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
-            } \
-            for (int _k = 0; _k < 2; _k++) { \
-                float _av0 = __half2float(_ap2[_k]); \
-                float _av1 = __half2float(_ap3[_k]); \
-                float _bv_e = __half2float(_bf0[_k]); \
-                float _bv_o = __half2float(_bf1[_k]); \
-                _r0 = __fmaf_rn(_av0, _bv_e, _r0); \
-                _r1 = __fmaf_rn(_av0, _bv_o, _r1); \
-                _r2 = __fmaf_rn(_av1, _bv_e, _r2); \
-                _r3 = __fmaf_rn(_av1, _bv_o, _r3); \
-            } \
-        } \
-        (d0) = _r0; (d1) = _r1; (d2) = _r2; (d3) = _r3; \
-    } while(0)
+    flash_mma_k16_sm70(d0,d1,d2,d3, a0,a1,a2,a3, b0,b1, c0,c1,c2,c3)
 
 #endif // __CUDA_ARCH__ >= 750
 
