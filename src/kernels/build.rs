@@ -65,7 +65,6 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_reshape_cache.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_turboquant_lowbit.cuh");
-    println!("cargo:rerun-if-changed=src/flash/flash_prefill_wmma_sm70.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
@@ -94,16 +93,13 @@ fn main() -> Result<()> {
     } else {
         builder = builder.arg("-Isrc/flash");
         if compute_cap <= 70 {
-            builder = builder.arg("-DFLASH_SM70_WMMA");
             println!(
-                "cargo:warning=Native flash kernels using WMMA Tensor Core path for SM{}. \
-                 m16n16k16 WMMA for prefill, scalar fallback for decode.",
+                "cargo:warning=Native flash kernels using m8n8k4 Tensor Core MMA for SM{}.",
                 compute_cap
             );
         } else if compute_cap <= 75 {
             println!(
-                "cargo:warning=Native flash kernels using FP16 fallback for SM{}. \
-                 m16n8k8 MMA will be used (SM80+ uses BF16 m16n8k16 for best performance).",
+                "cargo:warning=Native flash kernels using FP16 fallback for SM{}.",
                 compute_cap
             );
         }
