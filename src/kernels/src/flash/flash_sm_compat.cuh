@@ -42,8 +42,8 @@ using flash_half_t = __half;
 #define FLASH_CP_ASYNC(sa, gm_ptr) \
     do { \
         uint4 _tmp = *reinterpret_cast<const uint4*>(gm_ptr); \
-        *reinterpret_cast<uint4*>(__cvta_shared_to_generic(reinterpret_cast<void*>( \
-            static_cast<uintptr_t>(sa)))) = _tmp; \
+        *reinterpret_cast<uint4*>(__cvta_shared_to_generic( \
+            static_cast<size_t>(sa))) = _tmp; \
     } while(0)
 
 #define FLASH_ASYNC_COMMIT()
