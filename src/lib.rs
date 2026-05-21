@@ -43,6 +43,9 @@ pub mod swiglu;
 #[cfg(feature = "flash")]
 pub mod flash;
 
+#[cfg(feature = "metal")]
+pub mod metal_flash;
+
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
@@ -256,7 +259,12 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(any(feature = "flash", feature = "flashattn", feature = "flashinfer"))]
+    #[cfg(any(
+        feature = "flash",
+        feature = "flashattn",
+        feature = "flashinfer",
+        feature = "metal"
+    ))]
     fn packed_qkv(
         query: &Tensor,
         key: &Tensor,
@@ -1157,6 +1165,198 @@ impl PagedAttention {
                 self.k_scale.as_ref(),
                 self.v_scale.as_ref(),
                 Some(ws),
+            );
+        }
+
+        // Metal flash attention path
+        #[cfg(feature = "metal")]
+        {
+            let (query_p, key_p, value_p, attention_heads_p, key_value_heads_p, head_size_p) =
+                Self::packed_qkv(query, key, value)?;
+
+            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+            let tq_mode_metal = get_turboquant_mode();
+
+            if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
+                // Standard cache write: needed for BF16/FP8 and Turbo8 (K in FP8 cache)
+                // Turbo4/3 use TQ buffers exclusively (standard cache is 1-block dummy)
+                let tq_uses_std = matches!(tq_mode_metal, None | Some(TurboquantMode::Turbo8));
+                if tq_uses_std {
+                    crate::metal_flash::flash_reshape_and_cache_metal(
+                        &key_p,
+                        &value_p,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        self.k_scale.as_ref(),
+                        self.v_scale.as_ref(),
+                        &slot_mapping,
+                    )?;
+                }
+                // TurboQuant Turbo8: additionally write 4-bit V
+                if matches!(tq_mode_metal, Some(TurboquantMode::Turbo8)) {
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::metal_flash::flash_tq_store_k8v4_metal(
+                            &value_p,
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            &slot_mapping,
+                        )
+                    }) {
+                        r?;
+                    }
+                }
+                // TurboQuant Turbo4/Turbo3: WHT K + 4-bit V store
+                if matches!(
+                    tq_mode_metal,
+                    Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
+                ) {
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::metal_flash::flash_tq4_store_metal(
+                            &key_p,
+                            &value_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            &slot_mapping,
+                        )
+                    }) {
+                        r?;
+                    }
+                }
+            }
+
+            if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
+                return self.sdp_prefill(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    input_metadata,
+                    softcapping,
+                );
+            }
+
+            let block_tables = input_metadata.block_tables.as_ref().unwrap();
+            let context_lens = input_metadata.context_lens.as_ref().unwrap();
+
+            if input_metadata.is_prefill {
+                // Turbo4/3: prefill reads from TQ4 buffers (no standard cache)
+                if matches!(
+                    tq_mode_metal,
+                    Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
+                ) {
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::metal_flash::flash_tq4_prefill_metal(
+                            &query_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            block_tables,
+                            context_lens,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
+                            input_metadata.cu_seqlens_q.as_ref(),
+                            input_metadata.max_seqlen_q,
+                        )
+                    }) {
+                        return r;
+                    }
+                }
+                return crate::metal_flash::flash_prefill_metal(
+                    &query_p,
+                    key_cache.as_ref().unwrap(),
+                    value_cache.as_ref().unwrap(),
+                    block_tables,
+                    context_lens,
+                    attention_heads_p,
+                    key_value_heads_p,
+                    head_size_p,
+                    self.scale,
+                    softcapping.unwrap_or(0.0) as f32,
+                    self.sliding_window,
+                    self.k_scale.as_ref(),
+                    self.v_scale.as_ref(),
+                    input_metadata.cu_seqlens_q.as_ref(),
+                    input_metadata.max_seqlen_q,
+                );
+            }
+
+            let output = query_p.zeros_like()?;
+
+            // Turbo8 decode: use TQ k8v4 decode kernel (FP8 K + 4-bit V)
+            if matches!(tq_mode_metal, Some(TurboquantMode::Turbo8)) {
+                if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                    crate::metal_flash::flash_tq_decode_k8v4_metal(
+                        &query_p,
+                        key_cache.as_ref().unwrap(),
+                        &tq.v_absmax,
+                        &tq.v_quant,
+                        block_tables,
+                        context_lens,
+                        &output,
+                        input_metadata.max_context_len,
+                        attention_heads_p,
+                        key_value_heads_p,
+                        head_size_p,
+                        self.scale,
+                        softcapping.unwrap_or(0.0) as f32,
+                        self.k_scale.as_ref(),
+                        self.sliding_window,
+                    )
+                }) {
+                    return r;
+                }
+            }
+
+            // Turbo4/Turbo3 decode: use TQ4 decode kernel (4-bit WHT K + 4-bit V)
+            if matches!(
+                tq_mode_metal,
+                Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
+            ) {
+                if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                    crate::metal_flash::flash_tq4_decode_metal(
+                        &query_p,
+                        tq.k_absmax.as_ref().unwrap(),
+                        tq.k_quant.as_ref().unwrap(),
+                        &tq.v_absmax,
+                        &tq.v_quant,
+                        block_tables,
+                        context_lens,
+                        &output,
+                        attention_heads_p,
+                        key_value_heads_p,
+                        head_size_p,
+                        self.scale,
+                        softcapping.unwrap_or(0.0) as f32,
+                        self.sliding_window,
+                    )
+                }) {
+                    return r;
+                }
+            }
+
+            return crate::metal_flash::flash_decode_metal(
+                &query_p,
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                block_tables,
+                context_lens,
+                &output,
+                input_metadata.max_context_len,
+                attention_heads_p,
+                key_value_heads_p,
+                head_size_p,
+                self.scale,
+                softcapping.unwrap_or(0.0) as f32,
+                self.sliding_window,
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
             );
         }
 

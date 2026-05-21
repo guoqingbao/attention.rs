@@ -1834,6 +1834,1073 @@ pub fn call_mxfp4_moe_gemm(
     Ok(())
 }
 
+// ============================================================================
+// Flash Attention Metal Kernels
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    k_cache_offset: usize,
+    v_cache: &Buffer,
+    v_cache_offset: usize,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    seq_lens: &Buffer,
+    seq_lens_offset: usize,
+    query_start_len: &Buffer,
+    query_start_len_offset: usize,
+    alibi_slopes: Option<(MetalStorage, usize)>,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
+    sinks: Option<(MetalStorage, usize)>,
+    num_kv_heads: i32,
+    scale: f32,
+    block_table_stride: i32,
+    num_seqs: i32,
+    num_query_heads: i32,
+    num_query_tokens: i32,
+    head_size: i32,
+    block_size: i32,
+    softcapping: f32,
+    o_stride_tokens: i32,
+    sliding_window: i32,
+    total_num_blocks: i32,
+    kv_block_stride: i32,
+    kv_head_stride: i32,
+) -> Result<(), MetalKernelError> {
+    const BR: u64 = 64;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+
+    let fp8_suffix = if quantized_cache { "_fp8" } else { "" };
+    let name = format!(
+        "flash_prefill_{}{}_hd{}_bs{}",
+        type_prefix, fp8_suffix, head_size, block_size
+    );
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_cache), k_cache_offset as NSUInteger);
+    encoder.set_buffer(3, Some(v_cache), v_cache_offset as NSUInteger);
+    encoder.set_bytes(
+        4,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(5, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_buffer(6, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(7, Some(seq_lens), seq_lens_offset as NSUInteger);
+    encoder.set_bytes(
+        8,
+        size_of_val(&block_table_stride),
+        &block_table_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        9,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&num_query_heads),
+        &num_query_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_query_tokens),
+        &num_query_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&o_stride_tokens),
+        &o_stride_tokens as *const _ as *const c_void,
+    );
+    encoder.set_buffer(
+        14,
+        Some(query_start_len),
+        query_start_len_offset as NSUInteger,
+    );
+    if let Some((slop, offset)) = alibi_slopes {
+        encoder.set_buffer(15, Some(slop.buffer()), offset as NSUInteger);
+    }
+    if let Some(ks) = k_scale {
+        encoder.set_buffer(16, Some(ks.buffer()), 0);
+    }
+    if let Some(vs) = v_scale {
+        encoder.set_buffer(17, Some(vs.buffer()), 0);
+    }
+    if let Some((sk, offset)) = sinks {
+        encoder.set_buffer(18, Some(sk.buffer()), offset as NSUInteger);
+    }
+    encoder.set_bytes(
+        19,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        20,
+        size_of_val(&total_num_blocks),
+        &total_num_blocks as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        21,
+        size_of_val(&kv_block_stride),
+        &kv_block_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        22,
+        size_of_val(&kv_head_stride),
+        &kv_head_stride as *const _ as *const c_void,
+    );
+
+    let num_queries_per_kv = (num_query_heads / num_kv_heads) as u64;
+    let num_token_chunks = (num_query_tokens as u64 + BR - 1) / BR;
+
+    let thread_group_size = MTLSize {
+        width: BR,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: num_queries_per_kv,
+        height: num_kv_heads as u64,
+        depth: num_token_chunks,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_decode(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    k_cache_offset: usize,
+    v_cache: &Buffer,
+    v_cache_offset: usize,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    context_lens: &Buffer,
+    context_lens_offset: usize,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    scale: f32,
+    softcapping: f32,
+    block_size: i32,
+    max_context_len: i32,
+    num_seqs: i32,
+    head_size: i32,
+    max_num_blocks_per_seq: i32,
+    q_stride: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    const NUM_THREADS: u64 = 256;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+
+    let fp8_suffix = if quantized_cache { "_fp8" } else { "" };
+    let name = format!(
+        "flash_decode_{}{}_hd{}_bs{}",
+        type_prefix, fp8_suffix, head_size, block_size
+    );
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    // Shared memory: q_shared(HEAD_DIM) + sg_max(NUM_SIMD_GROUPS) + sg_sum(NUM_SIMD_GROUPS) + sg_out(NUM_SIMD_GROUPS * HEAD_DIM)
+    let num_simd_groups = (NUM_THREADS / 32) as u64;
+    let smem_size = ((head_size as u64) + num_simd_groups * 2 + num_simd_groups * head_size as u64)
+        * std::mem::size_of::<f32>() as u64;
+    encoder.set_threadgroup_memory_length(0, smem_size);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_cache), k_cache_offset as NSUInteger);
+    encoder.set_buffer(3, Some(v_cache), v_cache_offset as NSUInteger);
+    encoder.set_buffer(4, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(5, Some(context_lens), context_lens_offset as NSUInteger);
+    encoder.set_bytes(
+        6,
+        size_of_val(&max_num_blocks_per_seq),
+        &max_num_blocks_per_seq as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        7,
+        size_of_val(&num_q_heads),
+        &num_q_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        8,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        9,
+        size_of_val(&head_size),
+        &head_size as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+    encoder.set_bytes(11, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_bytes(
+        12,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&q_stride),
+        &q_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+    if let Some(ks) = k_scale {
+        encoder.set_buffer(16, Some(ks.buffer()), 0);
+    }
+    if let Some(vs) = v_scale {
+        encoder.set_buffer(17, Some(vs.buffer()), 0);
+    }
+
+    let thread_groups_count = MTLSize {
+        width: num_q_heads as u64,
+        height: num_seqs as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: NUM_THREADS,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_decode_splitk(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    partial_out: &Buffer,
+    partial_max: &Buffer,
+    partial_sum: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    k_cache_offset: usize,
+    v_cache: &Buffer,
+    v_cache_offset: usize,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    context_lens: &Buffer,
+    context_lens_offset: usize,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    scale: f32,
+    softcapping: f32,
+    block_size: i32,
+    num_seqs: i32,
+    head_size: i32,
+    max_num_blocks_per_seq: i32,
+    q_stride: i32,
+    sliding_window: i32,
+    num_splits: i32,
+) -> Result<(), MetalKernelError> {
+    const NUM_THREADS: u64 = 256;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let fp8_suffix = if quantized_cache { "_fp8" } else { "" };
+
+    // Phase 1: Split-K kernel
+    {
+        let name = format!(
+            "flash_decode_splitk_{}{}_hd{}_bs{}",
+            type_prefix, fp8_suffix, head_size, block_size
+        );
+        let pipeline = kernels.load_pipeline(device, name)?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        // s_max(NUM_THREADS) + s_sum(NUM_THREADS) + s_reduce(NUM_SIMD_GROUPS * HEAD_DIM)
+        let num_simd_groups = NUM_THREADS / 32;
+        let smem_size = (NUM_THREADS * 2 + num_simd_groups * head_size as u64)
+            * std::mem::size_of::<f32>() as u64;
+        encoder.set_threadgroup_memory_length(0, smem_size);
+
+        encoder.set_buffer(0, Some(partial_out), 0);
+        encoder.set_buffer(1, Some(partial_max), 0);
+        encoder.set_buffer(2, Some(partial_sum), 0);
+        encoder.set_buffer(3, Some(q), q_offset as NSUInteger);
+        encoder.set_buffer(4, Some(k_cache), k_cache_offset as NSUInteger);
+        encoder.set_buffer(5, Some(v_cache), v_cache_offset as NSUInteger);
+        encoder.set_buffer(6, Some(block_tables), block_tables_offset as NSUInteger);
+        encoder.set_buffer(7, Some(context_lens), context_lens_offset as NSUInteger);
+        encoder.set_bytes(
+            8,
+            size_of_val(&max_num_blocks_per_seq),
+            &max_num_blocks_per_seq as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            9,
+            size_of_val(&num_q_heads),
+            &num_q_heads as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            10,
+            size_of_val(&num_kv_heads),
+            &num_kv_heads as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            11,
+            size_of_val(&head_size),
+            &head_size as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            12,
+            size_of_val(&block_size),
+            &block_size as *const _ as *const c_void,
+        );
+        encoder.set_bytes(13, size_of_val(&scale), &scale as *const _ as *const c_void);
+        encoder.set_bytes(
+            14,
+            size_of_val(&num_seqs),
+            &num_seqs as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            15,
+            size_of_val(&num_splits),
+            &num_splits as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            16,
+            size_of_val(&q_stride),
+            &q_stride as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            17,
+            size_of_val(&softcapping),
+            &softcapping as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            18,
+            size_of_val(&sliding_window),
+            &sliding_window as *const _ as *const c_void,
+        );
+        if let Some(ks) = &k_scale {
+            encoder.set_buffer(19, Some(ks.buffer()), 0);
+        }
+        if let Some(vs) = &v_scale {
+            encoder.set_buffer(20, Some(vs.buffer()), 0);
+        }
+
+        let thread_groups_count = MTLSize {
+            width: num_q_heads as u64,
+            height: num_seqs as u64,
+            depth: num_splits as u64,
+        };
+        let thread_group_size = MTLSize {
+            width: NUM_THREADS,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    }
+
+    // Phase 2: Reduce kernel
+    {
+        let name = format!("flash_decode_reduce_{}_hd{}", type_prefix, head_size);
+        let pipeline = kernels.load_pipeline(device, name)?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(0, Some(output), 0);
+        encoder.set_buffer(1, Some(partial_out), 0);
+        encoder.set_buffer(2, Some(partial_max), 0);
+        encoder.set_buffer(3, Some(partial_sum), 0);
+        encoder.set_bytes(
+            4,
+            size_of_val(&num_q_heads),
+            &num_q_heads as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            5,
+            size_of_val(&num_splits),
+            &num_splits as *const _ as *const c_void,
+        );
+        encoder.set_bytes(
+            6,
+            size_of_val(&q_stride),
+            &q_stride as *const _ as *const c_void,
+        );
+
+        let thread_groups_count = MTLSize {
+            width: num_q_heads as u64,
+            height: num_seqs as u64,
+            depth: 1,
+        };
+        let thread_group_size = MTLSize {
+            width: head_size as u64,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_reshape_and_cache_metal(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    key: &Buffer,
+    key_offset: usize,
+    value: &Buffer,
+    value_offset: usize,
+    key_cache: &Buffer,
+    key_cache_offset: usize,
+    value_cache: &Buffer,
+    value_cache_offset: usize,
+    slot_mapping: &Buffer,
+    slot_mapping_offset: usize,
+    num_tokens: i32,
+    num_heads: i32,
+    head_size: i32,
+    block_size: i32,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
+) -> Result<(), MetalKernelError> {
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let cache_suffix = if quantized_cache {
+        "_fp8"
+    } else {
+        match ty {
+            PagedAttentionDType::BF16 => "_bf16",
+            PagedAttentionDType::F16 => "_f16",
+            PagedAttentionDType::F32 => "_bf16",
+        }
+    };
+    let name = format!("flash_reshape_cache_{}{}", type_prefix, cache_suffix);
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(key), key_offset as NSUInteger);
+    encoder.set_buffer(1, Some(value), value_offset as NSUInteger);
+    encoder.set_buffer(2, Some(key_cache), key_cache_offset as NSUInteger);
+    encoder.set_buffer(3, Some(value_cache), value_cache_offset as NSUInteger);
+    encoder.set_buffer(4, Some(slot_mapping), slot_mapping_offset as NSUInteger);
+    encoder.set_bytes(
+        5,
+        size_of_val(&num_tokens),
+        &num_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        6,
+        size_of_val(&num_heads),
+        &num_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        7,
+        size_of_val(&head_size),
+        &head_size as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        8,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+    if let Some(ks) = k_scale {
+        encoder.set_buffer(9, Some(ks.buffer()), 0);
+    }
+    if let Some(vs) = v_scale {
+        encoder.set_buffer(10, Some(vs.buffer()), 0);
+    }
+
+    let thread_groups_count = MTLSize {
+        width: num_tokens as u64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq_store_k8v4(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    value: &Buffer,
+    value_offset: usize,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    slot_mapping: &Buffer,
+    slot_mapping_offset: usize,
+    num_tokens: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        128 => "hd128",
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq_store_k8v4_{}_{}", type_prefix, hd_str);
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(value), value_offset as NSUInteger);
+    encoder.set_buffer(1, Some(v_absmax), 0);
+    encoder.set_buffer(2, Some(v_quant), 0);
+    encoder.set_buffer(3, Some(slot_mapping), slot_mapping_offset as NSUInteger);
+    encoder.set_bytes(
+        4,
+        size_of_val(&num_tokens),
+        &num_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        5,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        6,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_tokens as u64,
+        height: num_kv_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq_decode_k8v4(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    k_cache_offset: usize,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    context_lens: &Buffer,
+    context_lens_offset: usize,
+    k_scale: Option<MetalStorage>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    scale: f32,
+    softcap: f32,
+    block_size: i32,
+    num_seqs: i32,
+    head_dim: i32,
+    max_blocks_per_seq: i32,
+    q_stride: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        128 => "hd128",
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq_decode_k8v4_{}_{}_{}", type_prefix, hd_str, "bs32");
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_cache), k_cache_offset as NSUInteger);
+    encoder.set_buffer(3, Some(v_absmax), 0);
+    encoder.set_buffer(4, Some(v_quant), 0);
+    encoder.set_buffer(5, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(6, Some(context_lens), context_lens_offset as NSUInteger);
+
+    if let Some(ks) = &k_scale {
+        encoder.set_buffer(7, Some(ks.buffer()), 0);
+    }
+    encoder.set_bytes(8, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_bytes(
+        9,
+        size_of_val(&softcap),
+        &softcap as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&num_q_heads),
+        &num_q_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+
+    let max_context_len: i32 = 0;
+    encoder.set_bytes(
+        13,
+        size_of_val(&max_context_len),
+        &max_context_len as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&head_dim),
+        &head_dim as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        16,
+        size_of_val(&max_blocks_per_seq),
+        &max_blocks_per_seq as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&q_stride),
+        &q_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        18,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_seqs as u64,
+        height: num_q_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq4_store(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    key: &Buffer,
+    key_offset: usize,
+    value: &Buffer,
+    value_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    slot_mapping: &Buffer,
+    slot_mapping_offset: usize,
+    num_tokens: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq4_store_{}_{}", type_prefix, hd_str);
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(key), key_offset as NSUInteger);
+    encoder.set_buffer(1, Some(value), value_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_buffer(6, Some(slot_mapping), slot_mapping_offset as NSUInteger);
+    encoder.set_bytes(
+        7,
+        size_of_val(&num_tokens),
+        &num_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        8,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        9,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_tokens as u64,
+        height: num_kv_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq4_decode(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    context_lens: &Buffer,
+    context_lens_offset: usize,
+    scale: f32,
+    softcap: f32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    block_size: i32,
+    num_seqs: i32,
+    head_dim: i32,
+    max_blocks_per_seq: i32,
+    q_stride: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq4_decode_{}_{}_{}", type_prefix, hd_str, "bs32");
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_buffer(6, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(7, Some(context_lens), context_lens_offset as NSUInteger);
+    encoder.set_bytes(8, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_bytes(
+        9,
+        size_of_val(&softcap),
+        &softcap as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&num_q_heads),
+        &num_q_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&head_dim),
+        &head_dim as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&max_blocks_per_seq),
+        &max_blocks_per_seq as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        16,
+        size_of_val(&q_stride),
+        &q_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_seqs as u64,
+        height: num_q_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+pub fn flash_tq4_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    seq_lens: &Buffer,
+    seq_lens_offset: usize,
+    query_start_len: &Buffer,
+    query_start_len_offset: usize,
+    num_kv_heads: i32,
+    scale: f32,
+    block_table_stride: i32,
+    num_seqs: i32,
+    num_query_heads: i32,
+    num_query_tokens: i32,
+    head_size: i32,
+    block_size: i32,
+    softcapping: f32,
+    o_stride_tokens: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    const BR: u64 = 8;
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let name = format!(
+        "flash_tq4_prefill_{}_hd{}_bs{}",
+        type_prefix, head_size, block_size
+    );
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_bytes(
+        6,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(7, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_buffer(8, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(9, Some(seq_lens), seq_lens_offset as NSUInteger);
+    encoder.set_bytes(
+        10,
+        size_of_val(&block_table_stride),
+        &block_table_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&num_query_heads),
+        &num_query_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&num_query_tokens),
+        &num_query_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&o_stride_tokens),
+        &o_stride_tokens as *const _ as *const c_void,
+    );
+    encoder.set_buffer(
+        16,
+        Some(query_start_len),
+        query_start_len_offset as NSUInteger,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+
+    let num_groups_per_kv = num_query_heads / num_kv_heads;
+    let thread_groups_count = MTLSize {
+        width: num_groups_per_kv as u64,
+        height: num_kv_heads as u64,
+        depth: (num_query_tokens as u64 + BR - 1) / BR,
+    };
+    let thread_group_size = MTLSize {
+        width: BR,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
 fn gdn_type_name(ty: DType) -> Result<&'static str, MetalKernelError> {
     match ty {
         DType::F32 => Ok("float"),
