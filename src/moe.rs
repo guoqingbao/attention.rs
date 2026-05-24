@@ -1,7 +1,7 @@
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
 #[cfg(all(feature = "cuda", feature = "cutlass"))]
-use crate::workspace::get_moe_cutlass_workspace;
+use crate::workspace::{get_moe_activation_pool, get_moe_cutlass_workspace};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::quantized::QTensor;
@@ -1808,6 +1808,29 @@ pub fn moe_gemm_nvfp4_hardware(
     }
 
     let stream = *cuda_dev.cu_stream() as i64;
+    let k_scale = k / crate::nvfp4_linear::NVFP4_BLOCK_SIZE;
+    let k_scale_padded = pad_to(k_scale, 4);
+    let n_padded = pad_to(n, 128);
+    let total_sf_rows_capacity = size_m + 127 * num_experts;
+    let dtype_bytes = dtype.size_in_bytes();
+
+    let gathered_bytes = size_m * k * dtype_bytes;
+    let act_packed_bytes = size_m * (k / 2);
+    let act_scales_bytes = total_sf_rows_capacity * k_scale_padded;
+    let rep_out_bytes = size_m * n * dtype_bytes;
+    let output_bytes = rep_out_bytes;
+    let metadata_bytes = 1;
+
+    let pool = get_moe_activation_pool(
+        cuda_dev,
+        gathered_bytes,
+        act_packed_bytes,
+        act_scales_bytes,
+        rep_out_bytes,
+        output_bytes,
+        metadata_bytes,
+    )?;
+
     let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
     let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
     let sf_offsets_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
@@ -1838,7 +1861,7 @@ pub fn moe_gemm_nvfp4_hardware(
         let (problem_sizes_s, _) = problem_sizes_t.storage_and_layout();
         let (alphas_s, _) = alphas_t.storage_and_layout();
         let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
-        let input_scales_ptr = if let Some(scales) = input_scales {
+        let input_scales_ffi_ptr = if let Some(scales) = input_scales {
             let (scales_s, _) = scales.storage_and_layout();
             cuda_ptr(&scales_s, DType::F32)? as *const f32
         } else {
@@ -1848,7 +1871,7 @@ pub fn moe_gemm_nvfp4_hardware(
             ffi::nvfp4_moe_build_metadata(
                 cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
                 cuda_ptr(&weight_global_scales_s, DType::F32)? as *const f32,
-                input_scales_ptr,
+                input_scales_ffi_ptr,
                 cuda_ptr(&sf_offsets_s, DType::U32)? as *mut i32,
                 cuda_ptr(&problem_sizes_s, DType::U32)? as *mut i32,
                 cuda_ptr(&alphas_s, DType::F32)? as *mut f32,
@@ -1861,16 +1884,15 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    let gathered = Tensor::zeros((size_m, k), dtype, dev)?;
+    let gathered_ptr = pool.gathered_ptr;
     {
         let (input_s, _) = input.storage_and_layout();
-        let (gathered_s, _) = gathered.storage_and_layout();
         let (sorted_s, _) = sorted_token_ids.storage_and_layout();
         unsafe {
             match dtype {
                 DType::F16 => ffi::nvfp4_moe_gather_f16(
                     cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
-                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    gathered_ptr as *mut std::ffi::c_void,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     size_m as i32,
                     k as i32,
@@ -1879,7 +1901,7 @@ pub fn moe_gemm_nvfp4_hardware(
                 ),
                 DType::BF16 => ffi::nvfp4_moe_gather_bf16(
                     cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void,
-                    cuda_ptr(&gathered_s, dtype)? as *mut std::ffi::c_void,
+                    gathered_ptr as *mut std::ffi::c_void,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     size_m as i32,
                     k as i32,
@@ -1891,25 +1913,18 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    let k_scale = k / crate::nvfp4_linear::NVFP4_BLOCK_SIZE;
-    let k_scale_padded = pad_to(k_scale, 4);
-    let act_packed = Tensor::zeros((size_m, k / 2), DType::U8, dev)?;
-    let total_sf_rows_capacity = size_m + 127 * num_experts;
-    let act_scales_swizzled =
-        Tensor::zeros((total_sf_rows_capacity, k_scale_padded), DType::U8, dev)?;
+    let act_packed_ptr = pool.act_packed_ptr;
+    let act_scales_ptr = pool.act_scales_ptr;
     {
-        let (gathered_s, _) = gathered.storage_and_layout();
-        let (act_packed_s, _) = act_packed.storage_and_layout();
-        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
         let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
         let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
         let (sf_offsets_s, _) = sf_offsets_t.storage_and_layout();
         unsafe {
             match dtype {
                 DType::F16 => ffi::nvfp4_quantize_activation_grouped_f16(
-                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
-                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
-                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    gathered_ptr as *const std::ffi::c_void,
+                    act_packed_ptr as *mut std::ffi::c_void,
+                    act_scales_ptr as *mut std::ffi::c_void,
                     cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
                     cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
                     cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
@@ -1920,9 +1935,9 @@ pub fn moe_gemm_nvfp4_hardware(
                     stream,
                 ),
                 DType::BF16 => ffi::nvfp4_quantize_activation_grouped_bf16(
-                    cuda_ptr(&gathered_s, dtype)? as *const std::ffi::c_void,
-                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
-                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                    gathered_ptr as *const std::ffi::c_void,
+                    act_packed_ptr as *mut std::ffi::c_void,
+                    act_scales_ptr as *mut std::ffi::c_void,
                     cuda_ptr(&input_scale_invs_s, DType::F32)? as *const f32,
                     cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
                     cuda_ptr(&sf_offsets_s, DType::U32)? as *const i32,
@@ -1937,7 +1952,6 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    let n_padded = pad_to(n, 128);
     let weight_scales_swizzled =
         Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
     {
@@ -1962,25 +1976,22 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    let rep_out = Tensor::zeros((size_m, n), dtype, dev)?;
+    let rep_out_ptr = pool.rep_out_ptr;
     {
-        let (act_packed_s, _) = act_packed.storage_and_layout();
         let (weights_s, _) = weights.storage_and_layout();
-        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
         let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
         let (alphas_s, _) = alphas_t.storage_and_layout();
         let (eo_s, _) = expert_offsets_t.storage_and_layout();
         let (sfo_s, _) = sf_offsets_t.storage_and_layout();
         let (ps_s, _) = problem_sizes_t.storage_and_layout();
-        let (out_s, _) = rep_out.storage_and_layout();
         let (workspace_ptr, workspace_bytes) = get_moe_cutlass_workspace(cuda_dev, 0)?;
         unsafe {
             let ret = match dtype {
                 DType::F16 => ffi::nvfp4_cutlass_moe_gemm_f16(
-                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
-                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    rep_out_ptr as *mut std::ffi::c_void,
+                    act_packed_ptr as *const std::ffi::c_void,
                     cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
-                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    act_scales_ptr as *const std::ffi::c_void,
                     cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
                     cuda_ptr(&alphas_s, DType::F32)? as *const f32,
                     cuda_ptr(&eo_s, DType::U32)? as *const i32,
@@ -1995,10 +2006,10 @@ pub fn moe_gemm_nvfp4_hardware(
                     stream,
                 ),
                 DType::BF16 => ffi::nvfp4_cutlass_moe_gemm_bf16(
-                    cuda_ptr(&out_s, dtype)? as *mut std::ffi::c_void,
-                    cuda_ptr(&act_packed_s, DType::U8)? as *const std::ffi::c_void,
+                    rep_out_ptr as *mut std::ffi::c_void,
+                    act_packed_ptr as *const std::ffi::c_void,
                     cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
-                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *const std::ffi::c_void,
+                    act_scales_ptr as *const std::ffi::c_void,
                     cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
                     cuda_ptr(&alphas_s, DType::F32)? as *const f32,
                     cuda_ptr(&eo_s, DType::U32)? as *const i32,
@@ -2022,10 +2033,9 @@ pub fn moe_gemm_nvfp4_hardware(
 
     let output = Tensor::zeros((size_m, n), dtype, dev)?;
     {
-        let (rep_out_s, _) = rep_out.storage_and_layout();
         let (sorted_s, _) = sorted_token_ids.storage_and_layout();
         let (output_s, _) = output.storage_and_layout();
-        let weights_ptr = if let Some(t) = topk_weights {
+        let weights_ffi_ptr = if let Some(t) = topk_weights {
             let (s, _) = t.storage_and_layout();
             cuda_ptr(&s, DType::F32)? as *const f32
         } else {
@@ -2034,23 +2044,23 @@ pub fn moe_gemm_nvfp4_hardware(
         unsafe {
             match dtype {
                 DType::F16 => ffi::moe_fp8_scatter_rows_f16(
-                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    rep_out_ptr as *const std::ffi::c_void,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     size_m as i64,
                     size_m as i64,
                     n as i64,
-                    weights_ptr,
+                    weights_ffi_ptr,
                     stream,
                 ),
                 DType::BF16 => ffi::moe_fp8_scatter_rows_bf16(
-                    cuda_ptr(&rep_out_s, dtype)? as *const std::ffi::c_void,
+                    rep_out_ptr as *const std::ffi::c_void,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     size_m as i64,
                     size_m as i64,
                     n as i64,
-                    weights_ptr,
+                    weights_ffi_ptr,
                     stream,
                 ),
                 _ => unreachable!(),

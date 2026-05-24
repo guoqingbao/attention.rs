@@ -361,6 +361,119 @@ mod cuda {
         get_cutlass_workspace(dev, required_size)
     }
 
+    /// Thread-local pool for MoE NVFP4 hardware activation buffers.
+    ///
+    /// The Blackwell CUTLASS path allocates several large temporary tensors
+    /// (gathered, act_packed, act_scales, rep_out, output) that scale with
+    /// `size_m = num_tokens × topk`. By pooling these as grow-only raw
+    /// `CudaSlice` buffers, we avoid per-call `cudaMalloc`/`cudaFree` overhead
+    /// and reduce peak memory from allocation-deallocation hysteresis.
+    #[cfg(feature = "cutlass")]
+    pub struct MoeActivationPool {
+        pub gathered: CudaSlice<u8>,
+        pub gathered_bytes: usize,
+        pub act_packed: CudaSlice<u8>,
+        pub act_packed_bytes: usize,
+        pub act_scales: CudaSlice<u8>,
+        pub act_scales_bytes: usize,
+        pub rep_out: CudaSlice<u8>,
+        pub rep_out_bytes: usize,
+        pub metadata: CudaSlice<u8>,
+        pub metadata_bytes: usize,
+        pub device_ordinal: usize,
+    }
+
+    #[cfg(feature = "cutlass")]
+    thread_local! {
+        pub static MOE_ACTIVATION_POOL: std::cell::RefCell<Option<MoeActivationPool>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(feature = "cutlass")]
+    pub struct MoePoolBuffers {
+        pub gathered_ptr: u64,
+        pub act_packed_ptr: u64,
+        pub act_scales_ptr: u64,
+        pub rep_out_ptr: u64,
+        pub metadata_ptr: u64,
+    }
+
+    #[cfg(feature = "cutlass")]
+    pub fn get_moe_activation_pool(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        gathered_bytes: usize,
+        act_packed_bytes: usize,
+        act_scales_bytes: usize,
+        rep_out_bytes: usize,
+        _output_bytes: usize,
+        metadata_bytes: usize,
+    ) -> Result<MoePoolBuffers> {
+        MOE_ACTIVATION_POOL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+
+            let needs_realloc = match slot.as_ref() {
+                None => true,
+                Some(p) => {
+                    p.device_ordinal != ordinal
+                        || p.gathered_bytes < gathered_bytes
+                        || p.act_packed_bytes < act_packed_bytes
+                        || p.act_scales_bytes < act_scales_bytes
+                        || p.rep_out_bytes < rep_out_bytes
+                        || p.metadata_bytes < metadata_bytes
+                }
+            };
+
+            if needs_realloc {
+                let old = slot.take();
+                let (g_sz, ap_sz, as_sz, r_sz, m_sz) = if let Some(ref prev) = old {
+                    (
+                        gathered_bytes.max(prev.gathered_bytes),
+                        act_packed_bytes.max(prev.act_packed_bytes),
+                        act_scales_bytes.max(prev.act_scales_bytes),
+                        rep_out_bytes.max(prev.rep_out_bytes),
+                        metadata_bytes.max(prev.metadata_bytes),
+                    )
+                } else {
+                    (
+                        gathered_bytes,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        rep_out_bytes,
+                        metadata_bytes,
+                    )
+                };
+                drop(old);
+                let gathered = unsafe { dev.alloc::<u8>(g_sz.max(1)) }.w()?;
+                let act_packed = unsafe { dev.alloc::<u8>(ap_sz.max(1)) }.w()?;
+                let act_scales = unsafe { dev.alloc::<u8>(as_sz.max(1)) }.w()?;
+                let rep_out = unsafe { dev.alloc::<u8>(r_sz.max(1)) }.w()?;
+                let metadata = unsafe { dev.alloc::<u8>(m_sz.max(1)) }.w()?;
+                *slot = Some(MoeActivationPool {
+                    gathered,
+                    gathered_bytes: g_sz,
+                    act_packed,
+                    act_packed_bytes: ap_sz,
+                    act_scales,
+                    act_scales_bytes: as_sz,
+                    rep_out,
+                    rep_out_bytes: r_sz,
+                    metadata,
+                    metadata_bytes: m_sz,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let pool = slot.as_ref().unwrap();
+            Ok(MoePoolBuffers {
+                gathered_ptr: *pool.gathered.device_ptr(),
+                act_packed_ptr: *pool.act_packed.device_ptr(),
+                act_scales_ptr: *pool.act_scales.device_ptr(),
+                rep_out_ptr: *pool.rep_out.device_ptr(),
+                metadata_ptr: *pool.metadata.device_ptr(),
+            })
+        })
+    }
+
     /// Returns the FlashInfer FP8 blockscale workspace.
     ///
     /// This is a separate workspace used by the TRT-LLM blockscale FP8 GEMM runners,
