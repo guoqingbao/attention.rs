@@ -687,6 +687,7 @@ extern "C" {
         num_experts: i32,
         num_tokens: i32,
         topk: i32,
+        renormalize: i32,       // in: 1 to renormalize weights to sum=1.0, 0 to skip
         stream: i64,
     );
 
