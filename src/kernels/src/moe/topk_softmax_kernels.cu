@@ -588,6 +588,9 @@ __global__ void fusedSigmoidTopkKernel(
     for (int e = threadIdx.x; e < num_experts; e += TPB) {
         float logit = logits[row_offset + e];
         float sig = 1.0f / (1.0f + __expf(-logit));
+        if (isnan(sig) || isinf(sig)) {
+            sig = 0.0f;
+        }
         shared_sigmoid[e] = sig;
     }
     __syncthreads();
