@@ -565,6 +565,7 @@ __global__ void topkSelectKernel(
 // Replaces 4 separate kernels: sigmoid, bias_add, topk_select, gather.
 // Computes sigmoid(logits), adds bias for expert selection, finds top-k,
 // then returns original sigmoid weights (before bias) at selected indices.
+// If renormalize=1, weights are scaled to sum to 1.0.
 template <int TPB>
 __launch_bounds__(TPB)
 __global__ void fusedSigmoidTopkKernel(
@@ -573,18 +574,20 @@ __global__ void fusedSigmoidTopkKernel(
     float* __restrict__ topk_weights,
     uint32_t* __restrict__ topk_indices,
     const int num_experts,
-    const int k)
+    const int k,
+    const int renormalize)
 {
     using cub_kvp = cub::KeyValuePair<int, float>;
     using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
     __shared__ float shared_sigmoid[512];
+    __shared__ float shared_weight_sum;  // For renormalization
 
     cub::ArgMax arg_max;
     const int row = blockIdx.x;
     const int row_offset = row * num_experts;
 
-    // Phase 1: compute sigmoid scores and biased scores
+    // Phase 1: compute sigmoid scores
     for (int e = threadIdx.x; e < num_experts; e += TPB) {
         float logit = logits[row_offset + e];
         float sig = 1.0f / (1.0f + __expf(-logit));
@@ -624,6 +627,31 @@ __global__ void fusedSigmoidTopkKernel(
         }
         __syncthreads();
     }
+
+    // Phase 3: renormalize weights to sum to 1.0 if requested
+    if (renormalize) {
+        // Compute sum of top-k weights
+        float weight_sum = 0.0f;
+        for (int k_idx = 0; k_idx < k; ++k_idx) {
+            weight_sum += topk_weights[row * k + k_idx];
+        }
+
+        // Reduce across threads using CubAddOp (same pattern as line 87)
+        using BlockReduceSum = cub::BlockReduce<float, TPB>;
+        __shared__ typename BlockReduceSum::TempStorage sum_storage;
+        weight_sum = BlockReduceSum(sum_storage).Reduce(weight_sum, CubAddOp());
+
+        if (threadIdx.x == 0) {
+            shared_weight_sum = weight_sum > 0.0f ? weight_sum : 1.0f;
+        }
+        __syncthreads();
+
+        // Scale weights
+        float inv_sum = 1.0f / shared_weight_sum;
+        for (int k_idx = threadIdx.x; k_idx < k; k_idx += TPB) {
+            topk_weights[row * k + k_idx] *= inv_sum;
+        }
+    }
 }
 
 } // namespace moe
@@ -651,12 +679,13 @@ extern "C" void fused_sigmoid_topk(
     const int num_experts,
     const int num_tokens,
     const int topk,
+    const int renormalize,  // 1 to renormalize weights to sum=1.0, 0 to skip
     cudaStream_t stream)
 {
     constexpr int TPB = 256;
     int smem = num_experts * sizeof(float);
     vllm::moe::fusedSigmoidTopkKernel<TPB><<<num_tokens, TPB, 0, stream>>>(
-        logits, bias, topk_weights, topk_indices, num_experts, topk);
+        logits, bias, topk_weights, topk_indices, num_experts, topk, renormalize);
 }
 
 extern "C" void topk_softmax(
