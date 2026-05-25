@@ -314,6 +314,7 @@ __launch_bounds__(BLOCK_THREADS) __global__
         const T *__restrict__ input, const uint8_t *__restrict__ weights,
         const uint8_t *__restrict__ weight_scales, const T *__restrict__ biases,
         const uint32_t *__restrict__ indices, T *__restrict__ output,
+        const float *__restrict__ topk_weights,
         int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
         bool input_has_topk_dim,
         const int *__restrict__ g_token_lists,
@@ -453,6 +454,9 @@ __launch_bounds__(BLOCK_THREADS) __global__
             val += __bfloat162float(__ldg(&biases[(size_t)expert_id * N + gn]));
           }
         }
+        if (topk_weights != nullptr) {
+          val *= __ldg(&topk_weights[work_idx]);
+        }
         if constexpr (std::is_same_v<T, half>) {
           output[(size_t)work_idx * N + gn] = __float2half(val);
         } else {
@@ -525,6 +529,7 @@ static void launch_moe_wmma(
     KernelT kernel_fn,
     const T *input, const uint8_t *weights, const uint8_t *weight_scales,
     const T *biases, const uint32_t *indices, T *output,
+    const float *topk_weights,
     int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
     bool input_has_topk_dim, cudaStream_t stream) {
   using namespace mxfp4_wmma;
@@ -558,6 +563,7 @@ static void launch_moe_wmma(
 
     kernel_fn<<<grid, block, smem, stream>>>(
         input, weights, weight_scales, biases, indices, output,
+        topk_weights,
         num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim,
         g_token_lists, g_expert_counts, list_stride);
   }
@@ -569,11 +575,13 @@ static void launch_moe_wmma(
 extern "C" void mxfp4_moe_grouped_gemm_wmma_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
     const __half *biases, const uint32_t *indices, __half *output,
+    const float *topk_weights,
     int num_tokens, int topk, int num_experts, int N, int K, bool has_bias,
     bool input_has_topk_dim, cudaStream_t stream) {
   launch_moe_wmma<half>(
       mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<half>,
       input, weights, weight_scales, biases, indices, output,
+      topk_weights,
       num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 
@@ -581,17 +589,19 @@ extern "C" void mxfp4_moe_grouped_gemm_wmma_f16(
 extern "C" void mxfp4_moe_grouped_gemm_wmma_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const __nv_bfloat16 *biases,
-    const uint32_t *indices, __nv_bfloat16 *output, int num_tokens, int topk,
+    const uint32_t *indices, __nv_bfloat16 *output,
+    const float *topk_weights, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     cudaStream_t stream) {
   launch_moe_wmma<__nv_bfloat16>(
       mxfp4_wmma::mxfp4_moe_grouped_gemm_wmma_kernel<__nv_bfloat16>,
       input, weights, weight_scales, biases, indices, output,
+      topk_weights,
       num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 #else
 extern "C" void mxfp4_moe_grouped_gemm_wmma_bf16(
     const void *, const uint8_t *, const uint8_t *, const void *,
-    const uint32_t *, void *, int, int, int, int, int, bool, bool,
-    cudaStream_t) {}
+    const uint32_t *, void *, const float *, int, int, int, int, int, bool,
+    bool, cudaStream_t) {}
 #endif

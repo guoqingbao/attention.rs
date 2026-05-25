@@ -1654,6 +1654,553 @@ template <typename T, int HEAD_DIM, int BLOCK_SIZE, int NUM_THREADS>
     }
 }
 
+// ============================================================================
+// TurboQuant Turbo3: 3-bit K + 4-bit V
+// K_quant stride per head = HEAD_DIM * 3 / 8 bytes
+// 3-bit packing: 8 channels → 3 bytes (24 bits = 8×3-bit values)
+//   q = clamp(round(val / absmax * 3.0) + 3, 0, 6) → 3-bit unsigned [0,6]
+//   dequant: val = (q - 3) * absmax / 3.0
+// ============================================================================
+
+inline uint8_t tq3_quantize(float val, float inv_absmax) {
+    float scaled = val * inv_absmax * 3.0f;
+    int q = (int)(scaled + 3.5f);
+    return (uint8_t)clamp(q, 0, 6);
+}
+
+inline void tq3_pack_8(const thread uint8_t vals[8], thread uint8_t out[3]) {
+    uint bits = 0;
+    for (int i = 0; i < 8; i++) bits |= ((uint)vals[i]) << (i * 3);
+    out[0] = (uint8_t)(bits & 0xFF);
+    out[1] = (uint8_t)((bits >> 8) & 0xFF);
+    out[2] = (uint8_t)((bits >> 16) & 0xFF);
+}
+
+inline void tq3_unpack_8(const device uint8_t in[3], thread uint8_t vals[8]) {
+    uint bits = (uint)in[0] | ((uint)in[1] << 8) | ((uint)in[2] << 16);
+    for (int i = 0; i < 8; i++) vals[i] = (uint8_t)((bits >> (i * 3)) & 0x7);
+}
+
+// Turbo3 Store: K → sign_flip → WHT → 3-bit quant; V → 4-bit quant
+template <typename T, int HEAD_DIM>
+[[kernel]] void flash_tq3_store(
+    device const T* key [[buffer(0)]],
+    device const T* value [[buffer(1)]],
+    device float* k_absmax [[buffer(2)]],
+    device uint8_t* k_quant [[buffer(3)]],
+    device float* v_absmax [[buffer(4)]],
+    device uint8_t* v_quant [[buffer(5)]],
+    device const long* slot_mapping [[buffer(6)]],
+    const constant int& num_tokens [[buffer(7)]],
+    const constant int& num_kv_heads [[buffer(8)]],
+    const constant int& block_size [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane_id [[thread_index_in_simdgroup]]
+) {
+    const int token_idx = tgid.x;
+    const int head_idx = tgid.y;
+    if (token_idx >= num_tokens || head_idx >= num_kv_heads) return;
+
+    long slot = slot_mapping[token_idx];
+    if (slot < 0) return;
+
+    int block_idx = (int)(slot / block_size);
+    int block_off = (int)(slot % block_size);
+
+    constexpr int VEC = HEAD_DIM / 32;
+    constexpr int K_BYTES_PER_HEAD = HEAD_DIM * 3 / 8;
+    int base = token_idx * num_kv_heads * HEAD_DIM + head_idx * HEAD_DIM;
+    int vec_off = lane_id * VEC;
+
+    // --- K: sign_flip + WHT + 3-bit quant ---
+    float k_reg[VEC];
+    for (int i = 0; i < VEC; i++) {
+        int ch = vec_off + i;
+        k_reg[i] = float(key[base + ch]) * tq_sign_flip(head_idx, ch);
+    }
+    wht_transform<VEC, HEAD_DIM>(k_reg, lane_id);
+
+    float k_amax = 0.0f;
+    for (int i = 0; i < VEC; i++) k_amax = max(k_amax, abs(k_reg[i]));
+    k_amax = simd_max(k_amax);
+
+    long am_off = (long)block_idx * block_size * num_kv_heads
+        + (long)block_off * num_kv_heads + head_idx;
+    if (lane_id == 0) k_absmax[am_off] = k_amax;
+    k_amax = simd_broadcast(k_amax, 0);
+
+    float k_inv_amax = (k_amax > 0.0f) ? (1.0f / k_amax) : 0.0f;
+    long kq_off = (long)block_idx * block_size * num_kv_heads * K_BYTES_PER_HEAD
+        + (long)block_off * num_kv_heads * K_BYTES_PER_HEAD
+        + (long)head_idx * K_BYTES_PER_HEAD;
+
+    // 3-bit pack: 8 channels → 3 bytes. VEC channels per lane, total HEAD_DIM channels.
+    // Each lane quantizes its VEC values, then cooperates to pack groups of 8.
+    // For simplicity: each lane writes its own 3-byte groups when VEC >= 8.
+    // When VEC < 8 (HEAD_DIM < 256), lanes cooperate via simd_shuffle.
+    if constexpr (VEC >= 8) {
+        for (int g = 0; g < VEC; g += 8) {
+            uint8_t q3[8], packed[3];
+            for (int i = 0; i < 8; i++) q3[i] = tq3_quantize(k_reg[g + i], k_inv_amax);
+            tq3_pack_8(q3, packed);
+            int global_ch = vec_off + g;
+            int byte_base = (global_ch / 8) * 3;
+            k_quant[kq_off + byte_base + 0] = packed[0];
+            k_quant[kq_off + byte_base + 1] = packed[1];
+            k_quant[kq_off + byte_base + 2] = packed[2];
+        }
+    } else {
+        // VEC == 4 (HEAD_DIM == 128): each lane has 4 values, pairs of lanes form 8-groups
+        uint8_t q3_local[VEC];
+        for (int i = 0; i < VEC; i++) q3_local[i] = tq3_quantize(k_reg[i], k_inv_amax);
+
+        if ((lane_id & 1) == 0) {
+            uint8_t q3_8[8], packed[3];
+            for (int i = 0; i < VEC; i++) q3_8[i] = q3_local[i];
+            for (int i = 0; i < VEC; i++) {
+                q3_8[VEC + i] = (uint8_t)simd_shuffle(
+                    (ushort)q3_local[i], (ushort)(lane_id + 1));
+            }
+            tq3_pack_8(q3_8, packed);
+            int global_ch = vec_off;
+            int byte_base = (global_ch / 8) * 3;
+            k_quant[kq_off + byte_base + 0] = packed[0];
+            k_quant[kq_off + byte_base + 1] = packed[1];
+            k_quant[kq_off + byte_base + 2] = packed[2];
+        } else {
+            for (int i = 0; i < VEC; i++) {
+                simd_shuffle((ushort)q3_local[i], (ushort)(lane_id - 1));
+            }
+        }
+    }
+
+    // --- V: 4-bit quant (same as TQ4, no WHT) ---
+    float v_reg[VEC];
+    for (int i = 0; i < VEC; i++) {
+        v_reg[i] = float(value[base + vec_off + i]);
+    }
+
+    float v_amax = 0.0f;
+    for (int i = 0; i < VEC; i++) v_amax = max(v_amax, abs(v_reg[i]));
+    v_amax = simd_max(v_amax);
+
+    if (lane_id == 0) v_absmax[am_off] = v_amax;
+    v_amax = simd_broadcast(v_amax, 0);
+
+    float v_inv_amax = (v_amax > 0.0f) ? (1.0f / v_amax) : 0.0f;
+    long vq_off = (long)block_idx * block_size * num_kv_heads * (HEAD_DIM / 2)
+        + (long)block_off * num_kv_heads * (HEAD_DIM / 2)
+        + (long)head_idx * (HEAD_DIM / 2);
+
+    for (int i = 0; i < VEC; i += 2) {
+        uint8_t q0 = tq_quantize_4bit(v_reg[i], v_inv_amax);
+        uint8_t q1 = tq_quantize_4bit(v_reg[i+1], v_inv_amax);
+        int byte_idx = (vec_off + i) / 2;
+        v_quant[vq_off + byte_idx] = tq_pack_4bit(q0, q1);
+    }
+}
+
+// Turbo3 Decode: 3-bit K (WHT-rotated) + 4-bit V → attention output
+template <typename T, int HEAD_DIM, int BLOCK_SIZE, int NUM_THREADS>
+[[kernel]] void flash_tq3_decode(
+    device T* output [[buffer(0)]],
+    device const T* q [[buffer(1)]],
+    device const float* k_absmax [[buffer(2)]],
+    device const uint8_t* k_quant [[buffer(3)]],
+    device const float* v_absmax [[buffer(4)]],
+    device const uint8_t* v_quant [[buffer(5)]],
+    device const uint32_t* block_tables [[buffer(6)]],
+    device const int32_t* context_lens [[buffer(7)]],
+    const constant float& scale [[buffer(8)]],
+    const constant float& softcapping [[buffer(9)]],
+    const constant int& num_q_heads [[buffer(10)]],
+    const constant int& num_kv_heads [[buffer(11)]],
+    const constant int& block_size_param [[buffer(12)]],
+    const constant int& num_seqs [[buffer(13)]],
+    const constant int& head_dim_param [[buffer(14)]],
+    const constant int& max_blocks_per_seq [[buffer(15)]],
+    const constant int& q_stride [[buffer(16)]],
+    const constant int& sliding_window [[buffer(17)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    const int seq_idx = tgid.x;
+    const int head_idx = tgid.y;
+    const int thread_idx = lid;
+    if (seq_idx >= num_seqs) return;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+    const int kv_head_idx = head_idx / (num_q_heads / num_kv_heads);
+
+    constexpr int VEC = HEAD_DIM / 32;
+    constexpr int K_BYTES_PER_HEAD = HEAD_DIM * 3 / 8;
+
+    threadgroup float q_shared[HEAD_DIM];
+    if (simd_id == 0) {
+        device const T* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_DIM;
+        int vec_off = simd_lane * VEC;
+        float q_reg[VEC];
+        for (int i = 0; i < VEC; i++) {
+            int ch = vec_off + i;
+            q_reg[i] = float(q_ptr[ch]) * tq_sign_flip(kv_head_idx, ch);
+        }
+        wht_transform<VEC, HEAD_DIM>(q_reg, simd_lane);
+        for (int i = 0; i < VEC; i++) {
+            q_shared[vec_off + i] = q_reg[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const uint32_t* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+    float o_acc[HEAD_DIM];
+    for (int d = 0; d < HEAD_DIM; d++) o_acc[d] = 0.0f;
+
+    int start_pos = 0;
+    if (sliding_window > 0 && context_len > sliding_window) {
+        start_pos = context_len - sliding_window;
+    }
+
+    for (int pos = start_pos + (int)thread_idx; pos < context_len; pos += NUM_THREADS) {
+        int block_idx_local = pos / BLOCK_SIZE;
+        int block_offset = pos % BLOCK_SIZE;
+        int physical_block = (int)seq_block_table[block_idx_local];
+
+        // K: dequant 3-bit from k_quant with k_absmax
+        long kam_off = (long)physical_block * BLOCK_SIZE * num_kv_heads
+            + (long)block_offset * num_kv_heads + kv_head_idx;
+        float ka = k_absmax[kam_off];
+        float ks = ka / 3.0f;
+
+        long kq_off = (long)physical_block * BLOCK_SIZE * num_kv_heads * K_BYTES_PER_HEAD
+            + (long)block_offset * num_kv_heads * K_BYTES_PER_HEAD
+            + (long)kv_head_idx * K_BYTES_PER_HEAD;
+
+        float dot = 0.0f;
+        for (int d = 0; d < HEAD_DIM; d += 8) {
+            uint8_t q3[8];
+            tq3_unpack_8(k_quant + kq_off + (d / 8) * 3, q3);
+            for (int i = 0; i < 8; i++) {
+                float k_val = ((float)q3[i] - 3.0f) * ks;
+                dot += q_shared[d + i] * k_val;
+            }
+        }
+        dot *= scale;
+
+        if (softcapping > 0.0f) {
+            dot = softcapping * precise::tanh(dot / softcapping);
+        }
+
+        float m_new = max(m_local, dot);
+        float scale_old = exp(m_local - m_new);
+        float p = exp(dot - m_new);
+        for (int d = 0; d < HEAD_DIM; d++) o_acc[d] *= scale_old;
+        l_local = l_local * scale_old + p;
+        m_local = m_new;
+
+        // V: dequant 4-bit (same as TQ4)
+        float va = v_absmax[kam_off];
+        float vs_v = va / 7.5f;
+
+        long vq_off = (long)physical_block * BLOCK_SIZE * num_kv_heads * (HEAD_DIM / 2)
+            + (long)block_offset * num_kv_heads * (HEAD_DIM / 2)
+            + (long)kv_head_idx * (HEAD_DIM / 2);
+
+        for (int d = 0; d < HEAD_DIM; d += 2) {
+            uint8_t packed = v_quant[vq_off + d / 2];
+            float v0 = ((float)(packed & 0xF) - 7.5f) * vs_v;
+            float v1 = ((float)((packed >> 4) & 0xF) - 7.5f) * vs_v;
+            o_acc[d]   += p * v0;
+            o_acc[d+1] += p * v1;
+        }
+    }
+
+    // Cross-thread reduction (same as TQ4 decode)
+    const int NUM_SIMD_GROUPS = NUM_THREADS / 32;
+    threadgroup float smem[HEAD_DIM + NUM_THREADS * 2 + NUM_SIMD_GROUPS * HEAD_DIM];
+    threadgroup float* s_m = smem;
+    threadgroup float* s_l = s_m + NUM_THREADS;
+    threadgroup float* s_reduce = s_l + NUM_THREADS;
+
+    s_m[thread_idx] = m_local;
+    s_l[thread_idx] = l_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int stride = NUM_THREADS / 2; stride > 0; stride >>= 1) {
+        if (thread_idx < (uint)stride) {
+            s_m[thread_idx] = max(s_m[thread_idx], s_m[thread_idx + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float global_max = s_m[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float my_rescale = exp(m_local - global_max);
+    l_local *= my_rescale;
+    for (int d = 0; d < HEAD_DIM; d++) o_acc[d] *= my_rescale;
+
+    s_l[thread_idx] = l_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int stride = NUM_THREADS / 2; stride > 0; stride >>= 1) {
+        if (thread_idx < (uint)stride) s_l[thread_idx] += s_l[thread_idx + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float global_l = s_l[0];
+    float inv_l = 1.0f / max(global_l, 1e-10f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = 0; d < HEAD_DIM; d++) o_acc[d] = simd_sum(o_acc[d]);
+
+    if (simd_lane == 0) {
+        for (int d = 0; d < HEAD_DIM; d++) s_reduce[simd_id * HEAD_DIM + d] = o_acc[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (thread_idx < (uint)HEAD_DIM) {
+        int d = thread_idx;
+        float sum = 0.0f;
+        for (int sg = 0; sg < NUM_SIMD_GROUPS; sg++) sum += s_reduce[sg * HEAD_DIM + d];
+        int out_off = seq_idx * q_stride + head_idx * HEAD_DIM + d;
+        output[out_off] = T(sum * inv_l);
+    }
+}
+
+// Turbo3 Prefill: 3-bit K + 4-bit V flash attention
+template <typename T, int HEAD_DIM, int BLOCK_SIZE, int BR, int BC>
+[[kernel]] void flash_tq3_prefill(
+    device T* output [[buffer(0)]],
+    device const T* q [[buffer(1)]],
+    device const float* k_absmax [[buffer(2)]],
+    device const uint8_t* k_quant [[buffer(3)]],
+    device const float* v_absmax [[buffer(4)]],
+    device const uint8_t* v_quant [[buffer(5)]],
+    const constant int& num_kv_heads [[buffer(6)]],
+    const constant float& scale [[buffer(7)]],
+    device const uint32_t* block_tables [[buffer(8)]],
+    device const uint32_t* seq_lens [[buffer(9)]],
+    const constant int& block_table_stride [[buffer(10)]],
+    const constant int& num_seqs [[buffer(11)]],
+    const constant int& num_q_heads [[buffer(12)]],
+    const constant int& num_q_tokens [[buffer(13)]],
+    const constant float& softcapping [[buffer(14)]],
+    const constant int& o_stride [[buffer(15)]],
+    device const uint32_t* query_start_len [[buffer(16)]],
+    const constant int& sliding_window [[buffer(17)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    const int q_head_within_kv = tgid.x;
+    const int kv_head_idx = tgid.y;
+    const int token_chunk_idx = tgid.z;
+
+    const int num_queries_per_kv = num_q_heads / num_kv_heads;
+    const int q_head_idx = kv_head_idx * num_queries_per_kv + q_head_within_kv;
+
+    const int thread_idx = tid.x;
+
+    const int token_start = token_chunk_idx * BR;
+    const int my_token_idx = token_start + thread_idx;
+
+    if (my_token_idx >= num_q_tokens) return;
+
+    int seq_idx = 0;
+    int query_start = 0;
+    for (int s = 0; s < num_seqs; s++) {
+        int next_start = query_start_len[s + 1];
+        if (my_token_idx < (int)next_start) {
+            seq_idx = s;
+            break;
+        }
+        query_start = next_start;
+    }
+
+    const int local_q_idx = my_token_idx - query_start;
+    const int context_len = seq_lens[seq_idx];
+    const int q_len = query_start_len[seq_idx + 1] - query_start_len[seq_idx];
+    const int kv_start = context_len - q_len;
+    const int total_kv_len = context_len;
+
+    // Load Q with sign_flip + WHT (single-thread butterfly)
+    float q_reg[HEAD_DIM];
+    device const T* q_ptr = q + (my_token_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    for (int d = 0; d < HEAD_DIM; d++) {
+        q_reg[d] = float(q_ptr[d]) * tq_sign_flip(kv_head_idx, d);
+    }
+    for (int step = 1; step < HEAD_DIM; step <<= 1) {
+        for (int i = 0; i < HEAD_DIM; i += step * 2) {
+            for (int j = i; j < i + step; j++) {
+                float a = q_reg[j];
+                float b = q_reg[j + step];
+                q_reg[j] = a + b;
+                q_reg[j + step] = a - b;
+            }
+        }
+    }
+    float norm = rsqrt((float)HEAD_DIM);
+    for (int d = 0; d < HEAD_DIM; d++) q_reg[d] *= norm;
+
+    constexpr int K_BYTES_PER_HEAD = HEAD_DIM * 3 / 8;
+
+    float o_acc[HEAD_DIM];
+    for (int d = 0; d < HEAD_DIM; d++) o_acc[d] = 0.0f;
+    float m_prev = -INFINITY;
+    float l_prev = 0.0f;
+
+    device const uint32_t* seq_block_table = block_tables + seq_idx * block_table_stride;
+
+    const int causal_end = kv_start + local_q_idx + 1;
+    int kv_end = min(total_kv_len, causal_end);
+
+    for (int kv_pos = 0; kv_pos < kv_end; kv_pos += BC) {
+        int tile_end = min(kv_pos + BC, kv_end);
+        int tile_len = tile_end - kv_pos;
+
+        float m_cur = -INFINITY;
+        float l_cur = 0.0f;
+        float p_vals[BC];
+
+        for (int t = 0; t < tile_len; t++) {
+            int kv_idx = kv_pos + t;
+            int block_idx = kv_idx / BLOCK_SIZE;
+            int block_offset = kv_idx % BLOCK_SIZE;
+            uint32_t physical_block = seq_block_table[block_idx];
+
+            long kam_off = (long)physical_block * BLOCK_SIZE * num_kv_heads
+                + (long)block_offset * num_kv_heads + kv_head_idx;
+            float ka = k_absmax[kam_off];
+            float ks = ka / 3.0f;
+
+            long kq_off = (long)physical_block * BLOCK_SIZE * num_kv_heads * K_BYTES_PER_HEAD
+                + (long)block_offset * num_kv_heads * K_BYTES_PER_HEAD
+                + (long)kv_head_idx * K_BYTES_PER_HEAD;
+
+            float dot = 0.0f;
+            for (int d = 0; d < HEAD_DIM; d += 8) {
+                uint8_t q3[8];
+                tq3_unpack_8(k_quant + kq_off + (d / 8) * 3, q3);
+                for (int i = 0; i < 8; i++) {
+                    float k_val = ((float)q3[i] - 3.0f) * ks;
+                    dot += q_reg[d + i] * k_val;
+                }
+            }
+            dot *= scale;
+
+            if (softcapping > 0.0f) {
+                dot = softcapping * precise::tanh(dot / softcapping);
+            }
+            if (kv_idx > kv_start + local_q_idx) {
+                dot = -INFINITY;
+            }
+
+            p_vals[t] = dot;
+            m_cur = max(m_cur, dot);
+        }
+
+        float m_new = max(m_prev, m_cur);
+        float scale_prev = exp(m_prev - m_new);
+
+        l_cur = 0.0f;
+        for (int t = 0; t < tile_len; t++) {
+            p_vals[t] = exp(p_vals[t] - m_new);
+            l_cur += p_vals[t];
+        }
+
+        float l_new = l_prev * scale_prev + l_cur;
+
+        for (int d = 0; d < HEAD_DIM; d++) {
+            o_acc[d] *= (l_prev * scale_prev) / max(l_new, 1e-10f);
+        }
+
+        for (int t = 0; t < tile_len; t++) {
+            int kv_idx = kv_pos + t;
+            int block_idx = kv_idx / BLOCK_SIZE;
+            int block_offset = kv_idx % BLOCK_SIZE;
+            uint32_t physical_block = seq_block_table[block_idx];
+
+            long vam_off = (long)physical_block * BLOCK_SIZE * num_kv_heads
+                + (long)block_offset * num_kv_heads + kv_head_idx;
+            float va = v_absmax[vam_off];
+            float vs = va / 7.5f;
+
+            long vq_off = (long)physical_block * BLOCK_SIZE * num_kv_heads * (HEAD_DIM / 2)
+                + (long)block_offset * num_kv_heads * (HEAD_DIM / 2)
+                + (long)kv_head_idx * (HEAD_DIM / 2);
+
+            float weight = p_vals[t] / max(l_new, 1e-10f);
+            for (int d = 0; d < HEAD_DIM; d += 2) {
+                uint8_t packed = v_quant[vq_off + d / 2];
+                float v0 = ((float)(packed & 0xF) - 7.5f) * vs;
+                float v1 = ((float)((packed >> 4) & 0xF) - 7.5f) * vs;
+                o_acc[d]   += weight * v0;
+                o_acc[d+1] += weight * v1;
+            }
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    device T* o_ptr = output + (my_token_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    for (int d = 0; d < HEAD_DIM; d++) {
+        o_ptr[d] = T(o_acc[d]);
+    }
+}
+
+// Turbo3 instantiations
+#define INSTANTIATE_TQ3_STORE(T, HD, NAME) \
+    template [[host_name("flash_tq3_store_" NAME)]] \
+    [[kernel]] void flash_tq3_store<T, HD>( \
+        device const T*, device const T*, device float*, device uint8_t*, \
+        device float*, device uint8_t*, device const long*, \
+        const constant int&, const constant int&, const constant int&, \
+        uint3, uint);
+
+#define INSTANTIATE_TQ3_DECODE(T, HD, BS, NT, NAME) \
+    template [[host_name("flash_tq3_decode_" NAME)]] \
+    [[kernel]] void flash_tq3_decode<T, HD, BS, NT>( \
+        device T*, device const T*, device const float*, device const uint8_t*, \
+        device const float*, device const uint8_t*, \
+        device const uint32_t*, device const int32_t*, \
+        const constant float&, const constant float&, \
+        const constant int&, const constant int&, const constant int&, \
+        const constant int&, const constant int&, const constant int&, \
+        const constant int&, const constant int&, \
+        uint3, uint, uint, uint);
+
+#define INSTANTIATE_TQ3_PREFILL(T, HD, BS, BR, BC, NAME) \
+    template [[host_name("flash_tq3_prefill_" NAME)]] \
+    [[kernel]] void flash_tq3_prefill<T, HD, BS, BR, BC>( \
+        device T*, device const T*, device const float*, device const uint8_t*, \
+        device const float*, device const uint8_t*, \
+        const constant int&, const constant float&, \
+        device const uint32_t*, device const uint32_t*, \
+        const constant int&, const constant int&, const constant int&, \
+        const constant int&, const constant float&, const constant int&, \
+        device const uint32_t*, const constant int&, \
+        uint3, uint3, uint, uint);
+
+INSTANTIATE_TQ3_STORE(bfloat16_t, 128, "bf16_hd128")
+INSTANTIATE_TQ3_STORE(half, 128, "f16_hd128")
+INSTANTIATE_TQ3_STORE(bfloat16_t, 256, "bf16_hd256")
+INSTANTIATE_TQ3_STORE(half, 256, "f16_hd256")
+
+INSTANTIATE_TQ3_DECODE(bfloat16_t, 128, 32, 256, "bf16_hd128_bs32")
+INSTANTIATE_TQ3_DECODE(half, 128, 32, 256, "f16_hd128_bs32")
+INSTANTIATE_TQ3_DECODE(bfloat16_t, 256, 32, 256, "bf16_hd256_bs32")
+INSTANTIATE_TQ3_DECODE(half, 256, 32, 256, "f16_hd256_bs32")
+
+INSTANTIATE_TQ3_PREFILL(bfloat16_t, 128, 32, 8, 32, "bf16_hd128_bs32")
+INSTANTIATE_TQ3_PREFILL(half, 128, 32, 8, 32, "f16_hd128_bs32")
+INSTANTIATE_TQ3_PREFILL(bfloat16_t, 256, 32, 8, 32, "bf16_hd256_bs32")
+INSTANTIATE_TQ3_PREFILL(half, 256, 32, 8, 32, "f16_hd256_bs32")
+
 // Turbo4 instantiations
 #define INSTANTIATE_TQ4_STORE(T, HD, NAME) \
     template [[host_name("flash_tq4_store_" NAME)]] \

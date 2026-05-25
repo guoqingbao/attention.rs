@@ -883,3 +883,309 @@ pub fn flash_tq4_prefill_metal(
 
     Ok(output)
 }
+
+// ---------------------------------------------------------------------------
+// TurboQuant Turbo3: 3-bit K + 4-bit V
+// ---------------------------------------------------------------------------
+
+pub fn flash_tq3_store_metal(
+    key: &Tensor,
+    value: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    let device = get_metal_device(key)?;
+    let (num_tokens, num_kv_heads, head_dim) = key.dims3()?;
+    let block_size = k_absmax.dim(1)?;
+    let ty = metal_dtype(key.dtype());
+
+    let (k_s, k_l) = key.storage_and_layout();
+    let k_s = match &*k_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (v_s, v_l) = value.storage_and_layout();
+    let v_s = match &*v_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (ka_s, _) = k_absmax.storage_and_layout();
+    let ka_s = match &*ka_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (kq_s, _) = k_quant.storage_and_layout();
+    let kq_s = match &*kq_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (va_s, _) = v_absmax.storage_and_layout();
+    let va_s = match &*va_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (vq_s, _) = v_quant.storage_and_layout();
+    let vq_s = match &*vq_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (sm_s, sm_l) = slot_mapping.storage_and_layout();
+    let sm_s = match &*sm_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+
+    let command_buffer = device.command_buffer()?;
+    command_buffer.set_label("tq3-store");
+
+    metal_kernels::flash_tq3_store(
+        device.device(),
+        &command_buffer,
+        metal_kernels::Kernels::default(),
+        ty,
+        k_s.buffer(),
+        k_l.start_offset() * key.dtype().size_in_bytes(),
+        v_s.buffer(),
+        v_l.start_offset() * value.dtype().size_in_bytes(),
+        ka_s.buffer(),
+        kq_s.buffer(),
+        va_s.buffer(),
+        vq_s.buffer(),
+        sm_s.buffer(),
+        sm_l.start_offset() * slot_mapping.dtype().size_in_bytes(),
+        num_tokens as i32,
+        num_kv_heads as i32,
+        head_dim as i32,
+        block_size as i32,
+    )
+    .map_err(|e| candle::Error::Msg(format!("flash_tq3_store: {e}")))?;
+
+    Ok(())
+}
+
+pub fn flash_tq3_decode_metal(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    output: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: Option<usize>,
+) -> Result<Tensor> {
+    let device = get_metal_device(query)?;
+    let num_seqs = query.dim(0)? as i32;
+    let block_size = k_absmax.dim(1)? as i32;
+    let ty = metal_dtype(query.dtype());
+
+    let (q_s, q_l) = query.storage_and_layout();
+    let q_s = match &*q_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (ka_s, _) = k_absmax.storage_and_layout();
+    let ka_s = match &*ka_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (kq_s, _) = k_quant.storage_and_layout();
+    let kq_s = match &*kq_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (va_s, _) = v_absmax.storage_and_layout();
+    let va_s = match &*va_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (vq_s, _) = v_quant.storage_and_layout();
+    let vq_s = match &*vq_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (bt_s, bt_l) = block_tables.storage_and_layout();
+    let bt_s = match &*bt_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (cl_s, cl_l) = context_lens.storage_and_layout();
+    let cl_s = match &*cl_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+    let (o_s, _) = output.storage_and_layout();
+    let o_s = match &*o_s {
+        candle::Storage::Metal(s) => s.clone(),
+        _ => candle::bail!("Metal"),
+    };
+
+    let max_blocks_per_seq = block_tables.dim(1)? as i32;
+    let q_stride = (num_q_heads * head_dim) as i32;
+    let sw = sliding_window.unwrap_or(0) as i32;
+
+    let command_buffer = device.command_buffer()?;
+    command_buffer.set_label("tq3-decode");
+
+    metal_kernels::flash_tq3_decode(
+        device.device(),
+        &command_buffer,
+        metal_kernels::Kernels::default(),
+        ty,
+        o_s.buffer(),
+        q_s.buffer(),
+        q_l.start_offset() * query.dtype().size_in_bytes(),
+        ka_s.buffer(),
+        kq_s.buffer(),
+        va_s.buffer(),
+        vq_s.buffer(),
+        bt_s.buffer(),
+        bt_l.start_offset() * block_tables.dtype().size_in_bytes(),
+        cl_s.buffer(),
+        cl_l.start_offset() * context_lens.dtype().size_in_bytes(),
+        scale,
+        softcap,
+        num_q_heads as i32,
+        num_kv_heads as i32,
+        block_size,
+        num_seqs,
+        head_dim as i32,
+        max_blocks_per_seq,
+        q_stride,
+        sw,
+    )
+    .map_err(|e| candle::Error::Msg(format!("flash_tq3_decode: {e}")))?;
+
+    Ok(output.clone())
+}
+
+pub fn flash_tq3_prefill_metal(
+    query: &Tensor,
+    k_absmax: &Tensor,
+    k_quant: &Tensor,
+    v_absmax: &Tensor,
+    v_quant: &Tensor,
+    block_table: &Tensor,
+    context_lens: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: Option<usize>,
+    cu_seqlens_q: Option<&Tensor>,
+    _max_seqlen_q: usize,
+) -> Result<Tensor> {
+    let device = get_metal_device(query)?;
+    let q_len = query.dim(0)?;
+    let block_size = k_absmax.dim(1)? as i32;
+    let ty = metal_dtype(query.dtype());
+
+    let output = Tensor::zeros_like(query)?;
+
+    let num_seqs: i32;
+    let query_start_len: Tensor;
+    if let Some(cu) = cu_seqlens_q {
+        num_seqs = (cu.dim(0)? - 1) as i32;
+        query_start_len = cu.clone();
+    } else {
+        num_seqs = 1;
+        query_start_len = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
+    }
+
+    let block_table_stride = block_table.dim(1)? as i32;
+    let sw = sliding_window.unwrap_or(0) as i32;
+
+    {
+        let (q_s, q_l) = query.storage_and_layout();
+        let q_s = match &*q_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (ka_s, _) = k_absmax.storage_and_layout();
+        let ka_s = match &*ka_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (kq_s, _) = k_quant.storage_and_layout();
+        let kq_s = match &*kq_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (va_s, _) = v_absmax.storage_and_layout();
+        let va_s = match &*va_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (vq_s, _) = v_quant.storage_and_layout();
+        let vq_s = match &*vq_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (bt_s, bt_l) = block_table.storage_and_layout();
+        let bt_s = match &*bt_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (cl_s, cl_l) = context_lens.storage_and_layout();
+        let cl_s = match &*cl_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (o_s, _o_l) = output.storage_and_layout();
+        let o_s = match &*o_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+        let (qsl_s, qsl_l) = query_start_len.storage_and_layout();
+        let qsl_s = match &*qsl_s {
+            candle::Storage::Metal(s) => s.clone(),
+            _ => candle::bail!("Metal"),
+        };
+
+        let command_buffer = device.command_buffer()?;
+        command_buffer.set_label("tq3-prefill");
+
+        metal_kernels::flash_tq3_prefill(
+            device.device(),
+            &command_buffer,
+            metal_kernels::Kernels::default(),
+            ty,
+            o_s.buffer(),
+            q_s.buffer(),
+            q_l.start_offset() * query.dtype().size_in_bytes(),
+            ka_s.buffer(),
+            kq_s.buffer(),
+            va_s.buffer(),
+            vq_s.buffer(),
+            bt_s.buffer(),
+            bt_l.start_offset() * block_table.dtype().size_in_bytes(),
+            cl_s.buffer(),
+            cl_l.start_offset() * context_lens.dtype().size_in_bytes(),
+            qsl_s.buffer(),
+            qsl_l.start_offset() * query_start_len.dtype().size_in_bytes(),
+            num_kv_heads as i32,
+            scale,
+            block_table_stride,
+            num_seqs,
+            num_q_heads as i32,
+            q_len as i32,
+            head_dim as i32,
+            block_size,
+            softcap,
+            (num_q_heads * head_dim) as i32,
+            sw,
+        )
+        .map_err(|e| candle::Error::Msg(format!("flash_tq3_prefill: {e}")))?;
+    }
+
+    Ok(output)
+}

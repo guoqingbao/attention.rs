@@ -1407,6 +1407,7 @@ pub fn call_nvfp4_moe_gemm(
     scales: (&Buffer, usize),
     global_scales: (&Buffer, usize),
     indices: (&Buffer, usize),
+    topk_weights: Option<(&Buffer, usize)>,
     out: &Buffer,
     num_tokens: usize,
     topk: usize,
@@ -1429,37 +1430,41 @@ pub fn call_nvfp4_moe_gemm(
         }
     };
 
+    let has_topk_weights: i32 = if topk_weights.is_some() { 1 } else { 0 };
+
     let pipeline = kernels.load_pipeline(device, name.to_string())?;
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    if reuse_topk {
-        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
-        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
-        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
-        encoder.set_buffer(3, Some(global_scales.0), global_scales.1 as NSUInteger);
-        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
-        encoder.set_buffer(5, Some(out), 0 as NSUInteger);
-        utils::set_param(encoder, 6, num_tokens as i32);
-        utils::set_param(encoder, 7, topk as i32);
-        utils::set_param(encoder, 8, num_experts as i32);
-        utils::set_param(encoder, 9, n as i32);
-        utils::set_param(encoder, 10, k as i32);
+    encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
+    encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
+    encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
+    encoder.set_buffer(3, Some(global_scales.0), global_scales.1 as NSUInteger);
+    encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
+    if let Some((tw_buf, tw_off)) = topk_weights {
+        encoder.set_buffer(5, Some(tw_buf), tw_off as NSUInteger);
     } else {
-        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
-        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
-        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
-        encoder.set_buffer(3, Some(global_scales.0), global_scales.1 as NSUInteger);
-        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
         encoder.set_buffer(5, Some(out), 0 as NSUInteger);
-        utils::set_param(encoder, 6, num_tokens as i32);
-        utils::set_param(encoder, 7, topk as i32);
-        utils::set_param(encoder, 8, num_experts as i32);
-        utils::set_param(encoder, 9, n as i32);
-        utils::set_param(encoder, 10, k as i32);
-        utils::set_param(encoder, 11, input_has_topk_dim as i32);
+    }
+    encoder.set_buffer(6, Some(out), 0 as NSUInteger);
+
+    if reuse_topk {
+        utils::set_param(encoder, 7, num_tokens as i32);
+        utils::set_param(encoder, 8, topk as i32);
+        utils::set_param(encoder, 9, num_experts as i32);
+        utils::set_param(encoder, 10, n as i32);
+        utils::set_param(encoder, 11, k as i32);
+        utils::set_param(encoder, 12, has_topk_weights);
+    } else {
+        utils::set_param(encoder, 7, num_tokens as i32);
+        utils::set_param(encoder, 8, topk as i32);
+        utils::set_param(encoder, 9, num_experts as i32);
+        utils::set_param(encoder, 10, n as i32);
+        utils::set_param(encoder, 11, k as i32);
+        utils::set_param(encoder, 12, input_has_topk_dim as i32);
+        utils::set_param(encoder, 13, has_topk_weights);
     }
 
     let group_dims = MTLSize {
@@ -1762,6 +1767,7 @@ pub fn call_mxfp4_moe_gemm(
     scales: (&Buffer, usize),
     biases: (&Buffer, usize),
     indices: (&Buffer, usize),
+    topk_weights: Option<(&Buffer, usize)>,
     out: &Buffer,
     num_tokens: usize,
     topk: usize,
@@ -1785,39 +1791,43 @@ pub fn call_mxfp4_moe_gemm(
         }
     };
 
+    let has_topk_w: i32 = if topk_weights.is_some() { 1 } else { 0 };
+
     let pipeline = kernels.load_pipeline(device, name.to_string())?;
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    if reuse_topk {
-        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
-        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
-        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
-        encoder.set_buffer(3, Some(biases.0), biases.1 as NSUInteger);
-        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
-        encoder.set_buffer(5, Some(out), 0 as NSUInteger);
-        utils::set_param(encoder, 6, num_tokens as i32);
-        utils::set_param(encoder, 7, topk as i32);
-        utils::set_param(encoder, 8, num_experts as i32);
-        utils::set_param(encoder, 9, n as i32);
-        utils::set_param(encoder, 10, k as i32);
-        utils::set_param(encoder, 11, has_bias as i32);
+    encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
+    encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
+    encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
+    encoder.set_buffer(3, Some(biases.0), biases.1 as NSUInteger);
+    encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
+    if let Some((tw_buf, tw_off)) = topk_weights {
+        encoder.set_buffer(5, Some(tw_buf), tw_off as NSUInteger);
     } else {
-        encoder.set_buffer(0, Some(x.0), x.1 as NSUInteger);
-        encoder.set_buffer(1, Some(w.0), w.1 as NSUInteger);
-        encoder.set_buffer(2, Some(scales.0), scales.1 as NSUInteger);
-        encoder.set_buffer(3, Some(biases.0), biases.1 as NSUInteger);
-        encoder.set_buffer(4, Some(indices.0), indices.1 as NSUInteger);
         encoder.set_buffer(5, Some(out), 0 as NSUInteger);
-        utils::set_param(encoder, 6, num_tokens as i32);
-        utils::set_param(encoder, 7, topk as i32);
-        utils::set_param(encoder, 8, num_experts as i32);
-        utils::set_param(encoder, 9, n as i32);
-        utils::set_param(encoder, 10, k as i32);
-        utils::set_param(encoder, 11, has_bias as i32);
-        utils::set_param(encoder, 12, input_has_topk_dim as i32);
+    }
+    encoder.set_buffer(6, Some(out), 0 as NSUInteger);
+
+    if reuse_topk {
+        utils::set_param(encoder, 7, num_tokens as i32);
+        utils::set_param(encoder, 8, topk as i32);
+        utils::set_param(encoder, 9, num_experts as i32);
+        utils::set_param(encoder, 10, n as i32);
+        utils::set_param(encoder, 11, k as i32);
+        utils::set_param(encoder, 12, has_bias as i32);
+        utils::set_param(encoder, 13, has_topk_w);
+    } else {
+        utils::set_param(encoder, 7, num_tokens as i32);
+        utils::set_param(encoder, 8, topk as i32);
+        utils::set_param(encoder, 9, num_experts as i32);
+        utils::set_param(encoder, 10, n as i32);
+        utils::set_param(encoder, 11, k as i32);
+        utils::set_param(encoder, 12, has_bias as i32);
+        utils::set_param(encoder, 13, input_has_topk_dim as i32);
+        utils::set_param(encoder, 14, has_topk_w);
     }
 
     let group_dims = MTLSize {
@@ -2823,6 +2833,315 @@ pub fn flash_tq4_prefill(
     };
     let name = format!(
         "flash_tq4_prefill_{}_hd{}_bs{}",
+        type_prefix, head_size, block_size
+    );
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_bytes(
+        6,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(7, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_buffer(8, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(9, Some(seq_lens), seq_lens_offset as NSUInteger);
+    encoder.set_bytes(
+        10,
+        size_of_val(&block_table_stride),
+        &block_table_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&num_query_heads),
+        &num_query_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&num_query_tokens),
+        &num_query_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&o_stride_tokens),
+        &o_stride_tokens as *const _ as *const c_void,
+    );
+    encoder.set_buffer(
+        16,
+        Some(query_start_len),
+        query_start_len_offset as NSUInteger,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+
+    let num_groups_per_kv = num_query_heads / num_kv_heads;
+    let thread_groups_count = MTLSize {
+        width: num_groups_per_kv as u64,
+        height: num_kv_heads as u64,
+        depth: (num_query_tokens as u64 + BR - 1) / BR,
+    };
+    let thread_group_size = MTLSize {
+        width: BR,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TurboQuant Turbo3: 3-bit K + 4-bit V (Metal kernels)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq3_store(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    key: &Buffer,
+    key_offset: usize,
+    value: &Buffer,
+    value_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    slot_mapping: &Buffer,
+    slot_mapping_offset: usize,
+    num_tokens: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq3_store_{}_{}", type_prefix, hd_str);
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(key), key_offset as NSUInteger);
+    encoder.set_buffer(1, Some(value), value_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_buffer(6, Some(slot_mapping), slot_mapping_offset as NSUInteger);
+    encoder.set_bytes(
+        7,
+        size_of_val(&num_tokens),
+        &num_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        8,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        9,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_tokens as u64,
+        height: num_kv_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq3_decode(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    context_lens: &Buffer,
+    context_lens_offset: usize,
+    scale: f32,
+    softcap: f32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    block_size: i32,
+    num_seqs: i32,
+    head_dim: i32,
+    max_blocks_per_seq: i32,
+    q_stride: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let hd_str = match head_dim {
+        256 => "hd256",
+        _ => "hd128",
+    };
+    let name = format!("flash_tq3_decode_{}_{}_{}", type_prefix, hd_str, "bs32");
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(output), 0);
+    encoder.set_buffer(1, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(2, Some(k_absmax), 0);
+    encoder.set_buffer(3, Some(k_quant), 0);
+    encoder.set_buffer(4, Some(v_absmax), 0);
+    encoder.set_buffer(5, Some(v_quant), 0);
+    encoder.set_buffer(6, Some(block_tables), block_tables_offset as NSUInteger);
+    encoder.set_buffer(7, Some(context_lens), context_lens_offset as NSUInteger);
+    encoder.set_bytes(8, size_of_val(&scale), &scale as *const _ as *const c_void);
+    encoder.set_bytes(
+        9,
+        size_of_val(&softcap),
+        &softcap as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&num_q_heads),
+        &num_q_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        11,
+        size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        12,
+        size_of_val(&block_size),
+        &block_size as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        13,
+        size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        14,
+        size_of_val(&head_dim),
+        &head_dim as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        15,
+        size_of_val(&max_blocks_per_seq),
+        &max_blocks_per_seq as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        16,
+        size_of_val(&q_stride),
+        &q_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        17,
+        size_of_val(&sliding_window),
+        &sliding_window as *const _ as *const c_void,
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_seqs as u64,
+        height: num_q_heads as u64,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn flash_tq3_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: PagedAttentionDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k_absmax: &Buffer,
+    k_quant: &Buffer,
+    v_absmax: &Buffer,
+    v_quant: &Buffer,
+    block_tables: &Buffer,
+    block_tables_offset: usize,
+    seq_lens: &Buffer,
+    seq_lens_offset: usize,
+    query_start_len: &Buffer,
+    query_start_len_offset: usize,
+    num_kv_heads: i32,
+    scale: f32,
+    block_table_stride: i32,
+    num_seqs: i32,
+    num_query_heads: i32,
+    num_query_tokens: i32,
+    head_size: i32,
+    block_size: i32,
+    softcapping: f32,
+    o_stride_tokens: i32,
+    sliding_window: i32,
+) -> Result<(), MetalKernelError> {
+    const BR: u64 = 8;
+
+    let type_prefix = match ty {
+        PagedAttentionDType::BF16 => "bf16",
+        PagedAttentionDType::F16 => "f16",
+        PagedAttentionDType::F32 => "bf16",
+    };
+    let name = format!(
+        "flash_tq3_prefill_{}_hd{}_bs{}",
         type_prefix, head_size, block_size
     );
 

@@ -1189,6 +1189,8 @@ pub fn moe_gemm_nvfp4(
     indices: &Tensor,
     pre_sorted: Option<(&Tensor, &Tensor)>,
     is_prefill: bool,
+    topk_weights: Option<&Tensor>,
+    weight_scales_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1324,17 +1326,19 @@ pub fn moe_gemm_nvfp4(
                     input.clone()
                 };
 
+                let topk_w_opt = topk_weights.cloned();
                 let output = moe_gemm_nvfp4_hardware(
                     &routed_input,
                     &weights,
                     &weight_scales,
                     &weight_global_scales,
                     input_scales,
-                    &None,
+                    &topk_w_opt,
                     &sorted_token_ids,
                     &sorted_expert_ids,
                     topk,
                     is_prefill,
+                    weight_scales_swizzled,
                 )?;
                 return output.reshape((num_tokens, topk, n));
             }
@@ -1379,6 +1383,13 @@ pub fn moe_gemm_nvfp4(
             let (eoffs_s, _) = expert_offsets_t.storage_and_layout();
             let (output_s, _) = output.storage_and_layout();
 
+            let topk_w_ptr = if let Some(tw) = topk_weights {
+                let (tw_s, _) = tw.storage_and_layout();
+                cuda_ptr(&tw_s, DType::F32)? as *const f32
+            } else {
+                std::ptr::null()
+            };
+
             unsafe {
                 match dtype {
                     DType::F16 => ffi::nvfp4_moe_gemm_wmma_f16(
@@ -1388,7 +1399,7 @@ pub fn moe_gemm_nvfp4(
                         cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                         cuda_ptr(&stids_s, DType::U32)? as *const i32,
                         cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
-                        std::ptr::null(),
+                        topk_w_ptr,
                         cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                         num_experts as i32,
                         topk as i32,
@@ -1405,7 +1416,7 @@ pub fn moe_gemm_nvfp4(
                         cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                         cuda_ptr(&stids_s, DType::U32)? as *const i32,
                         cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
-                        std::ptr::null(),
+                        topk_w_ptr,
                         cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                         num_experts as i32,
                         topk as i32,
@@ -1497,6 +1508,8 @@ pub fn moe_gemm_nvfp4(
     indices: &Tensor,
     _pre_sorted: Option<(&Tensor, &Tensor)>,
     _is_prefill: bool,
+    topk_weights: Option<&Tensor>,
+    _weight_scales_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::DType;
 
@@ -1637,6 +1650,22 @@ pub fn moe_gemm_nvfp4(
                     _ => candle_core::bail!("output must be metal"),
                 };
 
+                let tw_opt = if let Some(tw) = topk_weights {
+                    let tw_f32 = tw.to_dtype(candle_core::DType::F32)?;
+                    let (tw_s, tw_l) = tw_f32.storage_and_layout();
+                    let tw_ms = match &*tw_s {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("topk_weights must be metal"),
+                    };
+                    Some((
+                        tw_f32.clone(),
+                        tw_ms.buffer().clone(),
+                        tw_l.start_offset() * std::mem::size_of::<f32>(),
+                    ))
+                } else {
+                    None
+                };
+
                 let x = (
                     input_ms.buffer(),
                     input_l.start_offset() * dtype.size_in_bytes(),
@@ -1658,6 +1687,8 @@ pub fn moe_gemm_nvfp4(
                     indices_l.start_offset() * indices.dtype().size_in_bytes(),
                 );
 
+                let tw_arg = tw_opt.as_ref().map(|(_, buf, off)| (buf as &Buffer, *off));
+
                 metal_kernels::call_nvfp4_moe_gemm(
                     metal_dev.device(),
                     command_buffer_ref,
@@ -1668,6 +1699,7 @@ pub fn moe_gemm_nvfp4(
                     sc,
                     gs,
                     idx,
+                    tw_arg,
                     output_ms.buffer(),
                     num_tokens,
                     topk,
@@ -1704,6 +1736,7 @@ pub fn moe_gemm_nvfp4_hardware(
     experts_ids: &Tensor,
     topk: usize,
     _is_prefill: bool,
+    pre_swizzled_weight_scales: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1952,29 +1985,34 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    let weight_scales_swizzled =
-        Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
-    {
-        let (ws_s, _) = weight_scales.storage_and_layout();
-        let (wss_s, _) = weight_scales_swizzled.storage_and_layout();
-        let ws_base = cuda_ptr(&ws_s, DType::U8)?;
-        let wss_base = cuda_ptr(&wss_s, DType::U8)?;
-        for e in 0..num_experts {
-            let src_offset = (e * n * k_scale) as u64;
-            let dst_offset = (e * n_padded * k_scale_padded) as u64;
-            unsafe {
-                ffi::nvfp4_swizzle_weight_scales(
-                    (ws_base + src_offset) as *const std::ffi::c_void,
-                    (wss_base + dst_offset) as *mut std::ffi::c_void,
-                    n as i32,
-                    k_scale as i32,
-                    n_padded as i32,
-                    k_scale_padded as i32,
-                    stream,
-                );
+    let wss_owned;
+    let weight_scales_swizzled = if let Some(pre) = pre_swizzled_weight_scales {
+        pre
+    } else {
+        wss_owned = Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
+        {
+            let (ws_s, _) = weight_scales.storage_and_layout();
+            let (wss_s, _) = wss_owned.storage_and_layout();
+            let ws_base = cuda_ptr(&ws_s, DType::U8)?;
+            let wss_base = cuda_ptr(&wss_s, DType::U8)?;
+            for e in 0..num_experts {
+                let src_offset = (e * n * k_scale) as u64;
+                let dst_offset = (e * n_padded * k_scale_padded) as u64;
+                unsafe {
+                    ffi::nvfp4_swizzle_weight_scales(
+                        (ws_base + src_offset) as *const std::ffi::c_void,
+                        (wss_base + dst_offset) as *mut std::ffi::c_void,
+                        n as i32,
+                        k_scale as i32,
+                        n_padded as i32,
+                        k_scale_padded as i32,
+                        stream,
+                    );
+                }
             }
         }
-    }
+        &wss_owned
+    };
 
     let rep_out_ptr = pool.rep_out_ptr;
     {
@@ -2084,6 +2122,7 @@ pub fn moe_gemm_nvfp4_hardware(
     _: &Tensor,
     _: usize,
     _: bool,
+    _: Option<&Tensor>,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_nvfp4_hardware is not implemented on this platform!")
 }
@@ -2103,6 +2142,7 @@ pub fn moe_gemm_mxfp4(
     biases: Option<&Tensor>,
     indices: &Tensor,
     is_prefill: bool,
+    topk_weights: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -2231,6 +2271,13 @@ pub fn moe_gemm_mxfp4(
                     std::ptr::null()
                 };
 
+                let topk_w_ptr = if let Some(tw) = topk_weights {
+                    let (tw_s, _) = tw.storage_and_layout();
+                    cuda_ptr(&tw_s, DType::F32)? as *const f32
+                } else {
+                    std::ptr::null()
+                };
+
                 let stream = *cuda_dev.cu_stream() as i64;
 
                 unsafe {
@@ -2244,6 +2291,7 @@ pub fn moe_gemm_mxfp4(
                                     biases_ptr,
                                     indices_ptr,
                                     output_ptr,
+                                    topk_w_ptr,
                                     num_tokens as i32,
                                     topk as i32,
                                     num_experts as i32,
@@ -2281,6 +2329,7 @@ pub fn moe_gemm_mxfp4(
                                     biases_ptr,
                                     indices_ptr,
                                     output_ptr,
+                                    topk_w_ptr,
                                     num_tokens as i32,
                                     topk as i32,
                                     num_experts as i32,
@@ -2355,6 +2404,22 @@ pub fn moe_gemm_mxfp4(
                     _ => candle_core::bail!("output must be metal"),
                 };
 
+                let tw_opt = if let Some(tw) = topk_weights {
+                    let tw_f32 = tw.to_dtype(candle_core::DType::F32)?;
+                    let (tw_s, tw_l) = tw_f32.storage_and_layout();
+                    let tw_ms = match &*tw_s {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("topk_weights must be metal"),
+                    };
+                    Some((
+                        tw_f32.clone(),
+                        tw_ms.buffer().clone(),
+                        tw_l.start_offset() * std::mem::size_of::<f32>(),
+                    ))
+                } else {
+                    None
+                };
+
                 let x = (
                     input_ms.buffer(),
                     input_l.start_offset() * dtype.size_in_bytes(),
@@ -2371,6 +2436,8 @@ pub fn moe_gemm_mxfp4(
                     indices_ms.buffer(),
                     indices_l.start_offset() * indices.dtype().size_in_bytes(),
                 );
+
+                let tw_arg = tw_opt.as_ref().map(|(_, buf, off)| (buf as &Buffer, *off));
 
                 if let Some(biases) = biases {
                     let biases = if biases.is_contiguous() {
@@ -2398,6 +2465,7 @@ pub fn moe_gemm_mxfp4(
                         sc,
                         bias_buf,
                         idx,
+                        tw_arg,
                         output_ms.buffer(),
                         num_tokens,
                         topk,
@@ -2422,6 +2490,7 @@ pub fn moe_gemm_mxfp4(
                         sc,
                         dummy_biases,
                         idx,
+                        tw_arg,
                         output_ms.buffer(),
                         num_tokens,
                         topk,

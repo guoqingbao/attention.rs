@@ -111,6 +111,76 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result
     }
 }
 
+/// Batched variant for MoE: swizzle weight scales for all experts at once.
+///
+/// * `scale` - [E, N, K/16] U8 FP8 E4M3 block scales (linear / row-major)
+/// * `num_experts` - number of experts (E)
+/// * `n` - number of output channels per expert
+/// * `k` - full K dimension (not K/16)
+///
+/// Returns a U8 tensor of shape [E, N_padded, K_scale_padded] in swizzled layout.
+#[allow(unused)]
+pub fn swizzle_nvfp4_moe_weight_scales(
+    scale: &Tensor,
+    num_experts: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    let scale = if scale.is_contiguous() {
+        scale.clone()
+    } else {
+        scale.contiguous()?
+    };
+    let dev = scale.device();
+
+    match dev {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_dev) => {
+            use candle_core::Storage;
+
+            let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+            let k_scale_padded = pad_to(k_scale_cols, 4);
+            let n_padded = pad_to(n, 128);
+
+            let swizzled = Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
+
+            {
+                let (scale_s, _) = scale.storage_and_layout();
+                let scale_base = match &*scale_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+
+                let (sw_s, _) = swizzled.storage_and_layout();
+                let sw_base = match &*sw_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+
+                let stream = *cuda_dev.cu_stream() as i64;
+                for e in 0..num_experts {
+                    let src_offset = (e * n * k_scale_cols) as u64;
+                    let dst_offset = (e * n_padded * k_scale_padded) as u64;
+                    unsafe {
+                        ffi::nvfp4_swizzle_weight_scales(
+                            (scale_base + src_offset) as *const std::ffi::c_void,
+                            (sw_base + dst_offset) as *mut std::ffi::c_void,
+                            n as i32,
+                            k_scale_cols as i32,
+                            n_padded as i32,
+                            k_scale_padded as i32,
+                            stream,
+                        );
+                    }
+                }
+            }
+
+            Ok(swizzled)
+        }
+        _ => candle_core::bail!("swizzle_nvfp4_moe_weight_scales: unsupported backend (need CUDA)"),
+    }
+}
+
 /// NVFP4 linear: output = input @ weight^T [+ bias]
 ///
 /// * `input` - [M, K] in F16/BF16

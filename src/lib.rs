@@ -1205,13 +1205,27 @@ impl PagedAttention {
                         r?;
                     }
                 }
-                // TurboQuant Turbo4/Turbo3: WHT K + 4-bit V store
-                if matches!(
-                    tq_mode_metal,
-                    Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
-                ) {
+                // TurboQuant Turbo4: WHT K + 4-bit V store
+                if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq4_store_metal(
+                            &key_p,
+                            &value_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            &slot_mapping,
+                        )
+                    }) {
+                        r?;
+                    }
+                }
+
+                // TurboQuant Turbo3: WHT K + 3-bit K / 4-bit V store
+                if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::metal_flash::flash_tq3_store_metal(
                             &key_p,
                             &value_p,
                             tq.k_absmax.as_ref().unwrap(),
@@ -1241,13 +1255,35 @@ impl PagedAttention {
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
 
             if input_metadata.is_prefill {
-                // Turbo4/3: prefill reads from TQ4 buffers (no standard cache)
-                if matches!(
-                    tq_mode_metal,
-                    Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
-                ) {
+                // Turbo4: prefill reads from TQ4 buffers (4-bit K + 4-bit V)
+                if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq4_prefill_metal(
+                            &query_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            block_tables,
+                            context_lens,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
+                            input_metadata.cu_seqlens_q.as_ref(),
+                            input_metadata.max_seqlen_q,
+                        )
+                    }) {
+                        return r;
+                    }
+                }
+
+                // Turbo3: prefill reads from TQ3 buffers (3-bit K + 4-bit V)
+                if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::metal_flash::flash_tq3_prefill_metal(
                             &query_p,
                             tq.k_absmax.as_ref().unwrap(),
                             tq.k_quant.as_ref().unwrap(),
@@ -1314,13 +1350,34 @@ impl PagedAttention {
                 }
             }
 
-            // Turbo4/Turbo3 decode: use TQ4 decode kernel (4-bit WHT K + 4-bit V)
-            if matches!(
-                tq_mode_metal,
-                Some(TurboquantMode::Turbo4) | Some(TurboquantMode::Turbo3)
-            ) {
+            // Turbo4 decode: use TQ4 decode kernel (4-bit WHT K + 4-bit V)
+            if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
                 if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                     crate::metal_flash::flash_tq4_decode_metal(
+                        &query_p,
+                        tq.k_absmax.as_ref().unwrap(),
+                        tq.k_quant.as_ref().unwrap(),
+                        &tq.v_absmax,
+                        &tq.v_quant,
+                        block_tables,
+                        context_lens,
+                        &output,
+                        attention_heads_p,
+                        key_value_heads_p,
+                        head_size_p,
+                        self.scale,
+                        softcapping.unwrap_or(0.0) as f32,
+                        self.sliding_window,
+                    )
+                }) {
+                    return r;
+                }
+            }
+
+            // Turbo3 decode: use TQ3 decode kernel (3-bit WHT K + 4-bit V)
+            if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                    crate::metal_flash::flash_tq3_decode_metal(
                         &query_p,
                         tq.k_absmax.as_ref().unwrap(),
                         tq.k_quant.as_ref().unwrap(),

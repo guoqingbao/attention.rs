@@ -140,9 +140,11 @@ mxfp4_matmul_impl(const device T *x, const device uchar *w,
 template <typename T>
 METAL_FUNC void mxfp4_moe_gemm_split_impl(
     const device T *x, const device uchar *w, const device uchar *scales,
-    const device T *biases, const device uint *indices, device T *y,
+    const device T *biases, const device uint *indices,
+    const device float *topk_weights, device T *y,
     int num_tokens, int topk, int num_experts, int N, int K, int has_bias,
-    int input_has_topk_dim, threadgroup float *x_tile, uint tid,
+    int input_has_topk_dim, int has_topk_weights,
+    threadgroup float *x_tile, uint tid,
     ushort simd_gid, ushort lane_id, uint3 gid) {
   (void)tid;
 
@@ -203,6 +205,9 @@ METAL_FUNC void mxfp4_moe_gemm_split_impl(
     if (has_bias != 0) {
       acc += float(biases[size_t(expert_idx) * N + size_t(n)]);
     }
+    if (has_topk_weights != 0) {
+      acc *= topk_weights[token_idx * topk + expert_slot];
+    }
     y[(token_idx * topk + expert_slot) * N + n] = T(acc);
   }
 }
@@ -212,8 +217,10 @@ METAL_FUNC void mxfp4_moe_gemm_split_impl(
 template <typename T, int MAX_TOPK>
 METAL_FUNC void mxfp4_moe_gemm_reuse_impl(
     const device T *x, const device uchar *w, const device uchar *scales,
-    const device T *biases, const device uint *indices, device T *y,
+    const device T *biases, const device uint *indices,
+    const device float *topk_weights, device T *y,
     int num_tokens, int topk, int num_experts, int N, int K, int has_bias,
+    int has_topk_weights,
     uint tid, ushort simd_gid, threadgroup float *x_tile, ushort lane_id,
     uint3 gid) {
   (void)tid;
@@ -296,6 +303,9 @@ METAL_FUNC void mxfp4_moe_gemm_reuse_impl(
       if (has_bias != 0) {
         acc += float(biases[size_t(e) * N + size_t(n)]);
       }
+      if (has_topk_weights != 0) {
+        acc *= topk_weights[token_idx * topk + s];
+      }
       y[(token_idx * topk + s) * N + n] = T(acc);
     }
   }
@@ -346,21 +356,25 @@ METAL_FUNC void mxfp4_moe_gemm_reuse_impl(
     const device half *x [[buffer(0)]], const device uchar *w [[buffer(1)]],
     const device uchar *scales [[buffer(2)]],
     const device half *biases [[buffer(3)]],
-    const device uint *indices [[buffer(4)]], device half *y [[buffer(5)]],
-    const constant int &num_tokens [[buffer(6)]],
-    const constant int &topk [[buffer(7)]],
-    const constant int &num_experts [[buffer(8)]],
-    const constant int &N [[buffer(9)]], const constant int &K [[buffer(10)]],
-    const constant int &has_bias [[buffer(11)]],
-    const constant int &input_has_topk_dim [[buffer(12)]],
+    const device uint *indices [[buffer(4)]],
+    const device float *topk_weights [[buffer(5)]],
+    device half *y [[buffer(6)]],
+    const constant int &num_tokens [[buffer(7)]],
+    const constant int &topk [[buffer(8)]],
+    const constant int &num_experts [[buffer(9)]],
+    const constant int &N [[buffer(10)]], const constant int &K [[buffer(11)]],
+    const constant int &has_bias [[buffer(12)]],
+    const constant int &input_has_topk_dim [[buffer(13)]],
+    const constant int &has_topk_weights [[buffer(14)]],
     uint tid [[thread_index_in_threadgroup]],
     ushort simd_gid [[simdgroup_index_in_threadgroup]],
     ushort lane_id [[thread_index_in_simdgroup]],
     uint3 gid [[threadgroup_position_in_grid]]) {
   threadgroup float x_tile[mxfp4::kKTilePadded];
   mxfp4::mxfp4_moe_gemm_split_impl<half>(
-      x, w, scales, biases, indices, y, num_tokens, topk, num_experts, N, K,
-      has_bias, input_has_topk_dim, x_tile, tid, simd_gid, lane_id, gid);
+      x, w, scales, biases, indices, topk_weights, y, num_tokens, topk,
+      num_experts, N, K, has_bias, input_has_topk_dim, has_topk_weights,
+      x_tile, tid, simd_gid, lane_id, gid);
 }
 
 #if defined(__HAVE_BFLOAT__)
@@ -370,22 +384,25 @@ mxfp4_moe_gemm_split_bf16(const device bfloat16_t *x [[buffer(0)]],
                           const device uchar *scales [[buffer(2)]],
                           const device bfloat16_t *biases [[buffer(3)]],
                           const device uint *indices [[buffer(4)]],
-                          device bfloat16_t *y [[buffer(5)]],
-                          const constant int &num_tokens [[buffer(6)]],
-                          const constant int &topk [[buffer(7)]],
-                          const constant int &num_experts [[buffer(8)]],
-                          const constant int &N [[buffer(9)]],
-                          const constant int &K [[buffer(10)]],
-                          const constant int &has_bias [[buffer(11)]],
-                          const constant int &input_has_topk_dim [[buffer(12)]],
+                          const device float *topk_weights [[buffer(5)]],
+                          device bfloat16_t *y [[buffer(6)]],
+                          const constant int &num_tokens [[buffer(7)]],
+                          const constant int &topk [[buffer(8)]],
+                          const constant int &num_experts [[buffer(9)]],
+                          const constant int &N [[buffer(10)]],
+                          const constant int &K [[buffer(11)]],
+                          const constant int &has_bias [[buffer(12)]],
+                          const constant int &input_has_topk_dim [[buffer(13)]],
+                          const constant int &has_topk_weights [[buffer(14)]],
                           uint tid [[thread_index_in_threadgroup]],
                           ushort simd_gid [[simdgroup_index_in_threadgroup]],
                           ushort lane_id [[thread_index_in_simdgroup]],
                           uint3 gid [[threadgroup_position_in_grid]]) {
   threadgroup float x_tile[mxfp4::kKTilePadded];
   mxfp4::mxfp4_moe_gemm_split_impl<bfloat16_t>(
-      x, w, scales, biases, indices, y, num_tokens, topk, num_experts, N, K,
-      has_bias, input_has_topk_dim, x_tile, tid, simd_gid, lane_id, gid);
+      x, w, scales, biases, indices, topk_weights, y, num_tokens, topk,
+      num_experts, N, K, has_bias, input_has_topk_dim, has_topk_weights,
+      x_tile, tid, simd_gid, lane_id, gid);
 }
 #endif
 
@@ -393,20 +410,24 @@ mxfp4_moe_gemm_split_bf16(const device bfloat16_t *x [[buffer(0)]],
     const device half *x [[buffer(0)]], const device uchar *w [[buffer(1)]],
     const device uchar *scales [[buffer(2)]],
     const device half *biases [[buffer(3)]],
-    const device uint *indices [[buffer(4)]], device half *y [[buffer(5)]],
-    const constant int &num_tokens [[buffer(6)]],
-    const constant int &topk [[buffer(7)]],
-    const constant int &num_experts [[buffer(8)]],
-    const constant int &N [[buffer(9)]], const constant int &K [[buffer(10)]],
-    const constant int &has_bias [[buffer(11)]],
+    const device uint *indices [[buffer(4)]],
+    const device float *topk_weights [[buffer(5)]],
+    device half *y [[buffer(6)]],
+    const constant int &num_tokens [[buffer(7)]],
+    const constant int &topk [[buffer(8)]],
+    const constant int &num_experts [[buffer(9)]],
+    const constant int &N [[buffer(10)]], const constant int &K [[buffer(11)]],
+    const constant int &has_bias [[buffer(12)]],
+    const constant int &has_topk_weights [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]],
     ushort simd_gid [[simdgroup_index_in_threadgroup]],
     ushort lane_id [[thread_index_in_simdgroup]],
     uint3 gid [[threadgroup_position_in_grid]]) {
   threadgroup float x_tile[mxfp4::kKTilePadded];
   mxfp4::mxfp4_moe_gemm_reuse_impl<half, 8>(
-      x, w, scales, biases, indices, y, num_tokens, topk, num_experts, N, K,
-      has_bias, tid, simd_gid, x_tile, lane_id, gid);
+      x, w, scales, biases, indices, topk_weights, y, num_tokens, topk,
+      num_experts, N, K, has_bias, has_topk_weights, tid, simd_gid, x_tile,
+      lane_id, gid);
 }
 
 #if defined(__HAVE_BFLOAT__)
@@ -416,20 +437,23 @@ mxfp4_moe_gemm_reuse_bf16(const device bfloat16_t *x [[buffer(0)]],
                           const device uchar *scales [[buffer(2)]],
                           const device bfloat16_t *biases [[buffer(3)]],
                           const device uint *indices [[buffer(4)]],
-                          device bfloat16_t *y [[buffer(5)]],
-                          const constant int &num_tokens [[buffer(6)]],
-                          const constant int &topk [[buffer(7)]],
-                          const constant int &num_experts [[buffer(8)]],
-                          const constant int &N [[buffer(9)]],
-                          const constant int &K [[buffer(10)]],
-                          const constant int &has_bias [[buffer(11)]],
+                          const device float *topk_weights [[buffer(5)]],
+                          device bfloat16_t *y [[buffer(6)]],
+                          const constant int &num_tokens [[buffer(7)]],
+                          const constant int &topk [[buffer(8)]],
+                          const constant int &num_experts [[buffer(9)]],
+                          const constant int &N [[buffer(10)]],
+                          const constant int &K [[buffer(11)]],
+                          const constant int &has_bias [[buffer(12)]],
+                          const constant int &has_topk_weights [[buffer(13)]],
                           uint tid [[thread_index_in_threadgroup]],
                           ushort simd_gid [[simdgroup_index_in_threadgroup]],
                           ushort lane_id [[thread_index_in_simdgroup]],
                           uint3 gid [[threadgroup_position_in_grid]]) {
   threadgroup float x_tile[mxfp4::kKTilePadded];
   mxfp4::mxfp4_moe_gemm_reuse_impl<bfloat16_t, 8>(
-      x, w, scales, biases, indices, y, num_tokens, topk, num_experts, N, K,
-      has_bias, tid, simd_gid, x_tile, lane_id, gid);
+      x, w, scales, biases, indices, topk_weights, y, num_tokens, topk,
+      num_experts, N, K, has_bias, has_topk_weights, tid, simd_gid, x_tile,
+      lane_id, gid);
 }
 #endif
