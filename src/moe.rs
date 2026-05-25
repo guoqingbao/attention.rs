@@ -1493,6 +1493,10 @@ pub fn moe_gemm_nvfp4(
         }
     }
 
+    if let Some(tw) = topk_weights {
+        let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
+        return Ok(output.broadcast_mul(&tw)?);
+    }
     Ok(output)
 }
 
@@ -2365,6 +2369,12 @@ pub fn moe_gemm_mxfp4(
                 }
             }
 
+            if !use_fused {
+                if let Some(tw) = topk_weights {
+                    let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
+                    return Ok(output.broadcast_mul(&tw)?);
+                }
+            }
             Ok(output)
         }
 
