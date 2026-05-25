@@ -1691,7 +1691,9 @@ pub fn moe_gemm_nvfp4(
                     indices_l.start_offset() * indices.dtype().size_in_bytes(),
                 );
 
-                let tw_arg = tw_opt.as_ref().map(|(_, buf, off)| (buf as &Buffer, *off));
+                let tw_arg = tw_opt
+                    .as_ref()
+                    .map(|(_, buf, off)| (buf as &metal::Buffer, *off));
 
                 metal_kernels::call_nvfp4_moe_gemm(
                     metal_dev.device(),
@@ -2447,7 +2449,9 @@ pub fn moe_gemm_mxfp4(
                     indices_l.start_offset() * indices.dtype().size_in_bytes(),
                 );
 
-                let tw_arg = tw_opt.as_ref().map(|(_, buf, off)| (buf as &Buffer, *off));
+                let tw_arg = tw_opt
+                    .as_ref()
+                    .map(|(_, buf, off)| (buf as &metal::Buffer, *off));
 
                 if let Some(biases) = biases {
                     let biases = if biases.is_contiguous() {
