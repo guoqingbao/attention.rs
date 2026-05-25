@@ -48,23 +48,33 @@ fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }
 
-/// Pre-swizzle NVFP4 weight scales from linear [N, K/16] layout to the CUTLASS
-/// 128x4 block-interleaved layout. Call once at model load time and pass the
-/// result to [`nvfp4_matmul`] via `weight_scale_swizzled` to avoid re-swizzling
-/// on every inference call.
+/// Pre-swizzle NVFP4 weight scales from linear layout to the CUTLASS
+/// 128×4 block-interleaved layout required by Blackwell hardware FP4 tensor
+/// cores. Call once at model load time to avoid re-swizzling on every forward.
 ///
-/// * `scale` - [N, K/16] U8 FP8 E4M3 block scales (linear / row-major)
-/// * `n` - number of output channels (weight rows)
-/// * `k` - full K dimension (not K/16)
+/// Accepts rank-2 `[N, K/16]` (single linear layer) or rank-3 `[E, N, K/16]`
+/// (batched / MoE). All dimensions are read from the tensor shape, so
+/// sharded tensors work correctly without the caller adjusting sizes.
 ///
-/// Returns a U8 tensor of shape [N_padded, K_scale_padded] in swizzled layout.
+/// Returns a swizzled U8 tensor with the same rank (with N and K/16 padded).
 #[allow(unused)]
-pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+pub fn swizzle_nvfp4_weight_scales(scale: &Tensor) -> Result<Tensor> {
     let scale = if scale.is_contiguous() {
         scale.clone()
     } else {
         scale.contiguous()?
     };
+
+    let dims = scale.dims();
+    let (num_slices, n, k_scale_cols) = match dims {
+        [n, ksc] => (1, *n, *ksc),
+        [e, n, ksc] => (*e, *n, *ksc),
+        _ => candle_core::bail!(
+            "swizzle_nvfp4_weight_scales: expected rank 2 [N, K/16] or 3 [E, N, K/16], got {:?}",
+            dims
+        ),
+    };
+    let is_batched = dims.len() == 3;
     let dev = scale.device();
 
     match dev {
@@ -72,77 +82,14 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor, n: usize, k: usize) -> Result
         candle_core::Device::Cuda(cuda_dev) => {
             use candle_core::Storage;
 
-            let k_scale_cols = k / NVFP4_BLOCK_SIZE;
             let k_scale_padded = pad_to(k_scale_cols, 4);
             let n_padded = pad_to(n, 128);
 
-            let swizzled = Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
-
-            {
-                let (scale_s, _) = scale.storage_and_layout();
-                let scale_ptr = match &*scale_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
-                    _ => candle_core::bail!("tensor must be on CUDA"),
-                };
-
-                let (sw_s, _) = swizzled.storage_and_layout();
-                let sw_ptr = match &*sw_s {
-                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
-                    _ => candle_core::bail!("tensor must be on CUDA"),
-                };
-
-                let stream = *cuda_dev.cu_stream() as i64;
-                unsafe {
-                    ffi::nvfp4_swizzle_weight_scales(
-                        scale_ptr as *const std::ffi::c_void,
-                        sw_ptr as *mut std::ffi::c_void,
-                        n as i32,
-                        k_scale_cols as i32,
-                        n_padded as i32,
-                        k_scale_padded as i32,
-                        stream,
-                    );
-                }
-            }
-
-            Ok(swizzled)
-        }
-        _ => candle_core::bail!("swizzle_nvfp4_weight_scales: unsupported backend (need CUDA)"),
-    }
-}
-
-/// Batched variant for MoE: swizzle weight scales for all experts at once.
-///
-/// * `scale` - [E, N, K/16] U8 FP8 E4M3 block scales (linear / row-major)
-/// * `num_experts` - number of experts (E)
-/// * `n` - number of output channels per expert
-/// * `k` - full K dimension (not K/16)
-///
-/// Returns a U8 tensor of shape [E, N_padded, K_scale_padded] in swizzled layout.
-#[allow(unused)]
-pub fn swizzle_nvfp4_moe_weight_scales(
-    scale: &Tensor,
-    num_experts: usize,
-    n: usize,
-    k: usize,
-) -> Result<Tensor> {
-    let scale = if scale.is_contiguous() {
-        scale.clone()
-    } else {
-        scale.contiguous()?
-    };
-    let dev = scale.device();
-
-    match dev {
-        #[cfg(feature = "cuda")]
-        candle_core::Device::Cuda(cuda_dev) => {
-            use candle_core::Storage;
-
-            let k_scale_cols = k / NVFP4_BLOCK_SIZE;
-            let k_scale_padded = pad_to(k_scale_cols, 4);
-            let n_padded = pad_to(n, 128);
-
-            let swizzled = Tensor::zeros((num_experts, n_padded, k_scale_padded), DType::U8, dev)?;
+            let swizzled = if is_batched {
+                Tensor::zeros((num_slices, n_padded, k_scale_padded), DType::U8, dev)?
+            } else {
+                Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?
+            };
 
             {
                 let (scale_s, _) = scale.storage_and_layout();
@@ -158,7 +105,7 @@ pub fn swizzle_nvfp4_moe_weight_scales(
                 };
 
                 let stream = *cuda_dev.cu_stream() as i64;
-                for e in 0..num_experts {
+                for e in 0..num_slices {
                     let src_offset = (e * n * k_scale_cols) as u64;
                     let dst_offset = (e * n_padded * k_scale_padded) as u64;
                     unsafe {
@@ -177,7 +124,7 @@ pub fn swizzle_nvfp4_moe_weight_scales(
 
             Ok(swizzled)
         }
-        _ => candle_core::bail!("swizzle_nvfp4_moe_weight_scales: unsupported backend (need CUDA)"),
+        _ => candle_core::bail!("swizzle_nvfp4_weight_scales: unsupported backend (need CUDA)"),
     }
 }
 
