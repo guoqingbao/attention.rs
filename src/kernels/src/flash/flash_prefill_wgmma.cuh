@@ -47,7 +47,7 @@
     do { \
         const unsigned int _bs_shift = __ffs(cache_block_size) - 1; \
         const unsigned int _bs_mask = cache_block_size - 1; \
-        const unsigned int _rs = num_kv_heads * head_dim * sizeof(flash_half_t); \
+        const unsigned long long _rs = (unsigned long long)num_kv_heads * head_dim; \
         for (unsigned int _idx = (t); _idx < WGMMA_KV_CHUNKS; _idx += (stride)) { \
             unsigned int _row = _idx / (WGMMA_HDIM / 8); \
             unsigned int _col = (_idx % (WGMMA_HDIM / 8)) * 8; \
