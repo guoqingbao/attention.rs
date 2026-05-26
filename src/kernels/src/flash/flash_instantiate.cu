@@ -416,6 +416,38 @@ extern "C" void call_flash_prefill_paged(
     float inv_sqrt_d, float softcap,
     int64_t stream
 ) {
+#ifdef FLASH_TCGEN05_ENABLED
+    if (head_dim <= 256) {
+        extern void call_flash_prefill_tcgen05(
+            const void*, const void*, const void*, void*,
+            const int*, unsigned int, const unsigned int*, const unsigned int*,
+            unsigned int, unsigned int, unsigned int, unsigned int,
+            unsigned int, unsigned int, unsigned int, unsigned int,
+            float, float, int64_t);
+        call_flash_prefill_tcgen05(Q, K_cache, V_cache, O,
+            block_tables, block_table_stride, cu_seqlens_q, context_lens,
+            num_seqs, max_q_len, num_q_heads, num_kv_heads,
+            head_dim, cache_block_size, sliding_window, causal,
+            inv_sqrt_d, softcap, stream);
+        return;
+    }
+#elif defined(FLASH_WGMMA_ENABLED)
+    if (head_dim <= 256) {
+        extern void call_flash_prefill_wgmma(
+            const void*, const void*, const void*, void*,
+            const int*, unsigned int, const unsigned int*, const unsigned int*,
+            unsigned int, unsigned int, unsigned int, unsigned int,
+            unsigned int, unsigned int, unsigned int, unsigned int,
+            float, float, int64_t);
+        call_flash_prefill_wgmma(Q, K_cache, V_cache, O,
+            block_tables, block_table_stride, cu_seqlens_q, context_lens,
+            num_seqs, max_q_len, num_q_heads, num_kv_heads,
+            head_dim, cache_block_size, sliding_window, causal,
+            inv_sqrt_d, softcap, stream);
+        return;
+    }
+#endif
+
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     unsigned int br = 32;
     dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);

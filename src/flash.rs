@@ -278,7 +278,7 @@ pub fn flash_prefill(
 }
 
 pub const SPLIT_K_THRESHOLD: usize = 1024;
-pub const NUM_SPLITS: u32 = 8;
+pub const NUM_SPLITS: u32 = 16;
 pub const TQ_NUM_SPLITS: u32 = 16;
 
 #[cfg(feature = "cuda")]
@@ -337,6 +337,9 @@ pub fn flash_decode(
     let is_fp8 = key_cache.dtype() == DType::U8;
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
+    // Split-K: fixed num_splits (graph-capture-safe)
+    let num_splits_adaptive = NUM_SPLITS;
+
     // GQA disabled for native flash path: shared memory overflow at higher ratios
     // (e.g. GQA=8 with HDIM=256 needs 64KB smem, exceeding 48KB limit).
     // Each CTA handles one Q head; kv_head = q_head / gqa_ratio is computed inside kernel.
@@ -365,7 +368,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits_adaptive,
                     q_stride,
                     softcap,
                     ks_ptr,
@@ -380,7 +383,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits_adaptive,
                     num_seqs as u32,
                     stream,
                 );
@@ -431,7 +434,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits_adaptive,
                     q_stride,
                     softcap,
                     sw,
@@ -443,7 +446,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits_adaptive,
                     num_seqs as u32,
                     stream,
                 );

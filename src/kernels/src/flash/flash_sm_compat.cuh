@@ -37,10 +37,12 @@
 // ============================================================================
 
 using flash_half_t = __half;
+using flash_half2_t = __half2;
 
 #define FLASH_FLOAT2HALF(x)     __float2half(x)
 #define FLASH_HALF_AS_USHORT(x) __half_as_ushort(x)
 #define FLASH_HALF2FLOAT(x)     __half2float(x)
+#define FLASH_FLOATS2HALF2(a, b) __floats2half2_rn(a, b)
 
 // No cp.async; use direct 16-byte global→shared copy via LDG128 + STS128
 #define FLASH_CP_ASYNC(sa, gm_ptr) \
@@ -248,10 +250,12 @@ __device__ __forceinline__ void flash_mma_k16_sm70(
 #include <cuda_bf16.h>
 
 using flash_half_t = __nv_bfloat16;
+using flash_half2_t = __nv_bfloat162;
 
 #define FLASH_FLOAT2HALF(x)     __float2bfloat16(x)
 #define FLASH_HALF_AS_USHORT(x) __bfloat16_as_ushort(x)
 #define FLASH_HALF2FLOAT(x)     __bfloat162float(x)
+#define FLASH_FLOATS2HALF2(a, b) __floats2bfloat162_rn(a, b)
 
 #define FLASH_CP_ASYNC(sa, gm_ptr) \
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" \
@@ -270,3 +274,213 @@ using flash_half_t = __nv_bfloat16;
           "f"(c0), "f"(c1), "f"(c2), "f"(c3))
 
 #endif // NO_BF16_KERNEL
+
+// ============================================================================
+// SM90+ (Hopper): WGMMA + TMA + mbarrier path
+// These macros are used by the separate flash_prefill_wgmma.cuh kernel.
+// They require compilation with -arch=sm_90a and FLASH_WGMMA_ENABLED defined.
+// ============================================================================
+#ifdef FLASH_WGMMA_ENABLED
+
+// WGMMA m64n64k16: 4 warps (warp group) cooperatively compute 64x64 output
+// A is in shared memory (row-major), B is in shared memory (col-major)
+// D accumulator is in registers, distributed across 128 threads
+#define FLASH_WGMMA_F32_BF16_M64N64K16(d, a_smem_ptr, b_smem_ptr, scale_d) \
+    asm volatile( \
+        "{\n" \
+        ".reg .pred p;\n" \
+        "setp.ne.b32 p, %34, 0;\n" \
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 " \
+        "{%0, %1, %2, %3, %4, %5, %6, %7, " \
+        " %8, %9, %10, %11, %12, %13, %14, %15, " \
+        " %16, %17, %18, %19, %20, %21, %22, %23, " \
+        " %24, %25, %26, %27, %28, %29, %30, %31}, " \
+        "%32, %33, p, 1, 1, 0, 0;\n" \
+        "}\n" \
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]), \
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]), \
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]), \
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), \
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), \
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]) \
+        : "l"(a_smem_ptr), "l"(b_smem_ptr), "r"(scale_d))
+
+// WGMMA m64n128k16: 4 warps cooperatively compute 64x128 output (for PV with HDIM=128)
+#define FLASH_WGMMA_F32_BF16_M64N128K16(d, a_smem_ptr, b_smem_ptr, scale_d) \
+    asm volatile( \
+        "{\n" \
+        ".reg .pred p;\n" \
+        "setp.ne.b32 p, %66, 0;\n" \
+        "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 " \
+        "{%0, %1, %2, %3, %4, %5, %6, %7, " \
+        " %8, %9, %10, %11, %12, %13, %14, %15, " \
+        " %16, %17, %18, %19, %20, %21, %22, %23, " \
+        " %24, %25, %26, %27, %28, %29, %30, %31, " \
+        " %32, %33, %34, %35, %36, %37, %38, %39, " \
+        " %40, %41, %42, %43, %44, %45, %46, %47, " \
+        " %48, %49, %50, %51, %52, %53, %54, %55, " \
+        " %56, %57, %58, %59, %60, %61, %62, %63}, " \
+        "%64, %65, p, 1, 1, 0, 0;\n" \
+        "}\n" \
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]), \
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]), \
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]), \
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), \
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), \
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), \
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), \
+          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), \
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), \
+          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), \
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), \
+          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), \
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), \
+          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]) \
+        : "l"(a_smem_ptr), "l"(b_smem_ptr), "r"(scale_d))
+
+// WGMMA pipeline control
+#define FLASH_WGMMA_FENCE() \
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory")
+
+#define FLASH_WGMMA_COMMIT() \
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory")
+
+#define FLASH_WGMMA_WAIT(N) \
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory")
+
+// TMA bulk copy: global → shared, with mbarrier completion tracking
+// 2D tensor copy: copies a 2D tile from global memory to shared memory
+#define FLASH_TMA_LOAD_2D(smem_ptr, gmem_tensor_map, coord0, coord1, mbar_smem_ptr) \
+    asm volatile( \
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes " \
+        "[%0], [%1, {%2, %3}], [%4];\n" \
+        :: "r"(smem_ptr), "l"(gmem_tensor_map), \
+           "r"(coord0), "r"(coord1), "r"(mbar_smem_ptr) \
+        : "memory")
+
+// Mbarrier: init, arrive, wait
+#define FLASH_MBARRIER_INIT(mbar_smem_ptr, arrive_count) \
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" \
+                 :: "r"(mbar_smem_ptr), "r"(arrive_count) : "memory")
+
+#define FLASH_MBARRIER_ARRIVE_EXPECT_TX(mbar_smem_ptr, tx_count) \
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" \
+                 :: "r"(mbar_smem_ptr), "r"(tx_count) : "memory")
+
+#define FLASH_MBARRIER_TRY_WAIT(mbar_smem_ptr, phase, result) \
+    asm volatile( \
+        "{\n" \
+        ".reg .pred p;\n" \
+        "mbarrier.try_wait.parity.shared.b64 p, [%1], %2;\n" \
+        "selp.u32 %0, 1, 0, p;\n" \
+        "}\n" \
+        : "=r"(result) : "r"(mbar_smem_ptr), "r"(phase) : "memory")
+
+// Spin-wait until mbarrier phase completes
+__device__ __forceinline__ void flash_mbarrier_wait(
+    unsigned int mbar_smem_ptr, unsigned int phase)
+{
+    unsigned int done = 0;
+    while (!done) {
+        FLASH_MBARRIER_TRY_WAIT(mbar_smem_ptr, phase, done);
+    }
+}
+
+// cp.async.bulk for non-TMA bulk copies (shared→global for workspace writes)
+#define FLASH_CP_ASYNC_BULK_GLOBAL_TO_SHARED(smem_ptr, gmem_ptr, size, mbar_smem_ptr) \
+    asm volatile( \
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes " \
+        "[%0], [%1], %2, [%3];\n" \
+        :: "r"(smem_ptr), "l"(gmem_ptr), "r"(size), "r"(mbar_smem_ptr) \
+        : "memory")
+
+#endif // FLASH_WGMMA_ENABLED
+
+// ============================================================================
+// SM100/SM120+ (Blackwell): tcgen05 + TMA v2 path
+// These macros are used by the separate flash_prefill_tcgen05.cuh kernel.
+// They require compilation with -arch=sm_100a and FLASH_TCGEN05_ENABLED defined.
+// ============================================================================
+#ifdef FLASH_TCGEN05_ENABLED
+
+// tcgen05 MMA: 128x128x16 BF16 matrix multiply
+// tcgen05 operates on 128-thread "threadblock clusters" with larger accumulator tiles
+// The MMA descriptor encodes shared memory base and layout
+#define FLASH_TCGEN05_MMA_M128N128K16(d, a_desc, b_desc, scale_d) \
+    asm volatile( \
+        "{\n" \
+        ".reg .pred p;\n" \
+        "setp.ne.b32 p, %34, 0;\n" \
+        "tcgen05.mma.cta_group::1.kind::f32.bf16.bf16 " \
+        "{%0, %1, %2, %3, %4, %5, %6, %7, " \
+        " %8, %9, %10, %11, %12, %13, %14, %15, " \
+        " %16, %17, %18, %19, %20, %21, %22, %23, " \
+        " %24, %25, %26, %27, %28, %29, %30, %31}, " \
+        "%32, %33, p;\n" \
+        "}\n" \
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]), \
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]), \
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]), \
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), \
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), \
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]) \
+        : "l"(a_desc), "l"(b_desc), "r"(scale_d))
+
+// tcgen05 supports native FP8xFP8->FP32 MMA without dequantization
+#define FLASH_TCGEN05_MMA_M128N128K32_FP8(d, a_desc, b_desc, scale_d) \
+    asm volatile( \
+        "{\n" \
+        ".reg .pred p;\n" \
+        "setp.ne.b32 p, %34, 0;\n" \
+        "tcgen05.mma.cta_group::1.kind::f32.e4m3.e4m3 " \
+        "{%0, %1, %2, %3, %4, %5, %6, %7, " \
+        " %8, %9, %10, %11, %12, %13, %14, %15, " \
+        " %16, %17, %18, %19, %20, %21, %22, %23, " \
+        " %24, %25, %26, %27, %28, %29, %30, %31}, " \
+        "%32, %33, p;\n" \
+        "}\n" \
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]), \
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]), \
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]), \
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), \
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), \
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]) \
+        : "l"(a_desc), "l"(b_desc), "r"(scale_d))
+
+// tcgen05 pipeline control
+#define FLASH_TCGEN05_FENCE() \
+    asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory")
+
+#define FLASH_TCGEN05_COMMIT() \
+    asm volatile("tcgen05.commit.cta_group::1;\n" ::: "memory")
+
+#define FLASH_TCGEN05_WAIT() \
+    asm volatile("tcgen05.wait.cta_group::1;\n" ::: "memory")
+
+// TMA v2 multicast: copies tile to multiple CTAs in a cluster simultaneously
+#define FLASH_TMA_V2_LOAD_MULTICAST(smem_ptr, gmem_tensor_map, coord0, coord1, mbar_smem_ptr, cluster_mask) \
+    asm volatile( \
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster " \
+        "[%0], [%1, {%2, %3}], [%4], %5;\n" \
+        :: "r"(smem_ptr), "l"(gmem_tensor_map), \
+           "r"(coord0), "r"(coord1), "r"(mbar_smem_ptr), "h"(cluster_mask) \
+        : "memory")
+
+// TMA v2 single-CTA load (non-multicast, same as TMA but with v2 descriptor format)
+#define FLASH_TMA_V2_LOAD_2D(smem_ptr, gmem_tensor_map, coord0, coord1, mbar_smem_ptr) \
+    asm volatile( \
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes " \
+        "[%0], [%1, {%2, %3}], [%4];\n" \
+        :: "r"(smem_ptr), "l"(gmem_tensor_map), \
+           "r"(coord0), "r"(coord1), "r"(mbar_smem_ptr) \
+        : "memory")
+
+#endif // FLASH_TCGEN05_ENABLED
