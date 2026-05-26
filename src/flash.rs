@@ -200,6 +200,15 @@ pub fn flash_prefill(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
+    let cu_fallback = if cu_seqlens_q.is_none() {
+        Some(Tensor::from_vec(
+            vec![0u32, q_len as u32],
+            2,
+            query.device(),
+        )?)
+    } else {
+        None
+    };
     let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
         let ns = cu.dim(0)? - 1;
         (
@@ -209,9 +218,8 @@ pub fn flash_prefill(
             max_seqlen_q,
         )
     } else {
-        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
         (
-            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(cu_fallback.as_ref().unwrap())?,
             gpu_ptr_u32(context_lens)?,
             1usize,
             q_len,
@@ -1163,6 +1171,15 @@ pub fn flash_tq4_prefill(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
+    let cu_fallback = if cu_seqlens_q.is_none() {
+        Some(Tensor::from_vec(
+            vec![0u32, q_len as u32],
+            2,
+            query.device(),
+        )?)
+    } else {
+        None
+    };
     let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
         let ns = cu.dim(0)? - 1;
         (
@@ -1172,9 +1189,8 @@ pub fn flash_tq4_prefill(
             max_seqlen_q,
         )
     } else {
-        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
         (
-            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(cu_fallback.as_ref().unwrap())?,
             gpu_ptr_u32(context_lens)?,
             1usize,
             q_len,
@@ -1257,6 +1273,15 @@ pub fn flash_tq3_prefill(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
+    let cu_fallback = if cu_seqlens_q.is_none() {
+        Some(Tensor::from_vec(
+            vec![0u32, q_len as u32],
+            2,
+            query.device(),
+        )?)
+    } else {
+        None
+    };
     let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
         let ns = cu.dim(0)? - 1;
         (
@@ -1266,9 +1291,8 @@ pub fn flash_tq3_prefill(
             max_seqlen_q,
         )
     } else {
-        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
         (
-            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(cu_fallback.as_ref().unwrap())?,
             gpu_ptr_u32(context_lens)?,
             1usize,
             q_len,
