@@ -795,6 +795,7 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
     const T* __restrict__ bias,         // [d_conv] or nullptr
     float* __restrict__ conv_state,     // [batch, d_conv, kernel_size - 1], always F32
     T* __restrict__ out,                // [total_tokens, d_conv]
+    T* __restrict__ state_snapshots,    // optional [total_tokens, d_conv, kernel_size - 1]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
     int batch_size,
     int d_conv,
@@ -858,6 +859,15 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
             }
             history[KERNEL_SIZE - 2] = x_t;
         }
+
+        if (state_snapshots != nullptr) {
+            T* snapshot_ptr = state_snapshots +
+                ((start + t) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+#pragma unroll
+            for (int i = 0; i < KERNEL_SIZE - 1; ++i) {
+                snapshot_ptr[i] = from_float<T>(history[i]);
+            }
+        }
     }
 
 #pragma unroll
@@ -869,6 +879,7 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
 template <typename T>
 void launch_causal_conv1d_fwd_varlen(const T* x, const T* weight, const T* bias,
                                      float* conv_state, T* out,
+                                     T* state_snapshots,
                                      const uint32_t* cu_seqlens, int batch,
                                      int d_conv, int kernel_size, bool silu,
                                      cudaStream_t stream) {
@@ -877,13 +888,13 @@ void launch_causal_conv1d_fwd_varlen(const T* x, const T* weight, const T* bias,
 
     if (kernel_size == 4) {
         causal_conv1d_fwd_varlen_kernel<T, 4><<<grid, threads, 0, stream>>>(
-            x, weight, bias, conv_state, out, cu_seqlens, batch, d_conv, silu);
+            x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv, silu);
     } else if (kernel_size == 3) {
         causal_conv1d_fwd_varlen_kernel<T, 3><<<grid, threads, 0, stream>>>(
-            x, weight, bias, conv_state, out, cu_seqlens, batch, d_conv, silu);
+            x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv, silu);
     } else if (kernel_size == 2) {
         causal_conv1d_fwd_varlen_kernel<T, 2><<<grid, threads, 0, stream>>>(
-            x, weight, bias, conv_state, out, cu_seqlens, batch, d_conv, silu);
+            x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv, silu);
     } else {
          printf("causal_conv1d_fwd kernel_size=%d not supported (only 2,3,4)\\n", kernel_size);
     }
@@ -892,26 +903,26 @@ void launch_causal_conv1d_fwd_varlen(const T* x, const T* weight, const T* bias,
 
 extern "C" void causal_conv1d_fwd_f32(
     const float* x, const float* weight, const float* bias, float* conv_state,
-    float* out, const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size,
-    bool silu, cudaStream_t stream) {
-    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, cu_seqlens,
+    float* out, float* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
+    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, state_snapshots, cu_seqlens,
                                     batch, d_conv, kernel_size, silu, stream);
 }
 
 extern "C" void causal_conv1d_fwd_f16(
     const half* x, const half* weight, const half* bias, float* conv_state,
-    half* out, const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size,
-    bool silu, cudaStream_t stream) {
-    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, cu_seqlens,
+    half* out, half* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
+    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, state_snapshots, cu_seqlens,
                                     batch, d_conv, kernel_size, silu, stream);
 }
 
 extern "C" void causal_conv1d_fwd_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* weight,
     const __nv_bfloat16* bias, float* conv_state, __nv_bfloat16* out,
-    const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size, bool silu,
-    cudaStream_t stream) {
-    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, cu_seqlens,
+    __nv_bfloat16* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
+    launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, state_snapshots, cu_seqlens,
                                     batch, d_conv, kernel_size, silu, stream);
 }
 
@@ -1592,6 +1603,7 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     float* __restrict__ state,        // [max_batch, num_heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,              // [total_tokens, num_heads, v_dim]
+    float* __restrict__ state_snapshots, // optional [total_tokens, num_heads, k_dim, v_dim]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
     int batch,
     int num_heads,
@@ -1716,6 +1728,17 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
             if (lane == 0) {
                 out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
             }
+            if (state_snapshots != nullptr) {
+                float* snapshot_head = state_snapshots +
+                    (((start + t) * num_heads + head_idx) * k_dim * v_dim);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                    const int k_idx = r * GDN_WARP_SIZE + lane;
+                    if (k_idx < k_dim) {
+                        snapshot_head[k_idx * v_dim + v_idx] = s_shard[r];
+                    }
+                }
+            }
         }
 
         // Single sync: ensures next buffer load is complete before it's used
@@ -1736,7 +1759,7 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
 template <typename T>
 void launch_gated_delta_rule_recurrence_varlen(
     const T* q, const T* k, const T* v, const float* g, const float* beta,
-    float* state, const int64_t* slots, T* out,
+    float* state, const int64_t* slots, T* out, float* state_snapshots,
     const uint32_t* cu_seqlens,
     int batch, int num_heads, int k_dim, int v_dim,
     cudaStream_t stream) {
@@ -1747,7 +1770,7 @@ void launch_gated_delta_rule_recurrence_varlen(
         dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
         dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
     } else if (k_dim == 128) {
         constexpr int WARPS_PER_BLOCK = 8;
@@ -1755,7 +1778,7 @@ void launch_gated_delta_rule_recurrence_varlen(
         dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
         dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
     } else {
          printf("gated_delta_rule_recurrence_varlen: k_dim=%d not supported (only 64, 128)\n", k_dim);
@@ -1766,31 +1789,31 @@ void launch_gated_delta_rule_recurrence_varlen(
 extern "C" void gated_delta_rule_recurrence_varlen_f32(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, const int64_t* slots, float* out,
-    const uint32_t* cu_seqlens, int batch, int num_heads, int k_dim, int v_dim,
-    cudaStream_t stream) {
+    float* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int num_heads, int k_dim, int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_heads, k_dim, v_dim, stream);
 }
 
 extern "C" void gated_delta_rule_recurrence_varlen_f16(
     const half* q, const half* k, const half* v, const float* g,
     const float* beta, float* state, const int64_t* slots, half* out,
-    const uint32_t* cu_seqlens, int batch, int num_heads, int k_dim, int v_dim,
-    cudaStream_t stream) {
+    float* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int num_heads, int k_dim, int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_heads, k_dim, v_dim, stream);
 }
 
 extern "C" void gated_delta_rule_recurrence_varlen_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const float* g, const float* beta, float* state,
-    const int64_t* slots, __nv_bfloat16* out, const uint32_t* cu_seqlens,
-    int batch, int num_heads, int k_dim, int v_dim,
-    cudaStream_t stream) {
+    const int64_t* slots, __nv_bfloat16* out, float* state_snapshots,
+    const uint32_t* cu_seqlens, int batch, int num_heads, int k_dim,
+    int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_heads, k_dim, v_dim, stream);
 }
 

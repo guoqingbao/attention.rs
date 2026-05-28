@@ -162,6 +162,7 @@ pub struct InputMetadata {
     pub max_context_len: usize,
     pub seqlens: Option<Vec<u32>>,
     pub flashinfer_metadata: Option<FlashInferMetadata>,
+    pub is_mtp_verify: bool,
 }
 
 #[allow(dead_code)]
