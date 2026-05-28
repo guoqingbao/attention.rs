@@ -804,6 +804,7 @@ pub fn prefill_plan(
     out_dtype: DType,
     window_left: Option<i32>,
     kv_dtype: Option<DType>,
+    enable_cuda_graph: bool,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
     let sm = cuda_utils::sm_version(dev).unwrap_or(0);
@@ -841,7 +842,7 @@ pub fn prefill_plan(
     }
 
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
-        get_plan_workspace(dev, false)?;
+        get_plan_workspace(dev, enable_cuda_graph)?;
 
     let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
     let use_fp8_fa2_plan = is_fp8 && sm >= 90;
@@ -904,6 +905,42 @@ pub fn prefill_plan(
     Ok(plan_info)
 }
 
+/// Compute prefill plan for CUDA graph capture/replay. Uses the graph-dedicated workspace.
+/// This is the prefill analogue of `decode_plan(..., enable_cuda_graph: true)`.
+#[allow(clippy::too_many_arguments)]
+pub fn graph_prefill_plan(
+    dev: &candle_core::Device,
+    q_cu_seqlens_host: &[u32],
+    indptr_host: &[u32],
+    kv_len_arr_host: &[u32],
+    total_num_rows: u32,
+    batch_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+    out_dtype: DType,
+    window_left: Option<i32>,
+    kv_dtype: Option<DType>,
+) -> Result<Vec<i64>> {
+    prefill_plan(
+        dev,
+        q_cu_seqlens_host,
+        indptr_host,
+        kv_len_arr_host,
+        total_num_rows,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        out_dtype,
+        window_left,
+        kv_dtype,
+        true,
+    )
+}
+
 /// Run prefill using a pre-computed plan (from `prefill_plan`).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_with_plan(
@@ -925,6 +962,7 @@ pub fn prefill_with_plan(
     window_left: Option<i32>,
     logits_soft_cap: Option<f32>,
     plan_info: &[i64],
+    enable_cuda_graph: bool,
 ) -> Result<Tensor> {
     let op = FlashInferPrefillWithPlan {
         key_cache: key_cache.clone(),
@@ -944,6 +982,7 @@ pub fn prefill_with_plan(
         window_left: window_left.unwrap_or(-1),
         logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
         plan_info: plan_info.to_vec(),
+        enable_cuda_graph,
     };
     q.apply_op1(op)
 }
@@ -966,6 +1005,7 @@ struct FlashInferPrefillWithPlan {
     pub window_left: i32,
     pub logits_soft_cap: f32,
     pub plan_info: Vec<i64>,
+    pub enable_cuda_graph: bool,
 }
 
 impl candle::CustomOp1 for FlashInferPrefillWithPlan {
@@ -1038,7 +1078,7 @@ impl FlashInferPrefillWithPlan {
 
         let batch_size = self.q_cu_seqlens.dim(0)? - 1;
         let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, _, _) =
-            get_plan_workspace(dev, false)?;
+            get_plan_workspace(dev, self.enable_cuda_graph)?;
         validate_prefill_plan_info(&self.plan_info, ws_float_size, ws_int_size)?;
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;

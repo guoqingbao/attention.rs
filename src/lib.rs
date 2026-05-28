@@ -772,6 +772,7 @@ impl PagedAttention {
                             Some(self.sliding_window.unwrap_or(0) as i32),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
                             plan_info,
+                            fm.use_cuda_graph,
                         );
                     } else {
                         let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
