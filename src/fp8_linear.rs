@@ -130,6 +130,9 @@ pub fn fp8_matmul_fallback(
     );
     let scale_row_stride = (k_w + block_size[1] - 1) / block_size[1];
 
+    #[cfg(feature = "cuda")]
+    let output = unsafe { Tensor::empty_((m, n), dtype, dev)? };
+    #[cfg(not(feature = "cuda"))]
     let output = Tensor::zeros((m, n), dtype, dev)?;
 
     match (dev, dtype) {

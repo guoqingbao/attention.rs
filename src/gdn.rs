@@ -20,6 +20,16 @@ use metal_kernels;
 use std::ffi::{c_int, c_void};
 
 #[cfg(feature = "cuda")]
+fn cuda_full_write_output<S: Into<candle_core::Shape>>(
+    shape: S,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    // Caller must launch a CUDA kernel that writes every element before this tensor is read.
+    unsafe { Tensor::empty_(shape, dtype, device) }
+}
+
+#[cfg(feature = "cuda")]
 fn get_cuda_const_ptr(t: &Tensor) -> Result<*const c_void> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
@@ -829,7 +839,7 @@ pub fn causal_conv1d_fwd(
                 );
             }
             let batch = conv_state.dim(0)?;
-            let out = Tensor::zeros((total_tokens, d_conv), x.dtype(), x.device())?;
+            let out = cuda_full_write_output((total_tokens, d_conv), x.dtype(), x.device())?;
             let cu_u32 = if cu.dtype() == DType::U32 {
                 cu.clone()
             } else {
@@ -916,7 +926,7 @@ pub fn causal_conv1d_update(
         (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
             let (batch, d_conv) = x.dims2()?;
             let kernel_size = weight.dim(2)?;
-            let out = Tensor::zeros((batch, d_conv), x.dtype(), x.device())?;
+            let out = cuda_full_write_output((batch, d_conv), x.dtype(), x.device())?;
 
             let x_ptr = get_cuda_const_ptr(x)?;
             let weight_ptr = get_cuda_const_ptr(weight)?;
@@ -1092,8 +1102,8 @@ pub fn fused_gdn_gating(
     match (a.device(), a.dtype()) {
         (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
             let (batch, seq_len, heads) = a.dims3()?;
-            let g = Tensor::zeros(a.shape(), a.dtype(), a.device())?;
-            let beta = Tensor::zeros(a.shape(), a.dtype(), a.device())?;
+            let g = cuda_full_write_output(a.shape(), a.dtype(), a.device())?;
+            let beta = cuda_full_write_output(a.shape(), a.dtype(), a.device())?;
 
             let al_ptr = get_cuda_const_ptr(a_log)?;
             let a_ptr = get_cuda_const_ptr(a)?;
@@ -1258,7 +1268,7 @@ pub fn gated_rmsnorm_silu_mul(
             } else {
                 None
             };
-            let out = Tensor::zeros((rows, value_dim), x.dtype(), x.device())?;
+            let out = cuda_full_write_output((rows, value_dim), x.dtype(), x.device())?;
 
             let x_ptr = get_cuda_const_ptr(&x_c)?;
             let z_ptr = get_cuda_const_ptr(&z_c)?;
@@ -1463,7 +1473,7 @@ pub fn gated_delta_rule_recurrence(
             }
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
 
-            let out = Tensor::zeros((bh, seq_len, v_dim), DType::F32, q_c.device())?;
+            let out = cuda_full_write_output((bh, seq_len, v_dim), DType::F32, q_c.device())?;
 
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
@@ -1734,7 +1744,7 @@ pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
             }
             let dim = shape.dims()[shape.rank() - 1];
             let rows = shape.elem_count() / dim;
-            let output = Tensor::zeros(shape, input.dtype(), input.device())?;
+            let output = cuda_full_write_output(shape, input.dtype(), input.device())?;
             let in_ptr = get_cuda_const_ptr(&input_c)?;
             let out_ptr = get_cuda_mut_ptr(&output)?;
             let stream = *dev.cu_stream() as i64;
