@@ -3798,6 +3798,77 @@ pub fn call_gdn_gated_delta_rule_recurrence_varlen(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_recurrence_varlen_gqa(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    cu_seqlens: &Buffer,
+    cu_seqlens_offset: usize,
+    batch: i32,
+    num_v_heads: i32,
+    num_k_heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+    q_scale: f32,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_recurrence_varlen_gqa", ty, k_dim)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (v, v_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            (state, state_offset),
+            (slots, slots_offset),
+            (out, out_offset),
+            (cu_seqlens, cu_seqlens_offset),
+            batch,
+            num_v_heads,
+            num_k_heads,
+            k_dim,
+            v_dim,
+            q_scale
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((v_dim as u64) + 63) / 64,
+        height: (batch * num_v_heads) as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn call_gdn_mamba_scatter_rows(
     device: &Device,
     ep: impl EncoderProvider,

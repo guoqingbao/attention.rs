@@ -2288,6 +2288,24 @@ extern "C" {
         q_scale: f32,
         stream: i64,
     );
+    pub fn gated_delta_rule_recurrence_varlen_gqa_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut f32,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
 
     // Persistent GQA varlen prefill (H in registers, 128 threads per CTA)
     pub fn gated_delta_rule_prefill_persistent_varlen_gqa_bf16(

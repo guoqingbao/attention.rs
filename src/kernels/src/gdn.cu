@@ -2081,3 +2081,14 @@ extern "C" void gated_delta_rule_recurrence_varlen_gqa_f16(
         q, k, v, g, beta, state, slots, out, cu_seqlens,
         batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }
+
+extern "C" void gated_delta_rule_recurrence_varlen_gqa_f32(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, float* out,
+    const uint32_t* cu_seqlens,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence_varlen_gqa(
+        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}

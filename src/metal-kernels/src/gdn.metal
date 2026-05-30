@@ -589,6 +589,113 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     }
 }
 
+// GQA variant of varlen recurrence: q/k indexed by num_k_heads, v/g/beta/state/out by num_v_heads
+template <typename T, uint BK>
+kernel void gated_delta_rule_recurrence_varlen_gqa_kernel(
+    const device T* q [[buffer(0)]],
+    const device T* k [[buffer(1)]],
+    const device T* v [[buffer(2)]],
+    const device T* g [[buffer(3)]],
+    const device T* beta [[buffer(4)]],
+    device float* state [[buffer(5)]],
+    const device int64_t* slots [[buffer(6)]],
+    device T* out [[buffer(7)]],
+    const device uint* cu_seqlens [[buffer(8)]],
+    constant int& batch [[buffer(9)]],
+    constant int& num_v_heads [[buffer(10)]],
+    constant int& num_k_heads [[buffer(11)]],
+    constant int& k_dim [[buffer(12)]],
+    constant int& v_dim [[buffer(13)]],
+    constant float& q_scale [[buffer(14)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    const uint tid = tid3.x;
+    const uint v_idx = tgid.x * GDN_REC_THREADS + tid;
+    const uint seq_head = tgid.y;
+    if (seq_head >= static_cast<uint>(batch * num_v_heads) || v_idx >= static_cast<uint>(v_dim)) {
+        return;
+    }
+
+    const uint seq_idx = seq_head / num_v_heads;
+    const uint v_head_idx = seq_head % num_v_heads;
+    const uint kv_group_size = num_v_heads / num_k_heads;
+    const uint k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[seq_idx];
+    if (slot < 0) {
+        return;
+    }
+
+    const uint start = cu_seqlens[seq_idx];
+    const uint end = cu_seqlens[seq_idx + 1];
+    const uint seq_len = end - start;
+    if (seq_len == 0) {
+        return;
+    }
+
+    const uint token_stride_qk = num_k_heads * k_dim;
+    const uint token_stride_v = num_v_heads * v_dim;
+    const uint token_stride_g = num_v_heads;
+
+    threadgroup float k_shared[BK];
+    threadgroup float q_shared[BK];
+    threadgroup float scalars[2];
+
+    device float* state_head = state + ((static_cast<uint>(slot) * num_v_heads + v_head_idx) * k_dim * v_dim);
+    float s[BK];
+    for (uint j = 0; j < BK; ++j) {
+        s[j] = (j < static_cast<uint>(k_dim)) ? state_head[j * v_dim + v_idx] : 0.0f;
+    }
+
+    for (uint t = 0; t < seq_len; ++t) {
+        const uint token_idx = start + t;
+        const uint qk_base = token_idx * token_stride_qk + k_head_idx * k_dim;
+        const uint v_base = token_idx * token_stride_v + v_head_idx * v_dim;
+        const uint g_base = token_idx * token_stride_g + v_head_idx;
+
+        for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
+            k_shared[j] = gdn_to_float(k[qk_base + j]);
+        }
+        if (tid == 0) {
+            scalars[0] = exp(gdn_to_float(g[g_base]));
+            scalars[1] = gdn_to_float(beta[g_base]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float decay = scalars[0];
+        const float beta_t = scalars[1];
+        float kv_mem = 0.0f;
+        for (uint j = 0; j < BK; ++j) {
+            if (j < static_cast<uint>(k_dim)) {
+                s[j] *= decay;
+                kv_mem += s[j] * k_shared[j];
+            }
+        }
+        const float delta = (gdn_to_float(v[v_base + v_idx]) - kv_mem) * beta_t;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
+            q_shared[j] = gdn_to_float(q[qk_base + j]) * q_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float y = 0.0f;
+        for (uint j = 0; j < BK; ++j) {
+            if (j < static_cast<uint>(k_dim)) {
+                s[j] += k_shared[j] * delta;
+                y += s[j] * q_shared[j];
+            }
+        }
+        out[v_base + v_idx] = gdn_from_float<T>(y);
+    }
+
+    for (uint j = 0; j < BK; ++j) {
+        if (j < static_cast<uint>(k_dim)) {
+            state_head[j * v_dim + v_idx] = s[j];
+        }
+    }
+}
+
 template <typename T>
 kernel void mamba_scatter_rows_kernel(
     const device T* src [[buffer(0)]],
@@ -828,6 +935,34 @@ INSTANTIATE_VARLEN(half, 64)
 INSTANTIATE_VARLEN(half, 128)
 INSTANTIATE_VARLEN(bfloat16_t, 64)
 INSTANTIATE_VARLEN(bfloat16_t, 128)
+
+#define INSTANTIATE_VARLEN_GQA(type, bk) \
+template [[host_name("gdn_gated_delta_rule_recurrence_varlen_gqa_" #type "_k" #bk)]] \
+[[kernel]] void gated_delta_rule_recurrence_varlen_gqa_kernel<type, bk>( \
+    const device type* q [[buffer(0)]], \
+    const device type* k [[buffer(1)]], \
+    const device type* v [[buffer(2)]], \
+    const device type* g [[buffer(3)]], \
+    const device type* beta [[buffer(4)]], \
+    device float* state [[buffer(5)]], \
+    const device int64_t* slots [[buffer(6)]], \
+    device type* out [[buffer(7)]], \
+    const device uint* cu_seqlens [[buffer(8)]], \
+    constant int& batch [[buffer(9)]], \
+    constant int& num_v_heads [[buffer(10)]], \
+    constant int& num_k_heads [[buffer(11)]], \
+    constant int& k_dim [[buffer(12)]], \
+    constant int& v_dim [[buffer(13)]], \
+    constant float& q_scale [[buffer(14)]], \
+    uint3 tid3 [[thread_position_in_threadgroup]], \
+    uint3 tgid [[threadgroup_position_in_grid]]);
+
+INSTANTIATE_VARLEN_GQA(float, 64)
+INSTANTIATE_VARLEN_GQA(float, 128)
+INSTANTIATE_VARLEN_GQA(half, 64)
+INSTANTIATE_VARLEN_GQA(half, 128)
+INSTANTIATE_VARLEN_GQA(bfloat16_t, 64)
+INSTANTIATE_VARLEN_GQA(bfloat16_t, 128)
 
 INSTANTIATE_SCATTER(float)
 INSTANTIATE_SCATTER(half)
