@@ -2300,6 +2300,7 @@ extern "C" {
         slots: *const i64,
         out: *mut c_void,
         cu_seqlens: *const u32,
+        total_tokens: c_int,
         batch: c_int,
         num_v_heads: c_int,
         num_k_heads: c_int,
@@ -2307,7 +2308,7 @@ extern "C" {
         v_dim: c_int,
         q_scale: f32,
         stream: i64,
-    );
+    ) -> c_int;
     pub fn gated_delta_rule_prefill_persistent_varlen_gqa_f16(
         q: *const c_void,
         k: *const c_void,
@@ -2318,6 +2319,7 @@ extern "C" {
         slots: *const i64,
         out: *mut c_void,
         cu_seqlens: *const u32,
+        total_tokens: c_int,
         batch: c_int,
         num_v_heads: c_int,
         num_k_heads: c_int,
@@ -2325,7 +2327,7 @@ extern "C" {
         v_dim: c_int,
         q_scale: f32,
         stream: i64,
-    );
+    ) -> c_int;
 
     // =========================================================================
     // MXFP4 GEMM

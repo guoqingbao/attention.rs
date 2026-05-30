@@ -1,6 +1,8 @@
 // GDN (Gated Delta Net) operations module
 // Provides Rust interfaces for GDN CUDA kernels used in Qwen3.5's linear attention layers.
 
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+use crate::cuda_utils;
 #[cfg(feature = "cuda")]
 use candle_core as candle;
 #[cfg(feature = "metal")]
@@ -1987,6 +1989,65 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
             let stream = *dev.cu_stream() as i64;
+
+            #[cfg(feature = "flashinfer")]
+            if k_dim == v_dim
+                && num_v_heads > num_k_heads
+                && cuda_utils::sm_version(dev).is_some_and(|sm| sm == 90)
+            {
+                let decay_c = g_c.exp()?.to_dtype(DType::F32)?.contiguous()?;
+                let beta_f32_c = beta_c.to_dtype(DType::F32)?.contiguous()?;
+                let decay_ptr = get_cuda_const_ptr(&decay_c)?;
+                let beta_f32_ptr = get_cuda_const_ptr(&beta_f32_c)?;
+                let status = match q.dtype() {
+                    DType::BF16 => unsafe {
+                        ffi::gated_delta_rule_prefill_persistent_varlen_gqa_bf16(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            decay_ptr,
+                            beta_f32_ptr,
+                            state_ptr,
+                            slots_ptr,
+                            out_ptr,
+                            cu_ptr,
+                            total_tokens as c_int,
+                            batch as c_int,
+                            num_v_heads as c_int,
+                            num_k_heads as c_int,
+                            k_dim as c_int,
+                            v_dim as c_int,
+                            q_scale,
+                            stream,
+                        )
+                    },
+                    DType::F16 => unsafe {
+                        ffi::gated_delta_rule_prefill_persistent_varlen_gqa_f16(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            decay_ptr,
+                            beta_f32_ptr,
+                            state_ptr,
+                            slots_ptr,
+                            out_ptr,
+                            cu_ptr,
+                            total_tokens as c_int,
+                            batch as c_int,
+                            num_v_heads as c_int,
+                            num_k_heads as c_int,
+                            k_dim as c_int,
+                            v_dim as c_int,
+                            q_scale,
+                            stream,
+                        )
+                    },
+                    _ => -1,
+                };
+                if status == 0 {
+                    return Ok(out);
+                }
+            }
 
             match q.dtype() {
                 DType::BF16 => unsafe {
