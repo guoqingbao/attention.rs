@@ -374,10 +374,8 @@ flash_tq4_prefill(
             float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
-            smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
-            smem_P[row0 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p01);
-            smem_P[row1 * p_stride + c0]     = FLASH_FLOAT2HALF(p10);
-            smem_P[row1 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p11);
+            *(flash_half2_t*)&smem_P[row0 * p_stride + c0] = FLASH_FLOATS2HALF2(p00, p01);
+            *(flash_half2_t*)&smem_P[row1 * p_stride + c0] = FLASH_FLOATS2HALF2(p10, p11);
         }
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -441,14 +439,10 @@ flash_tq4_prefill(
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
-                *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
+                *(flash_half2_t*)&ob[gr0 * q_seq_stride + c0] = FLASH_FLOATS2HALF2(acc_o[nt][0] * il0, acc_o[nt][1] * il0);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
-                *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
+                *(flash_half2_t*)&ob[gr1 * q_seq_stride + c0] = FLASH_FLOATS2HALF2(acc_o[nt][2] * il1, acc_o[nt][3] * il1);
             }
         }
     }
@@ -725,10 +719,8 @@ extern "C" __global__ void flash_tq4_prefill(
                 float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
-                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p01);
-                smem_P[row1 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p10);
-                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p11);
+                *(flash_half2_t*)&smem_P[row0 * p_stride_512 + c0] = FLASH_FLOATS2HALF2(p00, p01);
+                *(flash_half2_t*)&smem_P[row1 * p_stride_512 + c0] = FLASH_FLOATS2HALF2(p10, p11);
             }
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -822,14 +814,10 @@ extern "C" __global__ void flash_tq4_prefill(
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
-                *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
+                *(flash_half2_t*)&ob[gr0 * q_seq_stride + c0] = FLASH_FLOATS2HALF2(acc_o[nt][0] * il0, acc_o[nt][1] * il0);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
-                *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
+                *(flash_half2_t*)&ob[gr1 * q_seq_stride + c0] = FLASH_FLOATS2HALF2(acc_o[nt][2] * il1, acc_o[nt][3] * il1);
             }
         }
     }

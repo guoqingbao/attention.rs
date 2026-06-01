@@ -68,6 +68,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_wgmma.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_tcgen05.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_instantiate_sm90.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -94,6 +97,19 @@ fn main() -> Result<()> {
         builder = builder.exclude(&["flash/*"]);
     } else {
         builder = builder.arg("-Isrc/flash");
+        if compute_cap >= 100 {
+            builder = builder.arg("-DFLASH_TCGEN05_ENABLED");
+            println!(
+                "cargo:warning=Native flash SM100+ tcgen05 large-tile prefill enabled (BR=128, BC=128) for SM{}.",
+                compute_cap
+            );
+        } else if compute_cap >= 90 {
+            builder = builder.arg("-DFLASH_WGMMA_ENABLED");
+            println!(
+                "cargo:warning=Native flash SM90 wgmma large-tile prefill enabled (BR=64, BC=64) for SM{}.",
+                compute_cap
+            );
+        }
         if compute_cap <= 70 {
             println!(
                 "cargo:warning=Native flash kernels using m8n8k4 Tensor Core MMA for SM{}.",
@@ -105,6 +121,9 @@ fn main() -> Result<()> {
                  SM80+ uses BF16 m16n8k16 for best performance.",
                 compute_cap
             );
+        }
+        if compute_cap < 90 {
+            builder = builder.exclude(&["flash/flash_instantiate_sm90.cu"]);
         }
     }
 

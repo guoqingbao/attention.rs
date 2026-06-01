@@ -311,9 +311,7 @@ extern "C" __global__ void flash_decode_paged_fp8(
         for (int i = 0; i < VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
-            o32[i] = lo | (hi << 16);
+            *(flash_half2_t*)&o32[i] = FLASH_FLOATS2HALF2(v0, v1);
         }
     }
 }
