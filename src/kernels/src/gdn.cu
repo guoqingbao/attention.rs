@@ -437,8 +437,8 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const T* __restrict__ q,      // [batch, heads, k_dim]
     const T* __restrict__ k,      // [batch, heads, k_dim]
     const T* __restrict__ v,      // [batch, heads, v_dim]
-    const T* __restrict__ g,      // [batch, heads] decay = exp(g)
-    const T* __restrict__ beta,   // [batch, heads]
+    const float* __restrict__ g,  // [batch, heads] decay = exp(g)
+    const float* __restrict__ beta, // [batch, heads]
     float* __restrict__ state,    // [max_batch, heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, heads, v_dim]
@@ -524,7 +524,7 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
 // K4: dispatch to exact BK sizes to minimize register pressure
 template <typename T>
 void launch_gated_delta_rule_decode_slots(
-    const T* q, const T* k, const T* v, const T* g, const T* beta,
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
     T* state, const int64_t* slots, T* out,
     int batch, int heads, int k_dim, int v_dim,
     cudaStream_t stream) {
@@ -596,7 +596,7 @@ extern "C" void gated_delta_rule_decode_slots_f32(
 }
 
 extern "C" void gated_delta_rule_decode_slots_f16(
-    const half* q, const half* k, const half* v, const half* g, const half* beta,
+    const half* q, const half* k, const half* v, const float* g, const float* beta,
     half* state, const int64_t* slots, half* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots(
@@ -605,7 +605,7 @@ extern "C" void gated_delta_rule_decode_slots_f16(
 
 extern "C" void gated_delta_rule_decode_slots_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* g, const __nv_bfloat16* beta, __nv_bfloat16* state,
+    const float* g, const float* beta, __nv_bfloat16* state,
     const int64_t* slots, __nv_bfloat16* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots(
@@ -639,8 +639,8 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     const T* __restrict__ q,      // [batch, num_k_heads, k_dim]
     const T* __restrict__ k,      // [batch, num_k_heads, k_dim]
     const T* __restrict__ v,      // [batch, num_v_heads, v_dim]
-    const T* __restrict__ g,      // [batch, num_v_heads]  (log-space, NOT exp'd)
-    const T* __restrict__ beta,   // [batch, num_v_heads]
+    const float* __restrict__ g,  // [batch, num_v_heads]  (log-space, NOT exp'd)
+    const float* __restrict__ beta, // [batch, num_v_heads]
     float* __restrict__ state,    // [max_batch, num_v_heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, num_v_heads, v_dim]
@@ -729,7 +729,7 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
 
 template <typename T>
 void launch_gated_delta_rule_decode_slots_gqa(
-    const T* q, const T* k, const T* v, const T* g, const T* beta,
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
     float* state, const int64_t* slots, T* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
@@ -764,7 +764,7 @@ void launch_gated_delta_rule_decode_slots_gqa(
 
 extern "C" void gated_delta_rule_decode_slots_gqa_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* g, const __nv_bfloat16* beta, float* state,
+    const float* g, const float* beta, float* state,
     const int64_t* slots, __nv_bfloat16* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
@@ -775,7 +775,7 @@ extern "C" void gated_delta_rule_decode_slots_gqa_bf16(
 
 extern "C" void gated_delta_rule_decode_slots_gqa_f16(
     const half* q, const half* k, const half* v,
-    const half* g, const half* beta, float* state,
+    const float* g, const float* beta, float* state,
     const int64_t* slots, half* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
@@ -1620,8 +1620,8 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const T* q_base = q + start * token_stride_k + head_idx * k_dim;
     const T* k_base = k + start * token_stride_k + head_idx * k_dim;
     const T* v_base = v + start * token_stride_v + head_idx * v_dim;
-    const T* g_base = g + start * token_stride_g + head_idx;
-    const T* beta_base = beta + start * token_stride_g + head_idx;
+    const float* g_base = g + start * token_stride_g + head_idx;
+    const float* beta_base = beta + start * token_stride_g + head_idx;
     T* out_base = out + start * token_stride_v + head_idx * v_dim;
 
     __shared__ float q_buf[2][BK];
@@ -1845,8 +1845,8 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
     const T* q_base = q + start * token_stride_qk + k_head_idx * k_dim;
     const T* k_base = k + start * token_stride_qk + k_head_idx * k_dim;
     const T* v_base = v + start * token_stride_v + v_head_idx * v_dim;
-    const T* g_base = g + start * token_stride_g + v_head_idx;
-    const T* beta_base = beta + start * token_stride_g + v_head_idx;
+    const float* g_base = g + start * token_stride_g + v_head_idx;
+    const float* beta_base = beta + start * token_stride_g + v_head_idx;
     T* out_base = out + start * token_stride_v + v_head_idx * v_dim;
 
     __shared__ float q_buf[2][BK];

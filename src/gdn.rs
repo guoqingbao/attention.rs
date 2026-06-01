@@ -1687,16 +1687,17 @@ pub fn gated_delta_rule_decode_slots(
                 );
             }
 
-            if q.dtype() != k.dtype()
-                || q.dtype() != v.dtype()
-                || q.dtype() != g.dtype()
-                || q.dtype() != beta.dtype()
-            {
+            if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
                 candle_core::bail!(
-                    "gated_delta_rule_decode_slots dtype mismatch: q={:?} k={:?} v={:?} g={:?} beta={:?}",
+                    "gated_delta_rule_decode_slots dtype mismatch: q={:?} k={:?} v={:?}",
                     q.dtype(),
                     k.dtype(),
-                    v.dtype(),
+                    v.dtype()
+                );
+            }
+            if g.dtype() != DType::F32 || beta.dtype() != DType::F32 {
+                candle_core::bail!(
+                    "gated_delta_rule_decode_slots expects F32 g/beta, got g={:?} beta={:?}",
                     g.dtype(),
                     beta.dtype()
                 );
@@ -1756,8 +1757,8 @@ pub fn gated_delta_rule_decode_slots(
                 let q_ptr = get_cuda_const_ptr(&q_c)?;
                 let k_ptr = get_cuda_const_ptr(&k_c)?;
                 let v_ptr = get_cuda_const_ptr(&v_c)?;
-                let g_ptr = get_cuda_const_ptr(&decay_c)?;
-                let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+                let g_ptr = get_cuda_const_ptr(&decay_c)? as *const f32;
+                let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
                 let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
                 let out_ptr = get_cuda_mut_ptr(&out)?;
 
@@ -1940,8 +1941,8 @@ pub fn gated_delta_rule_recurrence_varlen(
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
             let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&decay_c)?;
-            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let g_ptr = get_cuda_const_ptr(&decay_c)? as *const f32;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
@@ -1954,8 +1955,8 @@ pub fn gated_delta_rule_recurrence_varlen(
                         q_ptr as *const f32,
                         k_ptr as *const f32,
                         v_ptr as *const f32,
-                        g_ptr as *const f32,
-                        beta_ptr as *const f32,
+                        g_ptr,
+                        beta_ptr,
                         state_ptr,
                         slots_ptr,
                         out_ptr as *mut f32,
@@ -2066,8 +2067,8 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
             let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_c)?;
-            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
@@ -2210,8 +2211,8 @@ pub fn gated_delta_rule_decode_slots_gqa(
             let q_ptr = get_cuda_const_ptr(&q_c)?;
             let k_ptr = get_cuda_const_ptr(&k_c)?;
             let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_c)?;
-            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
