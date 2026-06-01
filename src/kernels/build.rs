@@ -51,6 +51,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
+    println!("cargo:rerun-if-changed=src/mlx_nvfp4_utils.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");

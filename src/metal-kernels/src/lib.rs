@@ -3917,3 +3917,91 @@ pub fn call_gdn_mamba_scatter_rows(
     encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// MLX NVFP4 utility kernels
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_nvfp4_repack(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: Kernels,
+    input: (&Buffer, usize),
+    output: &Buffer,
+    num_rows: usize,
+    num_u32_cols: usize,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(
+        device,
+        "mlx_nvfp4::mlx_nvfp4_repack_u32_to_u8_kernel".to_string(),
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.0), input.1 as NSUInteger);
+    encoder.set_buffer(1, Some(output), 0 as NSUInteger);
+    utils::set_param(encoder, 2, num_rows as u32);
+    utils::set_param(encoder, 3, num_u32_cols as u32);
+
+    let total = (num_rows * num_u32_cols) as u64;
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let gc = MTLSize {
+        width: (total + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(gc, tg);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_nvfp4_dequant_embedding(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: Kernels,
+    ty: DType,
+    weight: (&Buffer, usize),
+    scales: (&Buffer, usize),
+    output: &Buffer,
+    vocab_size: usize,
+    hidden_size: usize,
+) -> Result<(), MetalKernelError> {
+    let name = match ty {
+        DType::F16 => "mlx_nvfp4_dequant_embedding_f16",
+        DType::BF16 => "mlx_nvfp4_dequant_embedding_bf16",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(weight.0), weight.1 as NSUInteger);
+    encoder.set_buffer(1, Some(scales.0), scales.1 as NSUInteger);
+    encoder.set_buffer(2, Some(output), 0 as NSUInteger);
+    utils::set_param(encoder, 3, vocab_size as u32);
+    utils::set_param(encoder, 4, hidden_size as u32);
+
+    let total = (vocab_size * hidden_size / 2) as u64;
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let gc = MTLSize {
+        width: (total + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(gc, tg);
+    Ok(())
+}

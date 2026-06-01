@@ -3386,4 +3386,31 @@ extern "C" {
         softcap: f32,
         stream: i64,
     );
+
+    // MLX NVFP4 utility kernels
+    pub fn mlx_nvfp4_repack_u32_to_u8(
+        input: *const c_void,
+        output: *mut c_void,
+        num_rows: c_int,
+        num_u32_cols: c_int,
+        stream: i64,
+    );
+
+    pub fn mlx_nvfp4_dequant_embedding_f16(
+        weight_u32: *const c_void,
+        scales: *const c_void,
+        output: *mut c_void,
+        vocab_size: c_int,
+        hidden_size: c_int,
+        stream: i64,
+    );
+
+    pub fn mlx_nvfp4_dequant_embedding_bf16(
+        weight_u32: *const c_void,
+        scales: *const c_void,
+        output: *mut c_void,
+        vocab_size: c_int,
+        hidden_size: c_int,
+        stream: i64,
+    );
 }

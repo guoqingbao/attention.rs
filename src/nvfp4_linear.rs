@@ -637,3 +637,251 @@ pub fn nvfp4_matmul(
         _ => candle_core::bail!("nvfp4_matmul: unsupported backend (need CUDA or Metal)"),
     }
 }
+
+/// Repack MLX NVFP4 weights from U32 to U8 on GPU.
+///
+/// MLX stores FP4 E2M1 weights as U32 (8 nibbles per U32 in little-endian).
+/// Our NVFP4 GEMM kernels expect U8 (2 nibbles per byte). This function
+/// reinterprets the bytes on-device without CPU round-trip.
+///
+/// * `weight_u32` - `[rows, cols]` U32 tensor on GPU
+/// * Returns `[rows, cols * 4]` U8 tensor on GPU
+#[allow(unused)]
+pub fn mlx_repack_u32_to_u8(weight_u32: &Tensor) -> Result<Tensor> {
+    let weight_u32 = if weight_u32.is_contiguous() {
+        weight_u32.clone()
+    } else {
+        weight_u32.contiguous()?
+    };
+    let dims = weight_u32.dims();
+    if dims.len() != 2 {
+        candle_core::bail!("mlx_repack_u32_to_u8: expected rank 2, got {:?}", dims);
+    }
+    let rows = dims[0];
+    let u32_cols = dims[1];
+    let u8_cols = u32_cols * 4;
+    let dev = weight_u32.device();
+
+    match dev {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_dev) => {
+            use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+            use candle_core::Storage;
+
+            let output = Tensor::zeros((rows, u8_cols), candle_core::DType::U8, dev)?;
+            let stream = *cuda_dev.cu_stream() as i64;
+
+            {
+                let (in_s, _) = weight_u32.storage_and_layout();
+                let in_ptr = match &*in_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u32>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+                let (out_s, _) = output.storage_and_layout();
+                let out_ptr = match &*out_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("tensor must be on CUDA"),
+                };
+                unsafe {
+                    ffi::mlx_nvfp4_repack_u32_to_u8(
+                        in_ptr as *const std::ffi::c_void,
+                        out_ptr as *mut std::ffi::c_void,
+                        rows as i32,
+                        u32_cols as i32,
+                        stream,
+                    );
+                }
+            }
+            Ok(output)
+        }
+        #[cfg(feature = "metal")]
+        candle_core::Device::Metal(_metal_dev) => {
+            // Metal path: reinterpret U32 bytes as U8 via compute kernel
+            mlx_repack_u32_to_u8_metal(&weight_u32, rows, u32_cols)
+        }
+        _ => candle_core::bail!("mlx_repack_u32_to_u8: unsupported backend (need CUDA or Metal)"),
+    }
+}
+
+/// Dequantize MLX NVFP4 quantized embeddings on GPU.
+///
+/// * `weight_u32` - `[vocab_size, hidden_size/8]` U32 packed FP4 weights on GPU
+/// * `scales` - `[vocab_size, hidden_size/16]` U8 FP8 E4M3 block scales on GPU
+/// * `vocab_size` - vocabulary size
+/// * `hidden_size` - embedding dimension
+/// * `dtype` - output dtype (F16 or BF16)
+///
+/// Returns `[vocab_size, hidden_size]` dequantized embedding tensor
+#[allow(unused)]
+pub fn mlx_dequant_embedding(
+    weight_u32: &Tensor,
+    scales: &Tensor,
+    vocab_size: usize,
+    hidden_size: usize,
+    dtype: candle_core::DType,
+) -> Result<Tensor> {
+    let weight_u32 = if weight_u32.is_contiguous() {
+        weight_u32.clone()
+    } else {
+        weight_u32.contiguous()?
+    };
+    let scales = if scales.is_contiguous() {
+        scales.clone()
+    } else {
+        scales.contiguous()?
+    };
+    let dev = weight_u32.device();
+
+    match dev {
+        #[cfg(feature = "cuda")]
+        candle_core::Device::Cuda(cuda_dev) => {
+            use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+            use candle_core::Storage;
+
+            let output = Tensor::zeros((vocab_size, hidden_size), dtype, dev)?;
+            let stream = *cuda_dev.cu_stream() as i64;
+
+            {
+                let (w_s, _) = weight_u32.storage_and_layout();
+                let w_ptr = match &*w_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u32>()?.device_ptr(),
+                    _ => candle_core::bail!("weight must be on CUDA"),
+                };
+                let (s_s, _) = scales.storage_and_layout();
+                let s_ptr = match &*s_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+                    _ => candle_core::bail!("scales must be on CUDA"),
+                };
+                let (o_s, _) = output.storage_and_layout();
+                let o_ptr = match &*o_s {
+                    Storage::Cuda(c) => match dtype {
+                        candle_core::DType::F16 => *c.as_cuda_slice::<half::f16>()?.device_ptr(),
+                        candle_core::DType::BF16 => *c.as_cuda_slice::<half::bf16>()?.device_ptr(),
+                        _ => candle_core::bail!("output dtype must be F16 or BF16"),
+                    },
+                    _ => candle_core::bail!("output must be on CUDA"),
+                };
+                unsafe {
+                    match dtype {
+                        candle_core::DType::F16 => {
+                            ffi::mlx_nvfp4_dequant_embedding_f16(
+                                w_ptr as *const std::ffi::c_void,
+                                s_ptr as *const std::ffi::c_void,
+                                o_ptr as *mut std::ffi::c_void,
+                                vocab_size as i32,
+                                hidden_size as i32,
+                                stream,
+                            );
+                        }
+                        candle_core::DType::BF16 => {
+                            ffi::mlx_nvfp4_dequant_embedding_bf16(
+                                w_ptr as *const std::ffi::c_void,
+                                s_ptr as *const std::ffi::c_void,
+                                o_ptr as *mut std::ffi::c_void,
+                                vocab_size as i32,
+                                hidden_size as i32,
+                                stream,
+                            );
+                        }
+                        _ => candle_core::bail!(
+                            "mlx_dequant_embedding: unsupported dtype {:?}",
+                            dtype
+                        ),
+                    }
+                }
+            }
+            Ok(output)
+        }
+        #[cfg(feature = "metal")]
+        candle_core::Device::Metal(_metal_dev) => {
+            mlx_dequant_embedding_metal(&weight_u32, &scales, vocab_size, hidden_size, dtype)
+        }
+        _ => candle_core::bail!("mlx_dequant_embedding: unsupported backend (need CUDA or Metal)"),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn mlx_repack_u32_to_u8_metal(weight_u32: &Tensor, rows: usize, u32_cols: usize) -> Result<Tensor> {
+    let u8_cols = u32_cols * 4;
+    let dev = weight_u32.device();
+    let output = Tensor::zeros((rows, u8_cols), candle_core::DType::U8, dev)?;
+
+    let metal_dev = dev.as_metal_device()?;
+    let command_buffer = metal_dev.command_buffer()?;
+    let command_buffer_ref = command_buffer.as_ref();
+
+    {
+        use candle_core::Storage;
+        let (in_s, in_l) = weight_u32.storage_and_layout();
+        let in_ms = match &*in_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("tensor must be on Metal"),
+        };
+        let (out_s, _out_l) = output.storage_and_layout();
+        let out_ms = match &*out_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("tensor must be on Metal"),
+        };
+
+        metal_kernels::call_mlx_nvfp4_repack(
+            metal_dev.device(),
+            command_buffer_ref,
+            metal_kernels::Kernels::default(),
+            (in_ms.buffer(), in_l.start_offset() * 4),
+            out_ms.buffer(),
+            rows,
+            u32_cols,
+        )
+        .map_err(candle_core::Error::wrap)?;
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "metal")]
+fn mlx_dequant_embedding_metal(
+    weight_u32: &Tensor,
+    scales: &Tensor,
+    vocab_size: usize,
+    hidden_size: usize,
+    dtype: candle_core::DType,
+) -> Result<Tensor> {
+    let dev = weight_u32.device();
+    let output = Tensor::zeros((vocab_size, hidden_size), dtype, dev)?;
+
+    let metal_dev = dev.as_metal_device()?;
+    let command_buffer = metal_dev.command_buffer()?;
+    let command_buffer_ref = command_buffer.as_ref();
+
+    {
+        use candle_core::Storage;
+        let (w_s, w_l) = weight_u32.storage_and_layout();
+        let w_ms = match &*w_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("weight must be on Metal"),
+        };
+        let (s_s, s_l) = scales.storage_and_layout();
+        let s_ms = match &*s_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("scales must be on Metal"),
+        };
+        let (o_s, _o_l) = output.storage_and_layout();
+        let o_ms = match &*o_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("output must be on Metal"),
+        };
+
+        metal_kernels::call_mlx_nvfp4_dequant_embedding(
+            metal_dev.device(),
+            command_buffer_ref,
+            metal_kernels::Kernels::default(),
+            dtype,
+            (w_ms.buffer(), w_l.start_offset() * 4),
+            (s_ms.buffer(), s_l.start_offset()),
+            o_ms.buffer(),
+            vocab_size,
+            hidden_size,
+        )
+        .map_err(candle_core::Error::wrap)?;
+    }
+    Ok(output)
+}
