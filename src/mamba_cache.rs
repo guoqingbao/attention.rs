@@ -776,6 +776,22 @@ impl MambaCache {
             return Ok(false);
         }
 
+        // Evict before capture so we never exceed capacity (avoids transient OOM
+        // from holding capacity+1 snapshots while the new one is being created).
+        if !self.prefix_states.contains_key(&hash) {
+            while self.prefix_states.len() >= self.prefix_cache_capacity {
+                if let Some(h) = self.prefix_lru.pop_front() {
+                    self.remove_prefix_state(h);
+                    continue;
+                }
+                if let Some(h) = self.preserved_prefix_lru.pop_front() {
+                    self.remove_prefix_state(h);
+                    continue;
+                }
+                break;
+            }
+        }
+
         let device = self.conv_states[0].device();
         let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), device)?;
         let mut conv_states = Vec::with_capacity(self.num_gdn_layers);
@@ -793,7 +809,6 @@ impl MambaCache {
             },
         );
         self.touch_prefix_state(hash, preserve);
-        self.evict_prefix_states_if_needed();
         Ok(true)
     }
 
