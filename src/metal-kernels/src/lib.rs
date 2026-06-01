@@ -3432,7 +3432,6 @@ pub fn call_gdn_fused_gating(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     ty: DType,
-    a_log_ty: DType,
     a_log: &Buffer,
     a_log_offset: usize,
     a: &Buffer,
@@ -3448,15 +3447,12 @@ pub fn call_gdn_fused_gating(
     total_elements: i32,
     num_heads: i32,
 ) -> Result<(), MetalKernelError> {
-    let name = match (ty, a_log_ty) {
-        (DType::F32, DType::F32) => "gdn_fused_gating_float".to_string(),
-        (DType::F16, DType::F16) => "gdn_fused_gating_half".to_string(),
-        (DType::BF16, DType::BF16) => "gdn_fused_gating_bfloat16_t".to_string(),
-        (DType::F16, DType::F32) => "gdn_fused_gating_half_alog_f32".to_string(),
-        (DType::BF16, DType::F32) => "gdn_fused_gating_bfloat16_t_alog_f32".to_string(),
+    let name = match ty {
+        DType::F32 => "gdn_fused_gating_float".to_string(),
+        DType::BF16 => "gdn_fused_gating_bfloat16_t".to_string(),
         _ => {
             return Err(MetalKernelError::FailedToCreatePipeline(format!(
-                "unsupported fused gating dtypes: a={ty:?}, a_log={a_log_ty:?}"
+                "unsupported fused gating dtype: a={ty:?} (a_log and dt_bias are always F32)"
             )))
         }
     };
@@ -3926,7 +3922,7 @@ pub fn call_gdn_mamba_scatter_rows(
 pub fn call_mlx_nvfp4_repack(
     device: &Device,
     ep: impl EncoderProvider,
-    kernels: Kernels,
+    kernels: &Kernels,
     input: (&Buffer, usize),
     output: &Buffer,
     num_rows: usize,
@@ -3963,7 +3959,7 @@ pub fn call_mlx_nvfp4_repack(
 pub fn call_mlx_nvfp4_dequant_embedding(
     device: &Device,
     ep: impl EncoderProvider,
-    kernels: Kernels,
+    kernels: &Kernels,
     ty: DType,
     weight: (&Buffer, usize),
     scales: (&Buffer, usize),

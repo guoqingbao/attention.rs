@@ -43,7 +43,7 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     device T* out [[buffer(4)]],
     const device uint* cu_seqlens [[buffer(5)]],
     constant int& batch_size [[buffer(6)]],
@@ -61,14 +61,14 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     const uint end = cu_seqlens[seq_idx + 1];
     const uint seq_len = end - start;
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
-    device T* state_ptr = conv_state + (seq_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (seq_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
 
     float history[KERNEL_SIZE];
     for (uint i = 0; i < KERNEL_SIZE; ++i) {
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
     }
 
     float w_reg[KERNEL_SIZE];
@@ -100,7 +100,7 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     }
 
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        state_ptr[i] = gdn_from_float<T>(history[i]);
+        state_ptr[i] = history[i];
     }
 }
 
@@ -109,7 +109,7 @@ kernel void causal_conv1d_update_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     device T* out [[buffer(4)]],
     constant int& batch_size [[buffer(5)]],
     constant int& d_conv [[buffer(6)]],
@@ -122,7 +122,7 @@ kernel void causal_conv1d_update_kernel(
         return;
     }
 
-    device T* state_ptr = conv_state + (batch_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (batch_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
     const float x_t = gdn_to_float(x[batch_idx * d_conv + channel_idx]);
 
@@ -132,7 +132,7 @@ kernel void causal_conv1d_update_kernel(
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
         sum += history[i] * gdn_to_float(w_ptr[i]);
     }
 
@@ -146,9 +146,9 @@ kernel void causal_conv1d_update_kernel(
 
     if (KERNEL_SIZE > 1) {
         for (uint i = 0; i + 2 < KERNEL_SIZE; ++i) {
-            state_ptr[i] = gdn_from_float<T>(history[i + 1]);
+            state_ptr[i] = history[i + 1];
         }
-        state_ptr[KERNEL_SIZE - 2] = gdn_from_float<T>(x_t);
+        state_ptr[KERNEL_SIZE - 2] = x_t;
     }
 }
 
@@ -157,7 +157,7 @@ kernel void causal_conv1d_update_slots_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     const device int64_t* slots [[buffer(4)]],
     device T* out [[buffer(5)]],
     constant int& batch_size [[buffer(6)]],
@@ -176,7 +176,7 @@ kernel void causal_conv1d_update_slots_kernel(
         return;
     }
 
-    device T* state_ptr = conv_state + (static_cast<uint>(slot) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (static_cast<uint>(slot) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
     const float x_t = gdn_to_float(x[batch_idx * d_conv + channel_idx]);
 
@@ -186,7 +186,7 @@ kernel void causal_conv1d_update_slots_kernel(
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
         sum += history[i] * gdn_to_float(w_ptr[i]);
     }
 
@@ -200,20 +200,20 @@ kernel void causal_conv1d_update_slots_kernel(
 
     if (KERNEL_SIZE > 1) {
         for (uint i = 0; i + 2 < KERNEL_SIZE; ++i) {
-            state_ptr[i] = gdn_from_float<T>(history[i + 1]);
+            state_ptr[i] = history[i + 1];
         }
-        state_ptr[KERNEL_SIZE - 2] = gdn_from_float<T>(x_t);
+        state_ptr[KERNEL_SIZE - 2] = x_t;
     }
 }
 
-template <typename T, typename ALogT>
+template <typename T>
 kernel void fused_gdn_gating_kernel(
-    const device ALogT* a_log [[buffer(0)]],
+    const device float* a_log [[buffer(0)]],
     const device T* a [[buffer(1)]],
     const device T* b [[buffer(2)]],
-    const device T* dt_bias [[buffer(3)]],
-    device T* g [[buffer(4)]],
-    device T* beta [[buffer(5)]],
+    const device float* dt_bias [[buffer(3)]],
+    device float* g [[buffer(4)]],
+    device float* beta [[buffer(5)]],
     constant int& total_elements [[buffer(6)]],
     constant int& num_heads [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
@@ -224,12 +224,10 @@ kernel void fused_gdn_gating_kernel(
     const int h_idx = static_cast<int>(gid) % num_heads;
     const float a_val = gdn_to_float(a[gid]);
     const float b_val = gdn_to_float(b[gid]);
-    const float alog_val = gdn_to_float(a_log[h_idx]);
-    const float dt_val = gdn_to_float(dt_bias[h_idx]);
-    const float g_val = -exp(alog_val) * gdn_softplus(a_val + dt_val);
-    const float beta_val = gdn_sigmoid(b_val);
-    g[gid] = gdn_from_float<T>(g_val);
-    beta[gid] = gdn_from_float<T>(beta_val);
+    const float alog_val = a_log[h_idx];
+    const float dt_val = dt_bias[h_idx];
+    g[gid] = -exp(alog_val) * gdn_softplus(a_val + dt_val);
+    beta[gid] = gdn_sigmoid(b_val);
 }
 
 template <typename T>
@@ -414,8 +412,8 @@ kernel void gated_delta_rule_decode_slots_kernel(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device T* g [[buffer(3)]],
-    const device T* beta [[buffer(4)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
@@ -497,8 +495,8 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device T* g [[buffer(3)]],
-    const device T* beta [[buffer(4)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
@@ -595,8 +593,8 @@ kernel void gated_delta_rule_recurrence_varlen_gqa_kernel(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device T* g [[buffer(3)]],
-    const device T* beta [[buffer(4)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
@@ -726,7 +724,7 @@ template [[host_name("gdn_causal_conv1d_fwd_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     device type* out [[buffer(4)]], \
     const device uint* cu_seqlens [[buffer(5)]], \
     constant int& batch_size [[buffer(6)]], \
@@ -740,7 +738,7 @@ template [[host_name("gdn_causal_conv1d_update_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     device type* out [[buffer(4)]], \
     constant int& batch_size [[buffer(5)]], \
     constant int& d_conv [[buffer(6)]], \
@@ -753,7 +751,7 @@ template [[host_name("gdn_causal_conv1d_update_slots_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     const device int64_t* slots [[buffer(4)]], \
     device type* out [[buffer(5)]], \
     constant int& batch_size [[buffer(6)]], \
@@ -761,15 +759,15 @@ template [[host_name("gdn_causal_conv1d_update_slots_" #type "_k" #ksize)]] \
     constant bool& activation_silu [[buffer(8)]], \
     uint2 gid [[thread_position_in_grid]]);
 
-#define INSTANTIATE_GATING(type, alog_type, name) \
+#define INSTANTIATE_GATING(type, name) \
 template [[host_name(name)]] \
-[[kernel]] void fused_gdn_gating_kernel<type, alog_type>( \
-    const device alog_type* a_log [[buffer(0)]], \
+[[kernel]] void fused_gdn_gating_kernel<type>( \
+    const device float* a_log [[buffer(0)]], \
     const device type* a [[buffer(1)]], \
     const device type* b [[buffer(2)]], \
-    const device type* dt_bias [[buffer(3)]], \
-    device type* g [[buffer(4)]], \
-    device type* beta [[buffer(5)]], \
+    const device float* dt_bias [[buffer(3)]], \
+    device float* g [[buffer(4)]], \
+    device float* beta [[buffer(5)]], \
     constant int& total_elements [[buffer(6)]], \
     constant int& num_heads [[buffer(7)]], \
     uint gid [[thread_position_in_grid]]);
@@ -826,8 +824,8 @@ template [[host_name("gdn_gated_delta_rule_decode_slots_" #type "_k" #bk)]] \
     const device type* q [[buffer(0)]], \
     const device type* k [[buffer(1)]], \
     const device type* v [[buffer(2)]], \
-    const device type* g [[buffer(3)]], \
-    const device type* beta [[buffer(4)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
@@ -844,8 +842,8 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_" #type "_k" #bk)]]
     const device type* q [[buffer(0)]], \
     const device type* k [[buffer(1)]], \
     const device type* v [[buffer(2)]], \
-    const device type* g [[buffer(3)]], \
-    const device type* beta [[buffer(4)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
@@ -872,9 +870,6 @@ template [[host_name("gdn_mamba_scatter_rows_" #type)]] \
 INSTANTIATE_CONV_FWD(float, 2)
 INSTANTIATE_CONV_FWD(float, 3)
 INSTANTIATE_CONV_FWD(float, 4)
-INSTANTIATE_CONV_FWD(half, 2)
-INSTANTIATE_CONV_FWD(half, 3)
-INSTANTIATE_CONV_FWD(half, 4)
 INSTANTIATE_CONV_FWD(bfloat16_t, 2)
 INSTANTIATE_CONV_FWD(bfloat16_t, 3)
 INSTANTIATE_CONV_FWD(bfloat16_t, 4)
@@ -882,9 +877,6 @@ INSTANTIATE_CONV_FWD(bfloat16_t, 4)
 INSTANTIATE_CONV_UPDATE(float, 2)
 INSTANTIATE_CONV_UPDATE(float, 3)
 INSTANTIATE_CONV_UPDATE(float, 4)
-INSTANTIATE_CONV_UPDATE(half, 2)
-INSTANTIATE_CONV_UPDATE(half, 3)
-INSTANTIATE_CONV_UPDATE(half, 4)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 2)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 3)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 4)
@@ -892,18 +884,12 @@ INSTANTIATE_CONV_UPDATE(bfloat16_t, 4)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 2)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 3)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 4)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 2)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 3)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 4)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 2)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 3)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 4)
 
-INSTANTIATE_GATING(float, float, "gdn_fused_gating_float")
-INSTANTIATE_GATING(half, half, "gdn_fused_gating_half")
-INSTANTIATE_GATING(bfloat16_t, bfloat16_t, "gdn_fused_gating_bfloat16_t")
-INSTANTIATE_GATING(half, float, "gdn_fused_gating_half_alog_f32")
-INSTANTIATE_GATING(bfloat16_t, float, "gdn_fused_gating_bfloat16_t_alog_f32")
+INSTANTIATE_GATING(float, "gdn_fused_gating_float")
+INSTANTIATE_GATING(bfloat16_t, "gdn_fused_gating_bfloat16_t")
 
 INSTANTIATE_L2(float)
 INSTANTIATE_L2(half)
@@ -942,8 +928,8 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_gqa_" #type "_k" #b
     const device type* q [[buffer(0)]], \
     const device type* k [[buffer(1)]], \
     const device type* v [[buffer(2)]], \
-    const device type* g [[buffer(3)]], \
-    const device type* beta [[buffer(4)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \

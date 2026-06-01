@@ -151,11 +151,22 @@ pub fn causal_conv1d_fwd(
     if !conv_state.is_contiguous() {
         candle_core::bail!("metal causal_conv1d_fwd expects contiguous conv_state");
     }
-    if x_c.dtype() != weight_c.dtype() || conv_state.dtype() != x_c.dtype() {
+    if x_c.dtype() != weight_c.dtype() {
         candle_core::bail!(
-            "metal causal_conv1d_fwd dtype mismatch: x={:?}, weight={:?}, state={:?}",
+            "metal causal_conv1d_fwd dtype mismatch: x={:?}, weight={:?}",
             x_c.dtype(),
             weight_c.dtype(),
+        );
+    }
+    if !matches!(x_c.dtype(), DType::BF16 | DType::F32) {
+        candle_core::bail!(
+            "metal causal_conv1d_fwd expects BF16 or F32 x/weight, got {:?}",
+            x_c.dtype()
+        );
+    }
+    if conv_state.dtype() != DType::F32 {
+        candle_core::bail!(
+            "metal causal_conv1d_fwd expects F32 conv_state, got {:?}",
             conv_state.dtype()
         );
     }
@@ -217,11 +228,22 @@ pub fn causal_conv1d_update(
     if !conv_state.is_contiguous() {
         candle_core::bail!("metal causal_conv1d_update expects contiguous conv_state");
     }
-    if x_c.dtype() != weight_c.dtype() || conv_state.dtype() != x_c.dtype() {
+    if x_c.dtype() != weight_c.dtype() {
         candle_core::bail!(
-            "metal causal_conv1d_update dtype mismatch: x={:?}, weight={:?}, state={:?}",
+            "metal causal_conv1d_update dtype mismatch: x={:?}, weight={:?}",
             x_c.dtype(),
             weight_c.dtype(),
+        );
+    }
+    if !matches!(x_c.dtype(), DType::BF16 | DType::F32) {
+        candle_core::bail!(
+            "metal causal_conv1d_update expects BF16 or F32 x/weight, got {:?}",
+            x_c.dtype()
+        );
+    }
+    if conv_state.dtype() != DType::F32 {
+        candle_core::bail!(
+            "metal causal_conv1d_update expects F32 conv_state, got {:?}",
             conv_state.dtype()
         );
     }
@@ -285,11 +307,22 @@ pub fn causal_conv1d_update_slots(
     if !conv_state.is_contiguous() {
         candle_core::bail!("metal causal_conv1d_update_slots expects contiguous conv_state");
     }
-    if x_c.dtype() != weight_c.dtype() || conv_state.dtype() != x_c.dtype() {
+    if x_c.dtype() != weight_c.dtype() {
         candle_core::bail!(
-            "metal causal_conv1d_update_slots dtype mismatch: x={:?}, weight={:?}, state={:?}",
+            "metal causal_conv1d_update_slots dtype mismatch: x={:?}, weight={:?}",
             x_c.dtype(),
             weight_c.dtype(),
+        );
+    }
+    if !matches!(x_c.dtype(), DType::BF16 | DType::F32) {
+        candle_core::bail!(
+            "metal causal_conv1d_update_slots expects BF16 or F32 x/weight, got {:?}",
+            x_c.dtype()
+        );
+    }
+    if conv_state.dtype() != DType::F32 {
+        candle_core::bail!(
+            "metal causal_conv1d_update_slots expects F32 conv_state, got {:?}",
             conv_state.dtype()
         );
     }
@@ -355,20 +388,20 @@ pub fn fused_gdn_gating(
     } else {
         b.to_dtype(a_c.dtype())?.contiguous()?
     };
-    let dt_c = if dt_bias.dtype() == a_c.dtype() {
-        ensure_contiguous(dt_bias)?
-    } else {
-        dt_bias.to_dtype(a_c.dtype())?.contiguous()?
-    };
-    let a_log_c = if a_log.dtype() == DType::F32 || a_log.dtype() == a_c.dtype() {
-        ensure_contiguous(a_log)?
-    } else {
+    if a_log.dtype() != DType::F32 {
         candle_core::bail!(
-            "metal fused_gdn_gating expects a_log dtype {:?} or F32, got {:?}",
-            a_c.dtype(),
+            "metal fused_gdn_gating expects F32 a_log, got {:?}",
             a_log.dtype()
         );
-    };
+    }
+    if dt_bias.dtype() != DType::F32 {
+        candle_core::bail!(
+            "metal fused_gdn_gating expects F32 dt_bias, got {:?}",
+            dt_bias.dtype()
+        );
+    }
+    let a_log_c = ensure_contiguous(a_log)?;
+    let dt_c = ensure_contiguous(dt_bias)?;
     let (batch, seq_len, heads) = a_c.dims3()?;
     if b_c.shape() != a_c.shape() {
         candle_core::bail!(
@@ -384,8 +417,8 @@ pub fn fused_gdn_gating(
             dt_c.shape()
         );
     }
-    let g = Tensor::zeros(a_c.shape(), a_c.dtype(), a_c.device())?;
-    let beta = Tensor::zeros(a_c.shape(), a_c.dtype(), a_c.device())?;
+    let g = Tensor::zeros(a_c.shape(), DType::F32, a_c.device())?;
+    let beta = Tensor::zeros(a_c.shape(), DType::F32, a_c.device())?;
 
     let a_log_m = get_metal_slice(&a_log_c)?;
     let a_m = get_metal_slice(&a_c)?;
@@ -401,7 +434,6 @@ pub fn fused_gdn_gating(
         &*command_buffer,
         metal_kernels::Kernels::default(),
         a_c.dtype(),
-        a_log_c.dtype(),
         a_log_m.storage.buffer(),
         a_log_m.offset_in_bytes,
         a_m.storage.buffer(),
@@ -571,16 +603,8 @@ pub fn gated_delta_rule_recurrence(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_f32 = if g.dtype() == DType::F32 {
-        ensure_contiguous(g)?.exp()?.contiguous()?
-    } else {
-        g.to_dtype(DType::F32)?.exp()?.contiguous()?
-    };
-    let beta_f32 = if beta.dtype() == DType::F32 {
-        ensure_contiguous(beta)?
-    } else {
-        beta.to_dtype(DType::F32)?.contiguous()?
-    };
+    let g_f32 = g.exp()?;
+    let beta_f32 = ensure_contiguous(beta)?;
     if state.dtype() != DType::F32 || !state.is_contiguous() {
         candle_core::bail!(
             "metal gated_delta_rule_recurrence expects contiguous F32 state, got {:?}",
@@ -642,7 +666,7 @@ pub fn gated_delta_rule_decode_slots(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_c = ensure_contiguous(g)?.exp()?.contiguous()?;
+    let g_c = g.exp()?;
     let beta_c = ensure_contiguous(beta)?;
     let slots_c = if slots.dtype() == DType::I64 {
         ensure_contiguous(slots)?
@@ -750,7 +774,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_c = ensure_contiguous(g)?.exp()?.contiguous()?;
+    let g_c = g.exp()?;
     let beta_c = ensure_contiguous(beta)?;
     let slots_c = if slots.dtype() == DType::I64 {
         ensure_contiguous(slots)?
@@ -959,13 +983,14 @@ pub fn causal_conv1d_fwd(
             let cu_ptr = get_cuda_const_ptr_u32(&cu_u32)?;
             let stream = *dev.cu_stream() as i64;
 
+            let state_f32_ptr = state_ptr as *mut f32;
             unsafe {
                 match x.dtype() {
                     DType::F16 => ffi::causal_conv1d_fwd_f16(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         out_ptr,
                         cu_ptr,
                         batch as c_int,
@@ -978,7 +1003,7 @@ pub fn causal_conv1d_fwd(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         out_ptr,
                         cu_ptr,
                         batch as c_int,
@@ -991,7 +1016,7 @@ pub fn causal_conv1d_fwd(
                         x_ptr as *const f32,
                         weight_ptr as *const f32,
                         bias_ptr as *const f32,
-                        state_ptr as *mut f32,
+                        state_f32_ptr,
                         out_ptr as *mut f32,
                         cu_ptr,
                         batch as c_int,
@@ -1037,6 +1062,7 @@ pub fn causal_conv1d_update(
                 std::ptr::null()
             };
             let state_ptr = get_cuda_mut_ptr(conv_state)?;
+            let state_f32_ptr = state_ptr as *mut f32;
             let out_ptr = get_cuda_mut_ptr(&out)?;
             let stream = *dev.cu_stream() as i64;
 
@@ -1046,7 +1072,7 @@ pub fn causal_conv1d_update(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         out_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1058,7 +1084,7 @@ pub fn causal_conv1d_update(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         out_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1070,7 +1096,7 @@ pub fn causal_conv1d_update(
                         x_ptr as *const f32,
                         weight_ptr as *const f32,
                         bias_ptr as *const f32,
-                        state_ptr as *mut f32,
+                        state_f32_ptr,
                         out_ptr as *mut f32,
                         batch as c_int,
                         d_conv as c_int,
@@ -1131,6 +1157,7 @@ pub fn causal_conv1d_update_slots(
                 std::ptr::null()
             };
             let state_ptr = get_cuda_mut_ptr(conv_state)?;
+            let state_f32_ptr = state_ptr as *mut f32;
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
             let stream = *dev.cu_stream() as i64;
@@ -1141,7 +1168,7 @@ pub fn causal_conv1d_update_slots(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         slots_ptr,
                         out_ptr,
                         batch as c_int,
@@ -1154,7 +1181,7 @@ pub fn causal_conv1d_update_slots(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
-                        state_ptr,
+                        state_f32_ptr,
                         slots_ptr,
                         out_ptr,
                         batch as c_int,
@@ -1167,7 +1194,7 @@ pub fn causal_conv1d_update_slots(
                         x_ptr as *const f32,
                         weight_ptr as *const f32,
                         bias_ptr as *const f32,
-                        state_ptr as *mut f32,
+                        state_f32_ptr,
                         slots_ptr,
                         out_ptr as *mut f32,
                         batch as c_int,
@@ -1203,84 +1230,50 @@ pub fn fused_gdn_gating(
     match (a.device(), a.dtype()) {
         (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
             let (batch, seq_len, heads) = a.dims3()?;
-            let g = cuda_full_write_output(a.shape(), a.dtype(), a.device())?;
-            let beta = cuda_full_write_output(a.shape(), a.dtype(), a.device())?;
+            let g = cuda_full_write_output(a.shape(), DType::F32, a.device())?;
+            let beta = cuda_full_write_output(a.shape(), DType::F32, a.device())?;
 
-            let al_ptr = get_cuda_const_ptr(a_log)?;
+            let al_ptr = get_cuda_const_ptr(a_log)? as *const f32;
             let a_ptr = get_cuda_const_ptr(a)?;
             let b_ptr = get_cuda_const_ptr(b)?;
-            let dt_ptr = get_cuda_const_ptr(dt_bias)?;
-            let g_ptr = get_cuda_mut_ptr(&g)?;
-            let beta_ptr = get_cuda_mut_ptr(&beta)?;
+            let dt_ptr = get_cuda_const_ptr(dt_bias)? as *const f32;
+            let g_ptr = get_cuda_mut_ptr(&g)? as *mut f32;
+            let beta_ptr = get_cuda_mut_ptr(&beta)? as *mut f32;
             let stream = *dev.cu_stream() as i64;
 
             unsafe {
                 match a.dtype() {
-                    DType::F16 => {
-                        if a_log.dtype() == DType::F32 {
-                            ffi::fused_gdn_gating_f16_alog_f32(
-                                al_ptr as *const f32,
-                                a_ptr,
-                                b_ptr,
-                                dt_ptr,
-                                g_ptr,
-                                beta_ptr,
-                                batch as c_int,
-                                seq_len as c_int,
-                                heads as c_int,
-                                stream,
-                            )
-                        } else {
-                            ffi::fused_gdn_gating_f16(
-                                al_ptr,
-                                a_ptr,
-                                b_ptr,
-                                dt_ptr,
-                                g_ptr,
-                                beta_ptr,
-                                batch as c_int,
-                                seq_len as c_int,
-                                heads as c_int,
-                                stream,
-                            )
-                        }
-                    }
-                    DType::BF16 => {
-                        if a_log.dtype() == DType::F32 {
-                            ffi::fused_gdn_gating_bf16_alog_f32(
-                                al_ptr as *const f32,
-                                a_ptr,
-                                b_ptr,
-                                dt_ptr,
-                                g_ptr,
-                                beta_ptr,
-                                batch as c_int,
-                                seq_len as c_int,
-                                heads as c_int,
-                                stream,
-                            )
-                        } else {
-                            ffi::fused_gdn_gating_bf16(
-                                al_ptr,
-                                a_ptr,
-                                b_ptr,
-                                dt_ptr,
-                                g_ptr,
-                                beta_ptr,
-                                batch as c_int,
-                                seq_len as c_int,
-                                heads as c_int,
-                                stream,
-                            )
-                        }
-                    }
+                    DType::F16 => ffi::fused_gdn_gating_f16(
+                        al_ptr,
+                        a_ptr,
+                        b_ptr,
+                        dt_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        batch as c_int,
+                        seq_len as c_int,
+                        heads as c_int,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::fused_gdn_gating_bf16(
+                        al_ptr,
+                        a_ptr,
+                        b_ptr,
+                        dt_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        batch as c_int,
+                        seq_len as c_int,
+                        heads as c_int,
+                        stream,
+                    ),
                     DType::F32 => ffi::fused_gdn_gating_f32(
-                        al_ptr as *const f32,
+                        al_ptr,
                         a_ptr as *const f32,
                         b_ptr as *const f32,
-                        dt_ptr as *const f32,
-                        g_ptr as *mut f32,
-                        beta_ptr as *mut f32,
+                        dt_ptr,
+                        g_ptr,
+                        beta_ptr,
                         batch as c_int,
                         seq_len as c_int,
                         heads as c_int,
@@ -1552,16 +1545,8 @@ pub fn gated_delta_rule_recurrence(
             }
 
             let out_dtype = q_c.dtype();
-            let decay_f32 = if g.dtype() == DType::F32 {
-                ensure_contiguous(g)?.exp()?.contiguous()?
-            } else {
-                g.to_dtype(DType::F32)?.exp()?.contiguous()?
-            };
-            let beta_f32 = if beta.dtype() == DType::F32 {
-                ensure_contiguous(beta)?
-            } else {
-                beta.to_dtype(DType::F32)?.contiguous()?
-            };
+            let decay_f32 = g.exp()?;
+            let beta_f32 = ensure_contiguous(beta)?;
 
             if state.dtype() != DType::F32 {
                 candle_core::bail!(
@@ -1662,13 +1647,13 @@ pub fn gated_delta_rule_decode_slots(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let decay_c = ensure_contiguous(g)?.exp()?.contiguous()?;
+            let decay_c = g.exp()?;
             let beta_c = ensure_contiguous(beta)?;
 
             let (bq, hq, kq) = q.dims3()?;
             let (bk, hk, kk) = k.dims3()?;
             let (bv, hv, v_dim) = v.dims3()?;
-            let (bg, hg) = g.dims2()?; // g is [batch, heads]
+            let (bg, hg) = g.dims2()?;
             let (bb, hb) = beta.dims2()?;
 
             let batch = bq;
@@ -1920,7 +1905,7 @@ pub fn gated_delta_rule_recurrence_varlen(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let decay_c = ensure_contiguous(g)?.exp()?.contiguous()?;
+            let decay_c = g.exp()?;
             let beta_c = ensure_contiguous(beta)?;
 
             let (total_tokens, num_heads, k_dim) = q_c.dims3()?;
