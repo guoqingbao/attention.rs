@@ -2851,10 +2851,47 @@ pub fn moe_gemm_gguf(
     is_prefill: bool,
     dtype: candle_core::DType,
 ) -> Result<Tensor> {
-    use candle_core::DType;
+    use candle_core::quantized::GgmlDType;
+    use candle_core::{DType, Storage};
 
-    let _shape = weights.shape().dims3()?;
-    let dequant = weights.dequantize_f16(input.device())?;
+    let (num_experts, size_n, size_k) = weights.shape().dims3()?;
+    let (input_rows, size_k1) = input.dims2()?;
+    assert!(
+        size_k == size_k1,
+        "input {:?} and weight {:?} last dim mismatch!",
+        size_k1,
+        size_k,
+    );
+
+    let size_m = if topk_weights.is_none() {
+        input_rows * topk
+    } else {
+        input_rows
+    };
+
+    let gguf_type: i32 = match weights.dtype() {
+        GgmlDType::Q8_0 => 0,
+        GgmlDType::Q4K => 1,
+        GgmlDType::Q2K => 2,
+        GgmlDType::Q3K => 3,
+        GgmlDType::Q5K => 4,
+        GgmlDType::Q6K => 5,
+        _ => {
+            candle_core::bail!(
+                "moe_gemm_gguf Metal only supports q2k, q3k, q4k, q5k, q6k, q8_0 weights!"
+            )
+        }
+    };
+
+    let (block_size_bytes, qk): (i32, i32) = match weights.dtype() {
+        GgmlDType::Q8_0 => (34, 32),
+        GgmlDType::Q4K => (144, 256),
+        GgmlDType::Q2K => (84, 256),
+        GgmlDType::Q3K => (110, 256),
+        GgmlDType::Q5K => (176, 256),
+        GgmlDType::Q6K => (210, 256),
+        _ => unreachable!(),
+    };
 
     let compute_dtype = if dtype == DType::F16 || dtype == DType::BF16 {
         dtype
@@ -2868,27 +2905,88 @@ pub fn moe_gemm_gguf(
         input.clone()
     };
 
-    let dequant = if dequant.dtype() != compute_dtype {
-        dequant.to_dtype(compute_dtype)?
-    } else {
-        dequant
-    };
+    let dev = input.device();
+    let metal_dev = dev.as_metal_device()?;
+    let command_buffer = metal_dev.command_buffer()?;
+    let command_buffer = command_buffer.as_ref();
 
-    let result = moe_gemm(
-        &input_cast,
-        &dequant,
-        topk_weights,
-        sorted_token_ids,
-        experts_ids,
-        topk,
-        is_prefill,
-    )?;
+    let output = Tensor::zeros((size_m, size_n), DType::F32, dev)?;
 
-    if result.dtype() != DType::F32 {
-        result.to_dtype(DType::F32)
-    } else {
-        Ok(result)
+    {
+        let (input_s, input_l) = input_cast.storage_and_layout();
+        let input_s = match &*input_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("input must be a metal tensor"),
+        };
+
+        let weights_buf = weights.metal_buffer()?;
+
+        let (sti_s, sti_l) = sorted_token_ids.storage_and_layout();
+        let sti_s = match &*sti_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("sorted_token_ids must be a metal tensor"),
+        };
+
+        let (eid_s, eid_l) = experts_ids.storage_and_layout();
+        let eid_s = match &*eid_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("experts_ids must be a metal tensor"),
+        };
+
+        let topk_weights_buf = if let Some(tw) = topk_weights {
+            let (tw_s, tw_l) = tw.storage_and_layout();
+            let tw_s = match &*tw_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("topk_weights must be a metal tensor"),
+            };
+            Some((
+                tw_s.buffer().clone(),
+                tw_l.start_offset() * tw.dtype().size_in_bytes(),
+            ))
+        } else {
+            None
+        };
+
+        let (output_s, output_l) = output.storage_and_layout();
+        let output_s = match &*output_s {
+            Storage::Metal(s) => s,
+            _ => candle_core::bail!("output must be a metal tensor"),
+        };
+
+        let tw_ref = topk_weights_buf
+            .as_ref()
+            .map(|(buf, off)| (buf as &metal::Buffer, *off));
+
+        metal_kernels::call_moe_gguf_gemm(
+            metal_dev.device(),
+            command_buffer,
+            metal_kernels::Kernels::default(),
+            compute_dtype,
+            input_s.buffer(),
+            input_l.start_offset() * compute_dtype.size_in_bytes(),
+            weights_buf,
+            0,
+            sti_s.buffer(),
+            sti_l.start_offset() * sorted_token_ids.dtype().size_in_bytes(),
+            eid_s.buffer(),
+            eid_l.start_offset() * experts_ids.dtype().size_in_bytes(),
+            tw_ref,
+            output_s.buffer(),
+            output_l.start_offset() * DType::F32.size_in_bytes(),
+            num_experts as i32,
+            topk as i32,
+            size_m as i32,
+            size_n as i32,
+            size_k as i32,
+            is_prefill,
+            gguf_type,
+            block_size_bytes,
+            qk,
+        )
+        .map_err(candle_core::Error::wrap)?;
     }
+
+    Ok(output)
 }
 
 #[cfg(not(any(feature = "cuda", feature = "metal")))]

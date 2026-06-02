@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, str};
-const METAL_SOURCES: [&str; 16] = [
+const METAL_SOURCES: [&str; 17] = [
     "copy_blocks",
     "pagedattention",
     "reshape_and_cache",
@@ -13,6 +13,7 @@ const METAL_SOURCES: [&str; 16] = [
     "fp8_moe_gemm",
     "gdn",
     "moe_gemm",
+    "moe_gguf",
     "mxfp4",
     "nvfp4",
     "gptoss_swiglu",
@@ -124,6 +125,7 @@ fn main() -> Result<(), String> {
         println!("cargo::rerun-if-changed=src/{src}.metal");
     }
     println!("cargo::rerun-if-changed=src/metal_dtype.metal");
+    println!("cargo::rerun-if-changed=src/gguf_utils.metal");
     println!("cargo::rerun-if-changed=build.rs");
 
     compile(Platform::MacOS)?;
