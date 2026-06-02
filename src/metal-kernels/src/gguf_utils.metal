@@ -91,8 +91,8 @@ static_assert(sizeof(block_q6_K) == 210, "wrong q6_K block size");
 // ============================================================
 
 inline int metal_dp4a(int a, int b, int c) {
-    const int8_t *a8 = reinterpret_cast<const int8_t *>(&a);
-    const int8_t *b8 = reinterpret_cast<const int8_t *>(&b);
+    const thread int8_t *a8 = reinterpret_cast<const thread int8_t *>(&a);
+    const thread int8_t *b8 = reinterpret_cast<const thread int8_t *>(&b);
     return c + int(a8[0]) * int(b8[0]) + int(a8[1]) * int(b8[1])
              + int(a8[2]) * int(b8[2]) + int(a8[3]) * int(b8[3]);
 }

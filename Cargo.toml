@@ -1,6 +1,6 @@
 [package]
 name = "attention-rs"
-version = "0.5.9"
+version = "0.6.0"
 edition = "2021"
 description = "High-performance LLM attention kernels and operations (PagedAttention, Flahinfer, Mamba, MoE, RoPE) for Candle, optimized for CUDA and Metal."
 repository = "https://github.com/guoqingbao/attention.rs"
@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "9b66476" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "9b66476" }
 #candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038", optional = true }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
@@ -23,7 +23,7 @@ parking_lot = "0.12.4"
 rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.5.9", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
-metal-kernels = { path = "./src/metal-kernels", version="0.2.3", optional = true}
+metal-kernels = { path = "./src/metal-kernels", version="0.2.4", optional = true}
 flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "fb341e0", optional = true }
 ureq = { version = "2.10", optional = true }
 sha2 = { version = "0.10", optional = true }
