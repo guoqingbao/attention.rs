@@ -56,11 +56,13 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
 /// Fused sigmoid + bias + topk selection.
 /// Takes raw router logits and optional bias. Returns (topk_weights, topk_indices).
 /// topk_weights are original sigmoid scores (before bias), topk_indices selected from biased scores.
+/// If renormalize=true, weights are scaled to sum to 1.0.
 #[cfg(feature = "cuda")]
 pub fn fused_sigmoid_topk(
     logits: &Tensor,
     bias: Option<&Tensor>,
     topk: usize,
+    renormalize: bool,
 ) -> Result<(Tensor, Tensor)> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::WrapErr;
@@ -118,6 +120,7 @@ pub fn fused_sigmoid_topk(
             _num_experts as i32,
             num_tokens as i32,
             topk as i32,
+            if renormalize { 1 } else { 0 },
             stream,
         )
     }
