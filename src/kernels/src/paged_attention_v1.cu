@@ -127,6 +127,9 @@ void paged_attention_v1_launcher(
     case 256:
       LAUNCH_PAGED_ATTENTION_V1(256);
       break;
+    case 512:
+      LAUNCH_PAGED_ATTENTION_V1(512);
+      break;
     default:
       break;
   }

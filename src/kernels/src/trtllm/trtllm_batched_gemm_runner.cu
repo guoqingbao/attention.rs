@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include <cstring>
 #include <vector>
@@ -85,26 +85,40 @@ std::vector<int64_t> prioritizePredefinedConfigs(
   return prioritizedIndices;
 }
 
+static bool isArchCompatible(CudaArch configArch, int smVersion) {
+  if (smVersion >= 90 && smVersion < 100) {
+    return isArchHopper(configArch);
+  }
+  if (smVersion >= 100) {
+    return isArchBlackwell(configArch);
+  }
+  return false;
+}
+
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     TrtllmGenBatchedGemmRunnerOptions const& options_)
     : mOptions(options_) {
-  // Select a GEMM kernel config to use
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
+
+  static int const smVersion = tensorrt_llm::common::getSMVersion();
 
   mPassingConfigIndices.clear();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+    if (!isArchCompatible(configs[i].mSm, smVersion)) {
+      continue;
+    }
+
     auto const options = configs[i].mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
-    // When we include low-latency kernels we can set transposeMmaOutput via constructor
     if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB &&
         options.mDtypeC == mOptions.dtypeC && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8 &&
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrix == mOptions.useShuffledMatrixA &&
+        options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
@@ -255,7 +269,8 @@ void TrtllmGenBatchedGemmRunner::run(
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
   auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                           multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
+                           multiProcessorCount, enable_pdl, /*pinnedHostBuffer=*/nullptr,
+                           globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"

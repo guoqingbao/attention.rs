@@ -7,7 +7,7 @@ The library provides specialized support for **Gated Delta Net (GDN)** and **Mam
 ### 1. `MambaCache`
 GDN/Mamba requires two types of persistent state:
 - **Convolution State**: A sliding window of the last $N$ tokens (typically 4). Shape: `[max_batch, d_conv, kernel_size - 1]`.
-- **Recurrent State**: A state matrix updated per-token. Shape: `[max_batch, num_heads, d_k, d_v]`.
+- **Recurrent State**: A state matrix updated per-token. Shape: `[max_batch, num_heads, d_k, d_v]` (all backends).
 
 `MambaCache` manages these states using **slot-based indexing**, where each sequence is assigned a slot index in the pre-allocated buffers.
 

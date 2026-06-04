@@ -52,7 +52,7 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
 }
 
 __device__ __forceinline__ float silu_float(float x) {
-    return x / (1.0f + expf(-x));
+    return x / (1.0f + __expf(-x));
 }
 
 static constexpr int GDN_WARP_SIZE = 32;
@@ -75,7 +75,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     const T* __restrict__ v,          // [BH, S, V]
     const float* __restrict__ g,      // [BH, S] decay = exp(g)
     const float* __restrict__ beta,   // [BH, S]
-    float* __restrict__ state,        // [BH, V, K] (in/out)
+    float* __restrict__ state,        // [BH, K, V] (in/out)
     float* __restrict__ out,          // [BH, S, V]
     int seq_len,
     int v_dim) {
@@ -93,20 +93,18 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
-    float* state_bh = state + bh * BK * v_dim + v_idx * BK;
+    float* state_base = state + bh * BK * v_dim;
     float* out_bh = out + bh * seq_len * v_dim;
 
-    // Shared memory layout: k_buf[BK] + q_buf[BK] + scalars[2]
     __shared__ float k_buf[BK];
     __shared__ float q_buf[BK];
     __shared__ float scalars[2]; // decay, beta_t
 
-    // State is stored transposed as [V, K], so each thread owns one contiguous
-    // value column and walks K in registers.
+    // State layout: [K, V] — each thread loads its v_idx element from each key row
     float s[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s[j] = state_bh[j];
+        s[j] = state_base[j * v_dim + v_idx];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -152,10 +150,9 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
         out_bh[t * v_dim + v_idx] = y_t;
     }
 
-    // Store state back
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        state_bh[j] = s[j];
+        state_base[j * v_dim + v_idx] = s[j];
     }
 }
 
@@ -166,7 +163,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const T* __restrict__ v,          // [BH, S, V]
     const float* __restrict__ g,      // [BH, S] decay = exp(g)
     const float* __restrict__ beta,   // [BH, S]
-    float* __restrict__ state,        // [BH, V, K] (in/out)
+    float* __restrict__ state,        // [BH, K, V] (in/out)
     float* __restrict__ out,          // [BH, S, V]
     int seq_len,
     int k_dim,
@@ -185,10 +182,9 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const T* v_bh = v + bh * seq_len * v_dim;
     const float* g_bh = g + bh * seq_len;
     const float* beta_bh = beta + bh * seq_len;
-    float* state_bh = state + bh * k_dim * v_dim + v_idx * k_dim;
+    float* state_base = state + bh * k_dim * v_dim;
     float* out_bh = out + bh * seq_len * v_dim;
 
-    // Dynamic shared memory: k_buf[k_dim] + q_buf[k_dim] + scalars[2]
     extern __shared__ float shared[];
     float* k_buf = shared;
     float* q_buf = shared + k_dim;
@@ -196,7 +192,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
     float s[MAX_K];
     for (int j = 0; j < k_dim; ++j) {
-        s[j] = state_bh[j];
+        s[j] = state_base[j * v_dim + v_idx];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -237,7 +233,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     }
 
     for (int j = 0; j < k_dim; ++j) {
-        state_bh[j] = s[j];
+        state_base[j * v_dim + v_idx] = s[j];
     }
 }
 
@@ -351,100 +347,9 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const T* __restrict__ q,      // [batch, heads, k_dim]
     const T* __restrict__ k,      // [batch, heads, k_dim]
     const T* __restrict__ v,      // [batch, heads, v_dim]
-    const T* __restrict__ g,      // [batch, heads] decay = exp(g)
-    const T* __restrict__ beta,   // [batch, heads]
-    T* __restrict__ state,        // [max_batch, heads, v_dim, k_dim]
-    const int64_t* __restrict__ slots, // [batch]
-    T* __restrict__ out,          // [batch, heads, v_dim]
-    int batch,
-    int heads,
-    int k_dim,
-    int v_dim) {
-    const int v_tile = blockIdx.x;
-    const int bh = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int v_idx = v_tile * BV + tid;
-    if (v_idx >= v_dim || bh >= batch * heads) return;
-
-    const int b = bh / heads;
-    const int h = bh % heads;
-    const int64_t slot = slots[b];
-    if (slot < 0) return;
-
-    extern __shared__ float smem[];
-    float* q_smem = smem;                  // [BK]
-    float* k_smem = smem + BK;             // [BK]
-    float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
-
-    if (tid == 0) {
-        scalars[0] = to_float(g[bh]);
-        scalars[1] = to_float(beta[bh]);
-    }
-
-    // K6: cooperative load of q/k into shared memory
-    const T* q_bh = q + bh * k_dim;
-    const T* k_bh = k + bh * k_dim;
-    for (int j = tid; j < k_dim; j += BV) {
-        k_smem[j] = to_float(k_bh[j]);
-    }
-    __syncthreads();
-    const float decay = scalars[0];
-    const float beta_t = scalars[1];
-
-    T* state_bh = state + (((slot * heads + h) * v_dim + v_idx) * k_dim);
-
-    float s_buf[BK];
-#pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? to_float(state_bh[j]) : 0.0f;
-    }
-
-    float kv_mem = 0.0f;
-#pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
-            s_buf[j] *= decay;
-            kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
-        }
-    }
-
-    const T* v_bh = v + (bh * v_dim);
-    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
-
-    // Load q into shared memory (reuse k_smem space — k no longer needed)
-    __syncthreads();
-    for (int j = tid; j < k_dim; j += BV) {
-        q_smem[j] = to_float(q_bh[j]);
-    }
-    __syncthreads();
-
-    float y = 0.0f;
-#pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
-            s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
-            y = __fmaf_rn(s_buf[j], q_smem[j], y);
-        }
-    }
-
-#pragma unroll
-    for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
-            state_bh[j] = from_float<T>(s_buf[j]);
-        }
-    }
-
-    out[bh * v_dim + v_idx] = from_float<T>(y);
-}
-
-template <typename T, int BV, int BK>
-__global__ void gated_delta_rule_decode_slots_kernel_state_f32(
-    const T* __restrict__ q,      // [batch, heads, k_dim]
-    const T* __restrict__ k,      // [batch, heads, k_dim]
-    const T* __restrict__ v,      // [batch, heads, v_dim]
-    const T* __restrict__ g,      // [batch, heads] decay = exp(g)
-    const T* __restrict__ beta,   // [batch, heads]
-    float* __restrict__ state,    // [max_batch, heads, v_dim, k_dim]
+    const float* __restrict__ g,  // [batch, heads] decay = exp(g)
+    const float* __restrict__ beta, // [batch, heads]
+    T* __restrict__ state,        // [max_batch, heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, heads, v_dim]
     int batch,
@@ -465,14 +370,14 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     extern __shared__ float smem[];
     float* q_smem = smem;
     float* k_smem = smem + BK;
-    float* scalars = smem + 2 * BK;        // [2]: decay, beta_t
+    float* scalars = smem + 2 * BK;
 
     if (tid == 0) {
         scalars[0] = to_float(g[bh]);
         scalars[1] = to_float(beta[bh]);
     }
 
-    // K6: cooperative load of k into shared memory
+    // K6: cooperative load of q/k into shared memory
     const T* q_bh = q + bh * k_dim;
     const T* k_bh = k + bh * k_dim;
     for (int j = tid; j < k_dim; j += BV) {
@@ -482,12 +387,12 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const float decay = scalars[0];
     const float beta_t = scalars[1];
 
-    float* state_bh = state + (((slot * heads + h) * v_dim + v_idx) * k_dim);
+    T* state_head = state + ((slot * heads + h) * k_dim * v_dim);
 
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? state_bh[j] : 0.0f;
+        s_buf[j] = (j < k_dim) ? to_float(state_head[j * v_dim + v_idx]) : 0.0f;
     }
 
     float kv_mem = 0.0f;
@@ -502,7 +407,6 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const T* v_bh = v + (bh * v_dim);
     const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
 
-    // Load q into shared memory
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
         q_smem[j] = to_float(q_bh[j]);
@@ -521,7 +425,96 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
         if (j < k_dim) {
-            state_bh[j] = s_buf[j];
+            state_head[j * v_dim + v_idx] = from_float<T>(s_buf[j]);
+        }
+    }
+
+    out[bh * v_dim + v_idx] = from_float<T>(y);
+}
+
+template <typename T, int BV, int BK>
+__global__ void gated_delta_rule_decode_slots_kernel_state_f32(
+    const T* __restrict__ q,      // [batch, heads, k_dim]
+    const T* __restrict__ k,      // [batch, heads, k_dim]
+    const T* __restrict__ v,      // [batch, heads, v_dim]
+    const float* __restrict__ g,  // [batch, heads] decay = exp(g)
+    const float* __restrict__ beta, // [batch, heads]
+    float* __restrict__ state,    // [max_batch, heads, k_dim, v_dim]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,          // [batch, heads, v_dim]
+    int batch,
+    int heads,
+    int k_dim,
+    int v_dim) {
+    const int v_tile = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int v_idx = v_tile * BV + tid;
+    if (v_idx >= v_dim || bh >= batch * heads) return;
+
+    const int b = bh / heads;
+    const int h = bh % heads;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    extern __shared__ float smem[];
+    float* q_smem = smem;
+    float* k_smem = smem + BK;
+    float* scalars = smem + 2 * BK;
+
+    if (tid == 0) {
+        scalars[0] = to_float(g[bh]);
+        scalars[1] = to_float(beta[bh]);
+    }
+
+    const T* q_bh = q + bh * k_dim;
+    const T* k_bh = k + bh * k_dim;
+    for (int j = tid; j < k_dim; j += BV) {
+        k_smem[j] = to_float(k_bh[j]);
+    }
+    __syncthreads();
+    const float decay = scalars[0];
+    const float beta_t = scalars[1];
+
+    float* state_head = state + ((slot * heads + h) * k_dim * v_dim);
+
+    float s_buf[BK];
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        s_buf[j] = (j < k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
+    }
+
+    float kv_mem = 0.0f;
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            s_buf[j] *= decay;
+            kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
+        }
+    }
+
+    const T* v_bh = v + (bh * v_dim);
+    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+
+    __syncthreads();
+    for (int j = tid; j < k_dim; j += BV) {
+        q_smem[j] = to_float(q_bh[j]);
+    }
+    __syncthreads();
+
+    float y = 0.0f;
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
+            y = __fmaf_rn(s_buf[j], q_smem[j], y);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            state_head[j * v_dim + v_idx] = s_buf[j];
         }
     }
 
@@ -531,7 +524,7 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
 // K4: dispatch to exact BK sizes to minimize register pressure
 template <typename T>
 void launch_gated_delta_rule_decode_slots(
-    const T* q, const T* k, const T* v, const T* g, const T* beta,
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
     T* state, const int64_t* slots, T* out,
     int batch, int heads, int k_dim, int v_dim,
     cudaStream_t stream) {
@@ -564,7 +557,7 @@ void launch_gated_delta_rule_decode_slots(
 
 template <typename T>
 void launch_gated_delta_rule_decode_slots_state_f32(
-    const T* q, const T* k, const T* v, const T* g, const T* beta,
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
     float* state, const int64_t* slots, T* out,
     int batch, int heads, int k_dim, int v_dim,
     cudaStream_t stream) {
@@ -603,7 +596,7 @@ extern "C" void gated_delta_rule_decode_slots_f32(
 }
 
 extern "C" void gated_delta_rule_decode_slots_f16(
-    const half* q, const half* k, const half* v, const half* g, const half* beta,
+    const half* q, const half* k, const half* v, const float* g, const float* beta,
     half* state, const int64_t* slots, half* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots(
@@ -612,7 +605,7 @@ extern "C" void gated_delta_rule_decode_slots_f16(
 
 extern "C" void gated_delta_rule_decode_slots_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* g, const __nv_bfloat16* beta, __nv_bfloat16* state,
+    const float* g, const float* beta, __nv_bfloat16* state,
     const int64_t* slots, __nv_bfloat16* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots(
@@ -620,7 +613,7 @@ extern "C" void gated_delta_rule_decode_slots_bf16(
 }
 
 extern "C" void gated_delta_rule_decode_slots_f16_state_f32(
-    const half* q, const half* k, const half* v, const half* g, const half* beta,
+    const half* q, const half* k, const half* v, const float* g, const float* beta,
     float* state, const int64_t* slots, half* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots_state_f32(
@@ -629,11 +622,166 @@ extern "C" void gated_delta_rule_decode_slots_f16_state_f32(
 
 extern "C" void gated_delta_rule_decode_slots_bf16_state_f32(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* g, const __nv_bfloat16* beta, float* state,
+    const float* g, const float* beta, float* state,
     const int64_t* slots, __nv_bfloat16* out, int batch, int heads, int k_dim,
     int v_dim, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots_state_f32(
         q, k, v, g, beta, state, slots, out, batch, heads, k_dim, v_dim, stream);
+}
+
+// =============================================================================
+// GQA Decode: q/k have num_k_heads, v/g/beta/state/out have num_v_heads.
+// Fuses exp(g), q_scale. State is FP32.
+// =============================================================================
+
+template <typename T, int BV, int BK>
+__global__ void gated_delta_rule_decode_slots_gqa_kernel(
+    const T* __restrict__ q,      // [batch, num_k_heads, k_dim]
+    const T* __restrict__ k,      // [batch, num_k_heads, k_dim]
+    const T* __restrict__ v,      // [batch, num_v_heads, v_dim]
+    const float* __restrict__ g,  // [batch, num_v_heads]  (log-space, NOT exp'd)
+    const float* __restrict__ beta, // [batch, num_v_heads]
+    float* __restrict__ state,    // [max_batch, num_v_heads, k_dim, v_dim]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,          // [batch, num_v_heads, v_dim]
+    int batch,
+    int num_v_heads,
+    int num_k_heads,
+    int k_dim,
+    int v_dim,
+    float q_scale) {
+    const int v_tile = blockIdx.x;
+    const int bh = blockIdx.y;    // batch * num_v_heads
+    const int tid = threadIdx.x;
+    const int v_idx = v_tile * BV + tid;
+    if (v_idx >= v_dim || bh >= batch * num_v_heads) return;
+
+    const int b = bh / num_v_heads;
+    const int v_head_idx = bh % num_v_heads;
+    const int kv_group_size = num_v_heads / num_k_heads;
+    const int k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    extern __shared__ float smem[];
+    float* q_smem = smem;
+    float* k_smem = smem + BK;
+    float* scalars = smem + 2 * BK;
+
+    if (tid == 0) {
+        scalars[0] = expf(to_float(g[b * num_v_heads + v_head_idx]));
+        scalars[1] = to_float(beta[b * num_v_heads + v_head_idx]);
+    }
+
+    const T* q_bh = q + (b * num_k_heads + k_head_idx) * k_dim;
+    const T* k_bh = k + (b * num_k_heads + k_head_idx) * k_dim;
+    for (int j = tid; j < k_dim; j += BV) {
+        k_smem[j] = to_float(k_bh[j]);
+    }
+    __syncthreads();
+    const float decay = scalars[0];
+    const float beta_t = scalars[1];
+
+    float* state_head = state + ((slot * num_v_heads + v_head_idx) * k_dim * v_dim);
+
+    float s_buf[BK];
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        s_buf[j] = (j < k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
+    }
+
+    float kv_mem = 0.0f;
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            s_buf[j] *= decay;
+            kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
+        }
+    }
+
+    const T* v_bh = v + (b * num_v_heads + v_head_idx) * v_dim;
+    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+
+    __syncthreads();
+    for (int j = tid; j < k_dim; j += BV) {
+        q_smem[j] = to_float(q_bh[j]) * q_scale;
+    }
+    __syncthreads();
+
+    float y = 0.0f;
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
+            y = __fmaf_rn(s_buf[j], q_smem[j], y);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < BK; ++j) {
+        if (j < k_dim) {
+            state_head[j * v_dim + v_idx] = s_buf[j];
+        }
+    }
+
+    out[(b * num_v_heads + v_head_idx) * v_dim + v_idx] = from_float<T>(y);
+}
+
+template <typename T>
+void launch_gated_delta_rule_decode_slots_gqa(
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, T* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    constexpr int BV = 64;
+    dim3 grid((v_dim + BV - 1) / BV, batch * num_v_heads);
+    dim3 block(BV);
+    if (k_dim <= 64) {
+        constexpr int BK = 64;
+        size_t smem = (2 * BK + 2) * sizeof(float);
+        gated_delta_rule_decode_slots_gqa_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
+            q, k, v, g, beta, state, slots, out,
+            batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
+    } else if (k_dim <= 128) {
+        constexpr int BK = 128;
+        size_t smem = (2 * BK + 2) * sizeof(float);
+        gated_delta_rule_decode_slots_gqa_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
+            q, k, v, g, beta, state, slots, out,
+            batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
+    } else {
+        constexpr int BK = 256;
+        if (k_dim > BK) {
+            printf("gated_delta_rule_decode_slots_gqa: k_dim=%d exceeds MAX_K=%d\n", k_dim, BK);
+            return;
+        }
+        size_t smem = (2 * BK + 2) * sizeof(float);
+        gated_delta_rule_decode_slots_gqa_kernel<T, BV, BK><<<grid, block, smem, stream>>>(
+            q, k, v, g, beta, state, slots, out,
+            batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
+    }
+    CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void gated_delta_rule_decode_slots_gqa_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const float* g, const float* beta, float* state,
+    const int64_t* slots, __nv_bfloat16* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots_gqa(
+        q, k, v, g, beta, state, slots, out,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_gqa_f16(
+    const half* q, const half* k, const half* v,
+    const float* g, const float* beta, float* state,
+    const int64_t* slots, half* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots_gqa(
+        q, k, v, g, beta, state, slots, out,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }
 
 // =============================================================================
@@ -645,7 +793,7 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
     const T* __restrict__ x,            // [total_tokens, d_conv]
     const T* __restrict__ weight,       // [d_conv, kernel_size]
     const T* __restrict__ bias,         // [d_conv] or nullptr
-    T* __restrict__ conv_state,         // [batch, d_conv, kernel_size - 1]
+    float* __restrict__ conv_state,     // [batch, d_conv, kernel_size - 1], always F32
     T* __restrict__ out,                // [total_tokens, d_conv]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
     int batch_size,
@@ -663,7 +811,7 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
     const int seq_len = end - start;
 
     const T* w_ptr = weight + channel_idx * KERNEL_SIZE;
-    T* state_ptr = conv_state +
+    float* state_ptr = conv_state +
                    (seq_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
 
     // Load weights into registers
@@ -680,7 +828,7 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
     }
 #pragma unroll
     for (int i = 0; i < KERNEL_SIZE - 1; ++i) {
-        history[i] = to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
     }
 
     float bias_val = (bias != nullptr) ? to_float(bias[channel_idx]) : 0.0f;
@@ -714,13 +862,13 @@ __global__ void causal_conv1d_fwd_varlen_kernel(
 
 #pragma unroll
     for (int i = 0; i < KERNEL_SIZE - 1; ++i) {
-        state_ptr[i] = from_float<T>(history[i]);
+        state_ptr[i] = history[i];
     }
 }
 
 template <typename T>
 void launch_causal_conv1d_fwd_varlen(const T* x, const T* weight, const T* bias,
-                                     T* conv_state, T* out,
+                                     float* conv_state, T* out,
                                      const uint32_t* cu_seqlens, int batch,
                                      int d_conv, int kernel_size, bool silu,
                                      cudaStream_t stream) {
@@ -751,7 +899,7 @@ extern "C" void causal_conv1d_fwd_f32(
 }
 
 extern "C" void causal_conv1d_fwd_f16(
-    const half* x, const half* weight, const half* bias, half* conv_state,
+    const half* x, const half* weight, const half* bias, float* conv_state,
     half* out, const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size,
     bool silu, cudaStream_t stream) {
     launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, cu_seqlens,
@@ -760,7 +908,7 @@ extern "C" void causal_conv1d_fwd_f16(
 
 extern "C" void causal_conv1d_fwd_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* weight,
-    const __nv_bfloat16* bias, __nv_bfloat16* conv_state, __nv_bfloat16* out,
+    const __nv_bfloat16* bias, float* conv_state, __nv_bfloat16* out,
     const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size, bool silu,
     cudaStream_t stream) {
     launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, cu_seqlens,
@@ -776,7 +924,7 @@ __global__ void causal_conv1d_update_kernel(
     const T* __restrict__ x,      // [batch, d_conv]
     const T* __restrict__ weight, // [d_conv, kernel_size]
     const T* __restrict__ bias,   // [d_conv] or nullptr
-    T* __restrict__ conv_state,   // [batch, d_conv, kernel_size - 1]
+    float* __restrict__ conv_state,   // [batch, d_conv, kernel_size - 1], always F32
     T* __restrict__ out,          // [batch, d_conv]
     int batch_size,
     int d_conv,
@@ -791,7 +939,7 @@ __global__ void causal_conv1d_update_kernel(
     int channel_idx = idx % d_conv;
 
     const T* w_ptr = weight + channel_idx * kernel_size;
-    T* state_ptr = conv_state +
+    float* state_ptr = conv_state +
                    (batch_idx * d_conv + channel_idx) * (kernel_size - 1);
 
     float history[GDN_MAX_KERNEL_SIZE];
@@ -800,7 +948,7 @@ __global__ void causal_conv1d_update_kernel(
         history[i] = 0.0f;
     }
     for (int i = 0; i < kernel_size - 1; ++i) {
-        history[i] = to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
     }
 
     float x_t = to_float(x[idx]);
@@ -818,9 +966,9 @@ __global__ void causal_conv1d_update_kernel(
 
     if (kernel_size > 1) {
         for (int k = 0; k < kernel_size - 2; ++k) {
-            state_ptr[k] = from_float<T>(history[k + 1]);
+            state_ptr[k] = history[k + 1];
         }
-        state_ptr[kernel_size - 2] = from_float<T>(x_t);
+        state_ptr[kernel_size - 2] = x_t;
     }
 
     out[idx] = from_float<T>(sum);
@@ -828,7 +976,7 @@ __global__ void causal_conv1d_update_kernel(
 
 template <typename T>
 void launch_causal_conv1d_update(const T* x, const T* weight, const T* bias,
-                                 T* conv_state, T* out, int batch, int d_conv,
+                                 float* conv_state, T* out, int batch, int d_conv,
                                  int kernel_size, bool silu,
                                  cudaStream_t stream) {
     if (kernel_size < 1 || kernel_size > GDN_MAX_KERNEL_SIZE) {
@@ -853,7 +1001,7 @@ extern "C" void causal_conv1d_update_f32(
 }
 
 extern "C" void causal_conv1d_update_f16(
-    const half* x, const half* weight, const half* bias, half* conv_state,
+    const half* x, const half* weight, const half* bias, float* conv_state,
     half* out, int batch, int d_conv, int kernel_size, bool silu,
     cudaStream_t stream) {
     launch_causal_conv1d_update(x, weight, bias, conv_state, out, batch, d_conv,
@@ -862,7 +1010,7 @@ extern "C" void causal_conv1d_update_f16(
 
 extern "C" void causal_conv1d_update_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* weight,
-    const __nv_bfloat16* bias, __nv_bfloat16* conv_state, __nv_bfloat16* out,
+    const __nv_bfloat16* bias, float* conv_state, __nv_bfloat16* out,
     int batch, int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
     launch_causal_conv1d_update(x, weight, bias, conv_state, out, batch, d_conv,
                                 kernel_size, silu, stream);
@@ -873,7 +1021,7 @@ __global__ void causal_conv1d_update_slots_kernel(
     const T* __restrict__ x,      // [batch, d_conv]
     const T* __restrict__ weight, // [d_conv, kernel_size]
     const T* __restrict__ bias,   // [d_conv] or nullptr
-    T* __restrict__ conv_state,   // [max_batch, d_conv, kernel_size - 1]
+    float* __restrict__ conv_state,   // [max_batch, d_conv, kernel_size - 1], always F32
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,          // [batch, d_conv]
     int batch_size,
@@ -890,7 +1038,7 @@ __global__ void causal_conv1d_update_slots_kernel(
     if (slot < 0) return;
 
     const T* w_ptr = weight + channel_idx * KERNEL_SIZE;
-    T* state_ptr = conv_state +
+    float* state_ptr = conv_state +
                    (slot * d_conv + channel_idx) * (KERNEL_SIZE - 1);
 
     // Load weights to registers
@@ -907,7 +1055,7 @@ __global__ void causal_conv1d_update_slots_kernel(
     }
 #pragma unroll
     for (int i = 0; i < KERNEL_SIZE - 1; ++i) {
-        history[i] = to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
     }
 
     float x_t = to_float(x[idx]);
@@ -928,9 +1076,9 @@ __global__ void causal_conv1d_update_slots_kernel(
     if (KERNEL_SIZE > 1) {
 #pragma unroll
         for (int k = 0; k < KERNEL_SIZE - 2; ++k) {
-            state_ptr[k] = from_float<T>(history[k + 1]);
+            state_ptr[k] = history[k + 1];
         }
-        state_ptr[KERNEL_SIZE - 2] = from_float<T>(x_t);
+        state_ptr[KERNEL_SIZE - 2] = x_t;
     }
 
     out[idx] = from_float<T>(sum);
@@ -938,7 +1086,7 @@ __global__ void causal_conv1d_update_slots_kernel(
 
 template <typename T>
 void launch_causal_conv1d_update_slots(const T* x, const T* weight, const T* bias,
-                                       T* conv_state, const int64_t* slots, T* out,
+                                       float* conv_state, const int64_t* slots, T* out,
                                        int batch, int d_conv, int kernel_size, bool silu,
                                        cudaStream_t stream) {
     int total = batch * d_conv;
@@ -969,7 +1117,7 @@ extern "C" void causal_conv1d_update_slots_f32(
 }
 
 extern "C" void causal_conv1d_update_slots_f16(
-    const half* x, const half* weight, const half* bias, half* conv_state,
+    const half* x, const half* weight, const half* bias, float* conv_state,
     const int64_t* slots, half* out, int batch, int d_conv, int kernel_size, bool silu,
     cudaStream_t stream) {
     launch_causal_conv1d_update_slots(
@@ -978,7 +1126,7 @@ extern "C" void causal_conv1d_update_slots_f16(
 
 extern "C" void causal_conv1d_update_slots_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
-    __nv_bfloat16* conv_state, const int64_t* slots, __nv_bfloat16* out,
+    float* conv_state, const int64_t* slots, __nv_bfloat16* out,
     int batch, int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
     launch_causal_conv1d_update_slots(
         x, weight, bias, conv_state, slots, out, batch, d_conv, kernel_size, silu, stream);
@@ -1010,31 +1158,26 @@ struct VecType<__nv_bfloat16> {
     static constexpr int size = 8;
 };
 
-template <typename T, typename ALogT>
+template <typename T>
 __device__ __forceinline__ void compute_gating(
-    T a_val, T b_val, ALogT a_log_val, T dt_val, T& g_val, T& beta_val) {
+    T a_val, T b_val, float a_log_val, float dt_val, float& g_val, float& beta_val) {
     float a_f = to_float(a_val);
     float b_f = to_float(b_val);
-    float alog_f = to_float(a_log_val);
-    float dt_f = to_float(dt_val);
 
-    float x = a_f + dt_f;
+    float x = a_f + dt_val;
     float softplus_x = (x <= 20.0f) ? log1pf(expf(x)) : x;
-    float g_f = -expf(alog_f) * softplus_x;
-    float beta_f = 1.0f / (1.0f + expf(-b_f));
-
-    g_val = from_float<T>(g_f);
-    beta_val = from_float<T>(beta_f);
+    g_val = -expf(a_log_val) * softplus_x;
+    beta_val = 1.0f / (1.0f + expf(-b_f));
 }
 
-template <typename T, typename ALogT>
+template <typename T>
 __global__ void fused_gdn_gating_kernel(
-    const ALogT* __restrict__ a_log,
+    const float* __restrict__ a_log,
     const T* __restrict__ a,
     const T* __restrict__ b,
-    const T* __restrict__ dt_bias,
-    T* __restrict__ g,
-    T* __restrict__ beta,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ g,
+    float* __restrict__ beta,
     int total_elements,
     int num_heads) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1042,7 +1185,7 @@ __global__ void fused_gdn_gating_kernel(
         return;
     }
     int h_idx = idx % num_heads;
-    compute_gating<T, ALogT>(
+    compute_gating<T>(
         a[idx],
         b[idx],
         a_log[h_idx],
@@ -1052,88 +1195,43 @@ __global__ void fused_gdn_gating_kernel(
     );
 }
 
-template <typename T, typename ALogT>
+template <typename T>
 __global__ void fused_gdn_gating_kernel_vectorized(
-    const ALogT* __restrict__ a_log,
+    const float* __restrict__ a_log,
     const T* __restrict__ a,
     const T* __restrict__ b,
-    const T* __restrict__ dt_bias,
-    T* __restrict__ g,
-    T* __restrict__ beta,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ g,
+    float* __restrict__ beta,
     int total_elements,
     int num_heads) {
     
-    using VecT = typename VecType<T>::Type;
-    constexpr int VecSize = VecType<T>::size;
-    
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * VecSize;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) {
         return;
     }
-
-    const VecT* a_vec_ptr = reinterpret_cast<const VecT*>(a);
-    const VecT* b_vec_ptr = reinterpret_cast<const VecT*>(b);
-    VecT* g_vec_ptr = reinterpret_cast<VecT*>(g);
-    VecT* beta_vec_ptr = reinterpret_cast<VecT*>(beta);
-
-    VecT a_vec = a_vec_ptr[blockIdx.x * blockDim.x + threadIdx.x];
-    VecT b_vec = b_vec_ptr[blockIdx.x * blockDim.x + threadIdx.x];
-    VecT g_vec;
-    VecT beta_vec;
-
-    T* a_arr = reinterpret_cast<T*>(&a_vec);
-    T* b_arr = reinterpret_cast<T*>(&b_vec);
-    T* g_arr = reinterpret_cast<T*>(&g_vec);
-    T* beta_arr = reinterpret_cast<T*>(&beta_vec);
-
-    #pragma unroll
-    for (int i = 0; i < VecSize; ++i) {
-        int curr_idx = idx + i;
-        if (curr_idx < total_elements) {
-            int h_idx = curr_idx % num_heads;
-            compute_gating<T, ALogT>(
-                a_arr[i],
-                b_arr[i],
-                a_log[h_idx],
-                dt_bias[h_idx],
-                g_arr[i],
-                beta_arr[i]
-            );
-        }
-    }
-
-    g_vec_ptr[blockIdx.x * blockDim.x + threadIdx.x] = g_vec;
-    beta_vec_ptr[blockIdx.x * blockDim.x + threadIdx.x] = beta_vec;
+    int h_idx = idx % num_heads;
+    compute_gating<T>(
+        a[idx],
+        b[idx],
+        a_log[h_idx],
+        dt_bias[h_idx],
+        g[idx],
+        beta[idx]
+    );
 }
 
-template <typename T, typename ALogT>
-void launch_fused_gdn_gating(const ALogT* al, const T* a, const T* b, const T* dt,
-                             T* g, T* beta, int bat, int seq, int h,
+template <typename T>
+void launch_fused_gdn_gating(const float* al, const T* a, const T* b, const float* dt,
+                             float* g, float* beta, int bat, int seq, int h,
                              cudaStream_t stream) {
     int total = bat * seq * h;
     if (total == 0) return;
 
-    constexpr int VecSize = VecType<T>::size;
-    
-    // Check alignment
-    bool aligned = (reinterpret_cast<uintptr_t>(a) % 16 == 0) &&
-                   (reinterpret_cast<uintptr_t>(b) % 16 == 0) &&
-                   (reinterpret_cast<uintptr_t>(g) % 16 == 0) &&
-                   (reinterpret_cast<uintptr_t>(beta) % 16 == 0) &&
-                   (total % VecSize == 0);
-
     int threads = 256;
-
-    if (aligned) {
-        int vec_elements = total / VecSize;
-        int blocks = (vec_elements + threads - 1) / threads;
-        fused_gdn_gating_kernel_vectorized<T, ALogT><<<blocks, threads, 0, stream>>>(
-            al, a, b, dt, g, beta, total, h);
-    } else {
-        int blocks = (total + threads - 1) / threads;
-        fused_gdn_gating_kernel<T, ALogT><<<blocks, threads, 0, stream>>>(
-            al, a, b, dt, g, beta, total, h);
-    }
+    int blocks = (total + threads - 1) / threads;
+    fused_gdn_gating_kernel<T><<<blocks, threads, 0, stream>>>(
+        al, a, b, dt, g, beta, total, h);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -1141,55 +1239,27 @@ extern "C" void fused_gdn_gating_f32(const float* al, const float* a,
                                      const float* b, const float* dt,
                                      float* g, float* beta, int bat,
                                      int seq, int h, cudaStream_t stream) {
-    launch_fused_gdn_gating<float, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
+    launch_fused_gdn_gating<float>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
-extern "C" void fused_gdn_gating_f16(const half* al, const half* a,
-                                     const half* b, const half* dt,
-                                     half* g, half* beta, int bat,
+extern "C" void fused_gdn_gating_f16(const float* al, const half* a,
+                                     const half* b, const float* dt,
+                                     float* g, float* beta, int bat,
                                      int seq, int h, cudaStream_t stream) {
-    launch_fused_gdn_gating<half, half>(al, a, b, dt, g, beta, bat, seq, h, stream);
+    launch_fused_gdn_gating<half>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
-extern "C" void fused_gdn_gating_bf16(const __nv_bfloat16* al,
+extern "C" void fused_gdn_gating_bf16(const float* al,
                                       const __nv_bfloat16* a,
                                       const __nv_bfloat16* b,
-                                      const __nv_bfloat16* dt,
-                                      __nv_bfloat16* g,
-                                      __nv_bfloat16* beta, int bat,
+                                      const float* dt,
+                                      float* g,
+                                      float* beta, int bat,
                                       int seq, int h,
                                       cudaStream_t stream) {
-    launch_fused_gdn_gating<__nv_bfloat16, __nv_bfloat16>(
+    launch_fused_gdn_gating<__nv_bfloat16>(
         al, a, b, dt, g, beta, bat, seq, h, stream
     );
-}
-
-extern "C" void fused_gdn_gating_f16_alog_f32(
-    const float* al,
-    const half* a,
-    const half* b,
-    const half* dt,
-    half* g,
-    half* beta,
-    int bat,
-    int seq,
-    int h,
-    cudaStream_t stream) {
-    launch_fused_gdn_gating<half, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
-}
-
-extern "C" void fused_gdn_gating_bf16_alog_f32(
-    const float* al,
-    const __nv_bfloat16* a,
-    const __nv_bfloat16* b,
-    const __nv_bfloat16* dt,
-    __nv_bfloat16* g,
-    __nv_bfloat16* beta,
-    int bat,
-    int seq,
-    int h,
-    cudaStream_t stream) {
-    launch_fused_gdn_gating<__nv_bfloat16, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
 
@@ -1517,9 +1587,9 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const T* __restrict__ q,          // [total_tokens, num_heads, k_dim]
     const T* __restrict__ k,          // [total_tokens, num_heads, k_dim]
     const T* __restrict__ v,          // [total_tokens, num_heads, v_dim]
-    const T* __restrict__ g,          // [total_tokens, num_heads] decay = exp(g)
-    const T* __restrict__ beta,       // [total_tokens, num_heads]
-    float* __restrict__ state,        // [max_batch, num_heads, v_dim, k_dim]
+    const float* __restrict__ g,      // [total_tokens, num_heads] decay = exp(g)
+    const float* __restrict__ beta,   // [total_tokens, num_heads]
+    float* __restrict__ state,        // [max_batch, num_heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,              // [total_tokens, num_heads, v_dim]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
@@ -1527,11 +1597,11 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     int num_heads,
     int k_dim,
     int v_dim) {
-    const int seq_head = blockIdx.y; // batch_idx * num_heads + head_idx
+    const int seq_head = blockIdx.y;
     const int lane = threadIdx.x;
     const int warp_id = threadIdx.y;
     const int v_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    if (v_idx >= v_dim || seq_head >= batch * num_heads) return;
+    if (seq_head >= batch * num_heads) return;
 
     const int seq_idx = seq_head / num_heads;
     const int head_idx = seq_head % num_heads;
@@ -1543,7 +1613,6 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const int seq_len = end - start;
     if (seq_len <= 0) return;
 
-    // Pointers: input layout is [total_tokens, num_heads, dim]
     const int token_stride_k = num_heads * k_dim;
     const int token_stride_v = num_heads * v_dim;
     const int token_stride_g = num_heads;
@@ -1551,87 +1620,140 @@ __global__ void gated_delta_rule_recurrence_varlen_kernel(
     const T* q_base = q + start * token_stride_k + head_idx * k_dim;
     const T* k_base = k + start * token_stride_k + head_idx * k_dim;
     const T* v_base = v + start * token_stride_v + head_idx * v_dim;
-    const T* g_base = g + start * token_stride_g + head_idx;
-    const T* beta_base = beta + start * token_stride_g + head_idx;
+    const float* g_base = g + start * token_stride_g + head_idx;
+    const float* beta_base = beta + start * token_stride_g + head_idx;
     T* out_base = out + start * token_stride_v + head_idx * v_dim;
 
-    float* state_col = state + (((slot * num_heads + head_idx) * v_dim + v_idx) * k_dim);
+    __shared__ float q_buf[2][BK];
+    __shared__ float k_buf[2][BK];
+    __shared__ float scalars[2][2]; // [buf_idx][0=decay, 1=beta]
+
+    const bool v_valid = (v_idx < v_dim);
+
+    // State layout: [k_dim, v_dim] — for each key row, load v_idx element
+    float* state_head = v_valid ?
+        state + ((slot * num_heads + head_idx) * k_dim * v_dim) : nullptr;
 
     constexpr int ROWS_PER_LANE = (BK + GDN_WARP_SIZE - 1) / GDN_WARP_SIZE;
     float s_shard[ROWS_PER_LANE];
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_LANE; ++r) {
-        const int k_idx = r * GDN_WARP_SIZE + lane;
-        s_shard[r] = (k_idx < k_dim) ? state_col[k_idx] : 0.0f;
-    }
-
-    for (int t = 0; t < seq_len; ++t) {
-        const T* q_t = q_base + t * token_stride_k;
-        const T* k_t = k_base + t * token_stride_k;
-        const T* v_t = v_base + t * token_stride_v;
-
-        float q_reg[ROWS_PER_LANE];
-        float k_reg[ROWS_PER_LANE];
+    if (v_valid) {
 #pragma unroll
         for (int r = 0; r < ROWS_PER_LANE; ++r) {
             const int k_idx = r * GDN_WARP_SIZE + lane;
-            q_reg[r] = (k_idx < k_dim) ? to_float(q_t[k_idx]) : 0.0f;
-            k_reg[r] = (k_idx < k_dim) ? to_float(k_t[k_idx]) : 0.0f;
-        }
-
-        const float decay = to_float(g_base[t * token_stride_g]);
-        const float beta_t = to_float(beta_base[t * token_stride_g]);
-
-        float kv_partial = 0.0f;
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; ++r) {
-            s_shard[r] *= decay;
-            kv_partial = __fmaf_rn(s_shard[r], k_reg[r], kv_partial);
-        }
-        const float kv_mem = warp_reduce_sum(kv_partial);
-        const float delta = (to_float(v_t[v_idx]) - kv_mem) * beta_t;
-
-        float y_partial = 0.0f;
-#pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; ++r) {
-            s_shard[r] = __fmaf_rn(k_reg[r], delta, s_shard[r]);
-            y_partial = __fmaf_rn(s_shard[r], q_reg[r], y_partial);
-        }
-        const float y_t = warp_reduce_sum(y_partial);
-
-        if (lane == 0) {
-            out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+            s_shard[r] = (k_idx < k_dim) ? state_head[k_idx * v_dim + v_idx] : 0.0f;
         }
     }
 
-    // Store the transposed [V, K] state back.
+    constexpr int TOTAL_THREADS = WARPS_PER_BLOCK * GDN_WARP_SIZE;
+    const int tid = warp_id * GDN_WARP_SIZE + lane;
+
+    // Preload first timestep into buffer 0
+    if (seq_len > 0) {
+        const T* q_0 = q_base;
+        const T* k_0 = k_base;
+        for (int j = tid; j < BK; j += TOTAL_THREADS) {
+            if (j < k_dim) {
+                q_buf[0][j] = to_float(q_0[j]);
+                k_buf[0][j] = to_float(k_0[j]);
+            } else {
+                q_buf[0][j] = 0.0f;
+                k_buf[0][j] = 0.0f;
+            }
+        }
+        if (tid == 0) {
+            scalars[0][0] = to_float(g_base[0]);
+            scalars[0][1] = to_float(beta_base[0]);
+        }
+        __syncthreads();
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int cur = t & 1;
+        const int nxt = 1 - cur;
+
+        // Start loading next timestep into the other buffer (overlaps with compute)
+        if (t + 1 < seq_len) {
+            const T* q_next = q_base + (t + 1) * token_stride_k;
+            const T* k_next = k_base + (t + 1) * token_stride_k;
+            for (int j = tid; j < BK; j += TOTAL_THREADS) {
+                if (j < k_dim) {
+                    q_buf[nxt][j] = to_float(q_next[j]);
+                    k_buf[nxt][j] = to_float(k_next[j]);
+                } else {
+                    q_buf[nxt][j] = 0.0f;
+                    k_buf[nxt][j] = 0.0f;
+                }
+            }
+            if (tid == 0) {
+                scalars[nxt][0] = to_float(g_base[(t + 1) * token_stride_g]);
+                scalars[nxt][1] = to_float(beta_base[(t + 1) * token_stride_g]);
+            }
+        }
+
+        if (v_valid) {
+            const float decay = scalars[cur][0];
+            const float beta_t = scalars[cur][1];
+
+            float kv_partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_LANE; ++r) {
-        const int k_idx = r * GDN_WARP_SIZE + lane;
-        if (k_idx < k_dim) {
-            state_col[k_idx] = s_shard[r];
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] *= decay;
+                kv_partial = __fmaf_rn(s_shard[r], k_buf[cur][k_idx], kv_partial);
+            }
+            const float kv_mem = warp_reduce_sum(kv_partial);
+            const float delta = (to_float(v_base[t * token_stride_v + v_idx]) - kv_mem) * beta_t;
+
+            float y_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] = __fmaf_rn(k_buf[cur][k_idx], delta, s_shard[r]);
+                y_partial = __fmaf_rn(s_shard[r], q_buf[cur][k_idx], y_partial);
+            }
+            const float y_t = warp_reduce_sum(y_partial);
+
+            if (lane == 0) {
+                out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+            }
+        }
+
+        // Single sync: ensures next buffer load is complete before it's used
+        __syncthreads();
+    }
+
+    if (v_valid) {
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            if (k_idx < k_dim) {
+                state_head[k_idx * v_dim + v_idx] = s_shard[r];
+            }
         }
     }
 }
 
 template <typename T>
 void launch_gated_delta_rule_recurrence_varlen(
-    const T* q, const T* k, const T* v, const T* g, const T* beta,
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
     float* state, const int64_t* slots, T* out,
     const uint32_t* cu_seqlens,
     int batch, int num_heads, int k_dim, int v_dim,
     cudaStream_t stream) {
-    constexpr int WARPS_PER_BLOCK = 4;
-    dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
-    dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
 
     if (k_dim == 64) {
+        constexpr int WARPS_PER_BLOCK = 4;
         constexpr int BK = 64;
+        dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
+        dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, slots, out, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
     } else if (k_dim == 128) {
+        constexpr int WARPS_PER_BLOCK = 8;
         constexpr int BK = 128;
+        dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_heads);
+        dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, slots, out, cu_seqlens,
             batch, num_heads, k_dim, v_dim);
@@ -1652,8 +1774,8 @@ extern "C" void gated_delta_rule_recurrence_varlen_f32(
 }
 
 extern "C" void gated_delta_rule_recurrence_varlen_f16(
-    const half* q, const half* k, const half* v, const half* g,
-    const half* beta, float* state, const int64_t* slots, half* out,
+    const half* q, const half* k, const half* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, half* out,
     const uint32_t* cu_seqlens, int batch, int num_heads, int k_dim, int v_dim,
     cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen(
@@ -1663,11 +1785,232 @@ extern "C" void gated_delta_rule_recurrence_varlen_f16(
 
 extern "C" void gated_delta_rule_recurrence_varlen_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* g, const __nv_bfloat16* beta, float* state,
+    const float* g, const float* beta, float* state,
     const int64_t* slots, __nv_bfloat16* out, const uint32_t* cu_seqlens,
     int batch, int num_heads, int k_dim, int v_dim,
     cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen(
         q, k, v, g, beta, state, slots, out, cu_seqlens,
         batch, num_heads, k_dim, v_dim, stream);
+}
+
+// =============================================================================
+// Grouped-Query Varlen Recurrence — handles num_k_heads != num_v_heads.
+// q/k have num_k_heads, v/g/beta/state/out have num_v_heads.
+// Each v_head maps to k_head via: k_head = v_head / kv_group_size.
+// Fuses the q_scale multiplication to avoid separate kernel launch.
+// Uses shared memory double buffering for q/k with k cached in registers.
+// Grid:  (v_dim / WARPS_PER_BLOCK, batch * num_v_heads)  Block: (32, WARPS_PER_BLOCK)
+// =============================================================================
+
+template <typename T, int BK, int WARPS_PER_BLOCK>
+__global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
+    const T* __restrict__ q,          // [total_tokens, num_k_heads, k_dim]
+    const T* __restrict__ k,          // [total_tokens, num_k_heads, k_dim]
+    const T* __restrict__ v,          // [total_tokens, num_v_heads, v_dim]
+    const float* __restrict__ g,      // [total_tokens, num_v_heads] decay = exp(g)
+    const float* __restrict__ beta,   // [total_tokens, num_v_heads]
+    float* __restrict__ state,        // [max_batch, num_v_heads, k_dim, v_dim]
+    const int64_t* __restrict__ slots, // [batch]
+    T* __restrict__ out,              // [total_tokens, num_v_heads, v_dim]
+    const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
+    int batch,
+    int num_v_heads,
+    int num_k_heads,
+    int k_dim,
+    int v_dim,
+    float q_scale) {
+    const int seq_head = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int v_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (seq_head >= batch * num_v_heads) return;
+
+    const int seq_idx = seq_head / num_v_heads;
+    const int v_head_idx = seq_head % num_v_heads;
+    const int kv_group_size = num_v_heads / num_k_heads;
+    const int k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[seq_idx];
+    if (slot < 0) return;
+
+    const int start = static_cast<int>(cu_seqlens[seq_idx]);
+    const int end = static_cast<int>(cu_seqlens[seq_idx + 1]);
+    const int seq_len = end - start;
+    if (seq_len <= 0) return;
+
+    const int token_stride_qk = num_k_heads * k_dim;
+    const int token_stride_v = num_v_heads * v_dim;
+    const int token_stride_g = num_v_heads;
+
+    const T* q_base = q + start * token_stride_qk + k_head_idx * k_dim;
+    const T* k_base = k + start * token_stride_qk + k_head_idx * k_dim;
+    const T* v_base = v + start * token_stride_v + v_head_idx * v_dim;
+    const float* g_base = g + start * token_stride_g + v_head_idx;
+    const float* beta_base = beta + start * token_stride_g + v_head_idx;
+    T* out_base = out + start * token_stride_v + v_head_idx * v_dim;
+
+    __shared__ float q_buf[2][BK];
+    __shared__ float k_buf[2][BK];
+    __shared__ float scalars[2][2];
+
+    const bool v_valid = (v_idx < v_dim);
+
+    float* state_head = v_valid ?
+        state + ((slot * num_v_heads + v_head_idx) * k_dim * v_dim) : nullptr;
+
+    constexpr int ROWS_PER_LANE = (BK + GDN_WARP_SIZE - 1) / GDN_WARP_SIZE;
+    float s_shard[ROWS_PER_LANE];
+    if (v_valid) {
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            s_shard[r] = (k_idx < k_dim) ? state_head[k_idx * v_dim + v_idx] : 0.0f;
+        }
+    }
+
+    constexpr int TOTAL_THREADS = WARPS_PER_BLOCK * GDN_WARP_SIZE;
+    const int tid = warp_id * GDN_WARP_SIZE + lane;
+
+    if (seq_len > 0) {
+        for (int j = tid; j < BK; j += TOTAL_THREADS) {
+            if (j < k_dim) {
+                q_buf[0][j] = to_float(q_base[j]) * q_scale;
+                k_buf[0][j] = to_float(k_base[j]);
+            } else {
+                q_buf[0][j] = 0.0f;
+                k_buf[0][j] = 0.0f;
+            }
+        }
+        if (tid == 0) {
+            scalars[0][0] = expf(to_float(g_base[0]));
+            scalars[0][1] = to_float(beta_base[0]);
+        }
+        __syncthreads();
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int cur = t & 1;
+        const int nxt = 1 - cur;
+
+        if (t + 1 < seq_len) {
+            const T* q_next = q_base + (t + 1) * token_stride_qk;
+            const T* k_next = k_base + (t + 1) * token_stride_qk;
+            for (int j = tid; j < BK; j += TOTAL_THREADS) {
+                if (j < k_dim) {
+                    q_buf[nxt][j] = to_float(q_next[j]) * q_scale;
+                    k_buf[nxt][j] = to_float(k_next[j]);
+                } else {
+                    q_buf[nxt][j] = 0.0f;
+                    k_buf[nxt][j] = 0.0f;
+                }
+            }
+            if (tid == 0) {
+                scalars[nxt][0] = expf(to_float(g_base[(t + 1) * token_stride_g]));
+                scalars[nxt][1] = to_float(beta_base[(t + 1) * token_stride_g]);
+            }
+        }
+
+        if (v_valid) {
+            const float decay = scalars[cur][0];
+            const float beta_t = scalars[cur][1];
+
+            float kv_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] *= decay;
+                kv_partial = __fmaf_rn(s_shard[r], k_buf[cur][k_idx], kv_partial);
+            }
+            const float kv_mem = warp_reduce_sum(kv_partial);
+            const float delta = (to_float(v_base[t * token_stride_v + v_idx]) - kv_mem) * beta_t;
+
+            float y_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                const int k_idx = r * GDN_WARP_SIZE + lane;
+                s_shard[r] = __fmaf_rn(k_buf[cur][k_idx], delta, s_shard[r]);
+                y_partial = __fmaf_rn(s_shard[r], q_buf[cur][k_idx], y_partial);
+            }
+            const float y_t = warp_reduce_sum(y_partial);
+
+            if (lane == 0) {
+                out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (v_valid) {
+#pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            const int k_idx = r * GDN_WARP_SIZE + lane;
+            if (k_idx < k_dim) {
+                state_head[k_idx * v_dim + v_idx] = s_shard[r];
+            }
+        }
+    }
+}
+
+template <typename T>
+void launch_gated_delta_rule_recurrence_varlen_gqa(
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, T* out,
+    const uint32_t* cu_seqlens,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+
+    if (k_dim == 128) {
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int BK = 128;
+        dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_v_heads);
+        dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
+        gated_delta_rule_recurrence_varlen_gqa_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
+    } else if (k_dim == 64) {
+        constexpr int WARPS_PER_BLOCK = 4;
+        constexpr int BK = 64;
+        dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_v_heads);
+        dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
+        gated_delta_rule_recurrence_varlen_gqa_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
+    } else {
+        printf("gated_delta_rule_recurrence_varlen_gqa: k_dim=%d not supported\n", k_dim);
+    }
+    CHECK_CUDA(cudaGetLastError());
+}
+
+extern "C" void gated_delta_rule_recurrence_varlen_gqa_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const float* g, const float* beta, float* state,
+    const int64_t* slots, __nv_bfloat16* out, const uint32_t* cu_seqlens,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence_varlen_gqa(
+        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}
+
+extern "C" void gated_delta_rule_recurrence_varlen_gqa_f16(
+    const half* q, const half* k, const half* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, half* out,
+    const uint32_t* cu_seqlens,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence_varlen_gqa(
+        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}
+
+extern "C" void gated_delta_rule_recurrence_varlen_gqa_f32(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, float* out,
+    const uint32_t* cu_seqlens,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_recurrence_varlen_gqa(
+        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }

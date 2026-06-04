@@ -43,7 +43,7 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     device T* out [[buffer(4)]],
     const device uint* cu_seqlens [[buffer(5)]],
     constant int& batch_size [[buffer(6)]],
@@ -61,14 +61,14 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     const uint end = cu_seqlens[seq_idx + 1];
     const uint seq_len = end - start;
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
-    device T* state_ptr = conv_state + (seq_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (seq_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
 
     float history[KERNEL_SIZE];
     for (uint i = 0; i < KERNEL_SIZE; ++i) {
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
     }
 
     float w_reg[KERNEL_SIZE];
@@ -100,7 +100,7 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     }
 
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        state_ptr[i] = gdn_from_float<T>(history[i]);
+        state_ptr[i] = history[i];
     }
 }
 
@@ -109,7 +109,7 @@ kernel void causal_conv1d_update_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     device T* out [[buffer(4)]],
     constant int& batch_size [[buffer(5)]],
     constant int& d_conv [[buffer(6)]],
@@ -122,7 +122,7 @@ kernel void causal_conv1d_update_kernel(
         return;
     }
 
-    device T* state_ptr = conv_state + (batch_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (batch_idx * d_conv + channel_idx) * (KERNEL_SIZE - 1);
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
     const float x_t = gdn_to_float(x[batch_idx * d_conv + channel_idx]);
 
@@ -132,7 +132,7 @@ kernel void causal_conv1d_update_kernel(
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
         sum += history[i] * gdn_to_float(w_ptr[i]);
     }
 
@@ -146,9 +146,9 @@ kernel void causal_conv1d_update_kernel(
 
     if (KERNEL_SIZE > 1) {
         for (uint i = 0; i + 2 < KERNEL_SIZE; ++i) {
-            state_ptr[i] = gdn_from_float<T>(history[i + 1]);
+            state_ptr[i] = history[i + 1];
         }
-        state_ptr[KERNEL_SIZE - 2] = gdn_from_float<T>(x_t);
+        state_ptr[KERNEL_SIZE - 2] = x_t;
     }
 }
 
@@ -157,7 +157,7 @@ kernel void causal_conv1d_update_slots_kernel(
     const device T* x [[buffer(0)]],
     const device T* weight [[buffer(1)]],
     const device T* bias [[buffer(2)]],
-    device T* conv_state [[buffer(3)]],
+    device float* conv_state [[buffer(3)]],
     const device int64_t* slots [[buffer(4)]],
     device T* out [[buffer(5)]],
     constant int& batch_size [[buffer(6)]],
@@ -176,7 +176,7 @@ kernel void causal_conv1d_update_slots_kernel(
         return;
     }
 
-    device T* state_ptr = conv_state + (static_cast<uint>(slot) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+    device float* state_ptr = conv_state + (static_cast<uint>(slot) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
     const device T* w_ptr = weight + channel_idx * KERNEL_SIZE;
     const float x_t = gdn_to_float(x[batch_idx * d_conv + channel_idx]);
 
@@ -186,7 +186,7 @@ kernel void causal_conv1d_update_slots_kernel(
         history[i] = 0.0f;
     }
     for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
-        history[i] = gdn_to_float(state_ptr[i]);
+        history[i] = state_ptr[i];
         sum += history[i] * gdn_to_float(w_ptr[i]);
     }
 
@@ -200,20 +200,20 @@ kernel void causal_conv1d_update_slots_kernel(
 
     if (KERNEL_SIZE > 1) {
         for (uint i = 0; i + 2 < KERNEL_SIZE; ++i) {
-            state_ptr[i] = gdn_from_float<T>(history[i + 1]);
+            state_ptr[i] = history[i + 1];
         }
-        state_ptr[KERNEL_SIZE - 2] = gdn_from_float<T>(x_t);
+        state_ptr[KERNEL_SIZE - 2] = x_t;
     }
 }
 
-template <typename T, typename ALogT>
+template <typename T>
 kernel void fused_gdn_gating_kernel(
-    const device ALogT* a_log [[buffer(0)]],
+    const device float* a_log [[buffer(0)]],
     const device T* a [[buffer(1)]],
     const device T* b [[buffer(2)]],
-    const device T* dt_bias [[buffer(3)]],
-    device T* g [[buffer(4)]],
-    device T* beta [[buffer(5)]],
+    const device float* dt_bias [[buffer(3)]],
+    device float* g [[buffer(4)]],
+    device float* beta [[buffer(5)]],
     constant int& total_elements [[buffer(6)]],
     constant int& num_heads [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
@@ -224,12 +224,10 @@ kernel void fused_gdn_gating_kernel(
     const int h_idx = static_cast<int>(gid) % num_heads;
     const float a_val = gdn_to_float(a[gid]);
     const float b_val = gdn_to_float(b[gid]);
-    const float alog_val = gdn_to_float(a_log[h_idx]);
-    const float dt_val = gdn_to_float(dt_bias[h_idx]);
-    const float g_val = -exp(alog_val) * gdn_softplus(a_val + dt_val);
-    const float beta_val = gdn_sigmoid(b_val);
-    g[gid] = gdn_from_float<T>(g_val);
-    beta[gid] = gdn_from_float<T>(beta_val);
+    const float alog_val = a_log[h_idx];
+    const float dt_val = dt_bias[h_idx];
+    g[gid] = -exp(alog_val) * gdn_softplus(a_val + dt_val);
+    beta[gid] = gdn_sigmoid(b_val);
 }
 
 template <typename T>
@@ -356,8 +354,8 @@ kernel void gated_delta_rule_recurrence_kernel(
     const device T* v_bh = v + bh_idx * seq_len * v_dim;
     const device float* g_bh = g + bh_idx * seq_len;
     const device float* beta_bh = beta + bh_idx * seq_len;
-    // State layout: [V, K] — each thread owns one contiguous K-row for its v_idx
-    device float* state_bh = state + (bh_idx * BK * v_dim) + v_idx * BK;
+    // State layout: [K, V] — each thread loads v_idx element from each key row
+    device float* state_base = state + bh_idx * BK * v_dim;
     device T* out_bh = out + bh_idx * seq_len * v_dim;
 
     threadgroup float k_shared[BK];
@@ -366,7 +364,7 @@ kernel void gated_delta_rule_recurrence_kernel(
 
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = state_bh[j];
+        s[j] = state_base[j * v_dim + v_idx];
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -374,7 +372,6 @@ kernel void gated_delta_rule_recurrence_kernel(
             k_shared[j] = gdn_to_float(k_bh[t * BK + j]);
         }
         if (tid == 0) {
-            // g is pre-computed decay = exp(g) by caller
             scalars[0] = g_bh[t];
             scalars[1] = beta_bh[t];
         }
@@ -406,7 +403,7 @@ kernel void gated_delta_rule_recurrence_kernel(
     }
 
     for (uint j = 0; j < BK; ++j) {
-        state_bh[j] = s[j];
+        state_base[j * v_dim + v_idx] = s[j];
     }
 }
 
@@ -415,8 +412,8 @@ kernel void gated_delta_rule_decode_slots_kernel(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device T* g [[buffer(3)]],
-    const device T* beta [[buffer(4)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
@@ -458,11 +455,11 @@ kernel void gated_delta_rule_decode_slots_kernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // State layout: [V, K] — contiguous K-row per v_idx
-    device float* state_bh = state + (((static_cast<uint>(slot) * heads + h) * v_dim + v_idx) * k_dim);
+    // State layout: [K, V] — for each key row j, access element at v_idx
+    device float* state_head = state + ((static_cast<uint>(slot) * heads + h) * k_dim * v_dim);
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = j < static_cast<uint>(k_dim) ? state_bh[j] : 0.0f;
+        s[j] = j < static_cast<uint>(k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
     }
 
     const float decay = scalars[0];
@@ -487,7 +484,7 @@ kernel void gated_delta_rule_decode_slots_kernel(
         if (j < static_cast<uint>(k_dim)) {
             s[j] += k_shared[j] * delta;
             y += s[j] * q_shared[j];
-            state_bh[j] = s[j];
+            state_head[j * v_dim + v_idx] = s[j];
         }
     }
     out[bh * v_dim + v_idx] = gdn_from_float<T>(y);
@@ -498,8 +495,8 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     const device T* q [[buffer(0)]],
     const device T* k [[buffer(1)]],
     const device T* v [[buffer(2)]],
-    const device T* g [[buffer(3)]],
-    const device T* beta [[buffer(4)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
@@ -540,11 +537,11 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     threadgroup float q_shared[BK];
     threadgroup float scalars[2];
 
-    // State layout: [V, K] — contiguous K-row per v_idx
-    device float* state_bh = state + (((static_cast<uint>(slot) * num_heads + head_idx) * v_dim + v_idx) * k_dim);
+    // State layout: [K, V] — for each key row j, access element at v_idx
+    device float* state_head = state + ((static_cast<uint>(slot) * num_heads + head_idx) * k_dim * v_dim);
     float s[BK];
     for (uint j = 0; j < BK; ++j) {
-        s[j] = state_bh[j];
+        s[j] = state_head[j * v_dim + v_idx];
     }
 
     for (uint t = 0; t < seq_len; ++t) {
@@ -557,7 +554,6 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
             k_shared[j] = gdn_to_float(k[qk_base + j]);
         }
         if (tid == 0) {
-            // g is pre-computed decay = exp(g) by caller
             scalars[0] = gdn_to_float(g[g_base]);
             scalars[1] = gdn_to_float(beta[g_base]);
         }
@@ -587,7 +583,114 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     }
 
     for (uint j = 0; j < BK; ++j) {
-        state_bh[j] = s[j];
+        state_head[j * v_dim + v_idx] = s[j];
+    }
+}
+
+// GQA variant of varlen recurrence: q/k indexed by num_k_heads, v/g/beta/state/out by num_v_heads
+template <typename T, uint BK>
+kernel void gated_delta_rule_recurrence_varlen_gqa_kernel(
+    const device T* q [[buffer(0)]],
+    const device T* k [[buffer(1)]],
+    const device T* v [[buffer(2)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
+    device float* state [[buffer(5)]],
+    const device int64_t* slots [[buffer(6)]],
+    device T* out [[buffer(7)]],
+    const device uint* cu_seqlens [[buffer(8)]],
+    constant int& batch [[buffer(9)]],
+    constant int& num_v_heads [[buffer(10)]],
+    constant int& num_k_heads [[buffer(11)]],
+    constant int& k_dim [[buffer(12)]],
+    constant int& v_dim [[buffer(13)]],
+    constant float& q_scale [[buffer(14)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    const uint tid = tid3.x;
+    const uint v_idx = tgid.x * GDN_REC_THREADS + tid;
+    const uint seq_head = tgid.y;
+    if (seq_head >= static_cast<uint>(batch * num_v_heads) || v_idx >= static_cast<uint>(v_dim)) {
+        return;
+    }
+
+    const uint seq_idx = seq_head / num_v_heads;
+    const uint v_head_idx = seq_head % num_v_heads;
+    const uint kv_group_size = num_v_heads / num_k_heads;
+    const uint k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[seq_idx];
+    if (slot < 0) {
+        return;
+    }
+
+    const uint start = cu_seqlens[seq_idx];
+    const uint end = cu_seqlens[seq_idx + 1];
+    const uint seq_len = end - start;
+    if (seq_len == 0) {
+        return;
+    }
+
+    const uint token_stride_qk = num_k_heads * k_dim;
+    const uint token_stride_v = num_v_heads * v_dim;
+    const uint token_stride_g = num_v_heads;
+
+    threadgroup float k_shared[BK];
+    threadgroup float q_shared[BK];
+    threadgroup float scalars[2];
+
+    device float* state_head = state + ((static_cast<uint>(slot) * num_v_heads + v_head_idx) * k_dim * v_dim);
+    float s[BK];
+    for (uint j = 0; j < BK; ++j) {
+        s[j] = (j < static_cast<uint>(k_dim)) ? state_head[j * v_dim + v_idx] : 0.0f;
+    }
+
+    for (uint t = 0; t < seq_len; ++t) {
+        const uint token_idx = start + t;
+        const uint qk_base = token_idx * token_stride_qk + k_head_idx * k_dim;
+        const uint v_base = token_idx * token_stride_v + v_head_idx * v_dim;
+        const uint g_base = token_idx * token_stride_g + v_head_idx;
+
+        for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
+            k_shared[j] = gdn_to_float(k[qk_base + j]);
+        }
+        if (tid == 0) {
+            scalars[0] = exp(gdn_to_float(g[g_base]));
+            scalars[1] = gdn_to_float(beta[g_base]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float decay = scalars[0];
+        const float beta_t = scalars[1];
+        float kv_mem = 0.0f;
+        for (uint j = 0; j < BK; ++j) {
+            if (j < static_cast<uint>(k_dim)) {
+                s[j] *= decay;
+                kv_mem += s[j] * k_shared[j];
+            }
+        }
+        const float delta = (gdn_to_float(v[v_base + v_idx]) - kv_mem) * beta_t;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
+            q_shared[j] = gdn_to_float(q[qk_base + j]) * q_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float y = 0.0f;
+        for (uint j = 0; j < BK; ++j) {
+            if (j < static_cast<uint>(k_dim)) {
+                s[j] += k_shared[j] * delta;
+                y += s[j] * q_shared[j];
+            }
+        }
+        out[v_base + v_idx] = gdn_from_float<T>(y);
+    }
+
+    for (uint j = 0; j < BK; ++j) {
+        if (j < static_cast<uint>(k_dim)) {
+            state_head[j * v_dim + v_idx] = s[j];
+        }
     }
 }
 
@@ -621,7 +724,7 @@ template [[host_name("gdn_causal_conv1d_fwd_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     device type* out [[buffer(4)]], \
     const device uint* cu_seqlens [[buffer(5)]], \
     constant int& batch_size [[buffer(6)]], \
@@ -635,7 +738,7 @@ template [[host_name("gdn_causal_conv1d_update_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     device type* out [[buffer(4)]], \
     constant int& batch_size [[buffer(5)]], \
     constant int& d_conv [[buffer(6)]], \
@@ -648,7 +751,7 @@ template [[host_name("gdn_causal_conv1d_update_slots_" #type "_k" #ksize)]] \
     const device type* x [[buffer(0)]], \
     const device type* weight [[buffer(1)]], \
     const device type* bias [[buffer(2)]], \
-    device type* conv_state [[buffer(3)]], \
+    device float* conv_state [[buffer(3)]], \
     const device int64_t* slots [[buffer(4)]], \
     device type* out [[buffer(5)]], \
     constant int& batch_size [[buffer(6)]], \
@@ -656,15 +759,15 @@ template [[host_name("gdn_causal_conv1d_update_slots_" #type "_k" #ksize)]] \
     constant bool& activation_silu [[buffer(8)]], \
     uint2 gid [[thread_position_in_grid]]);
 
-#define INSTANTIATE_GATING(type, alog_type, name) \
+#define INSTANTIATE_GATING(type, name) \
 template [[host_name(name)]] \
-[[kernel]] void fused_gdn_gating_kernel<type, alog_type>( \
-    const device alog_type* a_log [[buffer(0)]], \
+[[kernel]] void fused_gdn_gating_kernel<type>( \
+    const device float* a_log [[buffer(0)]], \
     const device type* a [[buffer(1)]], \
     const device type* b [[buffer(2)]], \
-    const device type* dt_bias [[buffer(3)]], \
-    device type* g [[buffer(4)]], \
-    device type* beta [[buffer(5)]], \
+    const device float* dt_bias [[buffer(3)]], \
+    device float* g [[buffer(4)]], \
+    device float* beta [[buffer(5)]], \
     constant int& total_elements [[buffer(6)]], \
     constant int& num_heads [[buffer(7)]], \
     uint gid [[thread_position_in_grid]]);
@@ -721,8 +824,8 @@ template [[host_name("gdn_gated_delta_rule_decode_slots_" #type "_k" #bk)]] \
     const device type* q [[buffer(0)]], \
     const device type* k [[buffer(1)]], \
     const device type* v [[buffer(2)]], \
-    const device type* g [[buffer(3)]], \
-    const device type* beta [[buffer(4)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
@@ -739,8 +842,8 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_" #type "_k" #bk)]]
     const device type* q [[buffer(0)]], \
     const device type* k [[buffer(1)]], \
     const device type* v [[buffer(2)]], \
-    const device type* g [[buffer(3)]], \
-    const device type* beta [[buffer(4)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
@@ -767,9 +870,6 @@ template [[host_name("gdn_mamba_scatter_rows_" #type)]] \
 INSTANTIATE_CONV_FWD(float, 2)
 INSTANTIATE_CONV_FWD(float, 3)
 INSTANTIATE_CONV_FWD(float, 4)
-INSTANTIATE_CONV_FWD(half, 2)
-INSTANTIATE_CONV_FWD(half, 3)
-INSTANTIATE_CONV_FWD(half, 4)
 INSTANTIATE_CONV_FWD(bfloat16_t, 2)
 INSTANTIATE_CONV_FWD(bfloat16_t, 3)
 INSTANTIATE_CONV_FWD(bfloat16_t, 4)
@@ -777,9 +877,6 @@ INSTANTIATE_CONV_FWD(bfloat16_t, 4)
 INSTANTIATE_CONV_UPDATE(float, 2)
 INSTANTIATE_CONV_UPDATE(float, 3)
 INSTANTIATE_CONV_UPDATE(float, 4)
-INSTANTIATE_CONV_UPDATE(half, 2)
-INSTANTIATE_CONV_UPDATE(half, 3)
-INSTANTIATE_CONV_UPDATE(half, 4)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 2)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 3)
 INSTANTIATE_CONV_UPDATE(bfloat16_t, 4)
@@ -787,18 +884,12 @@ INSTANTIATE_CONV_UPDATE(bfloat16_t, 4)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 2)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 3)
 INSTANTIATE_CONV_UPDATE_SLOTS(float, 4)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 2)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 3)
-INSTANTIATE_CONV_UPDATE_SLOTS(half, 4)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 2)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 3)
 INSTANTIATE_CONV_UPDATE_SLOTS(bfloat16_t, 4)
 
-INSTANTIATE_GATING(float, float, "gdn_fused_gating_float")
-INSTANTIATE_GATING(half, half, "gdn_fused_gating_half")
-INSTANTIATE_GATING(bfloat16_t, bfloat16_t, "gdn_fused_gating_bfloat16_t")
-INSTANTIATE_GATING(half, float, "gdn_fused_gating_half_alog_f32")
-INSTANTIATE_GATING(bfloat16_t, float, "gdn_fused_gating_bfloat16_t_alog_f32")
+INSTANTIATE_GATING(float, "gdn_fused_gating_float")
+INSTANTIATE_GATING(bfloat16_t, "gdn_fused_gating_bfloat16_t")
 
 INSTANTIATE_L2(float)
 INSTANTIATE_L2(half)
@@ -830,6 +921,34 @@ INSTANTIATE_VARLEN(half, 64)
 INSTANTIATE_VARLEN(half, 128)
 INSTANTIATE_VARLEN(bfloat16_t, 64)
 INSTANTIATE_VARLEN(bfloat16_t, 128)
+
+#define INSTANTIATE_VARLEN_GQA(type, bk) \
+template [[host_name("gdn_gated_delta_rule_recurrence_varlen_gqa_" #type "_k" #bk)]] \
+[[kernel]] void gated_delta_rule_recurrence_varlen_gqa_kernel<type, bk>( \
+    const device type* q [[buffer(0)]], \
+    const device type* k [[buffer(1)]], \
+    const device type* v [[buffer(2)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
+    device float* state [[buffer(5)]], \
+    const device int64_t* slots [[buffer(6)]], \
+    device type* out [[buffer(7)]], \
+    const device uint* cu_seqlens [[buffer(8)]], \
+    constant int& batch [[buffer(9)]], \
+    constant int& num_v_heads [[buffer(10)]], \
+    constant int& num_k_heads [[buffer(11)]], \
+    constant int& k_dim [[buffer(12)]], \
+    constant int& v_dim [[buffer(13)]], \
+    constant float& q_scale [[buffer(14)]], \
+    uint3 tid3 [[thread_position_in_threadgroup]], \
+    uint3 tgid [[threadgroup_position_in_grid]]);
+
+INSTANTIATE_VARLEN_GQA(float, 64)
+INSTANTIATE_VARLEN_GQA(float, 128)
+INSTANTIATE_VARLEN_GQA(half, 64)
+INSTANTIATE_VARLEN_GQA(half, 128)
+INSTANTIATE_VARLEN_GQA(bfloat16_t, 64)
+INSTANTIATE_VARLEN_GQA(bfloat16_t, 128)
 
 INSTANTIATE_SCATTER(float)
 INSTANTIATE_SCATTER(half)

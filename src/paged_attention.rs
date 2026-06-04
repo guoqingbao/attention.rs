@@ -135,9 +135,10 @@ impl PagedAttention {
             || head_size == 112
             || head_size == 128
             || head_size == 192
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192 or 256");
+            candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -233,7 +234,7 @@ impl PagedAttention {
             let o_stride_tokens = q_l.stride()[0] as i32;
             let sinks_ptr = std::ptr::null();
 
-            let (query_start_len_ptr, num_query_seqs) = {
+            let (query_start_len_ptr, _num_query_seqs) = {
                 let (cu_query_lens, cu_query_lens_layout) = cu_query_lens.storage_and_layout();
                 let cu_query_lens = match &*cu_query_lens {
                     candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
@@ -246,21 +247,19 @@ impl PagedAttention {
 
             unsafe {
                 // Calculate shared memory requirement for optimized kernel:
-                // smem_size = 32 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
+                // smem_size = 64 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
                 // sizeof(cache_t) = 2 for fp16/bf16, 1 for fp8
                 let cache_elem_size = if k_scales_ptr.is_null() {
                     2usize
                 } else {
                     1usize
                 };
-                let smem_size = 32 + 2 * head_size * block_size * cache_elem_size;
+                let smem_size = 64 + 2 * head_size * block_size * cache_elem_size;
+                let opt_eligible = smem_size <= 64 * 1024;
 
-                // Use optimized kernel with shared memory tiling when:
-                // 1. Tokens attention with KV cache is large (i.e., >1024 tokens)
-                // 2. Single sequence (optimized kernel assumes all tokens in chunk share same KV blocks)
-                // 3. Shared memory fits within 64KB (minimum on modern GPUs, extended via cudaFuncSetAttribute)
-                let single_seq = num_query_seqs == 1 && num_seqs_bt == 1;
-                if num_seqs > 1024 && single_seq && smem_size <= 64 * 1024 {
+                // Use optimized kernel with shared-memory KV tiling when smem fits
+                // and sequences have enough context. Works for both single and batched.
+                if opt_eligible && self.max_context_len > 1024 {
                     kernels::ffi::paged_attention_prefill_opt(
                         out_ptr,
                         q_ptr,
@@ -481,9 +480,10 @@ impl PagedAttention {
             || head_size == 96
             || head_size == 112
             || head_size == 128
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128 or 256");
+            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -922,25 +922,22 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(feature = "flashattn")]
-        if kc_rank != 4 {
+        let is_flash_cache = kc_rank == 4;
+        if kc_rank != 4 && kc_rank != 5 {
             candle::bail!(
-                "flash-attention expects `key_cache` tensor to be of rank 4 \
+                "reshape_and_cache expects key_cache rank 4 (flash) or 5 (paged), got {kc_rank} \
                     (key_cache: {kc_l:?})"
             )
         }
-
-        #[cfg(not(feature = "flashattn"))]
-        if kc_rank != 5 {
+        if is_flash_cache && vc_rank != 4 {
             candle::bail!(
-                "paged-attention expects `key_cache` tensor to be of rank 5 \
-                    (key_cache: {kc_l:?})"
+                "flash-format expects value_cache rank 4, got {vc_rank} \
+                    (value_cache: {vc_l:?})"
             )
         }
-
-        if vc_rank != 4 {
+        if !is_flash_cache && vc_rank != 4 {
             candle::bail!(
-                "paged-attention expects `value_cache` tensor to be of rank 4 \
+                "paged-attention expects value_cache rank 4, got {vc_rank} \
                     (value_cache: {vc_l:?})"
             )
         }
@@ -960,29 +957,31 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        #[cfg(feature = "flashattn")]
-        let (block_size, _x) = {
-            // [num_blocks, block_size, num_heads, head_size]
+        let (block_size, x) = if is_flash_cache {
             let (_, block_size, _, _) = kc_l.shape().dims4()?;
-            (block_size, 1)
-        };
-
-        #[cfg(not(feature = "flashattn"))]
-        let (block_size, x) = {
-            let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+            (block_size, 1usize)
+        } else {
+            let (_num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
                 candle::bail!(
-                    "shape mismatch value_cache {:?}, expected {:?}",
-                    vc_l.shape(),
-                    (num_blocks, num_heads, head_size / x, block_size, x)
+                    "shape mismatch key_cache {:?}, expected ({}, {}, {}, {}, {})",
+                    kc_l.shape(),
+                    _num_blocks,
+                    num_heads,
+                    head_size / x,
+                    block_size,
+                    x
                 )
             }
-
-            if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+            let (vn, vh, vd, vb) = vc_l.shape().dims4()?;
+            if vh != num_heads || vd != head_size || vb != block_size {
                 candle::bail!(
-                    "shape mismatch key_cache {:?} and value_cache {:?}",
-                    kc_l.shape(),
-                    vc_l.shape()
+                    "shape mismatch value_cache {:?}, expected ({}, {}, {}, {})",
+                    vc_l.shape(),
+                    vn,
+                    num_heads,
+                    head_size,
+                    block_size
                 )
             }
             (block_size, x)
@@ -1042,24 +1041,19 @@ impl ReshapeCache {
             };
 
         unsafe {
-            #[cfg(feature = "flashattn")]
-            {
-                assert!(
-                    k_scales_ptr.is_null() && v_scales_ptr.is_null(),
-                    "fp8 kvcache is not supported under flash context!"
-                );
+            if is_flash_cache {
                 let block_stride = kc_l.stride()[0];
                 let page_stride = kc_l.stride()[1];
                 let head_stride = kc_l.stride()[2];
 
                 kernels::ffi::call_reshape_and_cache_flash(
-                    k_ptr,  // [num_tokens, num_heads, head_size]
-                    v_ptr,  // [num_tokens, num_heads, head_size]
-                    kc_ptr, // [num_blocks, block_size, num_heads, head_size]
-                    vc_ptr, // [num_blocks, block_size, num_heads, head_size]
+                    k_ptr,
+                    v_ptr,
+                    kc_ptr,
+                    vc_ptr,
                     k_scales_ptr,
                     v_scales_ptr,
-                    s_ptr, // [num_tokens]
+                    s_ptr,
                     num_tokens as c_int,
                     num_heads as c_int,
                     head_size as c_int,
@@ -1072,9 +1066,7 @@ impl ReshapeCache {
                     internal_type,
                     *dev.cu_stream() as i64,
                 );
-            }
-            #[cfg(not(feature = "flashattn"))]
-            {
+            } else {
                 kernels::ffi::call_reshape_and_cache(
                     k_ptr,
                     v_ptr,
@@ -1774,4 +1766,74 @@ pub fn reshape_and_cache(
             candle::bail!("reshape_and_cache is only supported for f32, f16 and bf16 ({dt:?})")
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+pub fn convert_to_fp8(input: &Tensor, fixed_scale: Option<f32>) -> Result<(Tensor, Tensor)> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::WrapErr;
+    use std::ffi::c_int;
+
+    let input = input.contiguous()?;
+    let (s, l) = input.storage_and_layout();
+    let s = match &*s {
+        Storage::Cuda(s) => s,
+        _ => candle::bail!("convert_to_fp8: input must be a cuda tensor"),
+    };
+    let dev = s.device();
+    let dtype = s.dtype();
+    let internal_type = match dtype {
+        DType::F16 => 0u32,
+        DType::BF16 => 1u32,
+        _ => candle::bail!("convert_to_fp8: only f16/bf16 supported, got {dtype:?}"),
+    };
+
+    let rank = l.shape().rank();
+    let dims = l.shape().dims();
+    let (num_tokens, num_heads, head_dim) = if rank == 3 {
+        (dims[0], dims[1], dims[2])
+    } else if rank == 4 {
+        (dims[0] * dims[1], dims[2], dims[3])
+    } else {
+        candle::bail!(
+            "convert_to_fp8: expected rank 3 or 4, got {rank} ({:?})",
+            l.shape()
+        )
+    };
+
+    let num_elements = l.shape().elem_count();
+    let input_ptr = match dtype {
+        DType::F16 => {
+            let sl = s.as_cuda_slice::<half::f16>()?;
+            *sl.slice(l.start_offset()..).device_ptr() as *const core::ffi::c_void
+        }
+        DType::BF16 => {
+            let sl = s.as_cuda_slice::<half::bf16>()?;
+            *sl.slice(l.start_offset()..).device_ptr() as *const core::ffi::c_void
+        }
+        _ => unreachable!(),
+    };
+    let output = unsafe { dev.alloc::<u8>(num_elements) }.w()?;
+    let output_ptr = *output.device_ptr() as *mut core::ffi::c_void;
+    let scale_buf = unsafe { dev.alloc::<f32>(num_heads) }.w()?;
+    let scale_ptr = *scale_buf.device_ptr() as *mut f32;
+    let fs = fixed_scale.unwrap_or(-1.0f32);
+    unsafe {
+        kernels::ffi::call_convert_to_fp8(
+            input_ptr,
+            output_ptr,
+            scale_ptr,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_dim as c_int,
+            internal_type,
+            fs,
+            *dev.cu_stream() as i64,
+        );
+    }
+    let output_storage = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
+    let fp8_tensor = Tensor::from_storage(Storage::Cuda(output_storage), l.shape().clone())?;
+    let scale_storage = candle::CudaStorage::wrap_cuda_slice(scale_buf, dev.clone());
+    let scale_tensor = Tensor::from_storage(Storage::Cuda(scale_storage), (num_heads,))?;
+    Ok((fp8_tensor, scale_tensor))
 }

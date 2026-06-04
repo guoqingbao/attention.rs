@@ -1,2 +1,6 @@
 /target
 /Cargo.lock
+.xbot
+XBOt.md
+AGENTS.md
+.cursor

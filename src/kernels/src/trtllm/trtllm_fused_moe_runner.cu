@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include <iostream>
 
@@ -49,7 +49,8 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
 
 Runner::Runner() {}
 
-Runner::Runner(int32_t tileTokensDim) : mTileTokensDim(tileTokensDim) {}
+Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
+    : mTileTokensDim(tileTokensDim), mClusterSizeInBatchDim(clusterSizeInBatchDim) {}
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
                  int32_t topK, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
@@ -60,16 +61,15 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-                 RoutingMethodType routingMethodType, cudaStream_t stream) {
+                 RoutingMethodType routingMethodType, cudaStream_t stream,
+                 btg::Dtype dtypeLogits, bool normTopkProb) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeExpW =
-        btg::Dtype::Bfloat16;            // for DeepSeek, the expW is currently always bfloat16
-    routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
-
-    routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeBias = dtypeBias;
+    routingData.mDtypeInput = btg::Dtype::Fp32;
     routingData.mUsePdl = true;
 
     // output:
@@ -107,7 +107,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                       topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = btg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
 
     // output:
@@ -136,24 +137,28 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
   } else if (routingMethodType == RoutingMethodType::Renormalize         /* default */
              || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */
              || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */) {
-    moe::dev::routing::routingRenormalize::Data routingData;
+    moe::dev::routing::routingCustom::Data routingData;
 
-    //
-    // Config
-    //
-
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-    // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = btg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
-    routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
+
+    if (routingMethodType == RoutingMethodType::RenormalizeNaive) {
+      routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Softmax;
+      routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::SumNormalize;
+      routingData.mNormTopkProb = true;
+    } else if (routingMethodType == RoutingMethodType::Renormalize) {
+      routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::None;
+      routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::Softmax;
+      routingData.mNormTopkProb = true;
+    } else {
+      routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::None;
+      routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::None;
+      routingData.mNormTopkProb = false;
+    }
 
     routingData.mPtrScores = routingLogits;
 
-    //
-    // Outputs
-    //
     routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
@@ -161,16 +166,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
     routingData.mPtrTopKWeights = expertWeights;
 
-    //
-    // Grouped Gemm Launch Config Buffers
-    //
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
 
-    //
-    // Inputs
-    //
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
@@ -180,7 +179,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
 
-    moe::dev::routing::routingRenormalize::run(routingData, stream);
+    moe::dev::routing::routingCustom::run(routingData, stream);
   } else {
     FLASHINFER_CHECK(false, "Unimplemented routing method ",
                      serializeMoeRoutingMethodType(routingMethodType), " of enum ",
@@ -193,13 +192,12 @@ namespace PermuteGemm1 {
 
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8,
-    MoE::GatedActType gatedActType, bool useShuffledMatrixA,
+    MoE::ActivationType activationType, bool useShuffledMatrix,
     batchedGemm::gemm::MatrixLayout weightLayout) {
-  if (gatedActType == MoE::GatedActType::SwiGlu || gatedActType == MoE::GatedActType::GeGlu) {
+  if (MoE::isGatedActivation(activationType)) {
     ActType actType =
-        (gatedActType == MoE::GatedActType::SwiGlu) ? ActType::SwiGlu : ActType::GeGlu;
+        (activationType == MoE::ActivationType::Swiglu) ? ActType::SwiGlu : ActType::GeGlu;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
         .dtypeA = dtypeWeights,
         .dtypeB = dtypeAct,
         .dtypeC = dtypeAct,
@@ -211,24 +209,24 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
-        .useShuffledMatrixA = useShuffledMatrixA,
+        .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout};
     return options;
   } else {
-    FLASHINFER_CHECK(false, "Unimplemented gated act type ",
-                     MoE::serializeGatedActType(gatedActType), " of enum ", (int)gatedActType);
+    FLASHINFER_CHECK(false, "Unimplemented activation type ",
+                     MoE::serializeActivationType(activationType), " of enum ", (int)activationType);
   }
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim,
-               MoE::GatedActType gatedActType, bool useShuffledMatrixA,
+               MoE::ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, gatedActType,
-                     useShuffledMatrixA, weightLayout))) {}
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, activationType,
+                     useShuffledMatrix, weightLayout))) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
                  void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
@@ -288,9 +286,8 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
-    bool useDeepSeekFp8, bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout) {
+    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-      // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
       .dtypeB = dtypeAct,
       .dtypeC = dtypeOut,
@@ -301,13 +298,13 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
-      .useShuffledMatrixA = useShuffledMatrixA,
+      .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout};
   return options;
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut,
-               bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrixA,
+               bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
@@ -315,7 +312,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8,
-                     useShuffledMatrixA, weightLayout))) {}
+                     useShuffledMatrix, weightLayout))) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, float* outputScalesScalar, float* ptrBias, void* output,
@@ -375,12 +372,12 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 
 namespace MoE {
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
-               int32_t tileTokensDim, GatedActType gatedActType, bool useShuffledMatrixA,
+               int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim,
-                                         gatedActType, useShuffledMatrixA, weightLayout)),
+                                         activationType, useShuffledMatrix, weightLayout)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrixA, weightLayout)) {
+                           tileTokensDim, useShuffledMatrix, weightLayout)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -397,9 +394,9 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
 }
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
-               bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, GatedActType::SwiGlu,
-             useShuffledMatrixA, weightLayout) {}
+               bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActivationType::Swiglu,
+             useShuffledMatrix, weightLayout) {}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,

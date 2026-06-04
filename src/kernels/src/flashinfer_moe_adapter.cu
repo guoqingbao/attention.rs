@@ -1,7 +1,7 @@
 #include <cstdint>
+#include <cstdio>
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && \
-    __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -255,7 +254,9 @@ void run_routing_from_precomputed_topk(
       /*useRoutingScalesOnInput=*/false,
       /*useDeepSeekFp8=*/false,
       trtllm_moe::Routing::RoutingMethodType::Renormalize,
-      stream);
+      stream,
+      /*dtypeLogits=*/dtype_elt,
+      /*normTopkProb=*/true);
 }
 
 int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* topk_weights,
@@ -277,7 +278,7 @@ int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* 
       cache.bf16_input_dtype != input_dtype || cache.bf16_weight_dtype != weight_dtype) {
     cache.bf16_runner = std::make_unique<trtllm_moe::MoE::Runner>(
         input_dtype, weight_dtype, /*useDeepSeekFp8=*/false, tile_tokens_dim,
-        trtllm_moe::MoE::GatedActType::SwiGlu, /*useShuffledMatrixA=*/false,
+        trtllm_moe::MoE::ActivationType::Swiglu, /*useShuffledMatrix=*/false,
         batchedGemm::gemm::MatrixLayout::MajorK);
     cache.bf16_tile_tokens_dim = tile_tokens_dim;
     cache.bf16_input_dtype = input_dtype;
@@ -329,7 +330,7 @@ int run_fused_moe_bf16(const void* input, const int32_t* topk_ids, const float* 
   workspace.gemm2_output = cache.gemm2_output.ensure(
       static_cast<size_t>(max_num_padded_tokens) * hidden_size * gemm2_elem_size, stream);
   workspace.gemm2_output_scale = nullptr;
-  cache.bf16_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/true);
+  cache.bf16_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
   return 0;
 }
 
@@ -355,7 +356,7 @@ int run_fused_moe_fp8(const void* input, const int32_t* topk_ids, const float* t
   if (!cache.fp8_runner || cache.fp8_tile_tokens_dim != tile_tokens_dim) {
     cache.fp8_runner = std::make_unique<trtllm_moe::MoE::Runner>(
         btg::Dtype::E4m3, /*useDeepSeekFp8=*/true, tile_tokens_dim,
-        /*useShuffledMatrixA=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
+        /*useShuffledMatrix=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
     cache.fp8_tile_tokens_dim = tile_tokens_dim;
   }
 
@@ -399,23 +400,104 @@ int run_fused_moe_fp8(const void* input, const int32_t* topk_ids, const float* t
   workspace.hidden_states_scale_linear = nullptr;
   workspace.gemm1_output = cache.gemm1_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm1) * 2 * intermediate_size, stream);
-  workspace.gemm1_output_scale = cache.gemm1_output_scale.ensure(
+  workspace.gemm1_output_scale = static_cast<float*>(cache.gemm1_output_scale.ensure(
       static_cast<size_t>(2 * intermediate_size / 128) * max_num_padded_tokens_gemm1 *
           sizeof(float),
-      stream);
+      stream));
   workspace.activation_output = cache.activation_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm1) * intermediate_size, stream);
-  workspace.activation_output_scale = cache.activation_output_scale.ensure(
+  workspace.activation_output_scale = static_cast<float*>(cache.activation_output_scale.ensure(
       static_cast<size_t>(intermediate_size / 128) * max_num_padded_tokens_gemm1 *
           sizeof(float),
-      stream);
+      stream));
   workspace.gemm2_output = cache.gemm2_output.ensure(
       static_cast<size_t>(max_num_padded_tokens_gemm2) * hidden_size * sizeof(__nv_bfloat16),
       stream);
   workspace.gemm2_output_scale = nullptr;
-  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/true);
+  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
   return 0;
 }
+
+#if defined(ENABLE_FP4) && defined(FLASHINFER_ENABLE_FP4_E2M1)
+int run_fused_moe_mxfp4(const void* input, const int32_t* topk_ids, const float* topk_weights,
+                         const uint8_t* gate_up_weights, const uint8_t* gate_up_scales,
+                         const uint8_t* down_weights, const uint8_t* down_scales, void* output,
+                         int32_t num_tokens, int32_t hidden_size, int32_t intermediate_size,
+                         int32_t num_experts, int32_t top_k, int32_t input_dtype_code,
+                         cudaStream_t stream) {
+  btg::Dtype input_dtype = parse_dtype(input_dtype_code);
+  int32_t tile_tokens_dim = choose_tile_tokens_dim(num_tokens, top_k, num_experts);
+
+  if (hidden_size % 32 != 0 || intermediate_size % 32 != 0) {
+    throw std::runtime_error("MXFP4 fused moe requires hidden/intermediate dims divisible by 32");
+  }
+
+  StreamMoECache& cache = get_stream_cache(stream);
+  trtllm_moe::MoE::MoEWorkspace workspace{};
+
+  run_routing_from_precomputed_topk(topk_ids, topk_weights, num_tokens, num_experts, top_k,
+                                    tile_tokens_dim, input_dtype, workspace, cache, stream);
+
+  if (!cache.fp8_runner || cache.fp8_tile_tokens_dim != tile_tokens_dim) {
+    cache.fp8_runner = std::make_unique<trtllm_moe::MoE::Runner>(
+        input_dtype, btg::Dtype::MxE2m1,
+        /*useDeepSeekFp8=*/false, tile_tokens_dim,
+        trtllm_moe::MoE::ActivationType::Swiglu,
+        /*useShuffledMatrix=*/false, batchedGemm::gemm::MatrixLayout::MajorK);
+    cache.fp8_tile_tokens_dim = tile_tokens_dim;
+  }
+
+  trtllm_moe::MoE::MoERunnerArgs args{};
+  args.hidden_states = const_cast<void*>(input);
+  args.hidden_states_scale = nullptr;
+  args.gemm1_weights = const_cast<uint8_t*>(gate_up_weights);
+  args.gemm1_weights_scale = const_cast<uint8_t*>(gate_up_scales);
+  args.gemm2_weights = const_cast<uint8_t*>(down_weights);
+  args.gemm2_weights_scale = const_cast<uint8_t*>(down_scales);
+  args.output = output;
+
+  args.num_tokens = num_tokens;
+  args.num_experts = num_experts;
+  args.hidden_size = hidden_size;
+  args.intermediate_size = intermediate_size;
+  args.top_k = top_k;
+  args.local_expert_offset = 0;
+  args.local_num_experts = num_experts;
+  args.mDtypeElt = input_dtype;
+  args.mDtypeExpW = btg::Dtype::Bfloat16;
+  args.mDtypeOut = input_dtype;
+  args.mUseRoutingScalesOnInput = false;
+  args.mUseDeepSeekFp8 = false;
+  args.output_scale = nullptr;
+  args.do_finalize = true;
+
+  int64_t config_idx =
+      cache.fp8_runner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                   num_experts, num_tokens);
+
+  auto workspace_sizes = cache.fp8_runner->getWorkspaceSizeInBytes(args, config_idx);
+  workspace.bmm1_workspace =
+      cache.bmm1_workspace.ensure(static_cast<size_t>(std::get<0>(workspace_sizes)), stream);
+  workspace.bmm2_workspace =
+      cache.bmm2_workspace.ensure(static_cast<size_t>(std::get<1>(workspace_sizes)), stream);
+
+  int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
+  size_t elt_size = dtype_size(input_dtype);
+
+  workspace.hidden_states_scale_linear = nullptr;
+  workspace.gemm1_output = cache.gemm1_output.ensure(
+      static_cast<size_t>(max_num_padded_tokens) * 2 * intermediate_size * elt_size, stream);
+  workspace.gemm1_output_scale = nullptr;
+  workspace.activation_output = cache.activation_output.ensure(
+      static_cast<size_t>(max_num_padded_tokens) * intermediate_size * elt_size, stream);
+  workspace.activation_output_scale = nullptr;
+  workspace.gemm2_output = cache.gemm2_output.ensure(
+      static_cast<size_t>(max_num_padded_tokens) * hidden_size * elt_size, stream);
+  workspace.gemm2_output_scale = nullptr;
+  cache.fp8_runner->run(args, workspace, cache.device, stream, config_idx, /*enable_pdl=*/false);
+  return 0;
+}
+#endif  // ENABLE_FP4 && FLASHINFER_ENABLE_FP4_E2M1
 
 }  // namespace
 
@@ -455,43 +537,67 @@ extern "C" int flashinfer_fused_moe_fp8(
   }
 }
 
+extern "C" int flashinfer_fused_moe_mxfp4(
+    const void* input, const int32_t* topk_ids, const float* topk_weights,
+    const uint8_t* gate_up_weights, const uint8_t* gate_up_scales, const uint8_t* down_weights,
+    const uint8_t* down_scales, void* output, int32_t num_tokens, int32_t hidden_size,
+    int32_t intermediate_size, int32_t num_experts, int32_t top_k, int32_t input_dtype_code,
+    int64_t stream) {
+#if defined(ENABLE_FP4) && defined(FLASHINFER_ENABLE_FP4_E2M1)
+  try {
+    return run_fused_moe_mxfp4(input, topk_ids, topk_weights, gate_up_weights, gate_up_scales,
+                                down_weights, down_scales, output, num_tokens, hidden_size,
+                                intermediate_size, num_experts, top_k, input_dtype_code,
+                                reinterpret_cast<cudaStream_t>(stream));
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "flashinfer_fused_moe_mxfp4 failed: %s\n", e.what());
+    return -1;
+  }
+#else
+  return -1;
+#endif
+}
+
 #else
 
 extern "C" int flashinfer_fused_moe_bf16(
-    const void*,
-    const int32_t*,
-    const float*,
-    const void*,
-    const void*,
-    void*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t) {
+    const void*, const int32_t*, const float*, const void*, const void*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_bf16: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ Blackwell cubins)\n");
   return -1;
 }
 
 extern "C" int flashinfer_fused_moe_fp8(
-    const void*,
-    const int32_t*,
-    const float*,
-    const uint8_t*,
-    const float*,
-    const uint8_t*,
-    const float*,
-    void*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t) {
+    const void*, const int32_t*, const float*, const uint8_t*, const float*,
+    const uint8_t*, const float*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_fp8: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ Blackwell cubins)\n");
+  return -1;
+}
+
+extern "C" int flashinfer_fused_moe_mxfp4(
+    const void*, const int32_t*, const float*, const uint8_t*, const uint8_t*,
+    const uint8_t*, const uint8_t*, void*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t) {
+  std::fprintf(stderr, "flashinfer_fused_moe_mxfp4: TRT-LLM backend not available "
+               "(requires trtllm feature with SM100+ headers and cubins)\n");
   return -1;
 }
 
 #endif  // USE_FLASHINFER && required TRT-LLM headers
+
+// Cubin loader: provides FlashInferSetCubinCallback / FlashInferSetCurrentCubin
+// and the getCubin() function used by BatchedGemmInterface at runtime.
+// The extern "C" symbols are always needed when trtllm feature is enabled
+// so Rust FFI can register the callback.
+#if defined(USE_FLASHINFER) && __has_include("flashinfer/cubin_loader.h")
+#include <string>
+#include <stdexcept>
+namespace flashinfer {
+namespace trtllm_cubin_loader {
+#include <flashinfer/cubin_loader.h>
+}
+}
+#endif

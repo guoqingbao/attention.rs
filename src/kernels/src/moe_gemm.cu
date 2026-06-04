@@ -144,9 +144,7 @@ __global__ void moe_gemm_vectorized_kernel(
     // Layout: [BLOCK_N_TILE][BLOCK_K_TILE] for coalesced compute
     __shared__ T s_weights[BLOCK_N_TILE][BLOCK_K_TILE];
 
-    // This thread's accumulator
-    VecT acc;
-    vllm_rs::zero(acc);
+    float acc = 0.0f;
     LoadVecT zero_vec;
     zero_vec.x = zero_vec.y = zero_vec.z = zero_vec.w = 0.0f;
 
@@ -185,26 +183,37 @@ __global__ void moe_gemm_vectorized_kernel(
         
         __syncthreads(); // Wait for s_input and s_weights to be loaded
 
-        // Compute Partial Dot Product
+        // Compute Partial Dot Product in float32 for precision
         VecT* input_vec = reinterpret_cast<VecT*>(s_input);
         VecT* weight_vec = reinterpret_cast<VecT*>(s_weights[tid_n]);
 #pragma unroll
         for (int k_vec = 0; k_vec < k_compute_vec_tile_size; ++k_vec) {
-            acc = __hfma2(input_vec[k_vec], weight_vec[k_vec], acc);
+            if constexpr (std::is_same_v<T, half>) {
+                float2 in_f = __half22float2(input_vec[k_vec]);
+                float2 w_f = __half22float2(weight_vec[k_vec]);
+                acc = fmaf(in_f.x, w_f.x, acc);
+                acc = fmaf(in_f.y, w_f.y, acc);
+            } else {
+#ifndef NO_BF16_KERNEL
+                float2 in_f = __bfloat1622float2(input_vec[k_vec]);
+                float2 w_f = __bfloat1622float2(weight_vec[k_vec]);
+                acc = fmaf(in_f.x, w_f.x, acc);
+                acc = fmaf(in_f.y, w_f.y, acc);
+#endif
+            }
         }
     }
 
     __syncthreads();
 
     // Finalize and Write Output
+    float result = acc;
     if (topk_weights) {
-        // Apply top-k weight scaling
-        T output_val;
-        vllm::from_float(output_val, vllm::to_float(__hadd(acc.x, acc.y)) * topk_weights[token_id]);
-        output[token_id * N + n] = output_val;
-    } else {
-        output[token_id * N + n] = __hadd(acc.x, acc.y);
+        result *= topk_weights[token_id];
     }
+    T output_val;
+    vllm::from_float(output_val, result);
+    output[token_id * N + n] = output_val;
 }
 
 

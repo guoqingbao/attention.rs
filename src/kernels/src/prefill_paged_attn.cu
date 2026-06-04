@@ -46,7 +46,8 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
-#define TOKEN_CHUNK_SIZE 128
+#define TOKEN_CHUNK_SIZE_DEFAULT 128
+#define TOKEN_CHUNK_SIZE_LARGE_HEAD 64
 using namespace vllm;
 
 namespace vllm_rs {
@@ -118,7 +119,7 @@ __device__ inline T make_zero() {
  * @param[in]  kv_block_stride Stride between consecutive KV blocks in memory.
  * @param[in]  kv_head_stride  Stride between consecutive KV heads inside a block.
  */
-template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE>
+template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 __global__ void chunked_prefill_paged_attention_kernel(
     scalar_t* __restrict__ out,              // [num_all_tokens_new, num_query_heads, HEAD]
     const scalar_t* __restrict__ q,          // [num_all_tokens_new, num_query_heads, HEAD]
@@ -149,7 +150,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
     constexpr int NUM_VECS  = HEAD_SIZE / VEC_SIZE;
 
     const int tid     = threadIdx.x;
-    const int lane    = tid % TOKEN_CHUNK_SIZE; // each lane processes one token
+    const int lane    = tid % TOKEN_CHUNK_SIZE;
 
     const int NUM_BLOCK_VECS = BLOCK_SIZE / VEC_SIZE;
     // Grid setup: (query_head_per_kv, kv_heads, tokens / chunk_size)
@@ -173,18 +174,24 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
     // --- Find which sequence this token belongs to ---
     int seq_idx = 0;
+    int seq_query_start = 0;
+    int seq_query_len = 0;
     for (int i = 0; i < num_seqs; i++) {
         int s = query_start_len[i];
         int e = query_start_len[i + 1];
         if (token_start >= s && token_start < e) {
           seq_idx = i;
-          int seq_len = (e - s);
-          if (seq_len <= 0) return;
+          seq_query_start = s;
+          seq_query_len = e - s;
+          if (seq_query_len <= 0) return;
           break;
         }
     }
 
     const uint32_t seq_len_full = seq_lens[seq_idx];
+    const int q_pos_start = (int)seq_len_full - seq_query_len;
+    const int local_q_pos = token_start - seq_query_start;
+    const int q_abs_pos = q_pos_start + local_q_pos;
     const int num_blocks = (int)((seq_len_full + BLOCK_SIZE - 1) / BLOCK_SIZE);
     const uint32_t* block_table_for_seq = block_tables + (int64_t)seq_idx * (int64_t)block_table_stride;
     // const int context_len = (int)seq_len_full - 1;
@@ -225,11 +232,13 @@ __global__ void chunked_prefill_paged_attention_kernel(
     float L = 1.f;
 
     // Sliding Window Calculation
-    // We only attend to tokens in range [start_token_idx, seq_len_full)
+    // Each query token can only attend to keys up through its own absolute
+    // position. Using seq_len_full here would expose future tokens inside the
+    // current prefill chunk.
     int start_token_idx = 0;
     int start_block_idx = 0;
-    if (sliding_window > 0 && sliding_window < (int)seq_len_full) {
-        start_token_idx = (int)seq_len_full - sliding_window;
+    if (sliding_window > 0 && sliding_window <= q_abs_pos) {
+        start_token_idx = q_abs_pos + 1 - sliding_window;
         start_block_idx = start_token_idx / BLOCK_SIZE;
     }
 
@@ -248,8 +257,8 @@ __global__ void chunked_prefill_paged_attention_kernel(
         for (int b = 0; b < BLOCK_SIZE; ++b) {
             const int token_idx_in_full = block_in_full + b;
             
-            // Masking logic: Must be in valid context AND within sliding window
-            bool in_context = (token_idx_in_full < (int)seq_len_full);
+            // Masking logic: Must be in valid causal context AND within sliding window
+            bool in_context = (token_idx_in_full <= q_abs_pos);
             bool in_window = (token_idx_in_full >= start_token_idx);
 
             // Store status for P·V later
@@ -286,8 +295,7 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
             // Add ALiBi positional bias if enabled
             if (use_alibi) {
-                const int context_len = (int)seq_len_full - 1;
-                qk_block[b] += alibi * float(token_idx_in_full - context_len);
+                qk_block[b] += alibi * float(token_idx_in_full - q_abs_pos);
             }
         } // blk
 
@@ -365,31 +373,36 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
 }
 
-#define LAUNCH_PAGED_ATTENTION_PREFILL(HEAD_SIZE)   \
-  vllm_rs::chunked_prefill_paged_attention_kernel<T, cache_T, HEAD_SIZE, BLOCK_SIZE>  \
-  <<<grid, block, 0, stream>>>(                                                 \
-    reinterpret_cast<T*>(out),                                                                \
-    reinterpret_cast<T*>(query),                                                              \
-    reinterpret_cast<cache_T*>(key_cache),                                                          \
-    reinterpret_cast<cache_T*>(value_cache),                                                        \
-    k_scales, v_scales,                                                                       \
-    num_kv_heads,                                                                             \
-    scale,                                                                                    \
-    block_tables,                                                                             \
-    context_lens,                                                                             \
-    max_num_blocks_per_seq,                                                                   \
-    num_seqs,\
-    num_query_heads,\
-    num_query_tokens,\
-    softscapping,\
-    o_stride_tokens,\
-    query_start_len,\
-    alibi_slopes_ptr,                                                                         \
-    sinks,\
-    sliding_window,\
-    num_blocks, \
-    kv_block_stride,\
-    kv_head_stride);
+#define LAUNCH_PAGED_ATTENTION_PREFILL(HEAD_SIZE, CHUNK_SIZE)   \
+  do { \
+    int num_token_chunks_ = (num_query_tokens + (CHUNK_SIZE) - 1) / (CHUNK_SIZE); \
+    dim3 grid_(num_queries_per_kv, num_kv_heads, num_token_chunks_); \
+    dim3 block_(CHUNK_SIZE); \
+    vllm_rs::chunked_prefill_paged_attention_kernel<T, cache_T, HEAD_SIZE, BLOCK_SIZE, CHUNK_SIZE>  \
+    <<<grid_, block_, 0, stream>>>(                                                 \
+      reinterpret_cast<T*>(out),                                                                \
+      reinterpret_cast<T*>(query),                                                              \
+      reinterpret_cast<cache_T*>(key_cache),                                                          \
+      reinterpret_cast<cache_T*>(value_cache),                                                        \
+      k_scales, v_scales,                                                                       \
+      num_kv_heads,                                                                             \
+      scale,                                                                                    \
+      block_tables,                                                                             \
+      context_lens,                                                                             \
+      max_num_blocks_per_seq,                                                                   \
+      num_seqs,\
+      num_query_heads,\
+      num_query_tokens,\
+      softscapping,\
+      o_stride_tokens,\
+      query_start_len,\
+      alibi_slopes_ptr,                                                                         \
+      sinks,\
+      sliding_window,\
+      num_blocks, \
+      kv_block_stride,\
+      kv_head_stride); \
+  } while(0)
 
 
 template<
@@ -425,28 +438,16 @@ void paged_attention_prefill_launcher(
 
   const float* alibi_slopes_ptr = nullptr;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
-  int VEC_SIZE = 16 / sizeof(T);
-  // int NUM_VECS  = head_size / VEC_SIZE;
-
-  int num_token_chunks = (num_query_tokens + TOKEN_CHUNK_SIZE - 1) / TOKEN_CHUNK_SIZE;
-  dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);
-  dim3 block(TOKEN_CHUNK_SIZE);
   const cudaStream_t stream = (cudaStream_t)stream_;
   switch (head_size) {
     case 64:
-      LAUNCH_PAGED_ATTENTION_PREFILL(64);
-      break;
-    case 96:
-      LAUNCH_PAGED_ATTENTION_PREFILL(96);
+      LAUNCH_PAGED_ATTENTION_PREFILL(64, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 128:
-      LAUNCH_PAGED_ATTENTION_PREFILL(128);
-      break;
-    case 192:
-      LAUNCH_PAGED_ATTENTION_PREFILL(192);
+      LAUNCH_PAGED_ATTENTION_PREFILL(128, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 256:
-      LAUNCH_PAGED_ATTENTION_PREFILL(256);
+      LAUNCH_PAGED_ATTENTION_PREFILL(256, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     default:
       break;

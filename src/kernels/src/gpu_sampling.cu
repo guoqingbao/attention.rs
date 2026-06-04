@@ -228,18 +228,18 @@ __global__ void stageB_reduce_and_sample(
       }
     }
 
-    float sum = 0.0f;
+    double sum_d = 0.0;
     #pragma unroll
     for (int t = 0; t < K; ++t) {
       if (t < k_eff) {
-        float e = __expf(topv[t] - mx);
+        float e = expf(topv[t] - mx);
         probs[t] = e;
-        sum += e;
+        sum_d += (double)e;
       } else {
         probs[t] = 0.0f;
       }
     }
-    sum = fmaxf(sum, 1e-20f);
+    float sum = fmaxf((float)sum_d, 1e-20f);
     #pragma unroll
     for (int t = 0; t < K; ++t) probs[t] /= sum;
 

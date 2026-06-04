@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#if defined(USE_FLASHINFER) && __has_include("trtllm/gen/CudaRunner.h") && __has_include("tensorrt_llm/common/logger.h")
+#if defined(USE_FLASHINFER) && defined(USE_TRTLLM)
 
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>

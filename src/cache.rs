@@ -416,8 +416,9 @@ pub fn swap_blocks(
         DType::F16 => call_fwd::<f16>(src, dst, block_mapping),
         DType::BF16 => call_fwd::<bf16>(src, dst, block_mapping),
         DType::U8 => call_fwd::<u8>(src, dst, block_mapping),
+        DType::F32 => call_fwd::<f32>(src, dst, block_mapping),
         _ => {
-            candle_core::bail!("swap_blocks only accept f16/bf16/u8 kvcache dtypes!")
+            candle_core::bail!("swap_blocks only accept f16/bf16/f32/u8 kvcache dtypes!")
         }
     }
 }

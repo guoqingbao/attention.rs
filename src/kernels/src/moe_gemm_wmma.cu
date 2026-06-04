@@ -487,11 +487,7 @@ extern "C" void moe_gemm_wmma(
     bool is_prefill,
     cudaStream_t stream
 ) {
-    if (is_prefill) {
-        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    } else {
-        calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    }
+    g_calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
 
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
@@ -544,11 +540,7 @@ extern "C" void moe_gemm_wmma_fp8(
     bool is_prefill,
     cudaStream_t stream
 ) {
-    if (is_prefill) {
-        calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    } else {
-        calculate_expert_offsets_light(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    }
+    g_calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
 
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
@@ -579,4 +571,15 @@ extern "C" void moe_gemm_wmma_fp8(
         }
         #endif
     }
+}
+
+extern "C" void calculate_expert_offsets(
+    const int32_t* d_expert_ids,
+    int32_t* d_expert_counts,
+    int32_t* d_expert_offsets,
+    int num_experts,
+    int size_m,
+    cudaStream_t stream)
+{
+    g_calculate_expert_offsets(d_expert_ids, size_m, d_expert_counts, d_expert_offsets, num_experts, stream);
 }
