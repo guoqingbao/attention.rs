@@ -764,6 +764,7 @@ impl PagedAttention {
             }
         }
 
+        #[cfg(all(feature = "flashattn", feature = "gcu"))]
         if !input_metadata.disable_flash_attn.unwrap_or(false) {
             return self.flash_forward(
                 query,

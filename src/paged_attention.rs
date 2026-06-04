@@ -1703,27 +1703,13 @@ fn gcu_update_cache<
             _ => candle_core::bail!("Unsupport data type for flash attention!"),
         };
 
-        // The GCU kernel expects int32 slot_mapping, but candle stores it as i64.
-        // Convert on CPU and upload to device since GCU to_dtype(i64→u32) is unreliable.
-        let slot_i64_cpu: Vec<i64> = slot_mapping.to_vec1()?;
-        let slot_i32_cpu: Vec<i32> = slot_i64_cpu.iter().map(|&v| v as i32).collect();
-        let slot_i32_tensor =
-            Tensor::from_vec(slot_i32_cpu, slot_mapping.shape(), slot_mapping.device())?;
-        let (si32_storage, si32_layout) = slot_i32_tensor.storage_and_layout();
-        let si32_gcu = match &*si32_storage {
-            Storage::Gcu(g) => g,
-            _ => candle::bail!("slot_mapping must be a gcu tensor"),
-        };
-        let si32_slice = si32_gcu.as_gcu_slice::<i32>()?;
-        let si32_slice = si32_slice.slice(si32_layout.start_offset()..);
-
         unsafe {
             gcu_kernels::ffi::reshape_and_cache_flash_host(
                 dim3 { x: 2, y: 1, z: 1 },
                 dim3 { x: 12, y: 1, z: 1 },
                 k.device_ptr() as *const c_void,
                 v.device_ptr() as *const c_void,
-                si32_slice.device_ptr() as *const c_void,
+                s.device_ptr() as *const c_void,
                 kc.device_ptr() as *mut c_void,
                 vc.device_ptr() as *mut c_void,
                 data_type as i32,

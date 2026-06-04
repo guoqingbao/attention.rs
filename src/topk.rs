@@ -184,8 +184,21 @@ fn gcu_topk_func<
 
 #[cfg(feature = "gcu")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
+    topk_softmax_impl(logits, topk, false)
+}
+
+#[cfg(feature = "gcu")]
+pub fn topk_softmax_renorm(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
+    topk_softmax_impl(logits, topk, true)
+}
+
+#[cfg(feature = "gcu")]
+fn topk_softmax_impl(
+    logits: &Tensor,
+    topk: usize,
+    norm_topk_prob: bool,
+) -> Result<(Tensor, Tensor)> {
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
-    use candle::gcu_backend::ubridge::ffi::topk_softmax_f32;
     use candle::gcu_backend::WrapErr;
     use candle::Storage;
 
@@ -204,27 +217,72 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         _ => candle::bail!("logits must be a f32 gcu tensor"),
     };
 
-    let output = dev.alloc::<f32>(num_tokens * topk).w()?;
-    let index = dev.alloc::<u32>(num_tokens * topk).w()?;
+    #[cfg(feature = "aten")]
+    {
+        use candle::gcu_backend::ubridge::ffi::topsaten_topk_softmax_f32;
 
-    unsafe {
-        topk_softmax_f32(
-            logits_ptr as *mut f32,
-            output.device_ptr() as *mut f32,
-            index.device_ptr() as *mut i32,
-            num_tokens as i32,
-            num_experts as i32,
-            topk as i32,
-            0,
-            stream as *mut core::ffi::c_void,
-        );
+        let output = dev.alloc::<f32>(num_tokens * topk).w()?;
+        let index = dev.alloc::<i32>(num_tokens * topk).w()?;
+        let tei = dev.alloc::<i32>(num_tokens * topk).w()?;
+
+        let ret = unsafe {
+            topsaten_topk_softmax_f32(
+                logits_ptr as *mut f32,
+                output.device_ptr() as *mut f32,
+                index.device_ptr() as *mut i32,
+                tei.device_ptr() as *mut i32,
+                num_tokens as i32,
+                num_experts as i32,
+                topk as i32,
+                if norm_topk_prob { 1 } else { 0 },
+                stream as *mut core::ffi::c_void,
+            )
+        };
+        if ret != 0 {
+            candle::bail!("topsaten_topk_softmax_f32 failed with code {ret}");
+        }
+
+        let s_out = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
+        let topk_weights = Tensor::from_storage(candle::Storage::Gcu(s_out), (num_tokens, topk))?;
+
+        let s_idx = candle::GcuStorage::wrap_gcu_slice(index, dev.clone());
+        let topk_ids = Tensor::from_storage(candle::Storage::Gcu(s_idx), (num_tokens, topk))?;
+
+        return Ok((topk_weights, topk_ids));
     }
 
-    let s_out = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
-    let topk_weights = Tensor::from_storage(candle::Storage::Gcu(s_out), (num_tokens, topk))?;
+    #[cfg(not(feature = "aten"))]
+    {
+        use candle::gcu_backend::ubridge::ffi::topk_softmax_f32;
 
-    let s_idx = candle::GcuStorage::wrap_gcu_slice(index, dev.clone());
-    let topk_ids = Tensor::from_storage(candle::Storage::Gcu(s_idx), (num_tokens, topk))?;
+        let output = dev.alloc::<f32>(num_tokens * topk).w()?;
+        let index = dev.alloc::<u32>(num_tokens * topk).w()?;
 
-    Ok((topk_weights, topk_ids))
+        unsafe {
+            topk_softmax_f32(
+                logits_ptr as *mut f32,
+                output.device_ptr() as *mut f32,
+                index.device_ptr() as *mut i32,
+                num_tokens as i32,
+                num_experts as i32,
+                topk as i32,
+                0,
+                stream as *mut core::ffi::c_void,
+            );
+        }
+
+        let s_out = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
+        let topk_weights = Tensor::from_storage(candle::Storage::Gcu(s_out), (num_tokens, topk))?;
+
+        let s_idx = candle::GcuStorage::wrap_gcu_slice(index, dev.clone());
+        let topk_ids = Tensor::from_storage(candle::Storage::Gcu(s_idx), (num_tokens, topk))?;
+
+        let topk_weights = if norm_topk_prob {
+            topk_weights.broadcast_div(&topk_weights.sum_keepdim(candle::D::Minus1)?)?
+        } else {
+            topk_weights
+        };
+
+        return Ok((topk_weights, topk_ids));
+    }
 }

@@ -1890,7 +1890,7 @@ pub fn gated_delta_rule_recurrence_varlen(
 }
 
 // ─── GCU implementations ────────────────────────────────────────────────────
-// causal_conv1d uses ubridge FFI; remaining GDN ops use pure tensor math.
+// All GDN ops use ubridge host-kernel FFI for native GCU acceleration.
 
 #[cfg(feature = "gcu")]
 fn ensure_contiguous_gcu(t: &Tensor) -> Result<Tensor> {
@@ -2154,29 +2154,126 @@ pub fn fused_gdn_gating(
     b: &Tensor,
     dt_bias: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    let a_f32 = a.to_dtype(DType::F32)?;
-    let b_f32 = b.to_dtype(DType::F32)?;
-    let dt_f32 = dt_bias.to_dtype(DType::F32)?;
-    let a_log_f32 = a_log.to_dtype(DType::F32)?;
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
 
-    let a_plus_dt = a_f32.broadcast_add(&dt_f32)?;
-    let softplus = (a_plus_dt.exp()? + 1.0)?.log()?;
-    let neg_exp_a_log = a_log_f32.exp()?.neg()?;
-    let g = neg_exp_a_log.broadcast_mul(&softplus)?;
-    let beta = candle_nn::ops::sigmoid(&b_f32)?;
+    let a_c = ensure_contiguous_gcu(a)?;
+    let b_c = ensure_contiguous_gcu(b)?;
+    let a_log_c = ensure_contiguous_gcu(a_log)?;
+    let dt_c = ensure_contiguous_gcu(dt_bias)?;
 
-    Ok((g.to_dtype(a.dtype())?, beta.to_dtype(a.dtype())?))
+    let total = a_c.elem_count();
+    let num_heads = a_log_c.elem_count();
+    let dev = a_c.device().as_gcu_device()?;
+    let g_out = Tensor::zeros(a_c.shape(), a_c.dtype(), a_c.device())?;
+    let beta_out = Tensor::zeros(a_c.shape(), a_c.dtype(), a_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
+
+    match a_c.dtype() {
+        DType::F16 => unsafe {
+            ffi::gdn_fused_gating_f16(
+                get_gcu_ptr::<f16>(&a_log_c)?,
+                get_gcu_ptr::<f16>(&a_c)?,
+                get_gcu_ptr::<f16>(&b_c)?,
+                get_gcu_ptr::<f16>(&dt_c)?,
+                get_gcu_ptr::<f16>(&g_out)?,
+                get_gcu_ptr::<f16>(&beta_out)?,
+                total as i32,
+                num_heads as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            ffi::gdn_fused_gating_bf16(
+                get_gcu_ptr::<bf16>(&a_log_c)?,
+                get_gcu_ptr::<bf16>(&a_c)?,
+                get_gcu_ptr::<bf16>(&b_c)?,
+                get_gcu_ptr::<bf16>(&dt_c)?,
+                get_gcu_ptr::<bf16>(&g_out)?,
+                get_gcu_ptr::<bf16>(&beta_out)?,
+                total as i32,
+                num_heads as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            ffi::gdn_fused_gating_f32(
+                get_gcu_ptr::<f32>(&a_log_c)?,
+                get_gcu_ptr::<f32>(&a_c)?,
+                get_gcu_ptr::<f32>(&b_c)?,
+                get_gcu_ptr::<f32>(&dt_c)?,
+                get_gcu_ptr::<f32>(&g_out)?,
+                get_gcu_ptr::<f32>(&beta_out)?,
+                total as i32,
+                num_heads as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU fused_gdn_gating unsupported dtype: {:?}", dt),
+    }
+    Ok((g_out, beta_out))
 }
 
 /// GCU l2_norm_last_dim
 #[cfg(feature = "gcu")]
 pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
-    let input_f32 = input.to_dtype(DType::F32)?;
-    let sq = (&input_f32 * &input_f32)?;
-    let sum_sq = sq.sum_keepdim(input.rank() - 1)?;
-    let norm = (sum_sq + eps)?.sqrt()?;
-    let normalized = input_f32.broadcast_div(&norm)?;
-    normalized.to_dtype(input.dtype())
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
+
+    let input_c = ensure_contiguous_gcu(input)?;
+    let dims = input_c.dims();
+    let dim = *dims.last().unwrap();
+    let rows = input_c.elem_count() / dim;
+    let dev = input_c.device().as_gcu_device()?;
+    let output = Tensor::zeros(input_c.shape(), input_c.dtype(), input_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
+
+    match input_c.dtype() {
+        DType::F16 => unsafe {
+            ffi::gdn_l2_norm_f16(
+                get_gcu_ptr::<f16>(&input_c)?,
+                get_gcu_ptr::<f16>(&output)?,
+                rows as i32,
+                dim as i32,
+                eps as f32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            ffi::gdn_l2_norm_bf16(
+                get_gcu_ptr::<bf16>(&input_c)?,
+                get_gcu_ptr::<bf16>(&output)?,
+                rows as i32,
+                dim as i32,
+                eps as f32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            ffi::gdn_l2_norm_f32(
+                get_gcu_ptr::<f32>(&input_c)?,
+                get_gcu_ptr::<f32>(&output)?,
+                rows as i32,
+                dim as i32,
+                eps as f32,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU l2_norm unsupported dtype: {:?}", dt),
+    }
+    Ok(output)
 }
 
 /// GCU gated_rmsnorm_silu_mul
@@ -2189,31 +2286,98 @@ pub fn gated_rmsnorm_silu_mul(
     eps: f64,
     group_size: usize,
 ) -> Result<Tensor> {
-    let (rows, value_dim) = x.dims2()?;
-    let num_groups = value_dim / group_size;
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
 
-    let x_f32 = x.to_dtype(DType::F32)?;
-    let z_f32 = z.to_dtype(DType::F32)?;
-
-    let x_grouped = x_f32.reshape((rows, num_groups, group_size))?;
-    let sq = (&x_grouped * &x_grouped)?;
-    let mean_sq = sq.mean_keepdim(2)?;
-    let rms = (mean_sq + eps)?.sqrt()?;
-    let normed = x_grouped.broadcast_div(&rms)?;
-
-    let w_f32 = norm_weight.to_dtype(DType::F32)?;
-    let normed = normed.broadcast_mul(&w_f32)?;
-
-    let normed = if let Some(bias) = norm_bias {
-        let b_f32 = bias.to_dtype(DType::F32)?;
-        normed.broadcast_add(&b_f32)?
+    let x_c = ensure_contiguous_gcu(x)?;
+    let z_c = ensure_contiguous_gcu(z)?;
+    let w_c = ensure_contiguous_gcu(norm_weight)?;
+    let (rows, value_dim) = x_c.dims2()?;
+    let per_group = if w_c.elem_count() == group_size {
+        1i32
     } else {
-        normed
+        0i32
     };
+    let has_bias = if norm_bias.is_some() { 1i32 } else { 0i32 };
+    let dev = x_c.device().as_gcu_device()?;
+    let output = Tensor::zeros(x_c.shape(), x_c.dtype(), x_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
 
-    let normed = normed.reshape((rows, value_dim))?;
-    let silu_z = (&z_f32 * &candle_nn::ops::sigmoid(&z_f32)?)?;
-    (&normed * &silu_z)?.to_dtype(x.dtype())
+    let bias_c = norm_bias.map(|b| ensure_contiguous_gcu(b)).transpose()?;
+
+    match x_c.dtype() {
+        DType::F16 => unsafe {
+            let bias_ptr = if let Some(ref b) = bias_c {
+                get_gcu_ptr::<f16>(b)? as *const f16
+            } else {
+                std::ptr::null()
+            };
+            ffi::gdn_gated_rmsnorm_f16(
+                get_gcu_ptr::<f16>(&x_c)?,
+                get_gcu_ptr::<f16>(&z_c)?,
+                get_gcu_ptr::<f16>(&w_c)?,
+                bias_ptr,
+                get_gcu_ptr::<f16>(&output)?,
+                rows as i32,
+                value_dim as i32,
+                group_size as i32,
+                eps as f32,
+                per_group,
+                has_bias,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            let bias_ptr = if let Some(ref b) = bias_c {
+                get_gcu_ptr::<bf16>(b)? as *const bf16
+            } else {
+                std::ptr::null()
+            };
+            ffi::gdn_gated_rmsnorm_bf16(
+                get_gcu_ptr::<bf16>(&x_c)?,
+                get_gcu_ptr::<bf16>(&z_c)?,
+                get_gcu_ptr::<bf16>(&w_c)?,
+                bias_ptr,
+                get_gcu_ptr::<bf16>(&output)?,
+                rows as i32,
+                value_dim as i32,
+                group_size as i32,
+                eps as f32,
+                per_group,
+                has_bias,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            let bias_ptr = if let Some(ref b) = bias_c {
+                get_gcu_ptr::<f32>(b)? as *const f32
+            } else {
+                std::ptr::null()
+            };
+            ffi::gdn_gated_rmsnorm_f32(
+                get_gcu_ptr::<f32>(&x_c)?,
+                get_gcu_ptr::<f32>(&z_c)?,
+                get_gcu_ptr::<f32>(&w_c)?,
+                bias_ptr,
+                get_gcu_ptr::<f32>(&output)?,
+                rows as i32,
+                value_dim as i32,
+                group_size as i32,
+                eps as f32,
+                per_group,
+                has_bias,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU gated_rmsnorm unsupported dtype: {:?}", dt),
+    }
+    Ok(output)
 }
 
 /// GCU gated_delta_rule_recurrence
@@ -2226,38 +2390,83 @@ pub fn gated_delta_rule_recurrence(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
+
     let (bh, seq_len, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
 
-    let decay = g.to_dtype(DType::F32)?.exp()?;
-    let beta_f32 = beta.to_dtype(DType::F32)?;
-    let q_f32 = q.to_dtype(DType::F32)?;
-    let k_f32 = k.to_dtype(DType::F32)?;
-    let v_f32 = v.to_dtype(DType::F32)?;
+    let q_c = ensure_contiguous_gcu(q)?;
+    let k_c = ensure_contiguous_gcu(k)?;
+    let v_c = ensure_contiguous_gcu(v)?;
+    let g_f32 = g.to_dtype(DType::F32)?.contiguous()?;
+    let beta_f32 = beta.to_dtype(DType::F32)?.contiguous()?;
+    let state_c = ensure_contiguous_gcu(state)?;
 
-    let mut outputs = Vec::with_capacity(seq_len);
+    let dev = q_c.device().as_gcu_device()?;
+    let out = Tensor::zeros((bh, seq_len, v_dim), DType::F32, q_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
 
-    for t in 0..seq_len {
-        let q_t = q_f32.narrow(1, t, 1)?.squeeze(1)?;
-        let k_t = k_f32.narrow(1, t, 1)?.squeeze(1)?;
-        let v_t = v_f32.narrow(1, t, 1)?.squeeze(1)?;
-        let g_t = decay.narrow(1, t, 1)?.squeeze(1)?;
-        let b_t = beta_f32.narrow(1, t, 1)?.squeeze(1)?;
-
-        let v_col = v_t.unsqueeze(2)?;
-        let k_row = k_t.unsqueeze(1)?;
-        let outer = v_col.matmul(&k_row)?;
-        let b_t_expand = b_t.unsqueeze(1)?.unsqueeze(2)?;
-        let g_t_expand = g_t.unsqueeze(1)?.unsqueeze(2)?;
-
-        *state = (state.broadcast_mul(&g_t_expand)? + outer.broadcast_mul(&b_t_expand)?)?;
-
-        let q_col = q_t.unsqueeze(2)?;
-        let out_t = state.matmul(&q_col)?.squeeze(2)?;
-        outputs.push(out_t.unsqueeze(1)?);
+    match q_c.dtype() {
+        DType::F16 => unsafe {
+            ffi::gdn_recurrence_f16(
+                get_gcu_ptr::<f16>(&q_c)?,
+                get_gcu_ptr::<f16>(&k_c)?,
+                get_gcu_ptr::<f16>(&v_c)?,
+                get_gcu_ptr::<f32>(&g_f32)?,
+                get_gcu_ptr::<f32>(&beta_f32)?,
+                get_gcu_ptr::<f32>(&state_c)?,
+                get_gcu_ptr::<f32>(&out)?,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            ffi::gdn_recurrence_bf16(
+                get_gcu_ptr::<bf16>(&q_c)?,
+                get_gcu_ptr::<bf16>(&k_c)?,
+                get_gcu_ptr::<bf16>(&v_c)?,
+                get_gcu_ptr::<f32>(&g_f32)?,
+                get_gcu_ptr::<f32>(&beta_f32)?,
+                get_gcu_ptr::<f32>(&state_c)?,
+                get_gcu_ptr::<f32>(&out)?,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            ffi::gdn_recurrence_f32(
+                get_gcu_ptr::<f32>(&q_c)?,
+                get_gcu_ptr::<f32>(&k_c)?,
+                get_gcu_ptr::<f32>(&v_c)?,
+                get_gcu_ptr::<f32>(&g_f32)?,
+                get_gcu_ptr::<f32>(&beta_f32)?,
+                get_gcu_ptr::<f32>(&state_c)?,
+                get_gcu_ptr::<f32>(&out)?,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU gdn_recurrence unsupported dtype: {:?}", dt),
     }
 
-    Tensor::cat(&outputs, 1)?.to_dtype(q.dtype())
+    state.copy_(&state_c, 0)?;
+    out.to_dtype(q.dtype())
 }
 
 /// GCU gated_delta_rule_decode_slots
@@ -2271,47 +2480,84 @@ pub fn gated_delta_rule_decode_slots(
     state: &mut Tensor,
     slots: &Tensor,
 ) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
+
     let (batch, heads, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
 
-    let decay = g.to_dtype(DType::F32)?.exp()?;
-    let beta_f32 = beta.to_dtype(DType::F32)?;
-    let q_f32 = q.to_dtype(DType::F32)?;
-    let k_f32 = k.to_dtype(DType::F32)?;
-    let v_f32 = v.to_dtype(DType::F32)?;
+    let q_c = ensure_contiguous_gcu(q)?;
+    let k_c = ensure_contiguous_gcu(k)?;
+    let v_c = ensure_contiguous_gcu(v)?;
+    let g_c = ensure_contiguous_gcu(g)?;
+    let beta_c = ensure_contiguous_gcu(beta)?;
+    let slots_c = ensure_contiguous_gcu(slots)?;
 
-    let slots_vec = slots.to_vec1::<i64>()?;
-    let mut out_vecs = Vec::with_capacity(batch);
+    let dev = q_c.device().as_gcu_device()?;
+    let out = Tensor::zeros((batch, heads, v_dim), q_c.dtype(), q_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
 
-    for i in 0..batch {
-        let slot = slots_vec[i] as usize;
-        let q_i = q_f32.get(i)?;
-        let k_i = k_f32.get(i)?;
-        let v_i = v_f32.get(i)?;
-        let g_i = decay.get(i)?;
-        let b_i = beta_f32.get(i)?;
-
-        let state_i = state.get(slot)?;
-
-        let v_col = v_i.unsqueeze(2)?;
-        let k_row = k_i.unsqueeze(1)?;
-        let outer = v_col.matmul(&k_row)?;
-        let g_expand = g_i.unsqueeze(1)?.unsqueeze(2)?;
-        let b_expand = b_i.unsqueeze(1)?.unsqueeze(2)?;
-
-        let new_state = (state_i.broadcast_mul(&g_expand)? + outer.broadcast_mul(&b_expand)?)?;
-
-        let state_flat = state.flatten_all()?;
-        let new_flat = new_state.flatten_all()?;
-        let offset = slot * heads * v_dim * k_dim;
-        state_flat.slice_set(&new_flat, 0, offset)?;
-
-        let q_col = q_i.unsqueeze(2)?;
-        let out_i = new_state.matmul(&q_col)?.squeeze(2)?;
-        out_vecs.push(out_i.unsqueeze(0)?);
+    match q_c.dtype() {
+        DType::F16 => unsafe {
+            ffi::gdn_decode_slots_f16(
+                get_gcu_ptr::<f16>(&q_c)?,
+                get_gcu_ptr::<f16>(&k_c)?,
+                get_gcu_ptr::<f16>(&v_c)?,
+                get_gcu_ptr::<f16>(&g_c)?,
+                get_gcu_ptr::<f16>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<f16>(&out)?,
+                batch as i32,
+                heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            ffi::gdn_decode_slots_bf16(
+                get_gcu_ptr::<bf16>(&q_c)?,
+                get_gcu_ptr::<bf16>(&k_c)?,
+                get_gcu_ptr::<bf16>(&v_c)?,
+                get_gcu_ptr::<bf16>(&g_c)?,
+                get_gcu_ptr::<bf16>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<bf16>(&out)?,
+                batch as i32,
+                heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            ffi::gdn_decode_slots_f32(
+                get_gcu_ptr::<f32>(&q_c)?,
+                get_gcu_ptr::<f32>(&k_c)?,
+                get_gcu_ptr::<f32>(&v_c)?,
+                get_gcu_ptr::<f32>(&g_c)?,
+                get_gcu_ptr::<f32>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<f32>(&out)?,
+                batch as i32,
+                heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU gdn_decode_slots unsupported dtype: {:?}", dt),
     }
-
-    Tensor::cat(&out_vecs, 0)?.to_dtype(q.dtype())
+    Ok(out)
 }
 
 /// GCU gated_delta_rule_recurrence_varlen
@@ -2326,61 +2572,87 @@ pub fn gated_delta_rule_recurrence_varlen(
     slots: &Tensor,
     cu_seqlens: &Tensor,
 ) -> Result<Tensor> {
-    let (_total_tokens, num_heads, k_dim) = q.dims3()?;
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
+
+    let (total_tokens, num_heads, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
     let batch = slots.dim(0)?;
 
-    let cu_vec = cu_seqlens.to_dtype(DType::U32)?.to_vec1::<u32>()?;
-    let slots_vec = slots.to_vec1::<i64>()?;
+    let q_c = ensure_contiguous_gcu(q)?;
+    let k_c = ensure_contiguous_gcu(k)?;
+    let v_c = ensure_contiguous_gcu(v)?;
+    let g_c = ensure_contiguous_gcu(g)?;
+    let beta_c = ensure_contiguous_gcu(beta)?;
+    let slots_c = ensure_contiguous_gcu(slots)?;
+    let cu_u32 = cu_seqlens.to_dtype(DType::U32)?.contiguous()?;
 
-    let decay = g.to_dtype(DType::F32)?.exp()?;
-    let beta_f32 = beta.to_dtype(DType::F32)?;
-    let q_f32 = q.to_dtype(DType::F32)?;
-    let k_f32 = k.to_dtype(DType::F32)?;
-    let v_f32 = v.to_dtype(DType::F32)?;
+    let dev = q_c.device().as_gcu_device()?;
+    let out = Tensor::zeros((total_tokens, num_heads, v_dim), q_c.dtype(), q_c.device())?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
 
-    let mut out_chunks = Vec::with_capacity(batch);
-
-    for seq_idx in 0..batch {
-        let start = cu_vec[seq_idx] as usize;
-        let end = cu_vec[seq_idx + 1] as usize;
-        let seq_len = end - start;
-        let slot = slots_vec[seq_idx] as usize;
-
-        let mut local_state = state.get(slot)?.to_dtype(DType::F32)?;
-        let mut seq_outputs = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            let idx = start + t;
-            let q_t = q_f32.get(idx)?;
-            let k_t = k_f32.get(idx)?;
-            let v_t = v_f32.get(idx)?;
-            let g_t = decay.get(idx)?;
-            let b_t = beta_f32.get(idx)?;
-
-            let v_col = v_t.unsqueeze(2)?;
-            let k_row = k_t.unsqueeze(1)?;
-            let outer = v_col.matmul(&k_row)?;
-            let g_expand = g_t.unsqueeze(1)?.unsqueeze(2)?;
-            let b_expand = b_t.unsqueeze(1)?.unsqueeze(2)?;
-
-            local_state =
-                (local_state.broadcast_mul(&g_expand)? + outer.broadcast_mul(&b_expand)?)?;
-
-            let q_col = q_t.unsqueeze(2)?;
-            let out_t = local_state.matmul(&q_col)?.squeeze(2)?;
-            seq_outputs.push(out_t.unsqueeze(0)?);
-        }
-
-        let state_flat = state.flatten_all()?;
-        let new_flat = local_state.flatten_all()?;
-        let offset = slot * num_heads * v_dim * k_dim;
-        state_flat.slice_set(&new_flat, 0, offset)?;
-
-        if !seq_outputs.is_empty() {
-            out_chunks.push(Tensor::cat(&seq_outputs, 0)?);
-        }
+    match q_c.dtype() {
+        DType::F16 => unsafe {
+            ffi::gdn_recurrence_varlen_f16(
+                get_gcu_ptr::<f16>(&q_c)?,
+                get_gcu_ptr::<f16>(&k_c)?,
+                get_gcu_ptr::<f16>(&v_c)?,
+                get_gcu_ptr::<f16>(&g_c)?,
+                get_gcu_ptr::<f16>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<f16>(&out)?,
+                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                batch as i32,
+                num_heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::BF16 => unsafe {
+            ffi::gdn_recurrence_varlen_bf16(
+                get_gcu_ptr::<bf16>(&q_c)?,
+                get_gcu_ptr::<bf16>(&k_c)?,
+                get_gcu_ptr::<bf16>(&v_c)?,
+                get_gcu_ptr::<bf16>(&g_c)?,
+                get_gcu_ptr::<bf16>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<bf16>(&out)?,
+                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                batch as i32,
+                num_heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        DType::F32 => unsafe {
+            ffi::gdn_recurrence_varlen_f32(
+                get_gcu_ptr::<f32>(&q_c)?,
+                get_gcu_ptr::<f32>(&k_c)?,
+                get_gcu_ptr::<f32>(&v_c)?,
+                get_gcu_ptr::<f32>(&g_c)?,
+                get_gcu_ptr::<f32>(&beta_c)?,
+                get_gcu_ptr::<f32>(state)?,
+                get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+                get_gcu_ptr::<f32>(&out)?,
+                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                batch as i32,
+                num_heads as i32,
+                k_dim as i32,
+                v_dim as i32,
+                2,
+                12,
+                stream,
+            );
+        },
+        dt => candle_core::bail!("GCU gdn_recurrence_varlen unsupported dtype: {:?}", dt),
     }
-
-    Tensor::cat(&out_chunks, 0)?.to_dtype(q.dtype())
+    Ok(out)
 }
