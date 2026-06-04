@@ -1836,6 +1836,7 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
     float* __restrict__ state,        // [max_batch, num_v_heads, k_dim, v_dim]
     const int64_t* __restrict__ slots, // [batch]
     T* __restrict__ out,              // [total_tokens, num_v_heads, v_dim]
+    float* __restrict__ state_snapshots, // optional [total_tokens, num_v_heads, k_dim, v_dim]
     const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
     int batch,
     int num_v_heads,
@@ -1959,6 +1960,17 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
             if (lane == 0) {
                 out_base[t * token_stride_v + v_idx] = from_float<T>(y_t);
             }
+            if (state_snapshots != nullptr) {
+                float* snapshot_head = state_snapshots +
+                    (((start + t) * num_v_heads + v_head_idx) * k_dim * v_dim);
+#pragma unroll
+                for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                    const int k_idx = r * GDN_WARP_SIZE + lane;
+                    if (k_idx < k_dim) {
+                        snapshot_head[k_idx * v_dim + v_idx] = s_shard[r];
+                    }
+                }
+            }
         }
 
         __syncthreads();
@@ -1978,7 +1990,7 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
 template <typename T>
 void launch_gated_delta_rule_recurrence_varlen_gqa(
     const T* q, const T* k, const T* v, const float* g, const float* beta,
-    float* state, const int64_t* slots, T* out,
+    float* state, const int64_t* slots, T* out, float* state_snapshots,
     const uint32_t* cu_seqlens,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
@@ -1989,7 +2001,7 @@ void launch_gated_delta_rule_recurrence_varlen_gqa(
         dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_v_heads);
         dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_gqa_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
             batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
     } else if (k_dim == 64) {
         constexpr int WARPS_PER_BLOCK = 4;
@@ -1997,7 +2009,7 @@ void launch_gated_delta_rule_recurrence_varlen_gqa(
         dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_v_heads);
         dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_recurrence_varlen_gqa_kernel<T, BK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-            q, k, v, g, beta, state, slots, out, cu_seqlens,
+            q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
             batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale);
     } else {
         printf("gated_delta_rule_recurrence_varlen_gqa: k_dim=%d not supported\n", k_dim);
@@ -2008,32 +2020,33 @@ void launch_gated_delta_rule_recurrence_varlen_gqa(
 extern "C" void gated_delta_rule_recurrence_varlen_gqa_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const float* g, const float* beta, float* state,
-    const int64_t* slots, __nv_bfloat16* out, const uint32_t* cu_seqlens,
+    const int64_t* slots, __nv_bfloat16* out, float* state_snapshots,
+    const uint32_t* cu_seqlens,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen_gqa(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }
 
 extern "C" void gated_delta_rule_recurrence_varlen_gqa_f16(
     const half* q, const half* k, const half* v, const float* g,
     const float* beta, float* state, const int64_t* slots, half* out,
-    const uint32_t* cu_seqlens,
+    float* state_snapshots, const uint32_t* cu_seqlens,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen_gqa(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }
 
 extern "C" void gated_delta_rule_recurrence_varlen_gqa_f32(
     const float* q, const float* k, const float* v, const float* g,
     const float* beta, float* state, const int64_t* slots, float* out,
-    const uint32_t* cu_seqlens,
+    float* state_snapshots, const uint32_t* cu_seqlens,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
     launch_gated_delta_rule_recurrence_varlen_gqa(
-        q, k, v, g, beta, state, slots, out, cu_seqlens,
+        q, k, v, g, beta, state, slots, out, state_snapshots, cu_seqlens,
         batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
 }

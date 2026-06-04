@@ -3423,6 +3423,7 @@ pub fn call_gdn_causal_conv1d_fwd(
     conv_state_offset: usize,
     out: &Buffer,
     out_offset: usize,
+    state_snapshots: Option<(&Buffer, usize)>,
     cu_seqlens: &Buffer,
     cu_seqlens_offset: usize,
     batch_size: i32,
@@ -3444,10 +3445,15 @@ pub fn call_gdn_causal_conv1d_fwd(
     }
     encoder.set_buffer(3, Some(conv_state), conv_state_offset as NSUInteger);
     encoder.set_buffer(4, Some(out), out_offset as NSUInteger);
-    encoder.set_buffer(5, Some(cu_seqlens), cu_seqlens_offset as NSUInteger);
-    utils::set_param(encoder, 6, batch_size);
-    utils::set_param(encoder, 7, d_conv);
-    utils::set_param(encoder, 8, activation_silu);
+    if let Some((snap, offset)) = state_snapshots {
+        encoder.set_buffer(5, Some(snap), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(5, None, 0);
+    }
+    encoder.set_buffer(6, Some(cu_seqlens), cu_seqlens_offset as NSUInteger);
+    utils::set_param(encoder, 7, batch_size);
+    utils::set_param(encoder, 8, d_conv);
+    utils::set_param(encoder, 9, activation_silu);
 
     let thread_group_size = MTLSize {
         width: 256,
@@ -3892,6 +3898,7 @@ pub fn call_gdn_gated_delta_rule_recurrence_varlen(
     slots_offset: usize,
     out: &Buffer,
     out_offset: usize,
+    state_snapshots: Option<(&Buffer, usize)>,
     cu_seqlens: &Buffer,
     cu_seqlens_offset: usize,
     batch: i32,
@@ -3904,24 +3911,24 @@ pub fn call_gdn_gated_delta_rule_recurrence_varlen(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    set_params!(
-        encoder,
-        (
-            (q, q_offset),
-            (k, k_offset),
-            (v, v_offset),
-            (g, g_offset),
-            (beta, beta_offset),
-            (state, state_offset),
-            (slots, slots_offset),
-            (out, out_offset),
-            (cu_seqlens, cu_seqlens_offset),
-            batch,
-            num_heads,
-            k_dim,
-            v_dim
-        )
-    );
+    encoder.set_buffer(0, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(1, Some(k), k_offset as NSUInteger);
+    encoder.set_buffer(2, Some(v), v_offset as NSUInteger);
+    encoder.set_buffer(3, Some(g), g_offset as NSUInteger);
+    encoder.set_buffer(4, Some(beta), beta_offset as NSUInteger);
+    encoder.set_buffer(5, Some(state), state_offset as NSUInteger);
+    encoder.set_buffer(6, Some(slots), slots_offset as NSUInteger);
+    encoder.set_buffer(7, Some(out), out_offset as NSUInteger);
+    if let Some((snap, offset)) = state_snapshots {
+        encoder.set_buffer(8, Some(snap), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(8, None, 0);
+    }
+    encoder.set_buffer(9, Some(cu_seqlens), cu_seqlens_offset as NSUInteger);
+    utils::set_param(encoder, 10, batch);
+    utils::set_param(encoder, 11, num_heads);
+    utils::set_param(encoder, 12, k_dim);
+    utils::set_param(encoder, 13, v_dim);
 
     let thread_group_size = MTLSize {
         width: 64,
@@ -3959,6 +3966,7 @@ pub fn call_gdn_gated_delta_rule_recurrence_varlen_gqa(
     slots_offset: usize,
     out: &Buffer,
     out_offset: usize,
+    state_snapshots: Option<(&Buffer, usize)>,
     cu_seqlens: &Buffer,
     cu_seqlens_offset: usize,
     batch: i32,
@@ -3973,26 +3981,26 @@ pub fn call_gdn_gated_delta_rule_recurrence_varlen_gqa(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    set_params!(
-        encoder,
-        (
-            (q, q_offset),
-            (k, k_offset),
-            (v, v_offset),
-            (g, g_offset),
-            (beta, beta_offset),
-            (state, state_offset),
-            (slots, slots_offset),
-            (out, out_offset),
-            (cu_seqlens, cu_seqlens_offset),
-            batch,
-            num_v_heads,
-            num_k_heads,
-            k_dim,
-            v_dim,
-            q_scale
-        )
-    );
+    encoder.set_buffer(0, Some(q), q_offset as NSUInteger);
+    encoder.set_buffer(1, Some(k), k_offset as NSUInteger);
+    encoder.set_buffer(2, Some(v), v_offset as NSUInteger);
+    encoder.set_buffer(3, Some(g), g_offset as NSUInteger);
+    encoder.set_buffer(4, Some(beta), beta_offset as NSUInteger);
+    encoder.set_buffer(5, Some(state), state_offset as NSUInteger);
+    encoder.set_buffer(6, Some(slots), slots_offset as NSUInteger);
+    encoder.set_buffer(7, Some(out), out_offset as NSUInteger);
+    if let Some((snap, offset)) = state_snapshots {
+        encoder.set_buffer(8, Some(snap), offset as NSUInteger);
+    } else {
+        encoder.set_buffer(8, None, 0);
+    }
+    encoder.set_buffer(9, Some(cu_seqlens), cu_seqlens_offset as NSUInteger);
+    utils::set_param(encoder, 10, batch);
+    utils::set_param(encoder, 11, num_v_heads);
+    utils::set_param(encoder, 12, num_k_heads);
+    utils::set_param(encoder, 13, k_dim);
+    utils::set_param(encoder, 14, v_dim);
+    utils::set_param(encoder, 15, q_scale);
 
     let thread_group_size = MTLSize {
         width: 64,
