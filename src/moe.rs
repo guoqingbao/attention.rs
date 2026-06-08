@@ -1,9 +1,9 @@
-#[cfg(feature = "gcu")]
-use candle_core as candle;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
 #[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::workspace::{get_moe_activation_pool, get_moe_cutlass_workspace};
+#[cfg(feature = "gcu")]
+use candle_core as candle;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::quantized::QTensor;
@@ -3007,7 +3007,7 @@ pub fn moe_gemm(
     Ok(output)
 }
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
+#[cfg(not(any(feature = "cuda", feature = "metal", feature = "gcu")))]
 pub fn moe_gemm(
     _: &Tensor,
     _: &Tensor,

@@ -664,12 +664,13 @@ impl PagedAttention {
         let context_lens = input_metadata.context_lens.as_ref().unwrap();
 
         let q_input = query_3d.unsqueeze(1)?;
+
         let out = gcu_kernels::flash_attn_with_kvcache(
             &q_input,
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
             context_lens,
-            &Some(block_tables.to_owned()),
+            &Some(block_tables.clone()),
             self.scale as f32,
             Some(softcapping.unwrap_or(0.0f64) as f32),
             &None,
@@ -979,7 +980,7 @@ impl PagedAttention {
         } // end if !force_native_flash (flashinfer)
 
         #[cfg(all(feature = "flashattn", feature = "gcu"))]
-        if !input_metadata.disable_flash_attn.unwrap_or(false) {
+        {
             return self.flash_forward(
                 query,
                 key,

@@ -262,6 +262,7 @@ fn flash_attn_kvcache_func<
     use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
     use candle_core::gcu_backend::WrapErr;
     assert!(query.dim(0)? == context_lens.dim(0)?, "shape mismatch");
+
     let params = build_kvcache_params(
         query,
         key_cache,
@@ -290,9 +291,19 @@ fn flash_attn_kvcache_func<
     let key_cache_ptr = gcu_device_ptr!(key_cache, T);
     let value_cache_ptr = gcu_device_ptr!(value_cache, T);
 
-    let output = dev.alloc::<T>(query.elem_count()).w()?;
+    let batch = query.dim(0)?;
+    let seqlen_q = query.dim(1)?;
+    let q_num_heads = query.dim(2)?;
+    let head_size = query.dim(3)?;
+    let kv_num_heads = key_cache.dim(2)?;
+    let max_kernel_batches = (2 * 12 + kv_num_heads - 1) / kv_num_heads;
+    let alloc_batches = batch.max(max_kernel_batches);
+
+    let output = dev
+        .alloc::<T>(alloc_batches * seqlen_q * q_num_heads * head_size)
+        .w()?;
     let softmax_lse = dev
-        .alloc::<f32>(query.shape().dim(0)? * query.shape().dim(1)? * query.shape().dim(2)?)
+        .alloc::<f32>(alloc_batches * seqlen_q * q_num_heads)
         .w()?;
     let stream = dev.stream_inner().expect("Unable to obtain stream");
     unsafe {

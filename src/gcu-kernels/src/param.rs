@@ -497,7 +497,8 @@ pub fn build_kvcache_params(
         _ => candle_core::bail!("unsupported dtype"),
     };
 
-    let thread_group = 2; // C++ runtime chooses 1 or 2; 2 is safe default
+    let gqa_ratio = q_num_heads / kv_num_heads;
+    let thread_group = if gqa_ratio % 2 == 0 { 2 } else { 1 };
     let pingpong = 2;
     let shared_size = (2 * kv_seq_sub * head_size * bpe * 3 * pingpong)
         + (thread_group * q_seq_sub * head_size * bpe);
