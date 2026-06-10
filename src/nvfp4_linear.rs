@@ -12,6 +12,61 @@ use candle_core::{Result, Tensor};
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
 
+/// Compute online input scale from the activation tensor's max absolute value.
+/// Returns (input_scale, input_scale_inv) where input_scale = amax(|x|) / 6.0.
+/// This replaces static checkpoint-calibrated input_scale with a dynamic per-batch
+/// value, improving precision for long contexts where activation distributions
+/// shift beyond what the calibration captured.
+#[cfg(feature = "cuda")]
+pub fn compute_online_input_scale(input: &Tensor) -> Result<(f32, f32)> {
+    use candle_core::{DType, Storage};
+
+    let dev = input.device();
+    let dtype = input.dtype();
+    let num_elements = input.elem_count();
+
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let result_tensor = Tensor::zeros((2,), DType::F32, dev)?;
+    let (result_s, _) = result_tensor.storage_and_layout();
+    let result_ptr = match &*result_s {
+        Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+        _ => candle_core::bail!("result must be on CUDA"),
+    };
+
+    let (input_s, _) = input.storage_and_layout();
+    let input_ptr = match &*input_s {
+        Storage::Cuda(c) => match dtype {
+            DType::F16 => *c.as_cuda_slice::<half::f16>()?.device_ptr(),
+            DType::BF16 => *c.as_cuda_slice::<half::bf16>()?.device_ptr(),
+            _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+        },
+        _ => candle_core::bail!("tensor must be on CUDA"),
+    };
+
+    unsafe {
+        match dtype {
+            DType::F16 => ffi::nvfp4_compute_online_input_scale_f16(
+                input_ptr as *const std::ffi::c_void,
+                result_ptr as *mut f32,
+                num_elements as i32,
+                stream,
+            ),
+            DType::BF16 => ffi::nvfp4_compute_online_input_scale_bf16(
+                input_ptr as *const std::ffi::c_void,
+                result_ptr as *mut f32,
+                num_elements as i32,
+                stream,
+            ),
+            _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+        }
+    }
+
+    let result_vec = result_tensor.to_vec1::<f32>()?;
+    Ok((result_vec[0], result_vec[1]))
+}
+
 /// Check if hardware FP4 (CUTLASS block-scaled tensor ops) is available.
 /// Requires Blackwell SM100+ and the cutlass feature.
 #[cfg(feature = "cuda")]
@@ -263,12 +318,13 @@ pub fn nvfp4_matmul(
                         &wscale_sw_owned
                     };
 
-                    let input_scale_inv = if input_scale != 0.0 {
-                        1.0 / input_scale
-                    } else {
-                        1.0
-                    };
-                    let alpha = input_scale * weight_global_scale;
+                    // Online input scale: compute from activation tensor amax
+                    // instead of using the static checkpoint value.
+                    // This adapts to actual activation distributions which shift
+                    // for long contexts (64K+/128K+) beyond calibration range.
+                    let (online_input_scale, online_input_scale_inv) =
+                        compute_online_input_scale(&input)?;
+                    let alpha = online_input_scale * weight_global_scale;
                     let alpha_tensor = Tensor::new(&[alpha], dev)?;
 
                     {
@@ -310,7 +366,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    input_scale_inv,
+                                    online_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,
@@ -322,7 +378,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    input_scale_inv,
+                                    online_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,
