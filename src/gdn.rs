@@ -88,6 +88,21 @@ fn ensure_contiguous(t: &Tensor) -> Result<Tensor> {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn ensure_f32_contiguous(t: &Tensor) -> Result<Tensor> {
+    let t = if t.dtype() == DType::F32 {
+        t.clone()
+    } else {
+        t.to_dtype(DType::F32)?
+    };
+    ensure_contiguous(&t)
+}
+
+#[cfg(feature = "cuda")]
+fn exp_f32_contiguous(t: &Tensor) -> Result<Tensor> {
+    ensure_f32_contiguous(t)?.exp()?.contiguous()
+}
+
 #[cfg(feature = "metal")]
 #[derive(Clone)]
 struct MetalTensorSlice {
@@ -1232,11 +1247,13 @@ pub fn fused_gdn_gating(
             let (batch, seq_len, heads) = a.dims3()?;
             let g = cuda_full_write_output(a.shape(), DType::F32, a.device())?;
             let beta = cuda_full_write_output(a.shape(), DType::F32, a.device())?;
+            let a_log_f32 = ensure_f32_contiguous(a_log)?;
+            let dt_f32 = ensure_f32_contiguous(dt_bias)?;
 
-            let al_ptr = get_cuda_const_ptr(a_log)? as *const f32;
+            let al_ptr = get_cuda_const_ptr(&a_log_f32)? as *const f32;
             let a_ptr = get_cuda_const_ptr(a)?;
             let b_ptr = get_cuda_const_ptr(b)?;
-            let dt_ptr = get_cuda_const_ptr(dt_bias)? as *const f32;
+            let dt_ptr = get_cuda_const_ptr(&dt_f32)? as *const f32;
             let g_ptr = get_cuda_mut_ptr(&g)? as *mut f32;
             let beta_ptr = get_cuda_mut_ptr(&beta)? as *mut f32;
             let stream = *dev.cu_stream() as i64;
@@ -1545,8 +1562,8 @@ pub fn gated_delta_rule_recurrence(
             }
 
             let out_dtype = q_c.dtype();
-            let decay_f32 = g.exp()?;
-            let beta_f32 = ensure_contiguous(beta)?;
+            let decay_f32 = exp_f32_contiguous(g)?;
+            let beta_f32 = ensure_f32_contiguous(beta)?;
 
             if state.dtype() != DType::F32 {
                 candle_core::bail!(
@@ -1647,8 +1664,8 @@ pub fn gated_delta_rule_decode_slots(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let decay_c = g.exp()?;
-            let beta_c = ensure_contiguous(beta)?;
+            let decay_c = exp_f32_contiguous(g)?;
+            let beta_c = ensure_f32_contiguous(beta)?;
 
             let (bq, hq, kq) = q.dims3()?;
             let (bk, hk, kk) = k.dims3()?;
@@ -1906,8 +1923,8 @@ pub fn gated_delta_rule_recurrence_varlen(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let decay_c = g.exp()?;
-            let beta_c = ensure_contiguous(beta)?;
+            let decay_c = exp_f32_contiguous(g)?;
+            let beta_c = ensure_f32_contiguous(beta)?;
 
             let (total_tokens, num_heads, k_dim) = q_c.dims3()?;
             let num_heads_v = v_c.dim(1)?;
@@ -2039,8 +2056,8 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let g_c = ensure_contiguous(g)?;
-            let beta_c = ensure_contiguous(beta)?;
+            let g_c = ensure_f32_contiguous(g)?;
+            let beta_c = ensure_f32_contiguous(beta)?;
 
             let (total_tokens, num_k_heads, k_dim) = q_c.dims3()?;
             let num_v_heads = v_c.dim(1)?;
@@ -2175,8 +2192,8 @@ pub fn gated_delta_rule_decode_slots_gqa(
             let q_c = ensure_contiguous(q)?;
             let k_c = ensure_contiguous(k)?;
             let v_c = ensure_contiguous(v)?;
-            let g_c = ensure_contiguous(g)?;
-            let beta_c = ensure_contiguous(beta)?;
+            let g_c = ensure_f32_contiguous(g)?;
+            let beta_c = ensure_f32_contiguous(beta)?;
 
             let (batch, num_k_heads, k_dim) = q_c.dims3()?;
             let num_v_heads = v_c.dim(1)?;

@@ -537,7 +537,7 @@ __global__ void topkSelectKernel(
     for (int k_idx = 0; k_idx < k; ++k_idx) {
         cub_kvp thread_kvp;
         thread_kvp.key = 0;
-        thread_kvp.value = -1.f;
+        thread_kvp.value = -FLT_MAX;
 
         for (int e = threadIdx.x; e < num_experts; e += TPB) {
             cub_kvp inp_kvp;
@@ -546,7 +546,7 @@ __global__ void topkSelectKernel(
 
             for (int prior = 0; prior < k_idx; ++prior) {
                 if (topk_indices[row * k + prior] == (uint32_t)e) {
-                    inp_kvp.value = -1.f;
+                    inp_kvp.value = -FLT_MAX;
                 }
             }
             thread_kvp = arg_max(inp_kvp, thread_kvp);
@@ -578,7 +578,7 @@ __global__ void fusedSigmoidTopkKernel(
     using cub_kvp = cub::KeyValuePair<int, float>;
     using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
-    __shared__ float shared_sigmoid[512];
+    extern __shared__ float shared_sigmoid[];
 
     cub::ArgMax arg_max;
     const int row = blockIdx.x;
@@ -596,7 +596,7 @@ __global__ void fusedSigmoidTopkKernel(
     for (int k_idx = 0; k_idx < k; ++k_idx) {
         cub_kvp thread_kvp;
         thread_kvp.key = 0;
-        thread_kvp.value = -1.f;
+        thread_kvp.value = -FLT_MAX;
 
         for (int e = threadIdx.x; e < num_experts; e += TPB) {
             float biased = shared_sigmoid[e];
@@ -608,7 +608,7 @@ __global__ void fusedSigmoidTopkKernel(
 
             for (int prior = 0; prior < k_idx; ++prior) {
                 if (topk_indices[row * k + prior] == (uint32_t)e) {
-                    inp_kvp.value = -1.f;
+                    inp_kvp.value = -FLT_MAX;
                 }
             }
             thread_kvp = arg_max(inp_kvp, thread_kvp);
@@ -652,7 +652,7 @@ extern "C" void fused_sigmoid_topk(
 {
     constexpr int TPB = 256;
     int smem = num_experts * sizeof(float);
-    vllm::moe::fusedSigmoidTopkKernel<TPB><<<num_tokens, TPB, 0, stream>>>(
+    vllm::moe::fusedSigmoidTopkKernel<TPB><<<num_tokens, TPB, smem, stream>>>(
         logits, bias, topk_weights, topk_indices, num_experts, topk);
 }
 
@@ -669,8 +669,10 @@ extern "C" void topk_softmax(
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     const bool needs_workspace = !is_pow_2 || num_experts > 256;
     const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
-    float* softmax_workspace;
-    cudaMallocAsync((void**)&softmax_workspace, workspace_size * sizeof(float), stream);
+    float* softmax_workspace = nullptr;
+    if (workspace_size > 0) {
+        cudaMallocAsync((void**)&softmax_workspace, workspace_size * sizeof(float), stream);
+    }
     vllm::moe::topkGatingSoftmaxKernelLauncher<uint32_t>(
         gating_output,
         topk_weights,
@@ -681,5 +683,7 @@ extern "C" void topk_softmax(
         num_experts,
         topk,
         stream);
-    cudaFreeAsync(softmax_workspace, stream);
+    if (softmax_workspace != nullptr) {
+        cudaFreeAsync(softmax_workspace, stream);
+    }
 }
