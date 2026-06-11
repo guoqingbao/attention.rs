@@ -17,8 +17,14 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         "Softmax topk only accept f32 inputs!"
     );
 
-    let (logits, _) = logits.storage_and_layout();
-    let logits = match &*logits {
+    let logits_contig = if logits.is_contiguous() {
+        logits.clone()
+    } else {
+        logits.contiguous()?
+    };
+
+    let (storage, _) = logits_contig.storage_and_layout();
+    let logits_cuda = match &*storage {
         candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
         _ => candle::bail!("k_scales must be a cuda tensor"),
     };
@@ -31,7 +37,7 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
 
     unsafe {
         ffi::topk_softmax(
-            *logits.device_ptr() as *const f32,
+            *logits_cuda.device_ptr() as *const f32,
             *token_expert_indices.device_ptr() as *mut i32,
             *topk_weights.device_ptr() as *mut f32,
             *topk_indices.device_ptr() as *mut u32,
@@ -84,17 +90,22 @@ pub fn fused_sigmoid_topk(
         _ => candle::bail!("logits must be a cuda tensor"),
     };
 
-    let bias_ptr = if let Some(b) = bias {
+    let bias_contig = if let Some(b) = bias {
         let b_f32 = if b.dtype() != DType::F32 {
             b.to_dtype(DType::F32)?
         } else {
             b.clone()
         };
-        let b_contig = if b_f32.is_contiguous() {
+        Some(if b_f32.is_contiguous() {
             b_f32
         } else {
             b_f32.contiguous()?
-        };
+        })
+    } else {
+        None
+    };
+
+    let bias_ptr = if let Some(b_contig) = bias_contig.as_ref() {
         let (bs, _) = b_contig.storage_and_layout();
         match &*bs {
             candle::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,

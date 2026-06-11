@@ -2247,6 +2247,7 @@ pub fn moe_gemm_mxfp4(
                         DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
                         DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
                         DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+                        DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
                         _ => candle_core::bail!("unsupported dtype {:?}", dtype),
                     },
                     _ => candle_core::bail!("tensor must be on CUDA"),

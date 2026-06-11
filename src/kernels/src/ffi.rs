@@ -1555,6 +1555,21 @@ extern "C" {
         stream: i64,
     ) -> i32;
 
+    // NVFP4 online input scale computation
+    pub fn nvfp4_compute_online_input_scale_f16(
+        input: *const c_void,
+        output: *mut f32,
+        num_elements: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_compute_online_input_scale_bf16(
+        input: *const c_void,
+        output: *mut f32,
+        num_elements: i32,
+        stream: i64,
+    );
+
     // NVFP4 activation quantization (SM100+ / Blackwell)
     pub fn nvfp4_quantize_activation_f16(
         input: *const c_void,
