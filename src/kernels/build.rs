@@ -32,6 +32,10 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flashinfer_adapter_fp8.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_bmm_fp8.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_moe_adapter.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_hc.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_compressor.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_indexer.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_sparse_attn.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_batched_gemm_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");
@@ -340,6 +344,7 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=cublas");
 
     Ok(())
 }

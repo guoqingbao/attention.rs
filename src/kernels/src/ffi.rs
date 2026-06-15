@@ -3412,4 +3412,261 @@ extern "C" {
         hidden_size: c_int,
         stream: i64,
     );
+
+    // DeepSeek V4 Hyper-Connection kernels
+    pub fn ds_v4_hc_expand(
+        x: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_scale_mixes(
+        x: *const c_void,
+        mixes: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        mix_hc: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_from_mixes(
+        x: *const c_void,
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        post: *mut c_void,
+        comb: *mut c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        sinkhorn_iters: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_norm_from_mixes(
+        x: *const c_void,
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        norm_weight: *const c_void,
+        post: *mut c_void,
+        comb: *mut c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        sinkhorn_iters: c_int,
+        hc_eps: f32,
+        norm_eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_output(
+        x: *const c_void,
+        pre: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_head_pre(
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        pre: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_post(
+        x: *const c_void,
+        residual: *const c_void,
+        post: *const c_void,
+        comb: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    // DeepSeek V4 per-head RMSNorm
+    pub fn ds_v4_head_rms_norm(
+        x: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Attention kernels (from ds_attention.cu) ========
+
+    pub fn ds_sparse_attn_dispatch(
+        q: *const c_void,
+        kv: *const c_void,
+        attn_sink: *const c_void,
+        topk_idxs: *const c_int,
+        out: *mut c_void,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        kv_len: c_int,
+        topk: c_int,
+        softmax_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Compressor kernels (from ds_compressor.cu) ========
+
+    pub fn ds_compressor_nonoverlap_prefill_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        seq_len: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_prefill_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        seq_len: c_int,
+        head_dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_nonoverlap_decode_at(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const f32,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        start_pos: c_int,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_decode_at(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const f32,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        start_pos: c_int,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Indexer kernels (from ds_indexer.cu) ========
+
+    pub fn ds_indexer_scores_decode(
+        q: *const c_void,
+        kv: *const c_void,
+        weights: *const c_void,
+        scores: *mut f32,
+        local_heads: c_int,
+        head_dim: c_int,
+        compressed_len: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_topk_prefill(
+        scores: *const f32,
+        topk_idxs: *mut c_int,
+        seq_len: c_int,
+        compressed_len: c_int,
+        topk: c_int,
+        ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_topk_decode(
+        scores: *const f32,
+        topk_idxs: *mut c_int,
+        compressed_len: c_int,
+        topk: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_concat_topk_indices(
+        a: *const c_int,
+        b: *const c_int,
+        out: *mut c_int,
+        seq_len: c_int,
+        a_topk: c_int,
+        b_topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_window_topk_indices(
+        out: *mut c_int,
+        seq_len: c_int,
+        window_size: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compress_topk_indices(
+        out: *mut c_int,
+        seq_len: c_int,
+        compressed: c_int,
+        ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_scores_prefill(
+        q: *const c_void,
+        kv: *const c_void,
+        weights: *const c_void,
+        scores: *mut f32,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        compressed_len: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
 }
