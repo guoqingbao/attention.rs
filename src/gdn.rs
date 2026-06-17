@@ -2079,8 +2079,6 @@ pub fn causal_conv1d_fwd(
     let dev = x_c.device().as_gcu_device()?;
     let out = Tensor::zeros((total_tokens, d_conv), x_c.dtype(), x_c.device())?;
 
-    let cu_i32 = cu_seqlens.to_dtype(DType::U32)?.contiguous()?;
-
     let mut params = CausalConv1dParams {
         dim: d_conv as i32,
         batch: batch as i32,
@@ -2112,7 +2110,7 @@ pub fn causal_conv1d_fwd(
                 std::ptr::null_mut()
             };
             let state_ptr = get_gcu_ptr::<f16>(conv_state)?;
-            let cu_ptr = get_gcu_ptr::<u32>(&cu_i32)? as *mut i32;
+            let cu_ptr = get_gcu_ptr::<u32>(&cu_seqlens)? as *mut i32;
             let o_ptr = get_gcu_ptr::<f16>(&out)?;
             unsafe {
                 causal_conv1d_fwd_f16(
@@ -2140,7 +2138,7 @@ pub fn causal_conv1d_fwd(
                 std::ptr::null_mut()
             };
             let state_ptr = get_gcu_ptr::<bf16>(conv_state)?;
-            let cu_ptr = get_gcu_ptr::<u32>(&cu_i32)? as *mut i32;
+            let cu_ptr = get_gcu_ptr::<u32>(&cu_seqlens)? as *mut i32;
             let o_ptr = get_gcu_ptr::<bf16>(&out)?;
             unsafe {
                 causal_conv1d_fwd_bf16(
@@ -2198,8 +2196,6 @@ pub fn causal_conv1d_update_slots(
     let dev = x_c.device().as_gcu_device()?;
     let out = Tensor::zeros((batch, d_conv), x_c.dtype(), x_c.device())?;
 
-    let slots_i32 = slots.to_dtype(DType::U32)?.contiguous()?;
-
     let mut params = CausalConv1dParams {
         dim: d_conv as i32,
         batch: batch as i32,
@@ -2229,7 +2225,7 @@ pub fn causal_conv1d_update_slots(
                 std::ptr::null_mut()
             };
             let state_ptr = get_gcu_ptr::<f16>(conv_state)?;
-            let cache_idx_ptr = get_gcu_ptr::<u32>(&slots_i32)? as *mut i32;
+            let cache_idx_ptr = get_gcu_ptr::<i64>(&slots)?;
             let o_ptr = get_gcu_ptr::<f16>(&out)?;
             unsafe {
                 causal_conv1d_fwd_f16(
@@ -2257,7 +2253,7 @@ pub fn causal_conv1d_update_slots(
                 std::ptr::null_mut()
             };
             let state_ptr = get_gcu_ptr::<bf16>(conv_state)?;
-            let cache_idx_ptr = get_gcu_ptr::<u32>(&slots_i32)? as *mut i32;
+            let cache_idx_ptr = get_gcu_ptr::<i64>(&slots)?;
             let o_ptr = get_gcu_ptr::<bf16>(&out)?;
             unsafe {
                 causal_conv1d_fwd_bf16(
@@ -2720,7 +2716,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     let g_c = ensure_contiguous_gcu(g)?;
     let beta_c = ensure_contiguous_gcu(beta)?;
     let slots_c = ensure_contiguous_gcu(slots)?;
-    let cu_u32 = cu_seqlens.to_dtype(DType::U32)?.contiguous()?;
+    let cu_u32 = cu_seqlens.contiguous()?;
 
     let dev = q_c.device().as_gcu_device()?;
     let out = Tensor::zeros((total_tokens, num_heads, v_dim), q_c.dtype(), q_c.device())?;
