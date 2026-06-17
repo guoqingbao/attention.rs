@@ -2303,10 +2303,10 @@ pub fn fused_gdn_gating(
     match a_c.dtype() {
         DType::F16 => unsafe {
             ffi::gdn_fused_gating_f16(
-                get_gcu_ptr::<f16>(&a_log_c)?,
+                get_gcu_ptr::<f32>(&a_log_c)?,
                 get_gcu_ptr::<f16>(&a_c)?,
                 get_gcu_ptr::<f16>(&b_c)?,
-                get_gcu_ptr::<f16>(&dt_c)?,
+                get_gcu_ptr::<f32>(&dt_c)?,
                 get_gcu_ptr::<f16>(&g_out)?,
                 get_gcu_ptr::<f16>(&beta_out)?,
                 total as i32,
@@ -2318,10 +2318,10 @@ pub fn fused_gdn_gating(
         },
         DType::BF16 => unsafe {
             ffi::gdn_fused_gating_bf16(
-                get_gcu_ptr::<bf16>(&a_log_c)?,
+                get_gcu_ptr::<f32>(&a_log_c)?,
                 get_gcu_ptr::<bf16>(&a_c)?,
                 get_gcu_ptr::<bf16>(&b_c)?,
-                get_gcu_ptr::<bf16>(&dt_c)?,
+                get_gcu_ptr::<f32>(&dt_c)?,
                 get_gcu_ptr::<bf16>(&g_out)?,
                 get_gcu_ptr::<bf16>(&beta_out)?,
                 total as i32,
@@ -2439,14 +2439,14 @@ pub fn gated_rmsnorm_silu_mul(
     match x_c.dtype() {
         DType::F16 => unsafe {
             let bias_ptr = if let Some(ref b) = bias_c {
-                get_gcu_ptr::<f16>(b)? as *const f16
+                get_gcu_ptr::<f32>(b)? as *const f32
             } else {
                 std::ptr::null()
             };
             ffi::gdn_gated_rmsnorm_f16(
                 get_gcu_ptr::<f16>(&x_c)?,
                 get_gcu_ptr::<f16>(&z_c)?,
-                get_gcu_ptr::<f16>(&w_c)?,
+                get_gcu_ptr::<f32>(&w_c)?,
                 bias_ptr,
                 get_gcu_ptr::<f16>(&output)?,
                 rows as i32,
@@ -2462,14 +2462,14 @@ pub fn gated_rmsnorm_silu_mul(
         },
         DType::BF16 => unsafe {
             let bias_ptr = if let Some(ref b) = bias_c {
-                get_gcu_ptr::<bf16>(b)? as *const bf16
+                get_gcu_ptr::<f32>(b)? as *const f32
             } else {
                 std::ptr::null()
             };
             ffi::gdn_gated_rmsnorm_bf16(
                 get_gcu_ptr::<bf16>(&x_c)?,
                 get_gcu_ptr::<bf16>(&z_c)?,
-                get_gcu_ptr::<bf16>(&w_c)?,
+                get_gcu_ptr::<f32>(&w_c)?,
                 bias_ptr,
                 get_gcu_ptr::<bf16>(&output)?,
                 rows as i32,
@@ -2716,7 +2716,6 @@ pub fn gated_delta_rule_recurrence_varlen(
     let g_c = ensure_contiguous_gcu(g)?;
     let beta_c = ensure_contiguous_gcu(beta)?;
     let slots_c = ensure_contiguous_gcu(slots)?;
-    let cu_u32 = cu_seqlens.contiguous()?;
 
     let dev = q_c.device().as_gcu_device()?;
     let out = Tensor::zeros((total_tokens, num_heads, v_dim), q_c.dtype(), q_c.device())?;
@@ -2733,7 +2732,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                 get_gcu_ptr::<f32>(state)?,
                 get_gcu_ptr::<i64>(&slots_c)? as *const i64,
                 get_gcu_ptr::<f16>(&out)?,
-                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                get_gcu_ptr::<u32>(&cu_seqlens)? as *const u32,
                 batch as i32,
                 num_heads as i32,
                 k_dim as i32,
@@ -2753,7 +2752,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                 get_gcu_ptr::<f32>(state)?,
                 get_gcu_ptr::<i64>(&slots_c)? as *const i64,
                 get_gcu_ptr::<bf16>(&out)?,
-                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                get_gcu_ptr::<u32>(&cu_seqlens)? as *const u32,
                 batch as i32,
                 num_heads as i32,
                 k_dim as i32,
@@ -2773,7 +2772,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                 get_gcu_ptr::<f32>(state)?,
                 get_gcu_ptr::<i64>(&slots_c)? as *const i64,
                 get_gcu_ptr::<f32>(&out)?,
-                get_gcu_ptr::<u32>(&cu_u32)? as *const u32,
+                get_gcu_ptr::<u32>(&cu_seqlens)? as *const u32,
                 batch as i32,
                 num_heads as i32,
                 k_dim as i32,
