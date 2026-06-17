@@ -2855,6 +2855,53 @@ extern "C" {
     );
 
     // =========================================================================
+    // Sparse MLA attention (DSA — DeepSeek Sparse Attention)
+    // =========================================================================
+
+    pub fn mla_sparse_attention_prefill(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        cu_seqlens_q: *const c_int,
+        topk_indices: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        topk: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
+    pub fn mla_sparse_attention_decode(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        topk_indices: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        topk: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
+    // =========================================================================
     // FlashInfer MLA decode (plan + run)
     // =========================================================================
 

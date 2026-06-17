@@ -595,3 +595,158 @@ pub fn mla_prefill_run(
     }
     Ok(output)
 }
+
+// =============================================================================
+// Sparse MLA attention (DSA)
+// =============================================================================
+
+/// Sparse MLA paged prefill: attend only to top-k tokens per query position.
+///
+/// q_absorbed: [total_tokens, num_heads, kv_lora_rank]
+/// q_pe: [total_tokens, num_heads, qk_rope_head_dim]
+/// ckv_cache: [num_pages, page_size, kv_lora_rank]
+/// kpe_cache: [num_pages, page_size, qk_rope_head_dim]
+/// block_tables: [num_seqs, max_num_blocks_per_seq] U32
+/// context_lens: [num_seqs] U32
+/// cu_seqlens_q: [num_seqs + 1] U32
+/// topk_indices: [total_tokens, topk] I32 — flat KV token indices
+#[cfg(feature = "cuda")]
+pub fn mla_sparse_paged_prefill(
+    q_absorbed: &Tensor,
+    q_pe: &Tensor,
+    ckv_cache: &Tensor,
+    kpe_cache: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    cu_seqlens_q: &Tensor,
+    topk_indices: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let total_tokens = q_absorbed.dim(0)?;
+    let num_heads = q_absorbed.dim(1)?;
+    let kv_lora_rank = q_absorbed.dim(2)?;
+    let qk_rope_head_dim = q_pe.dim(2)?;
+    let block_size = ckv_cache.dim(1)? as i32;
+    let max_num_blocks_per_seq = block_tables.dim(1)? as i32;
+    let num_seqs = context_lens.dim(0)?;
+    let topk = topk_indices.dim(1)? as i32;
+    let dtype = dtype_to_u32(q_absorbed.dtype());
+
+    let output = Tensor::zeros(
+        (total_tokens, num_heads, kv_lora_rank),
+        q_absorbed.dtype(),
+        q_absorbed.device(),
+    )?;
+
+    let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_void;
+    let q_abs_ptr = get_cuda_ptr(q_absorbed)?;
+    let q_pe_ptr = get_cuda_ptr(q_pe)?;
+    let ckv_cache_ptr = get_cuda_ptr(ckv_cache)?;
+    let kpe_cache_ptr = get_cuda_ptr(kpe_cache)?;
+
+    let bt_ptr = get_cuda_ptr(block_tables)? as *const core::ffi::c_int;
+    let cl_ptr = get_cuda_ptr(context_lens)? as *const core::ffi::c_int;
+    let cu_ptr = get_cuda_ptr(cu_seqlens_q)? as *const core::ffi::c_int;
+    let topk_ptr = get_cuda_ptr(topk_indices)? as *const core::ffi::c_int;
+
+    let dev = q_absorbed.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    unsafe {
+        kernels::ffi::mla_sparse_attention_prefill(
+            out_ptr,
+            q_abs_ptr,
+            q_pe_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            bt_ptr,
+            cl_ptr,
+            cu_ptr,
+            topk_ptr,
+            scale,
+            num_seqs as i32,
+            num_heads as i32,
+            kv_lora_rank as i32,
+            qk_rope_head_dim as i32,
+            block_size,
+            max_num_blocks_per_seq,
+            topk,
+            dtype,
+            stream,
+        );
+    }
+    Ok(output)
+}
+
+/// Sparse MLA paged decode: single query token attends to top-k KV tokens.
+///
+/// q_absorbed: [num_seqs, num_heads, kv_lora_rank]
+/// q_pe: [num_seqs, num_heads, qk_rope_head_dim]
+/// ckv_cache: [num_pages, page_size, kv_lora_rank]
+/// kpe_cache: [num_pages, page_size, qk_rope_head_dim]
+/// block_tables: [num_seqs, max_num_blocks_per_seq] U32
+/// context_lens: [num_seqs] U32
+/// topk_indices: [num_seqs, topk] I32 — flat KV token indices
+#[cfg(feature = "cuda")]
+pub fn mla_sparse_paged_decode(
+    q_absorbed: &Tensor,
+    q_pe: &Tensor,
+    ckv_cache: &Tensor,
+    kpe_cache: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    topk_indices: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let num_seqs = q_absorbed.dim(0)?;
+    let num_heads = q_absorbed.dim(1)?;
+    let kv_lora_rank = q_absorbed.dim(2)?;
+    let qk_rope_head_dim = q_pe.dim(2)?;
+    let block_size = ckv_cache.dim(1)? as i32;
+    let max_num_blocks_per_seq = block_tables.dim(1)? as i32;
+    let topk = topk_indices.dim(1)? as i32;
+    let dtype = dtype_to_u32(q_absorbed.dtype());
+
+    let output = Tensor::zeros(
+        (num_seqs, num_heads, kv_lora_rank),
+        q_absorbed.dtype(),
+        q_absorbed.device(),
+    )?;
+
+    let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_void;
+    let q_abs_ptr = get_cuda_ptr(q_absorbed)?;
+    let q_pe_ptr = get_cuda_ptr(q_pe)?;
+    let ckv_cache_ptr = get_cuda_ptr(ckv_cache)?;
+    let kpe_cache_ptr = get_cuda_ptr(kpe_cache)?;
+
+    let bt_ptr = get_cuda_ptr(block_tables)? as *const core::ffi::c_int;
+    let cl_ptr = get_cuda_ptr(context_lens)? as *const core::ffi::c_int;
+    let topk_ptr = get_cuda_ptr(topk_indices)? as *const core::ffi::c_int;
+
+    let dev = q_absorbed.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    unsafe {
+        kernels::ffi::mla_sparse_attention_decode(
+            out_ptr,
+            q_abs_ptr,
+            q_pe_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            bt_ptr,
+            cl_ptr,
+            topk_ptr,
+            scale,
+            num_seqs as i32,
+            num_heads as i32,
+            kv_lora_rank as i32,
+            qk_rope_head_dim as i32,
+            block_size,
+            max_num_blocks_per_seq,
+            topk,
+            dtype,
+            stream,
+        );
+    }
+    Ok(output)
+}

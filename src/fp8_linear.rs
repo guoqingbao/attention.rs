@@ -468,9 +468,19 @@ pub fn fp8_matmul_cutlass(
         candle_core::bail!("mat_b (K dim) must be multiple of 16 bytes");
     }
 
-    if weight_scale.dim(0)? != weight.dim(0)? / 128 || weight_scale.dim(1)? != weight.dim(1)? / 128
-    {
-        candle_core::bail!("scales_b shape mismatch");
+    let expected_scale_dim0 = (weight.dim(0)? + block_size[0] - 1) / block_size[0];
+    let expected_scale_dim1 = (weight.dim(1)? + block_size[1] - 1) / block_size[1];
+    if weight_scale.dim(0)? != expected_scale_dim0 || weight_scale.dim(1)? != expected_scale_dim1 {
+        candle_core::bail!(
+            "scales_b shape mismatch: expected [{}, {}], got [{}, {}] for weight [{}, {}] with block_size {:?}",
+            expected_scale_dim0,
+            expected_scale_dim1,
+            weight_scale.dim(0)?,
+            weight_scale.dim(1)?,
+            weight.dim(0)?,
+            weight.dim(1)?,
+            block_size
+        );
     }
 
     let weight_scale_stride = weight_scale.stride();
