@@ -617,9 +617,9 @@ extern "C" {
 
     // MoE GEMM WMMA with FP8 weights and block-wise scales
     pub fn moe_gemm_wmma_fp8(
-        input: *const c_void,      // [size_m, size_k] in half/bf16
-        weights: *const u8,        // [num_experts, size_n, size_k] FP8 as uint8_t
-        weight_scales: *const f32, // [num_experts, scale_n_dim, scale_k_dim]
+        input: *const c_void,         // [size_m, size_k] in half/bf16
+        weights: *const u8,           // [num_experts, size_n, size_k] FP8 as uint8_t
+        weight_scales: *const c_void, // [num_experts, scale_n_dim, scale_k_dim]
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
         topk_weights: *const f32,
@@ -635,14 +635,15 @@ extern "C" {
         block_size_k: i32,
         dtype: i32, // 0=float16, 1=bf16 (for input/output)
         is_prefill: bool,
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
     // MoE GEMV with FP8 weights and block-wise scales (for decode phase)
     pub fn moe_gemv_fp8(
-        input: *const c_void,      // [size_m, size_k]
-        weights: *const u8,        // [num_experts, size_n, size_k] FP8
-        weight_scales: *const f32, // [num_experts, scale_n_dim, scale_k_dim]
+        input: *const c_void,         // [size_m, size_k]
+        weights: *const u8,           // [num_experts, size_n, size_k] FP8
+        weight_scales: *const c_void, // [num_experts, scale_n_dim, scale_k_dim]
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
         topk_weights: *const f32,
@@ -654,7 +655,8 @@ extern "C" {
         size_k: i32,
         block_size_n: i32,
         block_size_k: i32,
-        dtype: i32, // 0=float16, 1=bf16 (for input/output)
+        dtype: i32,         // 0=float16, 1=bf16 (for input/output)
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
@@ -974,16 +976,17 @@ extern "C" {
     );
 
     pub fn fp8_matmul_f16(
-        input: *const c_void,     // [M, K]
-        weight: *const u8,        // [N, K]
-        weight_scale: *const f32, // [N, K] (block-wise)
-        output: *mut c_void,      // [M, N]
+        input: *const c_void,        // [M, K]
+        weight: *const u8,           // [N, K]
+        weight_scale: *const c_void, // [N, K] (block-wise)
+        output: *mut c_void,         // [M, N]
         m: c_int,
         n: c_int,
         k: c_int,
         scale_row_stride: c_int,
         block_size_y: c_int,
         block_size_x: c_int,
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
@@ -1008,7 +1011,7 @@ extern "C" {
     pub fn fp8_matmul_bf16(
         input: *const c_void,
         weight: *const u8,
-        weight_scale: *const f32,
+        weight_scale: *const c_void,
         output: *mut c_void,
         m: c_int,
         n: c_int,
@@ -1016,6 +1019,7 @@ extern "C" {
         scale_row_stride: c_int,
         block_size_y: c_int,
         block_size_x: c_int,
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 

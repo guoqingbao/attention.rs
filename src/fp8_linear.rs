@@ -84,8 +84,17 @@ pub fn fp8_matmul(
     {
         let use_cutlass = sm_version >= 90 && block_size == [128, 128];
         if use_cutlass {
-            let cutlass_scale = weight_scale_cutlass.unwrap_or(weight_scale);
-            return fp8_matmul_cutlass(&input, &weight.t()?, cutlass_scale, block_size);
+            let cutlass_scale = match weight_scale_cutlass {
+                Some(s) => s.clone(),
+                None => {
+                    if sm_version >= 100 {
+                        weight_scale.t()?
+                    } else {
+                        weight_scale.t()?.contiguous()?
+                    }
+                }
+            };
+            return fp8_matmul_cutlass(&input, &weight.t()?, &cutlass_scale, block_size);
         }
     }
 
@@ -123,9 +132,10 @@ pub fn fp8_matmul_fallback(
 
     let dev = input.device();
     let dtype = input.dtype();
+    let scale_is_e8m0 = weight_scale.dtype() == DType::F8E8M0;
     assert!(
-        weight_scale.dtype() == DType::F32,
-        "fp8_matmul expects f32 scales, got {:?}",
+        weight_scale.dtype() == DType::F32 || scale_is_e8m0,
+        "fp8_matmul expects f32 or F8E8M0 scales, got {:?}",
         weight_scale.dtype()
     );
     let scale_row_stride = (k_w + block_size[1] - 1) / block_size[1];
@@ -153,11 +163,17 @@ pub fn fp8_matmul_fallback(
             let weight_ptr = *weight_slice.device_ptr() as *const u8;
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            let scale_ptr = match &*scale_storage {
+                candle_core::Storage::Cuda(c) => {
+                    if scale_is_e8m0 {
+                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const core::ffi::c_void
+                    } else {
+                        *c.as_cuda_slice::<f32>()?.device_ptr() as *const core::ffi::c_void
+                    }
+                }
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
+            let scale_dtype = if scale_is_e8m0 { 1i32 } else { 0i32 };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_slice = match &*output_storage {
@@ -172,7 +188,7 @@ pub fn fp8_matmul_fallback(
                 ffi::fp8_matmul_f16(
                     input_ptr,
                     weight_ptr,
-                    weight_scale_ptr,
+                    scale_ptr,
                     output_ptr,
                     m as i32,
                     n as i32,
@@ -180,6 +196,7 @@ pub fn fp8_matmul_fallback(
                     scale_row_stride as i32,
                     block_size[0] as i32,
                     block_size[1] as i32,
+                    scale_dtype,
                     stream,
                 )
             }
@@ -201,11 +218,17 @@ pub fn fp8_matmul_fallback(
             let weight_ptr = *weight_slice.device_ptr() as *const u8;
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            let scale_ptr = match &*scale_storage {
+                candle_core::Storage::Cuda(c) => {
+                    if scale_is_e8m0 {
+                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const core::ffi::c_void
+                    } else {
+                        *c.as_cuda_slice::<f32>()?.device_ptr() as *const core::ffi::c_void
+                    }
+                }
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
+            let scale_dtype = if scale_is_e8m0 { 1i32 } else { 0i32 };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_slice = match &*output_storage {
@@ -220,7 +243,7 @@ pub fn fp8_matmul_fallback(
                 ffi::fp8_matmul_bf16(
                     input_ptr,
                     weight_ptr,
-                    weight_scale_ptr,
+                    scale_ptr,
                     output_ptr,
                     m as i32,
                     n as i32,
@@ -228,6 +251,7 @@ pub fn fp8_matmul_fallback(
                     scale_row_stride as i32,
                     block_size[0] as i32,
                     block_size[1] as i32,
+                    scale_dtype,
                     stream,
                 )
             }

@@ -675,9 +675,10 @@ pub fn moe_gemm_fp8(
             weights.dtype()
         );
 
+        let scale_is_e8m0 = weight_scales.dtype() == DType::F8E8M0;
         assert!(
-            weight_scales.dtype() == DType::F32,
-            "moe_gemm_fp8 expects f32 scales, got {:?}",
+            weight_scales.dtype() == DType::F32 || scale_is_e8m0,
+            "moe_gemm_fp8 expects f32 or F8E8M0 scales, got {:?}",
             weight_scales.dtype()
         );
 
@@ -707,11 +708,22 @@ pub fn moe_gemm_fp8(
             _ => candle::bail!("weights must be a cuda tensor"),
         };
 
-        let (weight_scales, _) = weight_scales.storage_and_layout();
-        let weight_scales = match &*weight_scales {
-            candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-            _ => candle::bail!("weight_scales must be a cuda tensor"),
+        let (weight_scales_storage, _) = weight_scales.storage_and_layout();
+        use core::ffi::c_void;
+        let scale_ptr: *const c_void = if scale_is_e8m0 {
+            match &*weight_scales_storage {
+                candle::Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const c_void,
+                _ => candle::bail!("weight_scales must be a cuda tensor"),
+            }
+        } else {
+            match &*weight_scales_storage {
+                candle::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<f32>()?.device_ptr() as *const c_void
+                }
+                _ => candle::bail!("weight_scales must be a cuda tensor"),
+            }
         };
+        let scale_dtype = if scale_is_e8m0 { 1i32 } else { 0i32 };
 
         let (sorted_token_ids, _) = sorted_token_ids.storage_and_layout();
         let sorted_token_ids = match &*sorted_token_ids {
@@ -737,7 +749,8 @@ pub fn moe_gemm_fp8(
         };
 
         #[cfg(feature = "cutlass")]
-        let use_cutlass = sm_version >= 90 && block_size_n == 128 && block_size_k == 128;
+        let use_cutlass =
+            sm_version >= 90 && block_size_n == 128 && block_size_k == 128 && !scale_is_e8m0;
         #[cfg(not(feature = "cutlass"))]
         let use_cutlass = false;
 
@@ -884,7 +897,7 @@ pub fn moe_gemm_fp8(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
-                            *weight_scales.device_ptr() as *const f32,
+                            scale_ptr as *const f32,
                             *expert_offsets.device_ptr() as *const i32,
                             num_experts as i32,
                             size_m as i32,
@@ -911,7 +924,7 @@ pub fn moe_gemm_fp8(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
-                            *weight_scales.device_ptr() as *const f32,
+                            scale_ptr as *const f32,
                             *expert_offsets.device_ptr() as *const i32,
                             num_experts as i32,
                             size_m as i32,
@@ -945,7 +958,6 @@ pub fn moe_gemm_fp8(
         let output = unsafe { dev.alloc::<T>(size_m * size_n) }.w()?;
 
         let stream = *dev.cu_stream() as i64;
-        use core::ffi::c_void;
 
         unsafe {
             if is_prefill || size_m > 128 {
@@ -954,7 +966,7 @@ pub fn moe_gemm_fp8(
                 ffi::moe_gemm_wmma_fp8(
                     *input.device_ptr() as *const c_void,
                     *weights.device_ptr() as *const u8,
-                    *weight_scales.device_ptr() as *const f32,
+                    scale_ptr,
                     *sorted_token_ids.device_ptr() as *const i32,
                     *experts_ids.device_ptr() as *const i32,
                     topk_weights_ptr,
@@ -970,13 +982,14 @@ pub fn moe_gemm_fp8(
                     block_size_k as i32,
                     data_type as i32,
                     is_prefill,
+                    scale_dtype,
                     stream as i64,
                 );
             } else {
                 ffi::moe_gemv_fp8(
                     *input.device_ptr() as *const c_void,
                     *weights.device_ptr() as *const u8,
-                    *weight_scales.device_ptr() as *const f32,
+                    scale_ptr,
                     *sorted_token_ids.device_ptr() as *const i32,
                     *experts_ids.device_ptr() as *const i32,
                     topk_weights_ptr,
@@ -989,6 +1002,7 @@ pub fn moe_gemm_fp8(
                     block_size_n as i32,
                     block_size_k as i32,
                     data_type as i32,
+                    scale_dtype,
                     stream as i64,
                 );
             }
@@ -1075,8 +1089,8 @@ pub fn moe_gemm_fp8(
             weights.dtype()
         );
         assert!(
-            weight_scales.dtype() == DType::F32,
-            "moe_gemm_fp8 expects f32 scales, got {:?}",
+            weight_scales.dtype() == DType::F32 || weight_scales.dtype() == DType::F8E8M0,
+            "moe_gemm_fp8 expects f32 or F8E8M0 scales, got {:?}",
             weight_scales.dtype()
         );
 

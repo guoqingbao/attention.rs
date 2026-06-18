@@ -44,6 +44,7 @@
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
 #include "attention/dtype_fp8.cuh"
+#include "attention/dtype_e8m0.cuh"
 #include "moe/moe_utils.cuh"
 using namespace nvcuda::wmma;
 
@@ -261,11 +262,11 @@ __global__ void moe_gemm_grouped_kernel(
  *  @param block_size_n     Block size in N dimension for scales
  *  @param block_size_k     Block size in K dimension for scales
  */
-template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
+template<typename T, typename ScaleT, int WMMA_M, int WMMA_N, int WARPS_N>
 __global__ void moe_gemm_grouped_kernel_fp8(
     const T* __restrict__ input,              // [size_m, size_k]
     const uint8_t* __restrict__ weights,      // [num_experts, size_n, size_k] FP8
-    const float* __restrict__ weight_scales,  // [num_experts, scale_n_dim, scale_k_dim]
+    const ScaleT* __restrict__ weight_scales,  // [num_experts, scale_n_dim, scale_k_dim]
     const int32_t* __restrict__ sorted_token_ids, // [size_m]
     const int32_t* __restrict__ expert_offsets,   // [num_experts + 1]
     const float* __restrict__ topk_weights,   // [size_m]
@@ -296,7 +297,7 @@ __global__ void moe_gemm_grouped_kernel_fp8(
     // Scale layout: [num_experts, scale_n_dim, scale_k_dim]
     const int scale_n_dim = CEILDIV(size_n, block_size_n);
     const int scale_k_dim = CEILDIV(size_k, block_size_k);
-    const float* expert_scales = weight_scales + (size_t)expert_id * scale_n_dim * scale_k_dim;
+    const ScaleT* expert_scales = weight_scales + (size_t)expert_id * scale_n_dim * scale_k_dim;
 
     extern __shared__ uint8_t smem_bytes[];
     
@@ -351,7 +352,8 @@ __global__ void moe_gemm_grouped_kernel_fp8(
                         &expert_w[(size_t)n_global * size_k + k_global]
                     );
                     int scale_k_idx = k_global / block_size_k;
-                    float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+                    float scale = attention_rs::e8m0::read_scale(
+                        expert_scales, scale_n_idx * scale_k_dim + scale_k_idx);
                     if constexpr (std::is_same<T, half>::value) {
                         *reinterpret_cast<uint2*>(&B_sh[n_local * K_BLK + k_local]) = 
                             vllm::fp8::scaled_convert<uint2, uint32_t>(w4, scale);
@@ -366,7 +368,8 @@ __global__ void moe_gemm_grouped_kernel_fp8(
                         int kg = k_global + kk;
                         if (n_global < size_n && kg < size_k) {
                             int scale_k_idx = kg / block_size_k;
-                            float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
+                            float scale = attention_rs::e8m0::read_scale(
+                                expert_scales, scale_n_idx * scale_k_dim + scale_k_idx);
                             uint8_t fp8_val = expert_w[(size_t)n_global * size_k + kg];
                             B_sh[n_local * K_BLK + k_local + kk] =
                                 static_cast<T>(vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
@@ -455,11 +458,11 @@ __global__ void moe_gemm_grouped_kernel_fp8(
         size_m, size_n, size_k \
     );\
 
-#define LAUNCH_MOE_WMMA_FP8(DTYPE, WMMA_M, WMMA_N, WARPS_N)\
-    moe_gemm_grouped_kernel_fp8<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
+#define LAUNCH_MOE_WMMA_FP8(DTYPE, ScaleT, WMMA_M, WMMA_N, WARPS_N)\
+    moe_gemm_grouped_kernel_fp8<DTYPE, ScaleT, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>(\
         reinterpret_cast<const DTYPE*>(input),\
         weights_u8,\
-        weight_scales,\
+        ws_ptr,\
         sorted_token_ids,\
         expert_offsets,\
         topk_weights,\
@@ -522,7 +525,7 @@ extern "C" void moe_gemm_wmma(
 extern "C" void moe_gemm_wmma_fp8(
     const void* input,                // [size_m, size_k] in half/bf16
     const uint8_t* weights,           // [num_experts, size_n, size_k] FP8 as uint8_t
-    const float* weight_scales,       // [num_experts, scale_n_dim, scale_k_dim]
+    const void* weight_scales,        // [num_experts, scale_n_dim, scale_k_dim]
     const int32_t* sorted_token_ids,  // [size_m] (Device)
     const int32_t* expert_ids,        // [size_m * topk]
     const float* topk_weights,        // [size_m] (Device, can be nullptr)
@@ -538,6 +541,7 @@ extern "C" void moe_gemm_wmma_fp8(
     int block_size_k,
     int data_type,                    // 0 = half, 1 = bfloat16 (for input/output)
     bool is_prefill,
+    int scale_dtype,                  // 0 = f32, 1 = e8m0
     cudaStream_t stream
 ) {
     g_calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
@@ -556,20 +560,40 @@ extern "C" void moe_gemm_wmma_fp8(
 
     const uint8_t* weights_u8 = weights;
 
-    if (data_type == 0) { // half
-        if (is_prefill) {
-            LAUNCH_MOE_WMMA_FP8(half, 16, 16, 2)
-        } else {
-            LAUNCH_MOE_WMMA_FP8(half, 8, 32, 1)
+    if (scale_dtype == 1) { // e8m0
+        const uint8_t* ws_ptr = reinterpret_cast<const uint8_t*>(weight_scales);
+        if (data_type == 0) { // half
+            if (is_prefill) {
+                LAUNCH_MOE_WMMA_FP8(half, uint8_t, 16, 16, 2)
+            } else {
+                LAUNCH_MOE_WMMA_FP8(half, uint8_t, 8, 32, 1)
+            }
+        } else if (data_type == 1) { // bfloat16
+            #ifndef NO_BF16_KERNEL
+            if (is_prefill) {
+                LAUNCH_MOE_WMMA_FP8(nv_bfloat16, uint8_t, 16, 16, 2)
+            } else {
+                LAUNCH_MOE_WMMA_FP8(nv_bfloat16, uint8_t, 8, 32, 1)
+            }
+            #endif
         }
-    } else if (data_type == 1) { // bfloat16
-        #ifndef NO_BF16_KERNEL
-        if (is_prefill) {
-            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 16, 16, 2)
-        } else {
-            LAUNCH_MOE_WMMA_FP8(nv_bfloat16, 8, 32, 1)
+    } else { // f32
+        const float* ws_ptr = reinterpret_cast<const float*>(weight_scales);
+        if (data_type == 0) { // half
+            if (is_prefill) {
+                LAUNCH_MOE_WMMA_FP8(half, float, 16, 16, 2)
+            } else {
+                LAUNCH_MOE_WMMA_FP8(half, float, 8, 32, 1)
+            }
+        } else if (data_type == 1) { // bfloat16
+            #ifndef NO_BF16_KERNEL
+            if (is_prefill) {
+                LAUNCH_MOE_WMMA_FP8(nv_bfloat16, float, 16, 16, 2)
+            } else {
+                LAUNCH_MOE_WMMA_FP8(nv_bfloat16, float, 8, 32, 1)
+            }
+            #endif
         }
-        #endif
     }
 }
 

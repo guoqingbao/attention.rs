@@ -9,6 +9,7 @@
 #include "attention/attention_dtypes.h"
 #include "attention/attention_utils.cuh"
 #include "attention/dtype_fp8.cuh"
+#include "attention/dtype_e8m0.cuh"
 using namespace nvcuda::wmma;
 
 namespace vllm {
@@ -19,18 +20,19 @@ namespace vllm {
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-__device__ __forceinline__ float get_scale(const float *__restrict__ scale,
+template <typename ScaleT>
+__device__ __forceinline__ float get_scale(const ScaleT *__restrict__ scale,
                                            int n, int k, int scale_stride,
                                            int block_size_y, int block_size_x) {
   int sr = n / block_size_y;
   int sc = k / block_size_x;
-  return __ldg(&scale[sr * scale_stride + sc]);
+  return attention_rs::e8m0::read_scale(scale, sr * scale_stride + sc);
 }
 
-template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
+template <typename T, typename ScaleT, int BLOCK_M, int BLOCK_N, int BLOCK_K>
 __global__ void fp8_matmul_kernel(const T *__restrict__ input,
                                  const uint8_t *__restrict__ weight,
-                                 const float *__restrict__ weight_scale,
+                                 const ScaleT *__restrict__ weight_scale,
                                  T *__restrict__ output, int M, int N, int K,
                                  int scale_row_stride, int block_size_y,
                                  int block_size_x) {
@@ -87,7 +89,8 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
         float s = 0.0f;
         if (tile_scale_uniform) {
           int scale_row = gn / block_size_y;
-          s = __ldg(&weight_scale[scale_row * scale_row_stride + scale_k_idx_tile]);
+          s = attention_rs::e8m0::read_scale(
+              weight_scale, scale_row * scale_row_stride + scale_k_idx_tile);
         } else {
           s = get_scale(weight_scale, gn, gk, scale_row_stride, block_size_y,
                         block_size_x);
@@ -119,11 +122,11 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
 
 #define BK 32 
 
-template <typename T, int BM, int BN, int WMMA_M, int WMMA_N, int WMMA_K>
+template <typename T, typename ScaleT, int BM, int BN, int WMMA_M, int WMMA_N, int WMMA_K>
 __global__ void fp8_wmma_matmul(
     const T *__restrict__ input,
     const uint8_t *__restrict__ weight,
-    const float *__restrict__ weight_scale,
+    const ScaleT *__restrict__ weight_scale,
     T *__restrict__ output,
     int M, int N, int K,
     int scale_row_stride, int block_size_y, int block_size_x) 
@@ -233,7 +236,8 @@ __global__ void fp8_wmma_matmul(
                  // Scale
                  int sr = gn / block_size_y;
                  int sc = gk / block_size_x;
-                 float s = weight_scale[sr * scale_row_stride + sc];
+                 float s = attention_rs::e8m0::read_scale(
+                     weight_scale, sr * scale_row_stride + sc);
                  
                  val = vllm::fp8::dispatch_fp8_to_float(w) * s;
              }
@@ -294,58 +298,103 @@ __global__ void fp8_wmma_matmul(
 }
 
 extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
-                        const float *weight_scale, __half *output, int M,
+                        const void *weight_scale, __half *output, int M,
                         int N, int K, int scale_row_stride, int block_size_y,
-                        int block_size_x, cudaStream_t stream) {
+                        int block_size_x, int scale_dtype, cudaStream_t stream) {
 
-  
-  if (M <= 32) {
+  if (scale_dtype == 1) { // e8m0
+    const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
+    if (M <= 32) {
       constexpr int TILE = 32; 
       constexpr int TILE_K = 32; 
       
       dim3 block(TILE, TILE);
       dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
       
-      fp8_matmul_kernel<__half, TILE, TILE, TILE_K>
-       <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
+      fp8_matmul_kernel<__half, uint8_t, TILE, TILE, TILE_K>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
-  } else {
-      // Default / Prefill
+    } else {
       constexpr int BLOCK_M = 64;
       constexpr int BLOCK_N = 64;
       dim3 block(128, 1);
       dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
       
-      fp8_wmma_matmul<__half, BLOCK_M, BLOCK_N, 16, 16, 16>
-       <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
+      fp8_wmma_matmul<__half, uint8_t, BLOCK_M, BLOCK_N, 16, 16, 16>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
+    }
+  } else { // f32
+    const float* ws = reinterpret_cast<const float*>(weight_scale);
+    if (M <= 32) {
+      constexpr int TILE = 32; 
+      constexpr int TILE_K = 32; 
+      
+      dim3 block(TILE, TILE);
+      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
+      
+      fp8_matmul_kernel<__half, float, TILE, TILE, TILE_K>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
+                                    scale_row_stride, block_size_y, block_size_x);
+    } else {
+      constexpr int BLOCK_M = 64;
+      constexpr int BLOCK_N = 64;
+      dim3 block(128, 1);
+      dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
+      
+      fp8_wmma_matmul<__half, float, BLOCK_M, BLOCK_N, 16, 16, 16>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
+                                    scale_row_stride, block_size_y, block_size_x);
+    }
   }
 }
 
 extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
-                        const float *weight_scale, __nv_bfloat16 *output, int M,
+                        const void *weight_scale, __nv_bfloat16 *output, int M,
                         int N, int K, int scale_row_stride, int block_size_y,
-                        int block_size_x, cudaStream_t stream) {
-
+                        int block_size_x, int scale_dtype, cudaStream_t stream) {
 
 #ifndef NO_BF16_KERNEL
-  if (M <= 32) {
+  if (scale_dtype == 1) { // e8m0
+    const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
+    if (M <= 32) {
       constexpr int TILE = 32; 
       constexpr int TILE_K = 32; 
       dim3 block(TILE, TILE);
       dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
       
-      fp8_matmul_kernel<__nv_bfloat16, TILE, TILE, TILE_K>
-       <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
+      fp8_matmul_kernel<__nv_bfloat16, uint8_t, TILE, TILE, TILE_K>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
-  } else {
+    } else {
       constexpr int BLOCK_M = 64;
       constexpr int BLOCK_N = 64;
       dim3 block(128, 1);
       dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
-      fp8_wmma_matmul<__nv_bfloat16, BLOCK_M, BLOCK_N, 16, 16, 16>
-       <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
+      fp8_wmma_matmul<__nv_bfloat16, uint8_t, BLOCK_M, BLOCK_N, 16, 16, 16>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
+    }
+  } else { // f32
+    const float* ws = reinterpret_cast<const float*>(weight_scale);
+    if (M <= 32) {
+      constexpr int TILE = 32; 
+      constexpr int TILE_K = 32; 
+      dim3 block(TILE, TILE);
+      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
+      
+      fp8_matmul_kernel<__nv_bfloat16, float, TILE, TILE, TILE_K>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
+                                    scale_row_stride, block_size_y, block_size_x);
+    } else {
+      constexpr int BLOCK_M = 64;
+      constexpr int BLOCK_N = 64;
+      dim3 block(128, 1);
+      dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
+      fp8_wmma_matmul<__nv_bfloat16, float, BLOCK_M, BLOCK_N, 16, 16, 16>
+       <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
+                                    scale_row_stride, block_size_y, block_size_x);
+    }
   }
 #endif
 }
