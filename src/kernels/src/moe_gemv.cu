@@ -28,7 +28,6 @@
  */
 
 #include "moe/moe_utils.cuh"
-#include "attention/dtype_e8m0.cuh"
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -425,11 +424,11 @@ __device__ __forceinline__ void fp8x4_dot_half2(
 }
 
 // Warp-per-row FP8 GEMV. Input cached in shared memory in native T format.
-template <typename T, typename ScaleT, int ROWS_PER_BLOCK>
+template <typename T, int ROWS_PER_BLOCK>
 __global__ void moe_gemv_kernel_fp8(
     const T *__restrict__ input,
     const uint8_t *__restrict__ weights,
-    const ScaleT *__restrict__ weight_scales,
+    const float *__restrict__ weight_scales,
     const int32_t *__restrict__ sorted_token_ids,
     const int32_t *__restrict__ expert_ids,
     const float *__restrict__ topk_weights,
@@ -453,7 +452,7 @@ __global__ void moe_gemv_kernel_fp8(
 
   const int scale_k_dim = CEILDIV(K, block_size_k);
   const int scale_n_dim = CEILDIV(N, block_size_n);
-  const ScaleT *expert_scales = weight_scales + (size_t)expert * scale_n_dim * scale_k_dim;
+  const float *expert_scales = weight_scales + (size_t)expert * scale_n_dim * scale_k_dim;
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -486,7 +485,7 @@ __global__ void moe_gemv_kernel_fp8(
 
   const uint8_t *weight_row = weights + (size_t)expert * N * K + (size_t)row * K;
   const int scale_n_idx = row / block_size_n;
-  const ScaleT *row_scales = expert_scales + scale_n_idx * scale_k_dim;
+  const float *row_scales = expert_scales + scale_n_idx * scale_k_dim;
 
   float sum0 = 0.0f;
   float sum1 = 0.0f;
@@ -498,8 +497,7 @@ __global__ void moe_gemv_kernel_fp8(
   for (int vi = lane_id; vi < k_vec; vi += 32) {
     const int k_base = vi * VEC;
     uint4 w16 = __ldg(reinterpret_cast<const uint4*>(&weight_row[k_base]));
-    const float scale = attention_rs::e8m0::read_scale(
-        row_scales, k_base / block_size_k);
+    const float scale = __ldg(&row_scales[k_base / block_size_k]);
 
     float partial0 = 0.0f, partial1 = 0.0f;
     fp8x4_dot_half2<T>(w16.x, smem_input, k_base + 0, partial0);
@@ -521,8 +519,7 @@ __global__ void moe_gemv_kernel_fp8(
 #else
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
-    float scale = attention_rs::e8m0::read_scale(
-        row_scales, k / block_size_k);
+    float scale = __ldg(&row_scales[k / block_size_k]);
     sum = fmaf(smem_to_float(smem_input[k]), wf * scale, sum);
   }
 
@@ -540,11 +537,11 @@ __global__ void moe_gemv_kernel_fp8(
 
 // One-block-per-row FP8 GEMV with shared memory input caching (native T format).
 // Uses all BLOCK_SIZE threads for K-reduction on one output row.
-template <typename T, typename ScaleT, int BLOCK_SIZE = 256>
+template <typename T, int BLOCK_SIZE = 256>
 __global__ void moe_gemv_kernel_fp8_single(
     const T *__restrict__ input,
     const uint8_t *__restrict__ weights,
-    const ScaleT *__restrict__ weight_scales,
+    const float *__restrict__ weight_scales,
     const int32_t *__restrict__ sorted_token_ids,
     const int32_t *__restrict__ expert_ids,
     const float *__restrict__ topk_weights,
@@ -569,9 +566,9 @@ __global__ void moe_gemv_kernel_fp8_single(
 
   const int scale_k_dim = CEILDIV(K, block_size_k);
   const int scale_n_dim = CEILDIV(N, block_size_n);
-  const ScaleT *expert_scales = weight_scales + (size_t)expert * scale_n_dim * scale_k_dim;
+  const float *expert_scales = weight_scales + (size_t)expert * scale_n_dim * scale_k_dim;
   const int scale_n_idx = row / block_size_n;
-  const ScaleT *row_scales = expert_scales + scale_n_idx * scale_k_dim;
+  const float *row_scales = expert_scales + scale_n_idx * scale_k_dim;
 
   const int tid = threadIdx.x;
 
@@ -603,8 +600,7 @@ __global__ void moe_gemv_kernel_fp8_single(
   for (int vi = tid; vi < k_vec; vi += BLOCK_SIZE) {
     const int k_base = vi * VEC;
     uint4 w16 = __ldg(reinterpret_cast<const uint4*>(&weight_row[k_base]));
-    const float scale = attention_rs::e8m0::read_scale(
-        row_scales, k_base / block_size_k);
+    const float scale = __ldg(&row_scales[k_base / block_size_k]);
 
     float partial0 = 0.0f, partial1 = 0.0f;
     fp8x4_dot_half2<T>(w16.x, smem_input, k_base + 0, partial0);
@@ -626,8 +622,7 @@ __global__ void moe_gemv_kernel_fp8_single(
 #else
     wf = vllm::fp8::softmax_fp8_to_float_e4m3(weight_row[k]);
 #endif
-    float scale = attention_rs::e8m0::read_scale(
-        row_scales, k / block_size_k);
+    float scale = __ldg(&row_scales[k / block_size_k]);
     sum = fmaf(smem_to_float(smem_input[k]), wf * scale, sum);
   }
 
@@ -667,7 +662,7 @@ __global__ void moe_gemv_kernel_fp8_single(
 extern "C" void moe_gemv_fp8(
     const void *input,
     const uint8_t *weights,
-    const void *weight_scales,
+    const float *weight_scales,
     const int32_t *sorted_token_ids,
     const int32_t *expert_ids,
     const float *topk_weights,
@@ -680,82 +675,54 @@ extern "C" void moe_gemv_fp8(
     int block_size_n,
     int block_size_k,
     int dtype,
-    int scale_dtype,
     cudaStream_t stream) {
 
   // Shared memory: K elements in native T format (half/bf16 = 2 bytes each)
   int elem_size = (dtype == 0) ? sizeof(half) : sizeof(nv_bfloat16);
   int smem_bytes = size_k * elem_size;
 
-  if (scale_dtype == 1) { // e8m0
-    const uint8_t *ws_ptr = reinterpret_cast<const uint8_t *>(weight_scales);
-    auto launch = [&]<int RPB>() {
-      dim3 grid(CEILDIV(size_n, RPB), size_m);
-      dim3 block(RPB * 32);
+  // Choose ROWS_PER_BLOCK (= warps per block) based on N dimension.
+  // More rows → fewer blocks, better input reuse, but need enough N to fill.
+  // Thread count = ROWS_PER_BLOCK * 32.
+  //
+  // For N=512:  RPB=16 → 32 blocks per token, 512 threads/block
+  // For N=2048: RPB=8  → 256 blocks per token, 256 threads/block
+  // For N=4096: RPB=4  → 1024 blocks per token, 128 threads/block
 
-      if (dtype == 0) {
-        moe_gemv_kernel_fp8<half, uint8_t, RPB><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const half *>(input),
-            weights, ws_ptr, sorted_token_ids, expert_ids,
-            topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
-            size_m, size_n, size_k, block_size_n, block_size_k);
-      }
-#ifndef NO_BF16_KERNEL
-      else if (dtype == 1) {
-        moe_gemv_kernel_fp8<nv_bfloat16, uint8_t, RPB><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const nv_bfloat16 *>(input),
-            weights, ws_ptr, sorted_token_ids, expert_ids,
-            topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
-            size_m, size_n, size_k, block_size_n, block_size_k);
-      }
-#endif
-    };
+  auto launch = [&]<int RPB>() {
+    dim3 grid(CEILDIV(size_n, RPB), size_m);
+    dim3 block(RPB * 32);
 
-    if (size_k <= 512 && size_n > 512) {
-      launch.template operator()<16>();
-    } else if (size_n <= 512) {
-      launch.template operator()<16>();
-    } else if (size_n <= 2048) {
-      launch.template operator()<8>();
-    } else if (size_n <= 4096) {
-      launch.template operator()<4>();
-    } else {
-      launch.template operator()<2>();
+    if (dtype == 0) {
+      moe_gemv_kernel_fp8<half, RPB><<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<const half *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
     }
-  } else { // f32
-    const float *ws_ptr = reinterpret_cast<const float *>(weight_scales);
-    auto launch = [&]<int RPB>() {
-      dim3 grid(CEILDIV(size_n, RPB), size_m);
-      dim3 block(RPB * 32);
-
-      if (dtype == 0) {
-        moe_gemv_kernel_fp8<half, float, RPB><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const half *>(input),
-            weights, ws_ptr, sorted_token_ids, expert_ids,
-            topk_weights, reinterpret_cast<half *>(output), num_experts, topk,
-            size_m, size_n, size_k, block_size_n, block_size_k);
-      }
 #ifndef NO_BF16_KERNEL
-      else if (dtype == 1) {
-        moe_gemv_kernel_fp8<nv_bfloat16, float, RPB><<<grid, block, smem_bytes, stream>>>(
-            reinterpret_cast<const nv_bfloat16 *>(input),
-            weights, ws_ptr, sorted_token_ids, expert_ids,
-            topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
-            size_m, size_n, size_k, block_size_n, block_size_k);
-      }
-#endif
-    };
-
-    if (size_k <= 512 && size_n > 512) {
-      launch.template operator()<16>();
-    } else if (size_n <= 512) {
-      launch.template operator()<16>();
-    } else if (size_n <= 2048) {
-      launch.template operator()<8>();
-    } else if (size_n <= 4096) {
-      launch.template operator()<4>();
-    } else {
-      launch.template operator()<2>();
+    else if (dtype == 1) {
+      moe_gemv_kernel_fp8<nv_bfloat16, RPB><<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<const nv_bfloat16 *>(input),
+          weights, weight_scales, sorted_token_ids, expert_ids,
+          topk_weights, reinterpret_cast<nv_bfloat16 *>(output), num_experts, topk,
+          size_m, size_n, size_k, block_size_n, block_size_k);
     }
+#endif
+  };
+
+  // Use warp-per-row kernel for all N values. More rows per block gives better
+  // input reuse from shared memory and higher per-warp utilization.
+  // Each warp processes one output row with the full K-reduction.
+  if (size_k <= 512 && size_n > 512) {
+    launch.template operator()<16>();
+  } else if (size_n <= 512) {
+    launch.template operator()<16>();
+  } else if (size_n <= 2048) {
+    launch.template operator()<8>();
+  } else if (size_n <= 4096) {
+    launch.template operator()<4>();
+  } else {
+    launch.template operator()<2>();
   }
 }
