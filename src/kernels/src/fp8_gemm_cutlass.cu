@@ -956,3 +956,75 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
     }
 #endif
 }
+
+// Fused grouped FP8 GEMM with stacked weights (CUDA graph safe).
+// Quantizes BF16 input to FP8 in one kernel, then runs per-group CUTLASS GEMM
+// using pre-stacked weights. All buffers are pre-allocated by caller.
+//
+// input:        [n_groups * seq_len, K] BF16 (contiguous, groups concatenated)
+// input_q:      [n_groups * seq_len, K] FP8  (pre-allocated scratch)
+// input_scales: [n_groups * seq_len, ceil(K/128)] F32 (pre-allocated scratch)
+// weights:      [n_groups, N, K] FP8 (stacked weight tensor)
+// weight_scales:[n_groups, ceil(N/128), ceil(K/128)] F32 (stacked scale tensor)
+// output:       [n_groups, seq_len, N] BF16 (pre-allocated output)
+// workspace:    CUTLASS workspace buffer
+extern "C" int fp8_grouped_gemm_fused(
+    const void* input,
+    void* input_q,
+    float* input_scales,
+    const void* weights,
+    const float* weight_scales,
+    void* output,
+    int n_groups,
+    int seq_len,
+    int N,
+    int K,
+    int sm_version,
+    void* workspace,
+    int64_t workspace_bytes,
+    int64_t stream_) {
+#if defined(USE_CUTLASS)
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_);
+    int total_rows = n_groups * seq_len;
+    int scale_k = (K + 127) / 128;
+    int scale_n = (N + 127) / 128;
+
+    // Step 1: Quantize all input rows to FP8 in a single kernel launch
+    fp8_quantize_per_token_group_launch(
+        input,
+        input_q,
+        input_scales,
+        total_rows * scale_k,
+        128,
+        scale_k,
+        total_rows,
+        false,
+        sm_version >= 100,
+        stream
+    );
+
+    // Step 2: Per-group CUTLASS FP8 GEMM (each is a single kernel launch)
+    size_t ws_bytes = static_cast<size_t>(workspace_bytes);
+    for (int g = 0; g < n_groups; g++) {
+        const uint8_t* a_ptr = reinterpret_cast<const uint8_t*>(input_q) + g * seq_len * K;
+        const float* a_scales_ptr = input_scales + g * seq_len * scale_k;
+        const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(weights) + g * N * K;
+        const float* b_scales_ptr = weight_scales + g * scale_n * scale_k;
+        __nv_bfloat16* out_ptr = reinterpret_cast<__nv_bfloat16*>(output) + g * seq_len * N;
+
+        fp8_matmul_bf16_cutlass(
+            a_ptr, a_scales_ptr,
+            b_ptr, b_scales_ptr,
+            out_ptr,
+            seq_len, N, K,
+            0, 0, 0,
+            sm_version,
+            workspace, workspace_bytes,
+            stream
+        );
+    }
+    return 0;
+#else
+    return -1;
+#endif
+}

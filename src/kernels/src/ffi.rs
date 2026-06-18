@@ -617,9 +617,9 @@ extern "C" {
 
     // MoE GEMM WMMA with FP8 weights and block-wise scales
     pub fn moe_gemm_wmma_fp8(
-        input: *const c_void,         // [size_m, size_k] in half/bf16
-        weights: *const u8,           // [num_experts, size_n, size_k] FP8 as uint8_t
-        weight_scales: *const c_void, // [num_experts, scale_n_dim, scale_k_dim]
+        input: *const c_void,      // [size_m, size_k] in half/bf16
+        weights: *const u8,        // [num_experts, size_n, size_k] FP8 as uint8_t
+        weight_scales: *const f32, // [num_experts, scale_n_dim, scale_k_dim]
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
         topk_weights: *const f32,
@@ -635,15 +635,14 @@ extern "C" {
         block_size_k: i32,
         dtype: i32, // 0=float16, 1=bf16 (for input/output)
         is_prefill: bool,
-        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
     // MoE GEMV with FP8 weights and block-wise scales (for decode phase)
     pub fn moe_gemv_fp8(
-        input: *const c_void,         // [size_m, size_k]
-        weights: *const u8,           // [num_experts, size_n, size_k] FP8
-        weight_scales: *const c_void, // [num_experts, scale_n_dim, scale_k_dim]
+        input: *const c_void,      // [size_m, size_k]
+        weights: *const u8,        // [num_experts, size_n, size_k] FP8
+        weight_scales: *const f32, // [num_experts, scale_n_dim, scale_k_dim]
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
         topk_weights: *const f32,
@@ -655,8 +654,7 @@ extern "C" {
         size_k: i32,
         block_size_n: i32,
         block_size_k: i32,
-        dtype: i32,         // 0=float16, 1=bf16 (for input/output)
-        scale_dtype: c_int, // 0=f32, 1=e8m0
+        dtype: i32, // 0=float16, 1=bf16 (for input/output)
         stream: i64,
     );
 
@@ -3717,6 +3715,59 @@ extern "C" {
         head_dim: c_int,
         compressed_len: c_int,
         score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // =========================================================================
+    // FP8 grouped/strided GEMM (flashinfer + cutlass features)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_quantize_1x128(
+        mat_quant: *mut c_void,
+        scales: *mut f32,
+        mat: *const c_void,
+        shape_x: c_int,
+        shape_y: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_stride_batch_gemm(
+        mat_d: *mut c_void,
+        ld_d: c_int,
+        stride_d: c_int,
+        mat_a: *mut c_void,
+        ld_a: c_int,
+        stride_a: c_int,
+        mat_b: *const c_void,
+        ld_b: c_int,
+        stride_b: c_int,
+        num_problems: c_int,
+        shape_m: c_int,
+        shape_n: c_int,
+        shape_k: c_int,
+        scales_a: *mut f32,
+        stride_scales_a: c_int,
+        scales_b: *const f32,
+        stream: i64,
+    ) -> c_int;
+
+    #[cfg(feature = "cutlass")]
+    pub fn fp8_grouped_gemm_fused(
+        input: *const c_void,
+        input_q: *mut c_void,
+        input_scales: *mut f32,
+        weights: *const c_void,
+        weight_scales: *const f32,
+        output: *mut c_void,
+        n_groups: c_int,
+        seq_len: c_int,
+        n: c_int,
+        k: c_int,
+        sm_version: c_int,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
         stream: i64,
     ) -> c_int;
 
