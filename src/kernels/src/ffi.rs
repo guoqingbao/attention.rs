@@ -2630,6 +2630,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2644,6 +2645,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2658,6 +2660,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2672,6 +2675,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2690,6 +2694,7 @@ extern "C" {
         k: c_int,
         has_bias: bool,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2708,6 +2713,7 @@ extern "C" {
         k: c_int,
         has_bias: bool,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2726,6 +2732,7 @@ extern "C" {
         size_n: c_int,
         size_k: c_int,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2744,6 +2751,7 @@ extern "C" {
         size_n: c_int,
         size_k: c_int,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 

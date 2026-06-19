@@ -510,6 +510,7 @@ pub fn nvfp4_matmul(
                 };
 
                 let stream = *cuda_dev.cu_stream() as i64;
+                let force_lut = crate::nvfp4_force_lut();
 
                 unsafe {
                     if m < 32 {
@@ -526,6 +527,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -541,6 +543,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -563,6 +566,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -578,6 +582,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
