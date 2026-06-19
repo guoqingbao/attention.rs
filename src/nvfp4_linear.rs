@@ -318,13 +318,17 @@ pub fn nvfp4_matmul(
                         &wscale_sw_owned
                     };
 
-                    // Online input scale: compute from activation tensor amax
-                    // instead of using the static checkpoint value.
-                    // This adapts to actual activation distributions which shift
-                    // for long contexts (64K+/128K+) beyond calibration range.
-                    let (online_input_scale, online_input_scale_inv) =
-                        compute_online_input_scale(&input)?;
-                    let alpha = online_input_scale * weight_global_scale;
+                    // Use the checkpoint's calibrated input_scale when available.
+                    // The calibration scale was computed jointly with weight scales
+                    // to minimize quantization error. Only fall back to online
+                    // amax-based scaling when no calibration data exists (scale==1.0).
+                    let (hw_input_scale, hw_input_scale_inv) =
+                        if input_scale != 1.0 && input_scale > 1e-12 {
+                            (input_scale, 1.0 / input_scale)
+                        } else {
+                            compute_online_input_scale(&input)?
+                        };
+                    let alpha = hw_input_scale * weight_global_scale;
                     let alpha_tensor = Tensor::new(&[alpha], dev)?;
 
                     {
@@ -366,7 +370,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    online_input_scale_inv,
+                                    hw_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,
@@ -378,7 +382,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    online_input_scale_inv,
+                                    hw_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,

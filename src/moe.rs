@@ -1952,9 +1952,11 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    // Match the dense NVFP4 hardware path: derive activation scaling from the
-    // actual routed rows instead of relying on checkpoint calibration values.
-    {
+    // Use checkpoint calibration scales when available (set by build_metadata).
+    // Only fall back to online per-expert amax scaling when no calibration data
+    // exists. The calibration scales were jointly tuned with weight scales to
+    // minimize quantization error.
+    if input_scales.is_none() {
         let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
         let (weight_global_scales_s, _) = weight_global_scales.storage_and_layout();
         let (alphas_s, _) = alphas_t.storage_and_layout();
