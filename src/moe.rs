@@ -1390,6 +1390,7 @@ pub fn moe_gemm_nvfp4(
                 std::ptr::null()
             };
 
+            let force_lut = crate::nvfp4_force_lut();
             unsafe {
                 match dtype {
                     DType::F16 => ffi::nvfp4_moe_gemm_wmma_f16(
@@ -1407,6 +1408,7 @@ pub fn moe_gemm_nvfp4(
                         n as i32,
                         k as i32,
                         input_has_topk_dim,
+                        force_lut,
                         stream,
                     ),
                     DType::BF16 => ffi::nvfp4_moe_gemm_wmma_bf16(
@@ -1424,6 +1426,7 @@ pub fn moe_gemm_nvfp4(
                         n as i32,
                         k as i32,
                         input_has_topk_dim,
+                        force_lut,
                         stream,
                     ),
                     _ => unreachable!(),
@@ -1437,6 +1440,7 @@ pub fn moe_gemm_nvfp4(
     let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
     {
         let stream = *cuda_dev.cu_stream() as i64;
+        let force_lut = crate::nvfp4_force_lut();
 
         let (input_s, _) = input.storage_and_layout();
         let (weights_s, _) = weights.storage_and_layout();
@@ -1469,6 +1473,7 @@ pub fn moe_gemm_nvfp4(
                     k as i32,
                     biases.is_some(),
                     input_has_topk_dim,
+                    force_lut,
                     stream,
                 ),
                 DType::BF16 => ffi::nvfp4_indexed_moe_gemm_bf16(
@@ -1486,6 +1491,7 @@ pub fn moe_gemm_nvfp4(
                     k as i32,
                     biases.is_some(),
                     input_has_topk_dim,
+                    force_lut,
                     stream,
                 ),
                 _ => unreachable!(),
