@@ -85,6 +85,9 @@ mod cuda_sort {
                         candle::DType::F64 => {
                             ffi::asort_asc_f64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
                         }
+                        candle::DType::F8E8M0 | candle::DType::F8E4M3 => {
+                            ffi::asort_asc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
+                        }
                     }
                 } else {
                     match storage.dtype() {
@@ -139,6 +142,9 @@ mod cuda_sort {
                             self.inplace,
                             stream,
                         ),
+                        candle::DType::F8E8M0 | candle::DType::F8E4M3 => {
+                            ffi::asort_desc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
+                        }
                     }
                 }
             }
