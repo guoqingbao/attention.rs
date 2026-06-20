@@ -1958,42 +1958,6 @@ pub fn moe_gemm_nvfp4_hardware(
         }
     }
 
-    // Use checkpoint calibration scales when available (set by build_metadata).
-    // Only fall back to online per-expert amax scaling when no calibration data
-    // exists. The calibration scales were jointly tuned with weight scales to
-    // minimize quantization error.
-    if input_scales.is_none() {
-        let (expert_offsets_s, _) = expert_offsets_t.storage_and_layout();
-        let (weight_global_scales_s, _) = weight_global_scales.storage_and_layout();
-        let (alphas_s, _) = alphas_t.storage_and_layout();
-        let (input_scale_invs_s, _) = input_scale_invs_t.storage_and_layout();
-        unsafe {
-            match dtype {
-                DType::F16 => ffi::nvfp4_moe_compute_online_scales_f16(
-                    gathered_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
-                    cuda_ptr(&weight_global_scales_s, DType::F32)? as *const f32,
-                    cuda_ptr(&alphas_s, DType::F32)? as *mut f32,
-                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *mut f32,
-                    num_experts as i32,
-                    k as i32,
-                    stream,
-                ),
-                DType::BF16 => ffi::nvfp4_moe_compute_online_scales_bf16(
-                    gathered_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&expert_offsets_s, DType::U32)? as *const i32,
-                    cuda_ptr(&weight_global_scales_s, DType::F32)? as *const f32,
-                    cuda_ptr(&alphas_s, DType::F32)? as *mut f32,
-                    cuda_ptr(&input_scale_invs_s, DType::F32)? as *mut f32,
-                    num_experts as i32,
-                    k as i32,
-                    stream,
-                ),
-                _ => unreachable!(),
-            }
-        }
-    }
-
     let act_packed_ptr = pool.act_packed_ptr;
     let act_scales_ptr = pool.act_scales_ptr;
     {

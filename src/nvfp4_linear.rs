@@ -318,16 +318,15 @@ pub fn nvfp4_matmul(
                         &wscale_sw_owned
                     };
 
-                    // Use the checkpoint's calibrated input_scale when available.
-                    // The calibration scale was computed jointly with weight scales
-                    // to minimize quantization error. Only fall back to online
-                    // amax-based scaling when no calibration data exists (scale==1.0).
-                    let (hw_input_scale, hw_input_scale_inv) =
-                        if input_scale != 1.0 && input_scale > 1e-12 {
-                            (input_scale, 1.0 / input_scale)
-                        } else {
-                            compute_online_input_scale(&input)?
-                        };
+                    // Use the checkpoint's calibrated input_scale directly.
+                    // When input_scale==1.0 (no calibration data in checkpoint),
+                    // pass through without scaling — matching the original behavior
+                    // where alpha = weight_global_scale and input_scale_inv = 1.0.
+                    let (hw_input_scale, hw_input_scale_inv) = if input_scale > 1e-12 {
+                        (input_scale, 1.0 / input_scale)
+                    } else {
+                        (1.0, 1.0)
+                    };
                     let alpha = hw_input_scale * weight_global_scale;
                     let alpha_tensor = Tensor::new(&[alpha], dev)?;
 
