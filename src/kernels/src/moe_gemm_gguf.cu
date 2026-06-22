@@ -234,6 +234,26 @@ extern "C" void moe_gemm_gguf(
             LAUNCH_MOE_GGUF(QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
             break;
         }
+        case 6: // IQ2_XXS
+        {
+            LAUNCH_MOE_GGUF(QK_IQ2_XXS, QI_IQ2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1);
+            break;
+        }
+        case 7: // IQ2_XS
+        {
+            LAUNCH_MOE_GGUF(QK_IQ2_XS, QI_IQ2_XS, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ, vec_dot_iq2_xs_q8_1);
+            break;
+        }
+        case 8: // IQ3_XXS
+        {
+            LAUNCH_MOE_GGUF(QK_IQ3_XXS, QI_IQ3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1);
+            break;
+        }
+        case 9: // IQ4_XS
+        {
+            LAUNCH_MOE_GGUF(QK_IQ4_XS, QI_IQ4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1);
+            break;
+        }
         default:
             break;
     }
