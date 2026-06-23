@@ -2904,6 +2904,23 @@ extern "C" {
     );
 
     // =========================================================================
+    // DSA Lightning Indexer (fused score + causal + topk)
+    // =========================================================================
+
+    pub fn dsa_lightning_indexer_prefill(
+        q: *const c_void,
+        k: *const c_void,
+        weights: *const c_void,
+        topk_out: *mut c_int,
+        seq_len: c_int,
+        n_heads: c_int,
+        head_dim: c_int,
+        topk: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // =========================================================================
     // FlashInfer MLA decode (plan + run)
     // =========================================================================
 

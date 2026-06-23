@@ -750,3 +750,54 @@ pub fn mla_sparse_paged_decode(
     }
     Ok(output)
 }
+
+/// Fused DSA Lightning Indexer: compute index scores + causal mask + top-k
+/// in a single pass without materializing O(n²) intermediates.
+///
+/// q: [seq_len, n_heads, head_dim] BF16 — multi-head indexer query
+/// k: [seq_len, head_dim] BF16 — single-head indexer key
+/// weights: [seq_len, n_heads] F32 — per-head gating weights
+///
+/// Returns: [seq_len, topk] I32 — top-k token indices per query position
+#[cfg(feature = "cuda")]
+pub fn dsa_lightning_indexer_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    weights: &Tensor,
+    topk: usize,
+    score_scale: f32,
+) -> Result<Tensor> {
+    let seq_len = q.dim(0)?;
+    let n_heads = q.dim(1)?;
+    let head_dim = q.dim(2)?;
+
+    let output = Tensor::zeros((seq_len, topk), candle_core::DType::U32, q.device())?;
+
+    let q_ptr = get_cuda_ptr(q)?;
+    let k_ptr = get_cuda_ptr(k)?;
+    let w_ptr = get_cuda_ptr(weights)?;
+    let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_int;
+
+    let dev = q.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    let ret = unsafe {
+        kernels::ffi::dsa_lightning_indexer_prefill(
+            q_ptr,
+            k_ptr,
+            w_ptr,
+            out_ptr,
+            seq_len as i32,
+            n_heads as i32,
+            head_dim as i32,
+            topk as i32,
+            score_scale,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("dsa_lightning_indexer_prefill CUDA error: {}", ret);
+    }
+
+    Ok(output)
+}

@@ -8,11 +8,11 @@
  * Score = q_absorbed · ckv[topk_idx]^T + q_pe · kpe[topk_idx]^T
  * Output = softmax(scores) · ckv[topk_idx]
  *
- * Prefill: Grid(num_heads, num_seqs), each block processes one (head, seq).
- *          For each query position, attends only to its topk selected tokens.
+ * Prefill: Grid(num_heads, total_tokens) — one block per (head, query_position).
+ *          Much better GPU utilization than iterating queries serially.
  *
- * Decode:  Grid(num_heads, num_seqs), single-block per (head, seq).
- *          Single query token attends to topk selected KV positions.
+ * Decode:  Grid(num_heads, num_seqs) — one block per (head, seq).
+ *          Single query token per sequence.
  */
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -37,11 +37,9 @@ __device__ __forceinline__ float sparse_mla_warp_reduce_max(float val) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Sparse MLA Prefill Kernel                                          */
-/*  Grid: (num_heads, num_seqs)                                        */
-/*  For each query, attends only to its top-k selected KV tokens.      */
-/*  topk_indices: [total_tokens, topk] I32 — flat indices into the     */
-/*  paged KV cache (page_idx * block_size + offset_in_page).           */
+/*  Sparse MLA Prefill Kernel — one block per (head, query_position)  */
+/*  Grid: (num_heads, total_tokens)                                    */
+/*  topk_indices: [total_tokens, topk] I32 — flat KV token indices    */
 /* ------------------------------------------------------------------ */
 
 template <typename scalar_t, int BLOCK_SIZE, int NUM_THREADS>
@@ -56,141 +54,131 @@ __global__ void mla_sparse_prefill_kernel(
     const int32_t* __restrict__ cu_seqlens_q,
     const int32_t* __restrict__ topk_indices,
     const float scale,
+    const int num_seqs,
     const int num_heads,
     const int kv_lora_rank,
     const int qk_rope_head_dim,
     const int max_num_blocks_per_seq,
-    const int topk) {
+    const int topk,
+    const int total_tokens) {
 
     const int head_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y;
+    const int global_q_idx = blockIdx.y;
     const int tid = threadIdx.x;
     constexpr int NUM_WARPS = NUM_THREADS / MLA_WARP_SIZE;
 
+    if (global_q_idx >= total_tokens) return;
+
+    // Find which sequence this query belongs to (binary search on cu_seqlens_q)
+    int seq_idx = 0;
+    {
+        int lo = 0, hi = num_seqs;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (cu_seqlens_q[mid + 1] <= global_q_idx) lo = mid + 1;
+            else hi = mid;
+        }
+        seq_idx = lo;
+    }
+
     const int ctx_len = context_lens[seq_idx];
     if (ctx_len == 0) return;
-
-    const int q_start = cu_seqlens_q[seq_idx];
-    const int q_end = cu_seqlens_q[seq_idx + 1];
-    const int q_len = q_end - q_start;
-    if (q_len == 0) return;
-
     const int32_t* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+    const int32_t* qi_topk = topk_indices + global_q_idx * topk;
 
     extern __shared__ char smem_raw[];
     float* logits = reinterpret_cast<float*>(smem_raw);
     float* red_smem = logits + topk;
 
-    for (int qi = 0; qi < q_len; qi++) {
-        const int global_q_idx = q_start + qi;
-        const int32_t* qi_topk = topk_indices + global_q_idx * topk;
-        const int q_abs_off =
-            (global_q_idx * num_heads + head_idx) * kv_lora_rank;
-        const int q_pe_off =
-            (global_q_idx * num_heads + head_idx) * qk_rope_head_dim;
+    const int q_abs_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
+    const int q_pe_off = (global_q_idx * num_heads + head_idx) * qk_rope_head_dim;
 
-        int actual_topk = topk;
+    // Compute attention scores for each top-k KV token
+    for (int ki = tid; ki < topk; ki += NUM_THREADS) {
+        const int kv_flat_idx = qi_topk[ki];
+        if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) {
+            logits[ki] = -FLT_MAX;
+            continue;
+        }
+
+        const int blk_idx = kv_flat_idx / BLOCK_SIZE;
+        const int blk_off = kv_flat_idx % BLOCK_SIZE;
+        const int physical_block = block_table[blk_idx];
+
+        const int64_t ckv_base =
+            (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
+            (int64_t)blk_off * kv_lora_rank;
+        const int64_t kpe_base =
+            (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
+            (int64_t)blk_off * qk_rope_head_dim;
+
+        float dot = 0.f;
+        for (int d = 0; d < kv_lora_rank; ++d) {
+            dot += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
+        }
+        for (int d = 0; d < qk_rope_head_dim; ++d) {
+            dot += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
+        }
+        logits[ki] = dot * scale;
+    }
+    __syncthreads();
+
+    // Softmax over topk logits
+    float local_max = -FLT_MAX;
+    for (int ki = tid; ki < topk; ki += NUM_THREADS) {
+        local_max = fmaxf(local_max, logits[ki]);
+    }
+    int warp = tid / MLA_WARP_SIZE;
+    int lane = tid % MLA_WARP_SIZE;
+    local_max = sparse_mla_warp_reduce_max(local_max);
+    if (lane == 0) red_smem[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        local_max = (lane < NUM_WARPS) ? red_smem[lane] : -FLT_MAX;
+        local_max = sparse_mla_warp_reduce_max(local_max);
+        if (lane == 0) red_smem[0] = local_max;
+    }
+    __syncthreads();
+    float global_max = red_smem[0];
+
+    float local_sum = 0.f;
+    for (int ki = tid; ki < topk; ki += NUM_THREADS) {
+        float e = expf(logits[ki] - global_max);
+        logits[ki] = e;
+        local_sum += e;
+    }
+    local_sum = sparse_mla_warp_reduce_sum(local_sum);
+    if (lane == 0) red_smem[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0) {
+        local_sum = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
+        local_sum = sparse_mla_warp_reduce_sum(local_sum);
+        if (lane == 0) red_smem[0] = local_sum;
+    }
+    __syncthreads();
+    float inv_sum = (red_smem[0] > 0.f) ? (1.f / red_smem[0]) : 0.f;
+
+    for (int ki = tid; ki < topk; ki += NUM_THREADS) {
+        logits[ki] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Weighted sum: out = sum_i(attn_weight_i * ckv[topk_i])
+    const int out_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
+    for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
+        float acc = 0.f;
         for (int ki = 0; ki < topk; ki++) {
             const int kv_flat_idx = qi_topk[ki];
-            if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) {
-                if (tid == 0) logits[ki] = -FLT_MAX;
-                __syncthreads();
-                continue;
-            }
-
+            if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) continue;
             const int blk_idx = kv_flat_idx / BLOCK_SIZE;
             const int blk_off = kv_flat_idx % BLOCK_SIZE;
             const int physical_block = block_table[blk_idx];
-
             const int64_t ckv_base =
                 (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                 (int64_t)blk_off * kv_lora_rank;
-            const int64_t kpe_base =
-                (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
-                (int64_t)blk_off * qk_rope_head_dim;
-
-            float partial = 0.f;
-            for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
-                partial += (float)q_abs[q_abs_off + d] *
-                           (float)ckv_cache[ckv_base + d];
-            }
-            for (int d = tid; d < qk_rope_head_dim; d += NUM_THREADS) {
-                partial += (float)q_pe[q_pe_off + d] *
-                           (float)kpe_cache[kpe_base + d];
-            }
-
-            int warp = tid / MLA_WARP_SIZE;
-            int lane = tid % MLA_WARP_SIZE;
-            partial = sparse_mla_warp_reduce_sum(partial);
-            if (lane == 0) red_smem[warp] = partial;
-            __syncthreads();
-            if (warp == 0) {
-                partial = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
-                partial = sparse_mla_warp_reduce_sum(partial);
-                if (lane == 0) logits[ki] = partial * scale;
-            }
-            __syncthreads();
+            acc += logits[ki] * (float)ckv_cache[ckv_base + d];
         }
-
-        // Softmax over topk logits
-        float local_max = -FLT_MAX;
-        for (int ki = tid; ki < topk; ki += NUM_THREADS) {
-            local_max = fmaxf(local_max, logits[ki]);
-        }
-        int warp = tid / MLA_WARP_SIZE;
-        int lane = tid % MLA_WARP_SIZE;
-        local_max = sparse_mla_warp_reduce_max(local_max);
-        if (lane == 0) red_smem[warp] = local_max;
-        __syncthreads();
-        if (warp == 0) {
-            local_max = (lane < NUM_WARPS) ? red_smem[lane] : -FLT_MAX;
-            local_max = sparse_mla_warp_reduce_max(local_max);
-            if (lane == 0) red_smem[0] = local_max;
-        }
-        __syncthreads();
-        float global_max = red_smem[0];
-
-        float local_sum = 0.f;
-        for (int ki = tid; ki < topk; ki += NUM_THREADS) {
-            float e = expf(logits[ki] - global_max);
-            logits[ki] = e;
-            local_sum += e;
-        }
-        local_sum = sparse_mla_warp_reduce_sum(local_sum);
-        if (lane == 0) red_smem[warp] = local_sum;
-        __syncthreads();
-        if (warp == 0) {
-            local_sum = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
-            local_sum = sparse_mla_warp_reduce_sum(local_sum);
-            if (lane == 0) red_smem[0] = local_sum;
-        }
-        __syncthreads();
-        float inv_sum = (red_smem[0] > 0.f) ? (1.f / red_smem[0]) : 0.f;
-
-        for (int ki = tid; ki < topk; ki += NUM_THREADS) {
-            logits[ki] *= inv_sum;
-        }
-        __syncthreads();
-
-        // Weighted sum: out = sum_i(attn_weight_i * ckv[topk_i])
-        const int out_off =
-            (global_q_idx * num_heads + head_idx) * kv_lora_rank;
-        for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
-            float acc = 0.f;
-            for (int ki = 0; ki < topk; ki++) {
-                const int kv_flat_idx = qi_topk[ki];
-                if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) continue;
-                const int blk_idx = kv_flat_idx / BLOCK_SIZE;
-                const int blk_off = kv_flat_idx % BLOCK_SIZE;
-                const int physical_block = block_table[blk_idx];
-                const int64_t ckv_base =
-                    (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
-                    (int64_t)blk_off * kv_lora_rank;
-                acc += logits[ki] * (float)ckv_cache[ckv_base + d];
-            }
-            out[out_off + d] = (scalar_t)acc;
-        }
-        __syncthreads();
+        out[out_off + d] = (scalar_t)acc;
     }
 }
 
@@ -235,12 +223,11 @@ __global__ void mla_sparse_decode_kernel(
     float* logits = reinterpret_cast<float*>(smem_raw);
     float* red_smem = logits + topk;
 
-    // Compute logits for each top-k token
-    for (int ki = 0; ki < topk; ki++) {
+    // Compute logits: each thread handles multiple KV tokens
+    for (int ki = tid; ki < topk; ki += NUM_THREADS) {
         const int kv_flat_idx = seq_topk[ki];
         if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) {
-            if (tid == 0) logits[ki] = -FLT_MAX;
-            __syncthreads();
+            logits[ki] = -FLT_MAX;
             continue;
         }
 
@@ -255,28 +242,16 @@ __global__ void mla_sparse_decode_kernel(
             (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
             (int64_t)blk_off * qk_rope_head_dim;
 
-        float partial = 0.f;
-        for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
-            partial += (float)q_abs[q_abs_off + d] *
-                       (float)ckv_cache[ckv_base + d];
+        float dot = 0.f;
+        for (int d = 0; d < kv_lora_rank; ++d) {
+            dot += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
         }
-        for (int d = tid; d < qk_rope_head_dim; d += NUM_THREADS) {
-            partial += (float)q_pe[q_pe_off + d] *
-                       (float)kpe_cache[kpe_base + d];
+        for (int d = 0; d < qk_rope_head_dim; ++d) {
+            dot += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
         }
-
-        int warp = tid / MLA_WARP_SIZE;
-        int lane = tid % MLA_WARP_SIZE;
-        partial = sparse_mla_warp_reduce_sum(partial);
-        if (lane == 0) red_smem[warp] = partial;
-        __syncthreads();
-        if (warp == 0) {
-            partial = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
-            partial = sparse_mla_warp_reduce_sum(partial);
-            if (lane == 0) logits[ki] = partial * scale;
-        }
-        __syncthreads();
+        logits[ki] = dot * scale;
     }
+    __syncthreads();
 
     // Softmax
     float local_max = -FLT_MAX;
@@ -356,12 +331,21 @@ extern "C" void mla_sparse_attention_prefill(
     if (num_seqs == 0) return;
     const cudaStream_t stream = (cudaStream_t)stream_;
 
+    // Get total tokens from the last element of cu_seqlens_q
+    int32_t total_tokens_host = 0;
+    cudaMemcpyAsync(&total_tokens_host, cu_seqlens_q + num_seqs,
+                    sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    if (total_tokens_host == 0) return;
+
     constexpr int NUM_THREADS = 256;
     constexpr int NUM_WARPS = NUM_THREADS / MLA_WARP_SIZE;
 
     int smem_size = (topk + NUM_WARPS) * sizeof(float);
 
-    dim3 grid(num_heads, num_seqs);
+    // One block per (head, query_position)
+    dim3 grid(num_heads, total_tokens_host);
     dim3 block(NUM_THREADS);
 
 #define LAUNCH_SPARSE_MLA_PREFILL(T, BS) \
@@ -370,8 +354,9 @@ extern "C" void mla_sparse_attention_prefill(
             reinterpret_cast<T*>(out), reinterpret_cast<T*>(q_abs), \
             reinterpret_cast<T*>(q_pe), reinterpret_cast<T*>(ckv_cache), \
             reinterpret_cast<T*>(kpe_cache), block_tables, context_lens, \
-            cu_seqlens_q, topk_indices, scale, num_heads, \
-            kv_lora_rank, qk_rope_head_dim, max_num_blocks_per_seq, topk)
+            cu_seqlens_q, topk_indices, scale, num_seqs, num_heads, \
+            kv_lora_rank, qk_rope_head_dim, max_num_blocks_per_seq, topk, \
+            total_tokens_host)
 
 #define LAUNCH_SPARSE_MLA_PREFILL_BLOCK(T) \
     switch (block_size) { \
