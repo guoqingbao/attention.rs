@@ -332,6 +332,7 @@ pub fn mla_paged_prefill(
             qk_rope_head_dim as i32,
             block_size,
             max_num_blocks_per_seq,
+            total_tokens as i32,
             dtype,
             stream,
         );
@@ -671,6 +672,7 @@ pub fn mla_sparse_paged_prefill(
             block_size,
             max_num_blocks_per_seq,
             topk,
+            total_tokens as i32,
             dtype,
             stream,
         );

@@ -36,6 +36,29 @@ __device__ __forceinline__ float sparse_mla_warp_reduce_max(float val) {
     return val;
 }
 
+template <typename scalar_t>
+__device__ __forceinline__ float vec_dot(
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b, int len) {
+    float acc = 0.f;
+    int d = 0;
+    // Process pairs via 32-bit loads (2x BF16 or 2x FP16)
+    const int vec_len = len & ~1;
+    for (; d < vec_len; d += 2) {
+        uint32_t va = *reinterpret_cast<const uint32_t*>(a + d);
+        uint32_t vb = *reinterpret_cast<const uint32_t*>(b + d);
+        scalar_t a0, a1, b0, b1;
+        a0 = *reinterpret_cast<const scalar_t*>(&va);
+        a1 = *(reinterpret_cast<const scalar_t*>(&va) + 1);
+        b0 = *reinterpret_cast<const scalar_t*>(&vb);
+        b1 = *(reinterpret_cast<const scalar_t*>(&vb) + 1);
+        acc += (float)a0 * (float)b0 + (float)a1 * (float)b1;
+    }
+    if (d < len) {
+        acc += (float)a[d] * (float)b[d];
+    }
+    return acc;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Sparse MLA Prefill Kernel — one block per (head, query_position)  */
 /*  Grid: (num_heads, total_tokens)                                    */
@@ -93,7 +116,7 @@ __global__ void mla_sparse_prefill_kernel(
     const int q_abs_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
     const int q_pe_off = (global_q_idx * num_heads + head_idx) * qk_rope_head_dim;
 
-    // Compute attention scores for each top-k KV token
+    // Compute attention scores for each top-k KV token (vectorized loads)
     for (int ki = tid; ki < topk; ki += NUM_THREADS) {
         const int kv_flat_idx = qi_topk[ki];
         if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) {
@@ -112,13 +135,8 @@ __global__ void mla_sparse_prefill_kernel(
             (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
             (int64_t)blk_off * qk_rope_head_dim;
 
-        float dot = 0.f;
-        for (int d = 0; d < kv_lora_rank; ++d) {
-            dot += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
-        }
-        for (int d = 0; d < qk_rope_head_dim; ++d) {
-            dot += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
-        }
+        float dot = vec_dot(q_abs + q_abs_off, ckv_cache + ckv_base, kv_lora_rank);
+        dot += vec_dot(q_pe + q_pe_off, kpe_cache + kpe_base, qk_rope_head_dim);
         logits[ki] = dot * scale;
     }
     __syncthreads();
@@ -164,10 +182,13 @@ __global__ void mla_sparse_prefill_kernel(
     __syncthreads();
 
     // Weighted sum: out = sum_i(attn_weight_i * ckv[topk_i])
+    // Optimization: skip near-zero weights and pre-filter valid entries
     const int out_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
     for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
         float acc = 0.f;
         for (int ki = 0; ki < topk; ki++) {
+            float w = logits[ki];
+            if (w < 1e-8f) continue;
             const int kv_flat_idx = qi_topk[ki];
             if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) continue;
             const int blk_idx = kv_flat_idx / BLOCK_SIZE;
@@ -176,7 +197,7 @@ __global__ void mla_sparse_prefill_kernel(
             const int64_t ckv_base =
                 (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                 (int64_t)blk_off * kv_lora_rank;
-            acc += logits[ki] * (float)ckv_cache[ckv_base + d];
+            acc += w * (float)ckv_cache[ckv_base + d];
         }
         out[out_off + d] = (scalar_t)acc;
     }
@@ -223,7 +244,7 @@ __global__ void mla_sparse_decode_kernel(
     float* logits = reinterpret_cast<float*>(smem_raw);
     float* red_smem = logits + topk;
 
-    // Compute logits: each thread handles multiple KV tokens
+    // Compute logits: each thread handles multiple KV tokens (vectorized loads)
     for (int ki = tid; ki < topk; ki += NUM_THREADS) {
         const int kv_flat_idx = seq_topk[ki];
         if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) {
@@ -242,13 +263,8 @@ __global__ void mla_sparse_decode_kernel(
             (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
             (int64_t)blk_off * qk_rope_head_dim;
 
-        float dot = 0.f;
-        for (int d = 0; d < kv_lora_rank; ++d) {
-            dot += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
-        }
-        for (int d = 0; d < qk_rope_head_dim; ++d) {
-            dot += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
-        }
+        float dot = vec_dot(q_abs + q_abs_off, ckv_cache + ckv_base, kv_lora_rank);
+        dot += vec_dot(q_pe + q_pe_off, kpe_cache + kpe_base, qk_rope_head_dim);
         logits[ki] = dot * scale;
     }
     __syncthreads();
@@ -293,11 +309,13 @@ __global__ void mla_sparse_decode_kernel(
     }
     __syncthreads();
 
-    // Weighted sum
+    // Weighted sum (skip near-zero weights)
     const int out_off = (seq_idx * num_heads + head_idx) * kv_lora_rank;
     for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
         float acc = 0.f;
         for (int ki = 0; ki < topk; ki++) {
+            float w = logits[ki];
+            if (w < 1e-8f) continue;
             const int kv_flat_idx = seq_topk[ki];
             if (kv_flat_idx < 0 || kv_flat_idx >= ctx_len) continue;
             const int blk_idx = kv_flat_idx / BLOCK_SIZE;
@@ -306,7 +324,7 @@ __global__ void mla_sparse_decode_kernel(
             const int64_t ckv_base =
                 (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                 (int64_t)blk_off * kv_lora_rank;
-            acc += logits[ki] * (float)ckv_cache[ckv_base + d];
+            acc += w * (float)ckv_cache[ckv_base + d];
         }
         out[out_off + d] = (scalar_t)acc;
     }
@@ -325,26 +343,19 @@ extern "C" void mla_sparse_attention_prefill(
     int32_t num_seqs, int32_t num_heads,
     int32_t kv_lora_rank, int32_t qk_rope_head_dim,
     int32_t block_size, int32_t max_num_blocks_per_seq,
-    int32_t topk,
+    int32_t topk, int32_t total_tokens,
     uint32_t dtype, int64_t stream_) {
 
-    if (num_seqs == 0) return;
+    if (num_seqs == 0 || total_tokens == 0) return;
     const cudaStream_t stream = (cudaStream_t)stream_;
 
-    // Get total tokens from the last element of cu_seqlens_q
-    int32_t total_tokens_host = 0;
-    cudaMemcpyAsync(&total_tokens_host, cu_seqlens_q + num_seqs,
-                    sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    if (total_tokens_host == 0) return;
+    const int32_t total_tokens_host = total_tokens;
 
     constexpr int NUM_THREADS = 256;
     constexpr int NUM_WARPS = NUM_THREADS / MLA_WARP_SIZE;
 
     int smem_size = (topk + NUM_WARPS) * sizeof(float);
 
-    // One block per (head, query_position)
     dim3 grid(num_heads, total_tokens_host);
     dim3 block(NUM_THREADS);
 

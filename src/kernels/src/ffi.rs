@@ -2852,6 +2852,7 @@ extern "C" {
         qk_rope_head_dim: c_int,
         block_size: c_int,
         max_num_blocks_per_seq: c_int,
+        total_tokens: c_int,
         dtype: u32,
         stream: i64,
     );
@@ -2878,6 +2879,7 @@ extern "C" {
         block_size: c_int,
         max_num_blocks_per_seq: c_int,
         topk: c_int,
+        total_tokens: c_int,
         dtype: u32,
         stream: i64,
     );
@@ -3785,6 +3787,15 @@ extern "C" {
         sm_version: c_int,
         workspace: *mut c_void,
         workspace_bytes: i64,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn fast_topk_select(
+        scores: *const f32,
+        indices_out: *mut i32,
+        batch: c_int,
+        seq_len: c_int,
+        topk: c_int,
         stream: i64,
     ) -> c_int;
 
