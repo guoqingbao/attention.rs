@@ -77,24 +77,66 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
       s_input[lm][lk] = val;
     }
 
-    for (int i = tid; i < BLOCK_N * BLOCK_K; i += num_threads) {
-      int ln = i / BLOCK_K;
-      int lk = i % BLOCK_K;
+    // Vectorized FP8 weight loading: process 4 bytes per iteration
+    constexpr int WEIGHT_ELEMS = BLOCK_N * BLOCK_K;
+    constexpr int VEC4_ITERS = WEIGHT_ELEMS / 4;
+    for (int i = tid; i < VEC4_ITERS; i += num_threads) {
+      int flat = i * 4;
+      int ln = flat / BLOCK_K;
+      int lk = flat % BLOCK_K;
       int gn = bx * BLOCK_N + ln;
-      int gk = k_tile + lk;
+      int gk_base = k_tile + lk;
 
-      float val = 0.0f;
-      if (gn < N && gk < K) {
-        uint8_t w_raw = __ldg(&weight[gn * K + gk]);
-        float s = 0.0f;
+      if (gn < N && gk_base + 3 < K) {
+        uint32_t w4 = __ldg(reinterpret_cast<const uint32_t*>(&weight[gn * K + gk_base]));
+        float s;
         if (tile_scale_uniform) {
           int scale_row = gn / block_size_y;
           s = attention_rs::e8m0::read_scale(
               weight_scale, scale_row * scale_row_stride + scale_k_idx_tile);
         } else {
-          s = get_scale(weight_scale, gn, gk, scale_row_stride, block_size_y,
+          s = get_scale(weight_scale, gn, gk_base, scale_row_stride, block_size_y,
                         block_size_x);
         }
+        s_weight[ln][lk]     = vllm::fp8::dispatch_fp8_to_float((uint8_t)(w4 & 0xFF)) * s;
+        s_weight[ln][lk + 1] = vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 8) & 0xFF)) * s;
+        s_weight[ln][lk + 2] = vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 16) & 0xFF)) * s;
+        s_weight[ln][lk + 3] = vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 24) & 0xFF)) * s;
+      } else {
+        for (int d = 0; d < 4; d++) {
+          int cur_lk = lk + d;
+          int cur_gk = gk_base + d;
+          float val = 0.0f;
+          if (gn < N && cur_gk < K) {
+            uint8_t w_raw = __ldg(&weight[gn * K + cur_gk]);
+            float s = 0.0f;
+            if (tile_scale_uniform) {
+              int scale_row = gn / block_size_y;
+              s = attention_rs::e8m0::read_scale(
+                  weight_scale, scale_row * scale_row_stride + scale_k_idx_tile);
+            } else {
+              s = get_scale(weight_scale, gn, cur_gk, scale_row_stride, block_size_y,
+                            block_size_x);
+            }
+            val = vllm::fp8::dispatch_fp8_to_float(w_raw) * s;
+          }
+          s_weight[ln][cur_lk] = val;
+        }
+      }
+    }
+    // Handle remaining elements (when WEIGHT_ELEMS not divisible by 4)
+    for (int i = VEC4_ITERS * 4 + tid; i < WEIGHT_ELEMS; i += num_threads) {
+      int ln = i / BLOCK_K;
+      int lk = i % BLOCK_K;
+      int gn = bx * BLOCK_N + ln;
+      int gk = k_tile + lk;
+      float val = 0.0f;
+      if (gn < N && gk < K) {
+        uint8_t w_raw = __ldg(&weight[gn * K + gk]);
+        float s = tile_scale_uniform
+            ? attention_rs::e8m0::read_scale(
+                  weight_scale, (gn / block_size_y) * scale_row_stride + scale_k_idx_tile)
+            : get_scale(weight_scale, gn, gk, scale_row_stride, block_size_y, block_size_x);
         val = vllm::fp8::dispatch_fp8_to_float(w_raw) * s;
       }
       s_weight[ln][lk] = val;
@@ -104,11 +146,13 @@ __global__ void fp8_matmul_kernel(const T *__restrict__ input,
 
     if (row < M && col < N) {
 #pragma unroll
-      for (int k = 0; k < BLOCK_K; k += 2) {
-        float2 in2 = *reinterpret_cast<float2*>(&s_input[ty][k]);
-        float2 w2 = *reinterpret_cast<float2*>(&s_weight[tx][k]);
-        acc = fmaf(in2.x, w2.x, acc);
-        acc = fmaf(in2.y, w2.y, acc);
+      for (int k = 0; k < BLOCK_K; k += 4) {
+        float4 in4 = *reinterpret_cast<float4*>(&s_input[ty][k]);
+        float4 w4 = *reinterpret_cast<float4*>(&s_weight[tx][k]);
+        acc = fmaf(in4.x, w4.x, acc);
+        acc = fmaf(in4.y, w4.y, acc);
+        acc = fmaf(in4.z, w4.z, acc);
+        acc = fmaf(in4.w, w4.w, acc);
       }
     }
 
@@ -216,32 +260,64 @@ __global__ void fp8_wmma_matmul(
         }
 
         // Weight is N x K. Loading tile [BN, BK].
-        // Store into s_b[BN][BK] directly (no transpose).
-        // WMMA will load as col_major.
+        // Vectorized: load 4 FP8 bytes at once, dequant and store as half/bf16.
         
         constexpr int TILE_ELEMS = BN * BK;
+        constexpr int VEC4_TILE = TILE_ELEMS / 4;
         
         #pragma unroll
-        for (int i = tid; i < TILE_ELEMS; i += blockDim.x) {
-             int n_rel = i / BK;
-             int k_rel = i % BK;
+        for (int i = tid; i < VEC4_TILE; i += blockDim.x) {
+             int flat = i * 4;
+             int n_rel = flat / BK;
+             int k_rel = flat % BK;
              
              int gn = bx * BN + n_rel;
-             int gk = k_step + k_rel;
+             int gk_base = k_step + k_rel;
              
+             if (gn < N && gk_base + 3 < K) {
+                 uint32_t w4 = __ldg(reinterpret_cast<const uint32_t*>(&weight[gn * K + gk_base]));
+                 
+                 int sr = gn / block_size_y;
+                 int sc = gk_base / block_size_x;
+                 float s = attention_rs::e8m0::read_scale(
+                     weight_scale, sr * scale_row_stride + sc);
+                 
+                 vllm::from_float(s_b[n_rel][k_rel],     vllm::fp8::dispatch_fp8_to_float((uint8_t)(w4 & 0xFF)) * s);
+                 vllm::from_float(s_b[n_rel][k_rel + 1], vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 8) & 0xFF)) * s);
+                 vllm::from_float(s_b[n_rel][k_rel + 2], vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 16) & 0xFF)) * s);
+                 vllm::from_float(s_b[n_rel][k_rel + 3], vllm::fp8::dispatch_fp8_to_float((uint8_t)((w4 >> 24) & 0xFF)) * s);
+             } else {
+                 for (int d = 0; d < 4; d++) {
+                     int cur_k = k_rel + d;
+                     int gk = gk_base + d;
+                     float val = 0.0f;
+                     if (gn < N && gk < K) {
+                         uint8_t w = weight[gn * K + gk];
+                         int sr2 = gn / block_size_y;
+                         int sc2 = gk / block_size_x;
+                         float s2 = attention_rs::e8m0::read_scale(
+                             weight_scale, sr2 * scale_row_stride + sc2);
+                         val = vllm::fp8::dispatch_fp8_to_float(w) * s2;
+                     }
+                     vllm::from_float(s_b[n_rel][cur_k], val);
+                 }
+             }
+        }
+        // Handle remaining elements
+        for (int i = VEC4_TILE * 4 + tid; i < TILE_ELEMS; i += blockDim.x) {
+             int n_rel = i / BK;
+             int k_rel = i % BK;
+             int gn = bx * BN + n_rel;
+             int gk = k_step + k_rel;
              float val = 0.0f;
              if (gn < N && gk < K) {
                  uint8_t w = weight[gn * K + gk];
-                 
-                 // Scale
                  int sr = gn / block_size_y;
                  int sc = gk / block_size_x;
                  float s = attention_rs::e8m0::read_scale(
                      weight_scale, sr * scale_row_stride + sc);
-                 
                  val = vllm::fp8::dispatch_fp8_to_float(w) * s;
              }
-             
              vllm::from_float(s_b[n_rel][k_rel], val);
         }
         
@@ -305,13 +381,12 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
   if (scale_dtype == 1) { // e8m0
     const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
     if (M <= 32) {
-      constexpr int TILE = 32; 
-      constexpr int TILE_K = 32; 
-      
-      dim3 block(TILE, TILE);
-      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
-      
-      fp8_matmul_kernel<__half, uint8_t, TILE, TILE, TILE_K>
+      constexpr int BM = 8;
+      constexpr int BN = 64;
+      constexpr int BK_S = 32;
+      dim3 block(BN, BM);
+      dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+      fp8_matmul_kernel<__half, uint8_t, BM, BN, BK_S>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
     } else {
@@ -319,7 +394,6 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
       constexpr int BLOCK_N = 64;
       dim3 block(128, 1);
       dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
-      
       fp8_wmma_matmul<__half, uint8_t, BLOCK_M, BLOCK_N, 16, 16, 16>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
@@ -327,13 +401,12 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
   } else { // f32
     const float* ws = reinterpret_cast<const float*>(weight_scale);
     if (M <= 32) {
-      constexpr int TILE = 32; 
-      constexpr int TILE_K = 32; 
-      
-      dim3 block(TILE, TILE);
-      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
-      
-      fp8_matmul_kernel<__half, float, TILE, TILE, TILE_K>
+      constexpr int BM = 8;
+      constexpr int BN = 64;
+      constexpr int BK_S = 32;
+      dim3 block(BN, BM);
+      dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+      fp8_matmul_kernel<__half, float, BM, BN, BK_S>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
     } else {
@@ -341,7 +414,6 @@ extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
       constexpr int BLOCK_N = 64;
       dim3 block(128, 1);
       dim3 grid(CEILDIV(N, BLOCK_N), CEILDIV(M, BLOCK_M));
-      
       fp8_wmma_matmul<__half, float, BLOCK_M, BLOCK_N, 16, 16, 16>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
@@ -358,12 +430,12 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
   if (scale_dtype == 1) { // e8m0
     const uint8_t* ws = reinterpret_cast<const uint8_t*>(weight_scale);
     if (M <= 32) {
-      constexpr int TILE = 32; 
-      constexpr int TILE_K = 32; 
-      dim3 block(TILE, TILE);
-      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
-      
-      fp8_matmul_kernel<__nv_bfloat16, uint8_t, TILE, TILE, TILE_K>
+      constexpr int BM = 8;
+      constexpr int BN = 64;
+      constexpr int BK_S = 32;
+      dim3 block(BN, BM);
+      dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+      fp8_matmul_kernel<__nv_bfloat16, uint8_t, BM, BN, BK_S>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
     } else {
@@ -378,12 +450,12 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
   } else { // f32
     const float* ws = reinterpret_cast<const float*>(weight_scale);
     if (M <= 32) {
-      constexpr int TILE = 32; 
-      constexpr int TILE_K = 32; 
-      dim3 block(TILE, TILE);
-      dim3 grid(CEILDIV(N, TILE), CEILDIV(M, TILE));
-      
-      fp8_matmul_kernel<__nv_bfloat16, float, TILE, TILE, TILE_K>
+      constexpr int BM = 8;
+      constexpr int BN = 64;
+      constexpr int BK_S = 32;
+      dim3 block(BN, BM);
+      dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+      fp8_matmul_kernel<__nv_bfloat16, float, BM, BN, BK_S>
        <<<grid, block, 0, stream>>>(input, weight, ws, output, M, N, K,
                                     scale_row_stride, block_size_y, block_size_x);
     } else {
