@@ -2889,9 +2889,14 @@ pub fn moe_gemm_gguf(
         GgmlDType::Q3K => 3,
         GgmlDType::Q5K => 4,
         GgmlDType::Q6K => 5,
+        GgmlDType::IQ2_XXS => 6,
+        GgmlDType::IQ2_XS => 7,
+        GgmlDType::IQ3_XXS => 8,
+        GgmlDType::IQ4_XS => 9,
         _ => {
             candle_core::bail!(
-                "moe_gemm_gguf Metal only supports q2k, q3k, q4k, q5k, q6k, q8_0 weights!"
+                "moe_gemm_gguf Metal does not support {:?} weights!",
+                weights.dtype()
             )
         }
     };
@@ -2903,6 +2908,10 @@ pub fn moe_gemm_gguf(
         GgmlDType::Q3K => (110, 256),
         GgmlDType::Q5K => (176, 256),
         GgmlDType::Q6K => (210, 256),
+        GgmlDType::IQ2_XXS => (66, 256),
+        GgmlDType::IQ2_XS => (74, 256),
+        GgmlDType::IQ3_XXS => (98, 256),
+        GgmlDType::IQ4_XS => (136, 256),
         _ => unreachable!(),
     };
 
