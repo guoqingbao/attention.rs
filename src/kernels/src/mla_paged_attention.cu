@@ -180,13 +180,15 @@ __global__ void mla_paged_attention_decode_partitioned_kernel(
     }
 
     // Pass 3: weighted sum of ckv values (unnormalized — divide by global sum in reduce)
-    // Store as sum_i(exp(logit_i - part_max) * ckv_i) — the reduce kernel handles correction
+    // Skip zero-weight entries to avoid unnecessary global memory reads.
     const int64_t out_off =
         ((int64_t)seq_idx * num_heads + head_idx) * max_partitions * kv_lora_rank +
         (int64_t)part_idx * kv_lora_rank;
     for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
         float acc = 0.f;
         for (int ti = 0; ti < part_len; ti++) {
+            float w = logits[ti];
+            if (w == 0.f) continue;
             const int t = part_start + ti;
             const int blk_idx = t / BLOCK_SIZE;
             const int blk_off = t % BLOCK_SIZE;
@@ -194,7 +196,7 @@ __global__ void mla_paged_attention_decode_partitioned_kernel(
             const int64_t ckv_base =
                 (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                 (int64_t)blk_off * kv_lora_rank;
-            acc += logits[ti] * (float)ckv_cache[ckv_base + d];
+            acc += w * (float)ckv_cache[ckv_base + d];
         }
         tmp_out[out_off + d] = acc;
     }
@@ -402,11 +404,15 @@ __global__ void mla_paged_attention_decode_kernel(
 }
 
 /* ------------------------------------------------------------------ */
-/*  MLA Prefill Kernel                                                 */
+/*  MLA Prefill Kernel v2: Per-token grid with online softmax          */
+/*  Grid: (num_heads, total_tokens) — full GPU utilization             */
+/*  Uses streaming online softmax — no O(ctx_len) shared memory.       */
+/*  Each thread accumulates partial output using FlashAttention-style   */
+/*  running max/sum correction.                                         */
 /* ------------------------------------------------------------------ */
 
 template <typename scalar_t, int BLOCK_SIZE, int NUM_THREADS>
-__global__ void mla_paged_attention_prefill_kernel(
+__global__ void mla_paged_attention_prefill_v2_kernel(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ q_abs,
     const scalar_t* __restrict__ q_pe,
@@ -416,46 +422,72 @@ __global__ void mla_paged_attention_prefill_kernel(
     const int32_t* __restrict__ context_lens,
     const int32_t* __restrict__ cu_seqlens_q,
     const float scale,
+    const int num_seqs,
     const int num_heads,
     const int kv_lora_rank,
     const int qk_rope_head_dim,
-    const int max_num_blocks_per_seq) {
+    const int max_num_blocks_per_seq,
+    const int total_tokens) {
 
     const int head_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y;
+    const int global_q_idx = blockIdx.y;
     const int tid = threadIdx.x;
     constexpr int NUM_WARPS = NUM_THREADS / MLA_WARP_SIZE;
+
+    if (global_q_idx >= total_tokens) return;
+
+    // Find which sequence this query belongs to
+    int seq_idx = 0;
+    {
+        int lo = 0, hi = num_seqs;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (cu_seqlens_q[mid + 1] <= global_q_idx) lo = mid + 1;
+            else hi = mid;
+        }
+        seq_idx = lo;
+    }
 
     const int ctx_len = context_lens[seq_idx];
     if (ctx_len == 0) return;
 
     const int q_start = cu_seqlens_q[seq_idx];
-    const int q_end = cu_seqlens_q[seq_idx + 1];
-    const int q_len = q_end - q_start;
-    if (q_len == 0) return;
-
+    const int q_local_idx = global_q_idx - q_start;
+    const int q_len = cu_seqlens_q[seq_idx + 1] - q_start;
     const int q_pos_start = ctx_len - q_len;
+    const int causal_limit = q_pos_start + q_local_idx + 1;
+    const int attend_len = min(ctx_len, causal_limit);
+
     const int32_t* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
 
+    // Shared memory for reduction only (no O(ctx_len) buffer!)
     extern __shared__ char smem_raw[];
-    float* logits = reinterpret_cast<float*>(smem_raw);
-    float* red_smem = logits + ctx_len;
+    float* red_smem = reinterpret_cast<float*>(smem_raw);
 
-    for (int qi = 0; qi < q_len; qi++) {
-        const int global_q_idx = q_start + qi;
-        const int causal_limit = q_pos_start + qi + 1;
-        const int attend_len = min(ctx_len, causal_limit);
+    const int q_abs_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
+    const int q_pe_off = (global_q_idx * num_heads + head_idx) * qk_rope_head_dim;
 
-        const int q_abs_off =
-            (global_q_idx * num_heads + head_idx) * kv_lora_rank;
-        const int q_pe_off =
-            (global_q_idx * num_heads + head_idx) * qk_rope_head_dim;
+    // Use a tile-based approach: process TILE_SIZE scores at a time.
+    constexpr int TILE_SIZE = 128;
+    float* score_tile = red_smem;  // [TILE_SIZE]
+    float* warp_buf = score_tile + TILE_SIZE;  // [NUM_WARPS]
 
-        for (int t = 0; t < attend_len; t++) {
+    // Online softmax state (per-thread for the output accumulation loop)
+    float running_max = -FLT_MAX;
+    float running_sum = 0.f;
+
+    // First pass: find global max for numerical stability
+    float local_max = -FLT_MAX;
+    for (int tile_start = 0; tile_start < attend_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, attend_len);
+        int tile_len = tile_end - tile_start;
+
+        // Compute scores for this tile (collaborative)
+        for (int ti = 0; ti < tile_len; ti++) {
+            int t = tile_start + ti;
             const int blk_idx = t / BLOCK_SIZE;
             const int blk_off = t % BLOCK_SIZE;
             const int physical_block = block_table[blk_idx];
-
             const int64_t ckv_base =
                 (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                 (int64_t)blk_off * kv_lora_rank;
@@ -464,90 +496,131 @@ __global__ void mla_paged_attention_prefill_kernel(
                 (int64_t)blk_off * qk_rope_head_dim;
 
             float partial = 0.f;
-            for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
-                partial += (float)q_abs[q_abs_off + d] *
-                           (float)ckv_cache[ckv_base + d];
-            }
-            for (int d = tid; d < qk_rope_head_dim; d += NUM_THREADS) {
-                partial += (float)q_pe[q_pe_off + d] *
-                           (float)kpe_cache[kpe_base + d];
-            }
+            for (int d = tid; d < kv_lora_rank; d += NUM_THREADS)
+                partial += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
+            for (int d = tid; d < qk_rope_head_dim; d += NUM_THREADS)
+                partial += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
 
             int warp = tid / MLA_WARP_SIZE;
             int lane = tid % MLA_WARP_SIZE;
             partial = mla_warp_reduce_sum(partial);
-            if (lane == 0) red_smem[warp] = partial;
+            if (lane == 0) warp_buf[warp] = partial;
             __syncthreads();
             if (warp == 0) {
-                partial = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
+                partial = (lane < NUM_WARPS) ? warp_buf[lane] : 0.f;
                 partial = mla_warp_reduce_sum(partial);
-                if (lane == 0) logits[t] = partial * scale;
+                if (lane == 0) score_tile[ti] = partial * scale;
             }
             __syncthreads();
         }
 
-        for (int t = attend_len + tid; t < ctx_len; t += NUM_THREADS) {
-            logits[t] = -FLT_MAX;
-        }
+        // Update local max from this tile
+        for (int ti = tid; ti < tile_len; ti += NUM_THREADS)
+            local_max = fmaxf(local_max, score_tile[ti]);
         __syncthreads();
+    }
 
-        float local_max = -FLT_MAX;
-        for (int t = tid; t < attend_len; t += NUM_THREADS) {
-            local_max = fmaxf(local_max, logits[t]);
-        }
-        int warp = tid / MLA_WARP_SIZE;
-        int lane = tid % MLA_WARP_SIZE;
+    // Reduce to find global max
+    int warp = tid / MLA_WARP_SIZE;
+    int lane = tid % MLA_WARP_SIZE;
+    local_max = mla_warp_reduce_max(local_max);
+    if (lane == 0) warp_buf[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        local_max = (lane < NUM_WARPS) ? warp_buf[lane] : -FLT_MAX;
         local_max = mla_warp_reduce_max(local_max);
-        if (lane == 0) red_smem[warp] = local_max;
-        __syncthreads();
-        if (warp == 0) {
-            local_max = (lane < NUM_WARPS) ? red_smem[lane] : -FLT_MAX;
-            local_max = mla_warp_reduce_max(local_max);
-            if (lane == 0) red_smem[0] = local_max;
-        }
-        __syncthreads();
-        float global_max = red_smem[0];
+        if (lane == 0) warp_buf[0] = local_max;
+    }
+    __syncthreads();
+    float global_max = warp_buf[0];
 
-        float local_sum = 0.f;
-        for (int t = tid; t < attend_len; t += NUM_THREADS) {
-            float e = expf(logits[t] - global_max);
-            logits[t] = e;
-            local_sum += e;
-        }
-        local_sum = mla_warp_reduce_sum(local_sum);
-        if (lane == 0) red_smem[warp] = local_sum;
-        __syncthreads();
-        if (warp == 0) {
-            local_sum = (lane < NUM_WARPS) ? red_smem[lane] : 0.f;
-            local_sum = mla_warp_reduce_sum(local_sum);
-            if (lane == 0) red_smem[0] = local_sum;
-        }
-        __syncthreads();
-        float inv_sum = (red_smem[0] > 0.f) ? (1.f / red_smem[0]) : 0.f;
+    // Second pass: compute exp-sum and weighted output tile-by-tile.
+    float local_sum2 = 0.f;
+    const int out_off = (global_q_idx * num_heads + head_idx) * kv_lora_rank;
 
-        for (int t = tid; t < attend_len; t += NUM_THREADS) {
-            logits[t] *= inv_sum;
+    // Zero the output first (each thread handles its dimensions)
+    for (int d = tid; d < kv_lora_rank; d += NUM_THREADS)
+        out[out_off + d] = (scalar_t)0;
+    __syncthreads();
+
+    for (int tile_start = 0; tile_start < attend_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, attend_len);
+        int tile_len = tile_end - tile_start;
+
+        // Recompute scores for this tile
+        for (int ti = 0; ti < tile_len; ti++) {
+            int t = tile_start + ti;
+            const int blk_idx = t / BLOCK_SIZE;
+            const int blk_off = t % BLOCK_SIZE;
+            const int physical_block = block_table[blk_idx];
+            const int64_t ckv_base =
+                (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
+                (int64_t)blk_off * kv_lora_rank;
+            const int64_t kpe_base =
+                (int64_t)physical_block * BLOCK_SIZE * qk_rope_head_dim +
+                (int64_t)blk_off * qk_rope_head_dim;
+
+            float partial = 0.f;
+            for (int d = tid; d < kv_lora_rank; d += NUM_THREADS)
+                partial += (float)q_abs[q_abs_off + d] * (float)ckv_cache[ckv_base + d];
+            for (int d = tid; d < qk_rope_head_dim; d += NUM_THREADS)
+                partial += (float)q_pe[q_pe_off + d] * (float)kpe_cache[kpe_base + d];
+
+            int w = tid / MLA_WARP_SIZE;
+            int l = tid % MLA_WARP_SIZE;
+            partial = mla_warp_reduce_sum(partial);
+            if (l == 0) warp_buf[w] = partial;
+            __syncthreads();
+            if (w == 0) {
+                partial = (l < NUM_WARPS) ? warp_buf[l] : 0.f;
+                partial = mla_warp_reduce_sum(partial);
+                if (l == 0) score_tile[ti] = expf(partial * scale - global_max);
+            }
+            __syncthreads();
         }
+
+        // Accumulate exp-sum
+        for (int ti = tid; ti < tile_len; ti += NUM_THREADS)
+            local_sum2 += score_tile[ti];
         __syncthreads();
 
-        const int out_off =
-            (global_q_idx * num_heads + head_idx) * kv_lora_rank;
+        // Weighted sum for this tile
         for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
             float acc = 0.f;
-            for (int t = 0; t < attend_len; t++) {
+            for (int ti = 0; ti < tile_len; ti++) {
+                float w_val = score_tile[ti];
+                if (w_val == 0.f) continue;
+                int t = tile_start + ti;
                 const int blk_idx = t / BLOCK_SIZE;
                 const int blk_off = t % BLOCK_SIZE;
                 const int physical_block = block_table[blk_idx];
                 const int64_t ckv_base =
                     (int64_t)physical_block * BLOCK_SIZE * kv_lora_rank +
                     (int64_t)blk_off * kv_lora_rank;
-                acc += logits[t] * (float)ckv_cache[ckv_base + d];
+                acc += w_val * (float)ckv_cache[ckv_base + d];
             }
-            out[out_off + d] = (scalar_t)acc;
+            out[out_off + d] = (scalar_t)((float)out[out_off + d] + acc);
         }
         __syncthreads();
     }
+
+    // Reduce exp-sum and normalize output
+    local_sum2 = mla_warp_reduce_sum(local_sum2);
+    if (lane == 0) warp_buf[warp] = local_sum2;
+    __syncthreads();
+    if (warp == 0) {
+        local_sum2 = (lane < NUM_WARPS) ? warp_buf[lane] : 0.f;
+        local_sum2 = mla_warp_reduce_sum(local_sum2);
+        if (lane == 0) warp_buf[0] = local_sum2;
+    }
+    __syncthreads();
+    float inv_sum = (warp_buf[0] > 0.f) ? (1.f / warp_buf[0]) : 0.f;
+
+    for (int d = tid; d < kv_lora_rank; d += NUM_THREADS) {
+        out[out_off + d] = (scalar_t)((float)out[out_off + d] * inv_sum);
+    }
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  C API                                                              */
@@ -634,12 +707,26 @@ extern "C" void mla_paged_attention_decode(
 #undef LAUNCH_MLA_REDUCE
 
     } else {
-        // Fallback: single-block kernel for short contexts
+        // Fallback: single-block kernel for short contexts.
+        // This path is only used when max_partitions == 1 (context fits in one
+        // PARTITION_SIZE=128 chunk), so max_ctx is at most 128*block_size.
         int max_ctx = max_num_blocks_per_seq * block_size;
         int smem_size = (max_ctx + NUM_WARPS) * sizeof(float);
         if (smem_size > 48 * 1024) {
-            max_ctx = (48 * 1024) / sizeof(float) - NUM_WARPS;
-            smem_size = 48 * 1024;
+            cudaFuncAttribute attr = cudaFuncAttributeMaxDynamicSharedMemorySize;
+            if (dtype == 1) {
+                cudaFuncSetAttribute(
+                    mla_paged_attention_decode_kernel<__nv_bfloat16, 64, NUM_THREADS>,
+                    attr, smem_size);
+            } else if (dtype == 0) {
+                cudaFuncSetAttribute(
+                    mla_paged_attention_decode_kernel<__half, 64, NUM_THREADS>,
+                    attr, smem_size);
+            } else {
+                cudaFuncSetAttribute(
+                    mla_paged_attention_decode_kernel<float, 64, NUM_THREADS>,
+                    attr, smem_size);
+            }
         }
 
         dim3 grid(num_heads, num_seqs);
@@ -684,39 +771,38 @@ extern "C" void mla_paged_attention_prefill(
     int32_t num_seqs, int32_t num_heads,
     int32_t kv_lora_rank, int32_t qk_rope_head_dim,
     int32_t block_size, int32_t max_num_blocks_per_seq,
+    int32_t total_tokens,
     uint32_t dtype, int64_t stream_) {
 
-    if (num_seqs == 0) return;
+    if (num_seqs == 0 || total_tokens == 0) return;
     const cudaStream_t stream = (cudaStream_t)stream_;
 
     constexpr int NUM_THREADS = 256;
     constexpr int NUM_WARPS = NUM_THREADS / MLA_WARP_SIZE;
+    constexpr int TILE_SIZE_V2 = 128;
+    int smem_size = (TILE_SIZE_V2 + NUM_WARPS) * sizeof(float);
 
-    int max_ctx = max_num_blocks_per_seq * block_size;
-    int smem_size = (max_ctx + NUM_WARPS) * sizeof(float);
-    if (smem_size > 48 * 1024) {
-        max_ctx = (48 * 1024) / sizeof(float) - NUM_WARPS;
-        smem_size = 48 * 1024;
-    }
+    int32_t total_tokens_host = total_tokens;
 
-    dim3 grid(num_heads, num_seqs);
+    dim3 grid(num_heads, total_tokens_host);
     dim3 block(NUM_THREADS);
 
-#define LAUNCH_MLA_PREFILL(T, BS)                                             \
-    mla_paged_attention_prefill_kernel<T, BS, NUM_THREADS>                     \
-        <<<grid, block, smem_size, stream>>>(                                  \
-            reinterpret_cast<T*>(out), reinterpret_cast<T*>(q_abs),            \
-            reinterpret_cast<T*>(q_pe), reinterpret_cast<T*>(ckv_cache),       \
-            reinterpret_cast<T*>(kpe_cache), block_tables, context_lens,       \
-            cu_seqlens_q, scale, num_heads, kv_lora_rank, qk_rope_head_dim,   \
-            max_num_blocks_per_seq)
+#define LAUNCH_MLA_PREFILL(T, BS) \
+    mla_paged_attention_prefill_v2_kernel<T, BS, NUM_THREADS> \
+        <<<grid, block, smem_size, stream>>>( \
+            reinterpret_cast<T*>(out), reinterpret_cast<T*>(q_abs), \
+            reinterpret_cast<T*>(q_pe), reinterpret_cast<T*>(ckv_cache), \
+            reinterpret_cast<T*>(kpe_cache), block_tables, context_lens, \
+            cu_seqlens_q, scale, num_seqs, num_heads, \
+            kv_lora_rank, qk_rope_head_dim, max_num_blocks_per_seq, \
+            total_tokens_host)
 
-#define LAUNCH_MLA_PREFILL_BLOCK(T)                                           \
-    switch (block_size) {                                                      \
-        case 16: LAUNCH_MLA_PREFILL(T, 16); break;                            \
-        case 32: LAUNCH_MLA_PREFILL(T, 32); break;                            \
-        case 64: LAUNCH_MLA_PREFILL(T, 64); break;                            \
-        default: break;                                                        \
+#define LAUNCH_MLA_PREFILL_BLOCK(T) \
+    switch (block_size) { \
+        case 16: LAUNCH_MLA_PREFILL(T, 16); break; \
+        case 32: LAUNCH_MLA_PREFILL(T, 32); break; \
+        case 64: LAUNCH_MLA_PREFILL(T, 64); break; \
+        default: break; \
     }
 
     if (dtype == 0) {

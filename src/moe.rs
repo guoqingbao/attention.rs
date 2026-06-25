@@ -400,7 +400,9 @@ pub fn flashinfer_mxfp4_fused_moe(
             Storage::Cuda(c) => match dtype {
                 candle_core::DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
                 candle_core::DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
-                candle_core::DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                candle_core::DType::U8
+                | candle_core::DType::F8E8M0
+                | candle_core::DType::F8E4M3 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
                 candle_core::DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
                 candle_core::DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
                 _ => candle_core::bail!("unsupported dtype {:?}", dtype),
@@ -2706,7 +2708,7 @@ pub fn moe_gemm_gguf(
         );
         let dev = input.device().as_cuda_device()?;
 
-        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5
+        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5, IQ2_XXS: 6, IQ2_XS: 7, IQ3_XXS: 8, IQ4_XS: 9
         let gguf_dtype = match weights.dtype() {
             GgmlDType::Q8_0 => 0,
             GgmlDType::Q4K => 1,
@@ -2714,9 +2716,13 @@ pub fn moe_gemm_gguf(
             GgmlDType::Q3K => 3,
             GgmlDType::Q5K => 4,
             GgmlDType::Q6K => 5,
+            GgmlDType::IQ2_XXS => 6,
+            GgmlDType::IQ2_XS => 7,
+            GgmlDType::IQ3_XXS => 8,
+            GgmlDType::IQ4_XS => 9,
             _ => {
                 candle_core::bail!(
-                    "moe_gemm_gguf `ISQ` only accept q2k, q3k, q4k, q5k, q6k or q8_0 weights!"
+                    "moe_gemm_gguf `ISQ` only accept q2k, q3k, q4k, q5k, q6k, q8_0, iq2_xxs, iq2_xs, iq3_xxs, or iq4_xs weights!"
                 )
             }
         };

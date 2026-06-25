@@ -137,6 +137,53 @@ extern "C" int flashinfer_fp8_blockscale_fp8(const void* input, const float* inp
   }
 }
 
+// Quantize BF16 input to FP8 with 1x128 column-wise scaling.
+// mat: [shape_x, shape_y] BF16 input
+// mat_quant: [shape_x, shape_y] FP8 output (pre-allocated)
+// scales: [shape_x, ceil(shape_y/128)] F32 output (pre-allocated)
+extern "C" int flashinfer_fp8_quantize_1x128(void* mat_quant, float* scales,
+                                             const void* mat, int shape_x, int shape_y,
+                                             int64_t stream_) {
+  try {
+    auto& runner = get_runner();
+    runner.fp8CS1x128(reinterpret_cast<__nv_fp8_e4m3*>(mat_quant), scales,
+                      reinterpret_cast<__nv_bfloat16 const*>(mat), shape_x, shape_y,
+                      reinterpret_cast<cudaStream_t>(stream_));
+    return 0;
+  } catch (std::exception const& e) {
+    std::fprintf(stderr, "flashinfer_fp8_quantize_1x128 failed: %s\n", e.what());
+    return -1;
+  }
+}
+
+// Strided batched FP8 GEMM:
+// mat_a: [num_problems, shape_m, shape_k] FP8 (pre-quantized input)
+// mat_b: [num_problems, shape_n, shape_k] FP8 (weight, row-major)
+// scales_a: [num_problems, shape_m, ceil(shape_k/128)] F32 (activation scales)
+// scales_b: [num_problems, ceil(shape_n/128), ceil(shape_k/128)] F32 (weight scales)
+// mat_d: [num_problems, shape_m, shape_n] BF16 output
+extern "C" int flashinfer_fp8_stride_batch_gemm(void* mat_d, int ld_d, int stride_d,
+                                                void* mat_a, int ld_a, int stride_a,
+                                                const void* mat_b, int ld_b, int stride_b,
+                                                int num_problems, int shape_m, int shape_n,
+                                                int shape_k, float* scales_a,
+                                                int stride_scales_a, const float* scales_b,
+                                                int64_t stream_) {
+  try {
+    auto& runner = get_runner_fp8();
+    runner.strideBatchGemm(reinterpret_cast<__nv_bfloat16*>(mat_d), ld_d, stride_d,
+                           reinterpret_cast<__nv_fp8_e4m3*>(mat_a), ld_a, stride_a,
+                           reinterpret_cast<__nv_fp8_e4m3*>(const_cast<void*>(mat_b)), ld_b,
+                           stride_b, num_problems, shape_m, shape_n, shape_k,
+                           reinterpret_cast<cudaStream_t>(stream_), scales_a, stride_scales_a,
+                           const_cast<float*>(scales_b));
+    return 0;
+  } catch (std::exception const& e) {
+    std::fprintf(stderr, "flashinfer_fp8_stride_batch_gemm failed: %s\n", e.what());
+    return -1;
+  }
+}
+
 #else
 
 extern "C" size_t flashinfer_fp8_blockscale_workspace_size_bf16(int, int, int) { return 0; }
@@ -150,6 +197,16 @@ extern "C" size_t flashinfer_fp8_blockscale_workspace_size_fp8(int, int, int) { 
 
 extern "C" int flashinfer_fp8_blockscale_fp8(const void*, const float*, const void*, const float*,
                                              void*, int, int, int, void*, size_t, int64_t) {
+  return -1;
+}
+
+extern "C" int flashinfer_fp8_quantize_1x128(void*, float*, const void*, int, int, int64_t) {
+  return -1;
+}
+
+extern "C" int flashinfer_fp8_stride_batch_gemm(void*, int, int, void*, int, int, const void*, int,
+                                                int, int, int, int, int, float*, int, const float*,
+                                                int64_t) {
   return -1;
 }
 
