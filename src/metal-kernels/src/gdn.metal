@@ -45,10 +45,11 @@ kernel void causal_conv1d_fwd_varlen_kernel(
     const device T* bias [[buffer(2)]],
     device float* conv_state [[buffer(3)]],
     device T* out [[buffer(4)]],
-    const device uint* cu_seqlens [[buffer(5)]],
-    constant int& batch_size [[buffer(6)]],
-    constant int& d_conv [[buffer(7)]],
-    constant bool& activation_silu [[buffer(8)]],
+    device T* state_snapshots [[buffer(5)]],
+    const device uint* cu_seqlens [[buffer(6)]],
+    constant int& batch_size [[buffer(7)]],
+    constant int& d_conv [[buffer(8)]],
+    constant bool& activation_silu [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint channel_idx = gid.x;
@@ -96,6 +97,14 @@ kernel void causal_conv1d_fwd_varlen_kernel(
                 history[i] = history[i + 1];
             }
             history[KERNEL_SIZE - 2] = x_t;
+        }
+
+        if (state_snapshots != nullptr) {
+            device T* snapshot_ptr = state_snapshots +
+                ((start + t) * d_conv + channel_idx) * (KERNEL_SIZE - 1);
+            for (uint i = 0; i + 1 < KERNEL_SIZE; ++i) {
+                snapshot_ptr[i] = gdn_from_float<T>(history[i]);
+            }
         }
     }
 
@@ -500,11 +509,12 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
-    const device uint* cu_seqlens [[buffer(8)]],
-    constant int& batch [[buffer(9)]],
-    constant int& num_heads [[buffer(10)]],
-    constant int& k_dim [[buffer(11)]],
-    constant int& v_dim [[buffer(12)]],
+    device float* state_snapshots [[buffer(8)]],
+    const device uint* cu_seqlens [[buffer(9)]],
+    constant int& batch [[buffer(10)]],
+    constant int& num_heads [[buffer(11)]],
+    constant int& k_dim [[buffer(12)]],
+    constant int& v_dim [[buffer(13)]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
@@ -580,6 +590,14 @@ kernel void gated_delta_rule_recurrence_varlen_kernel(
             y += s[j] * q_shared[j];
         }
         out[v_base + v_idx] = gdn_from_float<T>(y);
+
+        if (state_snapshots != nullptr) {
+            device float* snapshot_head = state_snapshots +
+                ((start + t) * num_heads + head_idx) * k_dim * v_dim;
+            for (uint j = 0; j < BK; ++j) {
+                snapshot_head[j * v_dim + v_idx] = s[j];
+            }
+        }
     }
 
     for (uint j = 0; j < BK; ++j) {
@@ -598,13 +616,14 @@ kernel void gated_delta_rule_recurrence_varlen_gqa_kernel(
     device float* state [[buffer(5)]],
     const device int64_t* slots [[buffer(6)]],
     device T* out [[buffer(7)]],
-    const device uint* cu_seqlens [[buffer(8)]],
-    constant int& batch [[buffer(9)]],
-    constant int& num_v_heads [[buffer(10)]],
-    constant int& num_k_heads [[buffer(11)]],
-    constant int& k_dim [[buffer(12)]],
-    constant int& v_dim [[buffer(13)]],
-    constant float& q_scale [[buffer(14)]],
+    device float* state_snapshots [[buffer(8)]],
+    const device uint* cu_seqlens [[buffer(9)]],
+    constant int& batch [[buffer(10)]],
+    constant int& num_v_heads [[buffer(11)]],
+    constant int& num_k_heads [[buffer(12)]],
+    constant int& k_dim [[buffer(13)]],
+    constant int& v_dim [[buffer(14)]],
+    constant float& q_scale [[buffer(15)]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
@@ -685,6 +704,16 @@ kernel void gated_delta_rule_recurrence_varlen_gqa_kernel(
             }
         }
         out[v_base + v_idx] = gdn_from_float<T>(y);
+
+        if (state_snapshots != nullptr) {
+            device float* snapshot_head = state_snapshots +
+                ((start + t) * num_v_heads + v_head_idx) * k_dim * v_dim;
+            for (uint j = 0; j < BK; ++j) {
+                if (j < static_cast<uint>(k_dim)) {
+                    snapshot_head[j * v_dim + v_idx] = s[j];
+                }
+            }
+        }
     }
 
     for (uint j = 0; j < BK; ++j) {
@@ -726,10 +755,11 @@ template [[host_name("gdn_causal_conv1d_fwd_" #type "_k" #ksize)]] \
     const device type* bias [[buffer(2)]], \
     device float* conv_state [[buffer(3)]], \
     device type* out [[buffer(4)]], \
-    const device uint* cu_seqlens [[buffer(5)]], \
-    constant int& batch_size [[buffer(6)]], \
-    constant int& d_conv [[buffer(7)]], \
-    constant bool& activation_silu [[buffer(8)]], \
+    device type* state_snapshots [[buffer(5)]], \
+    const device uint* cu_seqlens [[buffer(6)]], \
+    constant int& batch_size [[buffer(7)]], \
+    constant int& d_conv [[buffer(8)]], \
+    constant bool& activation_silu [[buffer(9)]], \
     uint2 gid [[thread_position_in_grid]]);
 
 #define INSTANTIATE_CONV_UPDATE(type, ksize) \
@@ -847,11 +877,12 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_" #type "_k" #bk)]]
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
-    const device uint* cu_seqlens [[buffer(8)]], \
-    constant int& batch [[buffer(9)]], \
-    constant int& num_heads [[buffer(10)]], \
-    constant int& k_dim [[buffer(11)]], \
-    constant int& v_dim [[buffer(12)]], \
+    device float* state_snapshots [[buffer(8)]], \
+    const device uint* cu_seqlens [[buffer(9)]], \
+    constant int& batch [[buffer(10)]], \
+    constant int& num_heads [[buffer(11)]], \
+    constant int& k_dim [[buffer(12)]], \
+    constant int& v_dim [[buffer(13)]], \
     uint3 tid3 [[thread_position_in_threadgroup]], \
     uint3 tgid [[threadgroup_position_in_grid]]);
 
@@ -933,13 +964,14 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_gqa_" #type "_k" #b
     device float* state [[buffer(5)]], \
     const device int64_t* slots [[buffer(6)]], \
     device type* out [[buffer(7)]], \
-    const device uint* cu_seqlens [[buffer(8)]], \
-    constant int& batch [[buffer(9)]], \
-    constant int& num_v_heads [[buffer(10)]], \
-    constant int& num_k_heads [[buffer(11)]], \
-    constant int& k_dim [[buffer(12)]], \
-    constant int& v_dim [[buffer(13)]], \
-    constant float& q_scale [[buffer(14)]], \
+    device float* state_snapshots [[buffer(8)]], \
+    const device uint* cu_seqlens [[buffer(9)]], \
+    constant int& batch [[buffer(10)]], \
+    constant int& num_v_heads [[buffer(11)]], \
+    constant int& num_k_heads [[buffer(12)]], \
+    constant int& k_dim [[buffer(13)]], \
+    constant int& v_dim [[buffer(14)]], \
+    constant float& q_scale [[buffer(15)]], \
     uint3 tid3 [[thread_position_in_threadgroup]], \
     uint3 tgid [[threadgroup_position_in_grid]]);
 

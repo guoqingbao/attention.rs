@@ -149,6 +149,7 @@ pub fn causal_conv1d_fwd(
     weight: &Tensor,
     bias: Option<&Tensor>,
     conv_state: &mut Tensor,
+    state_snapshots: Option<&Tensor>,
     cu_seqlens: Option<&Tensor>,
     activation_silu: bool,
 ) -> Result<Tensor> {
@@ -191,11 +192,23 @@ pub fn causal_conv1d_fwd(
     let batch = conv_state.dim(0)?;
     let out = Tensor::zeros((total_tokens, d_conv), x_c.dtype(), x_c.device())?;
 
+    let snap_c = state_snapshots.map(ensure_contiguous).transpose()?;
+    if let Some(ref s) = snap_c {
+        if s.dtype() != x_c.dtype() {
+            candle_core::bail!(
+                "metal causal_conv1d_fwd: state_snapshots dtype {:?} != x dtype {:?}",
+                s.dtype(),
+                x_c.dtype()
+            );
+        }
+    }
+
     let x_m = get_metal_slice(&x_c)?;
     let weight_m = get_metal_slice(&weight_c)?;
     let bias_m = bias_c.as_ref().map(get_metal_slice).transpose()?;
     let state_m = get_metal_slice(conv_state)?;
     let out_m = get_metal_slice(&out)?;
+    let snap_m = snap_c.as_ref().map(get_metal_slice).transpose()?;
     let cu_m = get_metal_slice_with_dtype_size(&cu_u32, std::mem::size_of::<u32>())?;
 
     let dev = x_m.storage.device();
@@ -217,6 +230,9 @@ pub fn causal_conv1d_fwd(
         state_m.offset_in_bytes,
         out_m.storage.buffer(),
         out_m.offset_in_bytes,
+        snap_m
+            .as_ref()
+            .map(|s| (s.storage.buffer(), s.offset_in_bytes)),
         cu_m.storage.buffer(),
         cu_m.offset_in_bytes,
         batch as i32,
@@ -785,6 +801,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     state: &mut Tensor,
     slots: &Tensor,
     cu_seqlens: &Tensor,
+    state_snapshots: Option<&Tensor>,
 ) -> Result<Tensor> {
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
@@ -813,6 +830,16 @@ pub fn gated_delta_rule_recurrence_varlen(
     let batch = slots_c.dim(0)?;
     let out = Tensor::zeros((total_tokens, num_heads, v_dim), q_c.dtype(), q_c.device())?;
 
+    if let Some(snap) = state_snapshots {
+        if snap.dtype() != DType::F32 {
+            candle_core::bail!(
+                "metal gated_delta_rule_recurrence_varlen: state_snapshots must be F32, got {:?}",
+                snap.dtype()
+            );
+        }
+    }
+    let snap_c = state_snapshots.map(ensure_contiguous).transpose()?;
+
     let q_m = get_metal_slice(&q_c)?;
     let k_m = get_metal_slice(&k_c)?;
     let v_m = get_metal_slice(&v_c)?;
@@ -821,6 +848,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     let state_m = get_metal_slice(state)?;
     let slots_m = get_metal_slice_with_dtype_size(&slots_c, std::mem::size_of::<i64>())?;
     let out_m = get_metal_slice(&out)?;
+    let snap_m = snap_c.as_ref().map(get_metal_slice).transpose()?;
     let cu_m = get_metal_slice_with_dtype_size(&cu_u32, std::mem::size_of::<u32>())?;
     let dev = q_m.storage.device();
     let command_buffer = dev.command_buffer()?;
@@ -846,6 +874,9 @@ pub fn gated_delta_rule_recurrence_varlen(
         slots_m.offset_in_bytes,
         out_m.storage.buffer(),
         out_m.offset_in_bytes,
+        snap_m
+            .as_ref()
+            .map(|s| (s.storage.buffer(), s.offset_in_bytes)),
         cu_m.storage.buffer(),
         cu_m.offset_in_bytes,
         batch as i32,
@@ -870,6 +901,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
     slots: &Tensor,
     cu_seqlens: &Tensor,
     q_scale: f32,
+    state_snapshots: Option<&Tensor>,
 ) -> Result<Tensor> {
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
@@ -892,6 +924,15 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             state.dtype()
         );
     }
+    if let Some(snap) = state_snapshots {
+        if snap.dtype() != DType::F32 {
+            candle_core::bail!(
+                "metal gated_delta_rule_recurrence_varlen_gqa: state_snapshots must be F32, got {:?}",
+                snap.dtype()
+            );
+        }
+    }
+    let snap_c = state_snapshots.map(ensure_contiguous).transpose()?;
 
     let (total_tokens, num_k_heads, k_dim) = q_c.dims3()?;
     let num_v_heads = v_c.dim(1)?;
@@ -920,6 +961,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
     let state_m = get_metal_slice(state)?;
     let slots_m = get_metal_slice_with_dtype_size(&slots_c, std::mem::size_of::<i64>())?;
     let out_m = get_metal_slice(&out)?;
+    let snap_m = snap_c.as_ref().map(get_metal_slice).transpose()?;
     let cu_m = get_metal_slice_with_dtype_size(&cu_u32, std::mem::size_of::<u32>())?;
     let dev = q_m.storage.device();
     let command_buffer = dev.command_buffer()?;
@@ -945,6 +987,9 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
         slots_m.offset_in_bytes,
         out_m.storage.buffer(),
         out_m.offset_in_bytes,
+        snap_m
+            .as_ref()
+            .map(|s| (s.storage.buffer(), s.offset_in_bytes)),
         cu_m.storage.buffer(),
         cu_m.offset_in_bytes,
         batch as i32,
@@ -965,6 +1010,7 @@ pub fn causal_conv1d_fwd(
     weight: &Tensor,
     bias: Option<&Tensor>,
     conv_state: &mut Tensor,
+    state_snapshots: Option<&Tensor>,
     cu_seqlens: Option<&Tensor>,
     activation_silu: bool,
 ) -> Result<Tensor> {
@@ -995,6 +1041,27 @@ pub fn causal_conv1d_fwd(
             };
             let state_ptr = get_cuda_mut_ptr(conv_state)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
+            let snapshots_ptr = if let Some(snapshots) = state_snapshots {
+                if snapshots.dtype() != x.dtype() {
+                    candle_core::bail!(
+                        "causal_conv1d_fwd snapshot dtype mismatch: snapshots={:?}, x={:?}",
+                        snapshots.dtype(),
+                        x.dtype()
+                    );
+                }
+                if snapshots.dims() != [total_tokens, d_conv, kernel_size.saturating_sub(1)] {
+                    candle_core::bail!(
+                        "causal_conv1d_fwd snapshot shape {:?} != expected [{}, {}, {}]",
+                        snapshots.shape(),
+                        total_tokens,
+                        d_conv,
+                        kernel_size.saturating_sub(1)
+                    );
+                }
+                get_cuda_mut_ptr(snapshots)?
+            } else {
+                std::ptr::null_mut()
+            };
             let cu_ptr = get_cuda_const_ptr_u32(&cu_u32)?;
             let stream = *dev.cu_stream() as i64;
 
@@ -1007,6 +1074,7 @@ pub fn causal_conv1d_fwd(
                         bias_ptr,
                         state_f32_ptr,
                         out_ptr,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1020,6 +1088,7 @@ pub fn causal_conv1d_fwd(
                         bias_ptr,
                         state_f32_ptr,
                         out_ptr,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1033,6 +1102,7 @@ pub fn causal_conv1d_fwd(
                         bias_ptr as *const f32,
                         state_f32_ptr,
                         out_ptr as *mut f32,
+                        snapshots_ptr as *mut f32,
                         cu_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1917,6 +1987,7 @@ pub fn gated_delta_rule_recurrence_varlen(
     state: &mut Tensor,
     slots: &Tensor,
     cu_seqlens: &Tensor,
+    state_snapshots: Option<&Tensor>,
 ) -> Result<Tensor> {
     match q.device() {
         Device::Cuda(dev) => {
@@ -1964,6 +2035,27 @@ pub fn gated_delta_rule_recurrence_varlen(
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
+            let snapshots_ptr = if let Some(snapshots) = state_snapshots {
+                if snapshots.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "gated_delta_rule_recurrence_varlen snapshot expects F32, got {:?}",
+                        snapshots.dtype()
+                    );
+                }
+                if snapshots.dims() != [total_tokens, num_heads, k_dim, v_dim] {
+                    candle_core::bail!(
+                        "gated_delta_rule_recurrence_varlen snapshot shape {:?} != expected [{}, {}, {}, {}]",
+                        snapshots.shape(),
+                        total_tokens,
+                        num_heads,
+                        k_dim,
+                        v_dim
+                    );
+                }
+                get_cuda_mut_ptr(snapshots)? as *mut f32
+            } else {
+                std::ptr::null_mut()
+            };
             let stream = *dev.cu_stream() as i64;
 
             match q.dtype() {
@@ -1977,6 +2069,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                         state_ptr,
                         slots_ptr,
                         out_ptr as *mut f32,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_heads as c_int,
@@ -1995,6 +2088,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                         state_ptr,
                         slots_ptr,
                         out_ptr as *mut c_void,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_heads as c_int,
@@ -2013,6 +2107,7 @@ pub fn gated_delta_rule_recurrence_varlen(
                         state_ptr,
                         slots_ptr,
                         out_ptr as *mut c_void,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_heads as c_int,
@@ -2050,6 +2145,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
     slots: &Tensor,
     cu_seqlens: &Tensor,
     q_scale: f32,
+    state_snapshots: Option<&Tensor>,
 ) -> Result<Tensor> {
     match q.device() {
         Device::Cuda(dev) => {
@@ -2090,14 +2186,28 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             let slots_ptr = get_cuda_const_ptr_i64(slots)?;
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
+            let snapshots_ptr = if let Some(snapshots) = state_snapshots {
+                if snapshots.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "gated_delta_rule_recurrence_varlen_gqa snapshot expects F32, got {:?}",
+                        snapshots.dtype()
+                    );
+                }
+                if snapshots.dims() != [total_tokens, num_v_heads, k_dim, v_dim] {
+                    candle_core::bail!(
+                        "gated_delta_rule_recurrence_varlen_gqa snapshot shape {:?} != expected [{}, {}, {}, {}]",
+                        snapshots.shape(),
+                        total_tokens,
+                        num_v_heads,
+                        k_dim,
+                        v_dim
+                    );
+                }
+                get_cuda_mut_ptr(snapshots)? as *mut f32
+            } else {
+                std::ptr::null_mut()
+            };
             let stream = *dev.cu_stream() as i64;
-
-            // NOTE: FlashInfer's WGMMA-based delta rule prefill kernel (SM90) is disabled.
-            // It processes sequences in 64-token blocks, truncating the F32 recurrent state
-            // to BF16 for WGMMA operands and using an FP16 matrix inverse each block.
-            // The rounding error compounds across blocks, corrupting the recurrent state
-            // and producing degraded output (repeated text) for longer prompts.
-            // The native sequential kernel maintains full F32 precision throughout.
 
             match q.dtype() {
                 DType::BF16 => unsafe {
@@ -2110,6 +2220,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
                         state_ptr,
                         slots_ptr,
                         out_ptr,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_v_heads as c_int,
@@ -2130,6 +2241,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
                         state_ptr,
                         slots_ptr,
                         out_ptr,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_v_heads as c_int,
@@ -2150,6 +2262,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
                         state_ptr,
                         slots_ptr,
                         out_ptr as *mut f32,
+                        snapshots_ptr,
                         cu_ptr,
                         batch as c_int,
                         num_v_heads as c_int,
