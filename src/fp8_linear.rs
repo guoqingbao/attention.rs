@@ -84,8 +84,17 @@ pub fn fp8_matmul(
     {
         let use_cutlass = sm_version >= 90 && block_size == [128, 128];
         if use_cutlass {
-            let cutlass_scale = weight_scale_cutlass.unwrap_or(weight_scale);
-            return fp8_matmul_cutlass(&input, &weight.t()?, cutlass_scale, block_size);
+            let cutlass_scale = match weight_scale_cutlass {
+                Some(s) => s.clone(),
+                None => {
+                    if sm_version >= 100 {
+                        weight_scale.t()?
+                    } else {
+                        weight_scale.t()?.contiguous()?
+                    }
+                }
+            };
+            return fp8_matmul_cutlass(&input, &weight.t()?, &cutlass_scale, block_size);
         }
     }
 
@@ -123,9 +132,10 @@ pub fn fp8_matmul_fallback(
 
     let dev = input.device();
     let dtype = input.dtype();
+    let scale_is_e8m0 = weight_scale.dtype() == DType::F8E8M0;
     assert!(
-        weight_scale.dtype() == DType::F32,
-        "fp8_matmul expects f32 scales, got {:?}",
+        weight_scale.dtype() == DType::F32 || scale_is_e8m0,
+        "fp8_matmul expects f32 or F8E8M0 scales, got {:?}",
         weight_scale.dtype()
     );
     let scale_row_stride = (k_w + block_size[1] - 1) / block_size[1];
@@ -153,11 +163,17 @@ pub fn fp8_matmul_fallback(
             let weight_ptr = *weight_slice.device_ptr() as *const u8;
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            let scale_ptr = match &*scale_storage {
+                candle_core::Storage::Cuda(c) => {
+                    if scale_is_e8m0 {
+                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const core::ffi::c_void
+                    } else {
+                        *c.as_cuda_slice::<f32>()?.device_ptr() as *const core::ffi::c_void
+                    }
+                }
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
+            let scale_dtype = if scale_is_e8m0 { 1i32 } else { 0i32 };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_slice = match &*output_storage {
@@ -172,7 +188,7 @@ pub fn fp8_matmul_fallback(
                 ffi::fp8_matmul_f16(
                     input_ptr,
                     weight_ptr,
-                    weight_scale_ptr,
+                    scale_ptr,
                     output_ptr,
                     m as i32,
                     n as i32,
@@ -180,6 +196,7 @@ pub fn fp8_matmul_fallback(
                     scale_row_stride as i32,
                     block_size[0] as i32,
                     block_size[1] as i32,
+                    scale_dtype,
                     stream,
                 )
             }
@@ -201,11 +218,17 @@ pub fn fp8_matmul_fallback(
             let weight_ptr = *weight_slice.device_ptr() as *const u8;
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
-            let scale_slice = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+            let scale_ptr = match &*scale_storage {
+                candle_core::Storage::Cuda(c) => {
+                    if scale_is_e8m0 {
+                        *c.as_cuda_slice::<u8>()?.device_ptr() as *const core::ffi::c_void
+                    } else {
+                        *c.as_cuda_slice::<f32>()?.device_ptr() as *const core::ffi::c_void
+                    }
+                }
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
-            let weight_scale_ptr = *scale_slice.device_ptr() as *const f32;
+            let scale_dtype = if scale_is_e8m0 { 1i32 } else { 0i32 };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_slice = match &*output_storage {
@@ -220,7 +243,7 @@ pub fn fp8_matmul_fallback(
                 ffi::fp8_matmul_bf16(
                     input_ptr,
                     weight_ptr,
-                    weight_scale_ptr,
+                    scale_ptr,
                     output_ptr,
                     m as i32,
                     n as i32,
@@ -228,6 +251,7 @@ pub fn fp8_matmul_fallback(
                     scale_row_stride as i32,
                     block_size[0] as i32,
                     block_size[1] as i32,
+                    scale_dtype,
                     stream,
                 )
             }
@@ -468,9 +492,19 @@ pub fn fp8_matmul_cutlass(
         candle_core::bail!("mat_b (K dim) must be multiple of 16 bytes");
     }
 
-    if weight_scale.dim(0)? != weight.dim(0)? / 128 || weight_scale.dim(1)? != weight.dim(1)? / 128
-    {
-        candle_core::bail!("scales_b shape mismatch");
+    let expected_scale_dim0 = (weight.dim(0)? + block_size[0] - 1) / block_size[0];
+    let expected_scale_dim1 = (weight.dim(1)? + block_size[1] - 1) / block_size[1];
+    if weight_scale.dim(0)? != expected_scale_dim0 || weight_scale.dim(1)? != expected_scale_dim1 {
+        candle_core::bail!(
+            "scales_b shape mismatch: expected [{}, {}], got [{}, {}] for weight [{}, {}] with block_size {:?}",
+            expected_scale_dim0,
+            expected_scale_dim1,
+            weight_scale.dim(0)?,
+            weight_scale.dim(1)?,
+            weight.dim(0)?,
+            weight.dim(1)?,
+            block_size
+        );
     }
 
     let weight_scale_stride = weight_scale.stride();
@@ -617,3 +651,560 @@ pub fn fp8_matmul_cutlass(
 
     Ok(output)
 }
+
+/// Fused grouped FP8 matmul for block-diagonal linear layers.
+///
+/// Computes: for each group g in [0..n_groups):
+///   output[g] = input[g] @ weight[g].T
+///
+/// where input is [n_groups, seq_len, k] and weight is [n_groups * n, k] (stacked).
+///
+/// Uses CUTLASS grouped GEMM (single kernel launch) on SM90+ for seq_len > 1,
+/// falls back to per-group fp8_matmul otherwise.
+///
+/// # Arguments
+/// * `input` - BF16 tensor [n_groups, seq_len, k] (contiguous, already grouped)
+/// * `group_weights` - Vec of FP8 weight tensors [n, k] per group
+/// * `group_scales` - Vec of F32/E8M0 scale tensors per group
+/// * `group_scales_cutlass` - Vec of optional pre-transposed scale tensors per group
+/// * `block_size` - [block_size_y, block_size_x]
+/// * `is_prefill` - whether in prefill phase
+#[allow(unused)]
+pub fn fp8_grouped_matmul(
+    input: &Tensor,
+    group_weights: &[Tensor],
+    group_scales: &[Tensor],
+    group_scales_cutlass: &[Option<Tensor>],
+    block_size: &[usize],
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let n_groups = group_weights.len();
+    if n_groups == 0 {
+        candle_core::bail!("fp8_grouped_matmul: no groups provided");
+    }
+    let (n_groups_in, seq_len, k) = input.dims3()?;
+    if n_groups_in != n_groups {
+        candle_core::bail!(
+            "fp8_grouped_matmul: input groups {} != weight groups {}",
+            n_groups_in,
+            n_groups
+        );
+    }
+    let n = group_weights[0].dim(0)?;
+
+    #[cfg(feature = "cuda")]
+    let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
+        cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
+    } else {
+        0
+    };
+    #[cfg(not(feature = "cuda"))]
+    let sm_version = 0;
+
+    // For SM90+ CUTLASS with [128,128] block size, use fused grouped GEMM during prefill.
+    // Decode uses per-group path which is CUDA graph compatible (no dynamic allocations).
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
+    if is_prefill
+        && sm_version >= 90
+        && block_size == [128, 128]
+        && group_scales[0].dtype() == candle_core::DType::F32
+    {
+        return fp8_grouped_matmul_cutlass(
+            input,
+            group_weights,
+            group_scales,
+            n_groups,
+            seq_len,
+            n,
+            k,
+            sm_version,
+        );
+    }
+
+    // Fallback: per-group fp8_matmul (no extra allocations needed)
+    let mut group_outputs = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let g_input = input.narrow(0, g, 1)?.squeeze(0)?;
+        let out = fp8_matmul(
+            &g_input,
+            &group_weights[g],
+            &group_scales[g],
+            group_scales_cutlass[g].as_ref(),
+            block_size,
+            is_prefill,
+        )?;
+        group_outputs.push(out);
+    }
+    Tensor::cat(&group_outputs, 1)
+}
+
+/// Fused grouped GEMM using CUTLASS for SM90+ (single kernel launch).
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+fn fp8_grouped_matmul_cutlass(
+    input: &Tensor,
+    group_weights: &[Tensor],
+    group_scales: &[Tensor],
+    n_groups: usize,
+    seq_len: usize,
+    n: usize,
+    k: usize,
+    sm_version: usize,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::WrapErr;
+
+    let device = input.device().clone();
+    let total_m = n_groups * seq_len;
+    let k_blocks = (k + 128 - 1) / 128;
+    let is_column_major_scales = sm_version >= 100;
+
+    // 1. Reshape input [n_groups, seq_len, k] -> [n_groups * seq_len, k] as BF16
+    let input_flat = input.reshape((total_m, k))?.contiguous()?;
+
+    // 2. Quantize BF16 input to FP8 with per-token-group scales
+    let input_q = unsafe { Tensor::empty_((total_m, k), DType::U8, &device)? };
+    let input_scale = if is_column_major_scales {
+        unsafe { Tensor::empty_((k_blocks, total_m), DType::F32, &device)? }.t()?
+    } else {
+        unsafe { Tensor::empty_((total_m, k_blocks), DType::F32, &device)? }
+    };
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda_dev = device.as_cuda_device()?;
+        let stream = *cuda_dev.cu_stream() as i64;
+
+        let (input_storage, _input_layout) = input_flat.storage_and_layout();
+        let input_ptr = match &*input_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::bf16>()?.device_ptr(),
+            _ => candle_core::bail!("input must be cuda"),
+        };
+        let (iq_storage, _) = input_q.storage_and_layout();
+        let iq_ptr = match &*iq_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+            _ => candle_core::bail!("input_q must be cuda"),
+        };
+        let (is_storage, _) = input_scale.storage_and_layout();
+        let is_ptr = match &*is_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+            _ => candle_core::bail!("input_scale must be cuda"),
+        };
+
+        let num_groups_quant = (total_m * k_blocks) as i32;
+        unsafe {
+            ffi::fp8_quantize_per_token_group_launch(
+                input_ptr as *const std::ffi::c_void,
+                iq_ptr as *mut std::ffi::c_void,
+                is_ptr as *mut f32,
+                num_groups_quant,
+                128, // group_size
+                k_blocks as i32,
+                if is_column_major_scales {
+                    total_m as i32
+                } else {
+                    k_blocks as i32
+                },
+                false, // is_input_f16 (BF16)
+                is_column_major_scales,
+                stream,
+            );
+        }
+
+        // 3. Stack weights and scales (they're already contiguous per group from pre-slicing)
+        let stacked_weights = Tensor::cat(group_weights, 0)?; // [n_groups * n, k]
+        let stacked_scales = Tensor::cat(group_scales, 0)?; // [n_groups * scale_n, scale_k]
+
+        // 4. Create expert_offsets: [0, seq_len, 2*seq_len, ..., n_groups*seq_len]
+        let cuda_dev = device.as_cuda_device()?;
+        let offsets: Vec<i32> = (0..=n_groups).map(|g| (g * seq_len) as i32).collect();
+        let expert_offsets = cuda_dev.htod_sync_copy(&offsets).w()?;
+
+        // 5. Allocate output
+        let output = Tensor::zeros((total_m, n), DType::BF16, &device)?;
+
+        let (sw_storage, _) = stacked_weights.storage_and_layout();
+        let sw_ptr = match &*sw_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+            _ => candle_core::bail!("stacked_weights must be cuda"),
+        };
+        let (ss_storage, _) = stacked_scales.storage_and_layout();
+        let ss_ptr = match &*ss_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+            _ => candle_core::bail!("stacked_scales must be cuda"),
+        };
+        let eo_ptr = *expert_offsets.device_ptr();
+        let (out_storage, _) = output.storage_and_layout();
+        let out_ptr = match &*out_storage {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::bf16>()?.device_ptr(),
+            _ => candle_core::bail!("output must be cuda"),
+        };
+
+        unsafe {
+            ffi::moe_fp8_grouped_gemm_bf16(
+                iq_ptr as *const u8,
+                sw_ptr as *const u8,
+                is_ptr as *const f32,
+                ss_ptr as *const f32,
+                eo_ptr as *const i32,
+                n_groups as i32,
+                total_m as i32,
+                n as i32,
+                k as i32,
+                128, // block_size_n
+                128, // block_size_k
+                sm_version as i32,
+                out_ptr as *mut std::ffi::c_void,
+                stream,
+            );
+        }
+
+        // 6. Reshape output [n_groups * seq_len, n] -> [seq_len, n_groups * n]
+        let output = output.reshape((n_groups, seq_len, n))?;
+        let output = output.transpose(0, 1)?.contiguous()?;
+        return output.reshape((seq_len, n_groups * n));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    candle_core::bail!("fp8_grouped_matmul_cutlass requires CUDA")
+}
+
+/// FP8 grouped matmul via FlashInfer strided batch GEMM (CUDA graph safe).
+///
+/// This performs a batched FP8 GEMM using a single kernel call:
+/// 1. Quantize BF16 activations to FP8 with 1x128 column-wise scales
+/// 2. Run strided batched FP8 GEMM with block-wise weight scales
+///
+/// No intermediate tensor allocations/drops, making it safe for CUDA graph capture.
+///
+/// input: [n_groups, seq_len, k] BF16 (contiguous)
+/// group_weights: pre-stacked [n_groups, n, k] U8 (FP8_E4M3, contiguous)  
+/// group_scales: pre-stacked [n_groups, ceil(n/128), ceil(k/128)] F32 (contiguous)
+/// Returns: [n_groups, seq_len, n] BF16
+#[cfg(feature = "flashinfer")]
+pub fn fp8_grouped_matmul_strided(
+    input: &Tensor,
+    stacked_weights: &Tensor,
+    stacked_scales: &Tensor,
+    n_groups: usize,
+    seq_len: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let dev = input.device().as_cuda_device()?;
+        let stream = *dev.cu_stream() as i64;
+
+        // Allocate output: [n_groups, seq_len, n] BF16
+        let output = Tensor::zeros((n_groups, seq_len, n), DType::BF16, input.device())?;
+
+        // Allocate FP8 quantized input buffer: [n_groups, seq_len, k] U8
+        let input_q = unsafe { Tensor::empty_((n_groups, seq_len, k), DType::U8, input.device())? };
+
+        // Allocate activation scales: [n_groups * seq_len, ceil(k/128)] F32
+        let scale_k = (k + 127) / 128;
+        let input_scales =
+            unsafe { Tensor::empty_((n_groups * seq_len, scale_k), DType::F32, input.device())? };
+
+        // Get raw pointers via storage access (scoped to drop guards before Ok(output))
+        let input_ptr = {
+            let (s, _) = input.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *const std::ffi::c_void
+                }
+                _ => candle_core::bail!("input must be a CUDA tensor"),
+            }
+        };
+
+        let input_q_ptr = {
+            let (s, _) = input_q.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<u8>()?.device_ptr() as *mut std::ffi::c_void
+                }
+                _ => candle_core::bail!("input_q must be a CUDA tensor"),
+            }
+        };
+
+        let input_scales_ptr = {
+            let (s, _) = input_scales.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<f32>()?.device_ptr() as *mut f32
+                }
+                _ => candle_core::bail!("input_scales must be a CUDA tensor"),
+            }
+        };
+
+        let output_ptr = {
+            let (s, _) = output.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *mut std::ffi::c_void
+                }
+                _ => candle_core::bail!("output must be a CUDA tensor"),
+            }
+        };
+
+        let weights_ptr = {
+            let (s, _) = stacked_weights.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
+                }
+                _ => candle_core::bail!("weights must be a CUDA tensor"),
+            }
+        };
+
+        let scales_ptr = {
+            let (s, _) = stacked_scales.storage_and_layout();
+            match &*s {
+                candle_core::Storage::Cuda(c) => {
+                    *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32
+                }
+                _ => candle_core::bail!("scales must be a CUDA tensor"),
+            }
+        };
+
+        // Step 1: Quantize BF16 input to FP8 with 1x128 column-wise scales
+        let total_rows = (n_groups * seq_len) as i32;
+        let ret = unsafe {
+            kernels::ffi::flashinfer_fp8_quantize_1x128(
+                input_q_ptr,
+                input_scales_ptr,
+                input_ptr,
+                total_rows,
+                k as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("flashinfer_fp8_quantize_1x128 failed with code {}", ret);
+        }
+
+        // Step 2: Strided batched FP8 GEMM
+        let ld_a = k as i32;
+        let stride_a = (seq_len * k) as i32;
+        let ld_b = k as i32;
+        let stride_b = (n * k) as i32;
+        let ld_d = n as i32;
+        let stride_d = (seq_len * n) as i32;
+        let stride_scales_a = (seq_len * scale_k) as i32;
+
+        let ret = unsafe {
+            kernels::ffi::flashinfer_fp8_stride_batch_gemm(
+                output_ptr,
+                ld_d,
+                stride_d,
+                input_q_ptr,
+                ld_a,
+                stride_a,
+                weights_ptr,
+                ld_b,
+                stride_b,
+                n_groups as i32,
+                seq_len as i32,
+                n as i32,
+                k as i32,
+                input_scales_ptr,
+                stride_scales_a,
+                scales_ptr,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("flashinfer_fp8_stride_batch_gemm failed with code {}", ret);
+        }
+
+        Ok(output)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            input,
+            stacked_weights,
+            stacked_scales,
+            n_groups,
+            seq_len,
+            n,
+            k,
+        );
+        candle_core::bail!("fp8_grouped_matmul_strided requires cuda feature")
+    }
+}
+
+/// Fused grouped FP8 GEMM using CUTLASS (no FlashInfer dependency, CUDA graph safe).
+///
+/// Quantizes BF16 input to FP8 in one kernel, then runs per-group CUTLASS FP8 GEMM.
+/// Uses pooled scratch buffers to avoid per-call allocations (required for CUDA graph).
+///
+/// - input: [n_groups, seq_len, k] BF16
+/// - stacked_weights: [n_groups, n, k] U8 (FP8_E4M3)
+/// - stacked_scales: [n_groups, ceil(n/128), ceil(k/128)] F32
+/// - Returns: [n_groups, seq_len, n] BF16
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+pub fn fp8_grouped_gemm_fused(
+    input: &Tensor,
+    stacked_weights: &Tensor,
+    stacked_scales: &Tensor,
+    n_groups: usize,
+    seq_len: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
+    let dev = input.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+    let sm_version = cuda_utils::sm_version(dev).unwrap_or(0) as i32;
+
+    let output = Tensor::zeros((n_groups, seq_len, n), DType::BF16, input.device())?;
+
+    let total_rows = n_groups * seq_len;
+    let scale_k = (k + 127) / 128;
+    let input_q_bytes = total_rows * k;
+    let input_scales_bytes = total_rows * scale_k * 4; // f32
+
+    // Get pooled scratch buffers (grow-only, never freed during execution)
+    let (input_q_ptr, input_scales_ptr) =
+        get_grouped_gemm_scratch(dev, input_q_bytes, input_scales_bytes)?;
+
+    // Reshape input to [n_groups * seq_len, k] for quantization
+    let input_flat = input.reshape((total_rows, k))?.contiguous()?;
+
+    let input_ptr = {
+        let (s, _) = input_flat.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *const std::ffi::c_void
+            }
+            _ => candle_core::bail!("input must be a CUDA tensor"),
+        }
+    };
+
+    let output_ptr = {
+        let (s, _) = output.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *mut std::ffi::c_void
+            }
+            _ => candle_core::bail!("output must be a CUDA tensor"),
+        }
+    };
+
+    let weights_ptr = {
+        let (s, _) = stacked_weights.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<u8>()?.device_ptr() as *const std::ffi::c_void
+            }
+            _ => candle_core::bail!("weights must be a CUDA tensor"),
+        }
+    };
+
+    let scales_ptr = {
+        let (s, _) = stacked_scales.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,
+            _ => candle_core::bail!("scales must be a CUDA tensor"),
+        }
+    };
+
+    let (ws_ptr, ws_size) = crate::workspace::get_cutlass_workspace(dev, 0)?;
+
+    let ret = unsafe {
+        kernels::ffi::fp8_grouped_gemm_fused(
+            input_ptr,
+            input_q_ptr,
+            input_scales_ptr as *mut f32,
+            weights_ptr,
+            scales_ptr,
+            output_ptr,
+            n_groups as i32,
+            seq_len as i32,
+            n as i32,
+            k as i32,
+            sm_version,
+            ws_ptr,
+            ws_size as i64,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("fp8_grouped_gemm_fused failed with code {}", ret);
+    }
+
+    Ok(output)
+}
+
+/// Thread-local scratch buffer pool for grouped GEMM (avoids per-call allocations).
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+mod grouped_gemm_pool {
+    use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
+    use candle_core::cuda_backend::WrapErr;
+    use candle_core::Result;
+
+    struct ScratchPool {
+        input_q: CudaSlice<u8>,
+        input_q_bytes: usize,
+        input_scales: CudaSlice<u8>,
+        input_scales_bytes: usize,
+        device_ordinal: usize,
+    }
+
+    thread_local! {
+        static POOL: std::cell::RefCell<Option<ScratchPool>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub fn get_grouped_gemm_scratch(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        input_q_bytes: usize,
+        input_scales_bytes: usize,
+    ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+        POOL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+
+            let needs_realloc = match slot.as_ref() {
+                None => true,
+                Some(p) => {
+                    p.device_ordinal != ordinal
+                        || p.input_q_bytes < input_q_bytes
+                        || p.input_scales_bytes < input_scales_bytes
+                }
+            };
+
+            if needs_realloc {
+                let old = slot.take();
+                let (q_sz, s_sz) = if let Some(ref prev) = old {
+                    (
+                        input_q_bytes.max(prev.input_q_bytes),
+                        input_scales_bytes.max(prev.input_scales_bytes),
+                    )
+                } else {
+                    (input_q_bytes, input_scales_bytes)
+                };
+                drop(old);
+                let input_q = unsafe { dev.alloc::<u8>(q_sz.max(1)) }.w()?;
+                let input_scales = unsafe { dev.alloc::<u8>(s_sz.max(1)) }.w()?;
+                *slot = Some(ScratchPool {
+                    input_q,
+                    input_q_bytes: q_sz,
+                    input_scales,
+                    input_scales_bytes: s_sz,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let pool = slot.as_ref().unwrap();
+            Ok((
+                *pool.input_q.device_ptr() as *mut std::ffi::c_void,
+                *pool.input_scales.device_ptr() as *mut std::ffi::c_void,
+            ))
+        })
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+use grouped_gemm_pool::get_grouped_gemm_scratch;

@@ -243,6 +243,7 @@ struct CutlassFp4Gemm {
           __trap();
         }
 #endif
+    }
   };
 
   using GemmKernel = Sm10x11xOnly<

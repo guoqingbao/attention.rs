@@ -318,13 +318,16 @@ pub fn nvfp4_matmul(
                         &wscale_sw_owned
                     };
 
-                    // Online input scale: compute from activation tensor amax
-                    // instead of using the static checkpoint value.
-                    // This adapts to actual activation distributions which shift
-                    // for long contexts (64K+/128K+) beyond calibration range.
-                    let (online_input_scale, online_input_scale_inv) =
-                        compute_online_input_scale(&input)?;
-                    let alpha = online_input_scale * weight_global_scale;
+                    // Use the checkpoint's calibrated input_scale directly.
+                    // When input_scale==1.0 (no calibration data in checkpoint),
+                    // pass through without scaling — matching the original behavior
+                    // where alpha = weight_global_scale and input_scale_inv = 1.0.
+                    let (hw_input_scale, hw_input_scale_inv) = if input_scale > 1e-12 {
+                        (input_scale, 1.0 / input_scale)
+                    } else {
+                        (1.0, 1.0)
+                    };
+                    let alpha = hw_input_scale * weight_global_scale;
                     let alpha_tensor = Tensor::new(&[alpha], dev)?;
 
                     {
@@ -366,7 +369,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    online_input_scale_inv,
+                                    hw_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,
@@ -378,7 +381,7 @@ pub fn nvfp4_matmul(
                                     act_packed_ptr,
                                     act_scales_ptr,
                                     act_scales_sw_ptr,
-                                    online_input_scale_inv,
+                                    hw_input_scale_inv,
                                     m as i32,
                                     k as i32,
                                     m_padded as i32,
@@ -506,6 +509,7 @@ pub fn nvfp4_matmul(
                 };
 
                 let stream = *cuda_dev.cu_stream() as i64;
+                let force_lut = crate::nvfp4_force_lut();
 
                 unsafe {
                     if m < 32 {
@@ -522,6 +526,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -537,6 +542,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -559,6 +565,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }
@@ -574,6 +581,7 @@ pub fn nvfp4_matmul(
                                     n as i32,
                                     k as i32,
                                     has_bias,
+                                    force_lut,
                                     stream,
                                 );
                             }

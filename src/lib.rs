@@ -30,6 +30,7 @@ pub use metal_kernels;
 pub mod cache;
 #[cfg(feature = "cuda")]
 pub mod cuda_utils;
+pub mod deepseek_v4;
 pub mod fp8_linear;
 pub mod gdn;
 pub mod mamba_cache;
@@ -127,6 +128,19 @@ where
 
 #[cfg(feature = "trtllm")]
 pub mod trtllm_cubin_loader;
+
+static NVFP4_FORCE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Returns true if `XINFER_NVFP4_FORCE_LUT=1` is set, forcing the software
+/// GEMM decode path to use the higher-precision LUT-based dequantization
+/// instead of hardware FP4 intrinsics on Blackwell (SM100+).
+pub fn nvfp4_force_lut() -> bool {
+    *NVFP4_FORCE_LUT.get_or_init(|| {
+        std::env::var("XINFER_NVFP4_FORCE_LUT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};

@@ -974,16 +974,17 @@ extern "C" {
     );
 
     pub fn fp8_matmul_f16(
-        input: *const c_void,     // [M, K]
-        weight: *const u8,        // [N, K]
-        weight_scale: *const f32, // [N, K] (block-wise)
-        output: *mut c_void,      // [M, N]
+        input: *const c_void,        // [M, K]
+        weight: *const u8,           // [N, K]
+        weight_scale: *const c_void, // [N, K] (block-wise)
+        output: *mut c_void,         // [M, N]
         m: c_int,
         n: c_int,
         k: c_int,
         scale_row_stride: c_int,
         block_size_y: c_int,
         block_size_x: c_int,
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
@@ -1008,7 +1009,7 @@ extern "C" {
     pub fn fp8_matmul_bf16(
         input: *const c_void,
         weight: *const u8,
-        weight_scale: *const f32,
+        weight_scale: *const c_void,
         output: *mut c_void,
         m: c_int,
         n: c_int,
@@ -1016,6 +1017,7 @@ extern "C" {
         scale_row_stride: c_int,
         block_size_y: c_int,
         block_size_x: c_int,
+        scale_dtype: c_int, // 0=f32, 1=e8m0
         stream: i64,
     );
 
@@ -2617,6 +2619,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2631,6 +2634,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2645,6 +2649,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2659,6 +2664,7 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2677,6 +2683,7 @@ extern "C" {
         k: c_int,
         has_bias: bool,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2695,6 +2702,7 @@ extern "C" {
         k: c_int,
         has_bias: bool,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2713,6 +2721,7 @@ extern "C" {
         size_n: c_int,
         size_k: c_int,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2731,6 +2740,7 @@ extern "C" {
         size_n: c_int,
         size_k: c_int,
         input_has_topk_dim: bool,
+        force_lut: bool,
         stream: i64,
     );
 
@@ -2851,9 +2861,75 @@ extern "C" {
         qk_rope_head_dim: c_int,
         block_size: c_int,
         max_num_blocks_per_seq: c_int,
+        total_tokens: c_int,
         dtype: u32,
         stream: i64,
     );
+
+    // =========================================================================
+    // Sparse MLA attention (DSA — DeepSeek Sparse Attention)
+    // =========================================================================
+
+    pub fn mla_sparse_attention_prefill(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        cu_seqlens_q: *const c_int,
+        topk_indices: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        topk: c_int,
+        total_tokens: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
+    pub fn mla_sparse_attention_decode(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        topk_indices: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        topk: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // DSA Lightning Indexer (fused score + causal + topk)
+    // =========================================================================
+
+    pub fn dsa_lightning_indexer_prefill(
+        q: *const c_void,
+        k: *const c_void,
+        weights: *const c_void,
+        topk_out: *mut c_int,
+        seq_len: c_int,
+        n_heads: c_int,
+        head_dim: c_int,
+        topk: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
 
     // =========================================================================
     // FlashInfer MLA decode (plan + run)
@@ -3413,4 +3489,323 @@ extern "C" {
         hidden_size: c_int,
         stream: i64,
     );
+
+    // DeepSeek V4 Hyper-Connection kernels
+    pub fn ds_v4_hc_expand(
+        x: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_scale_mixes(
+        x: *const c_void,
+        mixes: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        mix_hc: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_from_mixes(
+        x: *const c_void,
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        post: *mut c_void,
+        comb: *mut c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        sinkhorn_iters: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_norm_from_mixes(
+        x: *const c_void,
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        norm_weight: *const c_void,
+        post: *mut c_void,
+        comb: *mut c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        sinkhorn_iters: c_int,
+        hc_eps: f32,
+        norm_eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_pre_output(
+        x: *const c_void,
+        pre: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_head_pre(
+        mixes: *const c_void,
+        hc_scale: *const c_void,
+        hc_base: *const c_void,
+        pre: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_post(
+        x: *const c_void,
+        residual: *const c_void,
+        post: *const c_void,
+        comb: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    // DeepSeek V4 per-head RMSNorm
+    pub fn ds_v4_head_rms_norm(
+        x: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Attention kernels (from ds_attention.cu) ========
+
+    pub fn ds_sparse_attn_dispatch(
+        q: *const c_void,
+        kv: *const c_void,
+        attn_sink: *const c_void,
+        topk_idxs: *const c_int,
+        out: *mut c_void,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        kv_len: c_int,
+        topk: c_int,
+        softmax_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Compressor kernels (from ds_compressor.cu) ========
+
+    pub fn ds_compressor_nonoverlap_prefill_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        seq_len: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_prefill_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        seq_len: c_int,
+        head_dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_nonoverlap_decode_at(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const f32,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        start_pos: c_int,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_decode_at(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const f32,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        start_pos: c_int,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // ======== DeepSeek V4 Indexer kernels (from ds_indexer.cu) ========
+
+    pub fn ds_indexer_scores_decode(
+        q: *const c_void,
+        kv: *const c_void,
+        weights: *const c_void,
+        scores: *mut f32,
+        local_heads: c_int,
+        head_dim: c_int,
+        compressed_len: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_topk_prefill(
+        scores: *const f32,
+        topk_idxs: *mut c_int,
+        seq_len: c_int,
+        compressed_len: c_int,
+        topk: c_int,
+        ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_topk_decode(
+        scores: *const f32,
+        topk_idxs: *mut c_int,
+        compressed_len: c_int,
+        topk: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_concat_topk_indices(
+        a: *const c_int,
+        b: *const c_int,
+        out: *mut c_int,
+        seq_len: c_int,
+        a_topk: c_int,
+        b_topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_window_topk_indices(
+        out: *mut c_int,
+        seq_len: c_int,
+        window_size: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compress_topk_indices(
+        out: *mut c_int,
+        seq_len: c_int,
+        compressed: c_int,
+        ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_scores_prefill(
+        q: *const c_void,
+        kv: *const c_void,
+        weights: *const c_void,
+        scores: *mut f32,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        compressed_len: c_int,
+        score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // =========================================================================
+    // FP8 grouped/strided GEMM (flashinfer + cutlass features)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_quantize_1x128(
+        mat_quant: *mut c_void,
+        scales: *mut f32,
+        mat: *const c_void,
+        shape_x: c_int,
+        shape_y: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fp8_stride_batch_gemm(
+        mat_d: *mut c_void,
+        ld_d: c_int,
+        stride_d: c_int,
+        mat_a: *mut c_void,
+        ld_a: c_int,
+        stride_a: c_int,
+        mat_b: *const c_void,
+        ld_b: c_int,
+        stride_b: c_int,
+        num_problems: c_int,
+        shape_m: c_int,
+        shape_n: c_int,
+        shape_k: c_int,
+        scales_a: *mut f32,
+        stride_scales_a: c_int,
+        scales_b: *const f32,
+        stream: i64,
+    ) -> c_int;
+
+    #[cfg(feature = "cutlass")]
+    pub fn fp8_grouped_gemm_fused(
+        input: *const c_void,
+        input_q: *mut c_void,
+        input_scales: *mut f32,
+        weights: *const c_void,
+        weight_scales: *const f32,
+        output: *mut c_void,
+        n_groups: c_int,
+        seq_len: c_int,
+        n: c_int,
+        k: c_int,
+        sm_version: c_int,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn fast_topk_select(
+        scores: *const f32,
+        indices_out: *mut i32,
+        batch: c_int,
+        seq_len: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
 }

@@ -221,15 +221,13 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
                                     float weight_global_scale,
                                     const T *__restrict__ bias,
                                     T *__restrict__ output, int M, int N,
-                                    int K, bool has_bias) {
+                                    int K, bool has_bias, bool force_lut) {
   extern __shared__ float s_input[];
 
-#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
-#endif
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -293,31 +291,30 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
        k += WARP_SIZE * ELEMS_PER_LANE) {
 
 #ifdef NVFP4_HW_DEQUANT
-    // --- Blackwell hardware path: fused dequant + dot product ---
-    // No * 0.5f: HW intrinsics produce exact FP4 E2M1 float values directly.
-    {
-      float block_scale =
-          fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale;
-      uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
-      const float *in = s_input + (k + (k / WARP_SIZE));
-      acc += hw_dot_16(w_vec, block_scale, in);
-    }
+    if (!force_lut) {
+      // --- Blackwell hardware path: fused dequant + dot product ---
+      {
+        float block_scale =
+            fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+            weight_global_scale;
+        uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+        const float *in = s_input + (k + (k / WARP_SIZE));
+        acc += hw_dot_16(w_vec, block_scale, in);
+      }
 
-    int k2 = k + NVFP4_BLOCK_SIZE;
-    if (k2 < K) {
-      float block_scale2 =
-          fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale;
-      uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-      const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
-      acc += hw_dot_16(w_vec2, block_scale2, in2);
-    }
-#else
-    // --- Legacy LUT path (SM < 100) ---
-    // Accumulate unscaled dot product per block, apply scale once at the end
-    // to halve the number of floating-point roundings per 16-element block.
+      int k2 = k + NVFP4_BLOCK_SIZE;
+      if (k2 < K) {
+        float block_scale2 =
+            fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+            weight_global_scale;
+        uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
+        acc += hw_dot_16(w_vec2, block_scale2, in2);
+      }
+    } else
+#endif
     {
+      // --- LUT path: FP4→int8 table lookup, FP32 accumulation ---
       float block_scale =
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
           weight_global_scale * 0.5f;
@@ -346,40 +343,39 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
       partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
       acc = fmaf(partial, block_scale, acc);
+
+      int k2 = k + NVFP4_BLOCK_SIZE;
+      if (k2 < K) {
+        float block_scale2 =
+            dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+            weight_global_scale * 0.5f;
+
+        uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
+
+        float partial2 = 0.0f;
+        int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
+        partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
+        partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
+        partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
+        partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
+        partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
+        partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
+        partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
+        partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
+
+        int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
+        partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
+        partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
+        partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
+        partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
+        partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
+        partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
+        partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
+        partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+        acc = fmaf(partial2, block_scale2, acc);
+      }
     }
-
-    int k2 = k + NVFP4_BLOCK_SIZE;
-    if (k2 < K) {
-      float block_scale2 =
-          dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale * 0.5f;
-
-      uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
-      const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
-
-      float partial2 = 0.0f;
-      int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-      partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
-      partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
-      partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
-      partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
-      partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
-      partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
-      partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
-      partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
-
-      int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-      partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
-      partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
-      partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
-      partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
-      partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
-      partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
-      partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
-      partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
-      acc = fmaf(partial2, block_scale2, acc);
-    }
-#endif // NVFP4_HW_DEQUANT
   }
 
 #pragma unroll
@@ -411,7 +407,7 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
                                    float weight_global_scale,
                                    const T *__restrict__ bias,
                                    T *__restrict__ output, int M, int N, int K,
-                                   bool has_bias) {
+                                   bool has_bias, bool force_lut) {
   constexpr int THREADS_N = BLOCK_N / TN;
   constexpr int THREADS_M = BLOCK_M / TM;
   constexpr int NUM_THREADS = THREADS_N * THREADS_M;
@@ -419,12 +415,10 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
   __shared__ float s_input[BLOCK_M][BLOCK_K + 1];
   __shared__ float s_weight[BLOCK_N][BLOCK_K + 1];
 
-#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
-#endif
 
   const int tid = threadIdx.y * THREADS_N + threadIdx.x;
   const int bx = blockIdx.x;
@@ -467,14 +461,17 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
             &weight[(size_t)gn * (K / 2) + k_tile / 2]);
 
 #ifdef NVFP4_HW_DEQUANT
-        hw_dequant_16(w_vec, raw_scale, &s_weight[ln][0]);
-#else
-        float lut_scale = raw_scale * 0.5f;
-        dequant_store_8(w_vec.x, lut_scale, LUT0, LUT1, LUT2, LUT3,
-                        &s_weight[ln][0]);
-        dequant_store_8(w_vec.y, lut_scale, LUT0, LUT1, LUT2, LUT3,
-                        &s_weight[ln][8]);
+        if (!force_lut) {
+          hw_dequant_16(w_vec, raw_scale, &s_weight[ln][0]);
+        } else
 #endif
+        {
+          float lut_scale = raw_scale * 0.5f;
+          dequant_store_8(w_vec.x, lut_scale, LUT0, LUT1, LUT2, LUT3,
+                          &s_weight[ln][0]);
+          dequant_store_8(w_vec.y, lut_scale, LUT0, LUT1, LUT2, LUT3,
+                          &s_weight[ln][8]);
+        }
       } else {
 #pragma unroll
         for (int k = 0; k < BLOCK_K; k++)
@@ -541,15 +538,13 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
                         const uint32_t *__restrict__ indices,
                         T *__restrict__ output, int num_tokens, int topk,
                         int num_experts, int N, int K, bool has_bias,
-                        bool input_has_topk_dim) {
+                        bool input_has_topk_dim, bool force_lut) {
   extern __shared__ float s_input_padded[];
 
-#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
-#endif
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -641,26 +636,27 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
          k += WARP_SIZE * MOE_ELEMS_PER_LANE) {
 
 #ifdef NVFP4_HW_DEQUANT
-      {
+      if (!force_lut) {
         float block_scale =
             fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             global_scale;
         uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
         acc += hw_dot_16(w_vec, block_scale, in);
-      }
-      int k2 = k + NVFP4_BLOCK_SIZE;
-      if (k2 < K) {
-        float block_scale2 =
-            fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            global_scale;
-        uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-        const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
-        acc += hw_dot_16(w_vec2, block_scale2, in2);
-      }
-#else
-      // --- First NVFP4 block of 16 ---
+
+        int k2 = k + NVFP4_BLOCK_SIZE;
+        if (k2 < K) {
+          float block_scale2 =
+              fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+              global_scale;
+          uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+          const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
+          acc += hw_dot_16(w_vec2, block_scale2, in2);
+        }
+      } else
+#endif
       {
+        // --- LUT path: FP4→int8 table lookup, FP32 accumulation ---
         float block_scale =
             dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             global_scale * 0.5f;
@@ -689,41 +685,39 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
         partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
         acc = fmaf(partial, block_scale, acc);
+
+        int k2 = k + NVFP4_BLOCK_SIZE;
+        if (k2 < K) {
+          float block_scale2 =
+              dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+              global_scale * 0.5f;
+
+          uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+          const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
+
+          float partial2 = 0.0f;
+          int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
+          partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
+          partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
+          partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
+          partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
+          partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
+          partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
+          partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
+          partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
+
+          int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
+          partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
+          partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
+          partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
+          partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
+          partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
+          partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
+          partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
+          partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+          acc = fmaf(partial2, block_scale2, acc);
+        }
       }
-
-      // --- Second NVFP4 block of 16 ---
-      int k2 = k + NVFP4_BLOCK_SIZE;
-      if (k2 < K) {
-        float block_scale2 =
-            dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            global_scale * 0.5f;
-
-        uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
-        const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
-
-        float partial2 = 0.0f;
-        int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-        partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
-        partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
-        partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
-        partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
-        partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
-        partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
-        partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
-        partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
-
-        int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-        partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
-        partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
-        partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
-        partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
-        partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
-        partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
-        partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
-        partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
-        acc = fmaf(partial2, block_scale2, acc);
-      }
-#endif // NVFP4_HW_DEQUANT
     }
 
 #pragma unroll
@@ -776,17 +770,15 @@ __global__ void nvfp4_wmma_matmul_kernel(
     float weight_global_scale,
     const T *__restrict__ bias,
     T *__restrict__ output,
-    int M, int N, int K, bool has_bias) {
+    int M, int N, int K, bool has_bias, bool force_lut) {
 
   using namespace nvcuda::wmma;
   using namespace nvfp4_gemm;
 
-#ifndef NVFP4_HW_DEQUANT
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
-#endif
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -835,32 +827,35 @@ __global__ void nvfp4_wmma_matmul_kernel(
         uint32_t word = sub ? w_vec.y : w_vec.x;
         int col_base = sub * 8;
 #ifdef NVFP4_HW_DEQUANT
+        if (!force_lut) {
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-          uint8_t byte_val = (word >> (j * 8)) & 0xFF;
-          __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
-              static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
-          float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
-          if constexpr (std::is_same_v<T, __half>) {
-            s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
-          } else {
-            s_b[row][col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
-            s_b[row][col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
+          for (int j = 0; j < 4; j++) {
+            uint8_t byte_val = (word >> (j * 8)) & 0xFF;
+            __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+                static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
+            float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+            if constexpr (std::is_same_v<T, __half>) {
+              s_b[row][col_base + j * 2]     = __float2half(f2.x * raw_scale);
+              s_b[row][col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+            } else {
+              s_b[row][col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
+              s_b[row][col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
+            }
+          }
+        } else
+#endif
+        {
+          float lut_scale = raw_scale * 0.5f;
+          float dq[8];
+          dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
+          #pragma unroll
+          for (int j = 0; j < 8; j++) {
+            if constexpr (std::is_same_v<T, __half>)
+              s_b[row][col_base + j] = __float2half(dq[j]);
+            else
+              s_b[row][col_base + j] = __float2bfloat16_rn(dq[j]);
           }
         }
-#else
-        float lut_scale = raw_scale * 0.5f;
-        float dq[8];
-        dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-          if constexpr (std::is_same_v<T, __half>)
-            s_b[row][col_base + j] = __float2half(dq[j]);
-          else
-            s_b[row][col_base + j] = __float2bfloat16_rn(dq[j]);
-        }
-#endif
       } else if (row < BN) {
         int col_base = sub * 8;
         #pragma unroll
@@ -931,7 +926,7 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
                                          float weight_global_scale,
                                          const __half *bias, __half *output,
                                          int M, int N, int K, bool has_bias,
-                                         cudaStream_t stream) {
+                                         bool force_lut, cudaStream_t stream) {
   using namespace nvfp4_gemm;
   constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
   dim3 block(THREADS);
@@ -941,7 +936,7 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
                                         weight_global_scale, bias, output, M, N,
-                                        K, has_bias);
+                                        K, has_bias, force_lut);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -952,7 +947,7 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           const __nv_bfloat16 *bias,
                                           __nv_bfloat16 *output,
                                           int M, int N, int K, bool has_bias,
-                                          cudaStream_t stream) {
+                                          bool force_lut, cudaStream_t stream) {
   using namespace nvfp4_gemm;
   constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
   dim3 block(THREADS);
@@ -962,12 +957,12 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
                                         weight_global_scale, bias, output, M, N,
-                                        K, has_bias);
+                                        K, has_bias, force_lut);
 }
 #else
 extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
                                           const uint8_t *, float, const void *,
-                                          void *, int, int, int, bool,
+                                          void *, int, int, int, bool, bool,
                                           cudaStream_t) {}
 #endif
 
@@ -975,7 +970,7 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                   const uint8_t *weight_scale,
                                   float weight_global_scale,
                                   const __half *bias, __half *output, int M,
-                                  int N, int K, bool has_bias,
+                                  int N, int K, bool has_bias, bool force_lut,
                                   cudaStream_t stream) {
 #ifndef NO_BF16_KERNEL
   constexpr int BM = 64, BN = 64;
@@ -984,7 +979,7 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
                                    weight_global_scale, bias, output, M, N, K,
-                                   has_bias);
+                                   has_bias, force_lut);
 #else
   constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
   constexpr int THREADS_N = BN / TN;
@@ -994,7 +989,7 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   nvfp4_gemm::nvfp4_matmul_tiled<half, BM, BN, BK, TM, TN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
                                    weight_global_scale, bias, output, M, N, K,
-                                   has_bias);
+                                   has_bias, force_lut);
 #endif
 }
 
@@ -1005,19 +1000,20 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
                                    float weight_global_scale,
                                    const __nv_bfloat16 *bias,
                                    __nv_bfloat16 *output, int M, int N, int K,
-                                   bool has_bias, cudaStream_t stream) {
+                                   bool has_bias, bool force_lut,
+                                   cudaStream_t stream) {
   constexpr int BM = 64, BN = 64;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
   nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
                                    weight_global_scale, bias, output, M, N, K,
-                                   has_bias);
+                                   has_bias, force_lut);
 }
 #else
 extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,
                                    const uint8_t *, float, const void *,
-                                   void *, int, int, int, bool,
+                                   void *, int, int, int, bool, bool,
                                    cudaStream_t) {}
 #endif
 
@@ -1026,7 +1022,7 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
     const float *weight_global_scales, const __half *biases,
     const uint32_t *indices, __half *output, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
-    cudaStream_t stream) {
+    bool force_lut, cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
   int n_chunks = CEILDIV(N, MOE_BLOCK_N);
   int total_blocks =
@@ -1039,7 +1035,7 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
       output, num_tokens, topk, num_experts, N, K, has_bias,
-      input_has_topk_dim);
+      input_has_topk_dim, force_lut);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -1048,7 +1044,8 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
     const uint8_t *weight_scales, const float *weight_global_scales,
     const __nv_bfloat16 *biases, const uint32_t *indices,
     __nv_bfloat16 *output, int num_tokens, int topk, int num_experts, int N,
-    int K, bool has_bias, bool input_has_topk_dim, cudaStream_t stream) {
+    int K, bool has_bias, bool input_has_topk_dim, bool force_lut,
+    cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
   int n_chunks = CEILDIV(N, MOE_BLOCK_N);
   int total_blocks =
@@ -1061,14 +1058,14 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
       output, num_tokens, topk, num_experts, N, K, has_bias,
-      input_has_topk_dim);
+      input_has_topk_dim, force_lut);
 }
 #else
 extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
                                              const uint8_t *, const float *,
                                              const void *, const uint32_t *,
                                              void *, int, int, int, int, int,
-                                             bool, bool, cudaStream_t) {}
+                                             bool, bool, bool, cudaStream_t) {}
 #endif
 
 
@@ -1101,16 +1098,14 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
     T* __restrict__ output,                    // [num_input_rows, N] (zero-init)
     const int num_experts, const int topk,
     const int32_t size_m, const int32_t size_n, const int32_t size_k,
-    const bool input_has_topk_dim
+    const bool input_has_topk_dim, const bool force_lut
 ) {
     using namespace nvcuda::wmma;
 
-#ifndef NVFP4_HW_DEQUANT
     const uint32_t LUT0 = 0x03020100;
     const uint32_t LUT1 = 0x0C080604;
     const uint32_t LUT2 = 0xFDFEFF00;
     const uint32_t LUT3 = 0xF4F8FAFC;
-#endif
 
     const int expert_id = blockIdx.x;
     const int n_tile_idx = blockIdx.y;
@@ -1181,32 +1176,35 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                     uint32_t word = sub ? w_vec.y : w_vec.x;
                     int col_base = sub * 8;
 #ifdef NVFP4_HW_DEQUANT
+                    if (!force_lut) {
 #pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        uint8_t byte_val = (word >> (j * 8)) & 0xFF;
-                        __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
-                            static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
-                        float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
-                        if constexpr (std::is_same_v<T, __half>) {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
-                        } else {
-                            s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
-                            s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
+                        for (int j = 0; j < 4; j++) {
+                            uint8_t byte_val = (word >> (j * 8)) & 0xFF;
+                            __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+                                static_cast<__nv_fp4x2_storage_t>(byte_val), __NV_E2M1);
+                            float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
+                            if constexpr (std::is_same_v<T, __half>) {
+                                s_b[row * B_STRIDE + col_base + j * 2]     = __float2half(f2.x * raw_scale);
+                                s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2half(f2.y * raw_scale);
+                            } else {
+                                s_b[row * B_STRIDE + col_base + j * 2]     = __float2bfloat16_rn(f2.x * raw_scale);
+                                s_b[row * B_STRIDE + col_base + j * 2 + 1] = __float2bfloat16_rn(f2.y * raw_scale);
+                            }
+                        }
+                    } else
+#endif
+                    {
+                        float lut_scale = raw_scale * 0.5f;
+                        float dq[8];
+                        dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            if constexpr (std::is_same_v<T, __half>)
+                                s_b[row * B_STRIDE + col_base + j] = __float2half(dq[j]);
+                            else
+                                s_b[row * B_STRIDE + col_base + j] = __float2bfloat16_rn(dq[j]);
                         }
                     }
-#else
-                    float lut_scale = raw_scale * 0.5f;
-                    float dq[8];
-                    dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
-                    #pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        if constexpr (std::is_same_v<T, __half>)
-                            s_b[row * B_STRIDE + col_base + j] = __float2half(dq[j]);
-                        else
-                            s_b[row * B_STRIDE + col_base + j] = __float2bfloat16_rn(dq[j]);
-                    }
-#endif
                 } else {
                     int col_base = sub * 8;
                     #pragma unroll
@@ -1265,7 +1263,7 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
     const float *topk_weights,
     __half *output,
     int num_experts, int topk, int size_m, int size_n, int size_k,
-    bool input_has_topk_dim,
+    bool input_has_topk_dim, bool force_lut,
     cudaStream_t stream) {
   using namespace nvfp4_gemm;
   dim3 grid(num_experts, CEILDIV(size_n, MOE_N_BLK));
@@ -1277,7 +1275,7 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
       input, weights, weight_scales, weight_global_scales,
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
-      input_has_topk_dim);
+      input_has_topk_dim, force_lut);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -1288,7 +1286,7 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
     const float *topk_weights,
     __nv_bfloat16 *output,
     int num_experts, int topk, int size_m, int size_n, int size_k,
-    bool input_has_topk_dim,
+    bool input_has_topk_dim, bool force_lut,
     cudaStream_t stream) {
   using namespace nvfp4_gemm;
   dim3 grid(num_experts, CEILDIV(size_n, MOE_N_BLK));
@@ -1300,11 +1298,11 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
       input, weights, weight_scales, weight_global_scales,
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
-      input_has_topk_dim);
+      input_has_topk_dim, force_lut);
 }
 #else
 extern "C" void nvfp4_moe_gemm_wmma_bf16(
     const void *, const uint8_t *, const uint8_t *, const float *,
     const int32_t *, const int32_t *, const float *,
-    void *, int, int, int, int, int, bool, cudaStream_t) {}
+    void *, int, int, int, int, int, bool, bool, cudaStream_t) {}
 #endif

@@ -538,6 +538,7 @@ __global__ void nvfp4_moe_build_metadata_kernel(
   }
 }
 
+
 template <typename InType>
 __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
     const InType* __restrict__ input,        // [total_rows, K]
@@ -739,6 +740,7 @@ void nvfp4_moe_build_metadata(
       N,
       K);
 }
+
 
 void nvfp4_quantize_activation_grouped_f16(
     const void* input,
