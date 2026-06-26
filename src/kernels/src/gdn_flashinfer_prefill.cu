@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#if defined(USE_FLASHINFER) && defined(FLAT_SM90A_ENABLED)
+#if defined(USE_FLASHINFER) && defined(ATTENTION_RS_ENABLE_FLASHINFER_GDN_PREFILL_SM90)
 #include "cutlass/arch/arch.h"
 #include "flashinfer/flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
 #endif
@@ -87,7 +87,7 @@ static int launch_flashinfer_gdn_prefill_gva(
     int v_dim,
     float q_scale,
     int64_t stream_i64) {
-#if defined(USE_FLASHINFER) && defined(FLAT_SM90A_ENABLED)
+#if defined(USE_FLASHINFER) && defined(ATTENTION_RS_ENABLE_FLASHINFER_GDN_PREFILL_SM90)
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
     if (k_dim != v_dim || num_v_heads <= num_k_heads || batch <= 0) {
         return 1;

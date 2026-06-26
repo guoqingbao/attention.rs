@@ -173,7 +173,9 @@ fn main() -> Result<()> {
             }
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
-                builder = builder.arg("-DFLAT_SM90A_ENABLED");
+            }
+            if compute_cap == 90 {
+                builder = builder.arg("-DATTENTION_RS_ENABLE_FLASHINFER_GDN_PREFILL_SM90");
             }
         }
     }
