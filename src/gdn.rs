@@ -2286,6 +2286,117 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
     }
 }
 
+/// FlashInfer SM90 persistent GDN prefill for GQA models.
+/// Falls back to the regular recurrence kernel when FlashInfer is unavailable,
+/// the GPU is not SM90, or parameters are unsupported (k_dim != v_dim, etc.).
+///
+/// Returns Ok(Some(output)) on success, Ok(None) when the kernel returned a
+/// non-zero status (caller should fall back).
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_prefill_flashinfer_gqa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    cu_seqlens: &Tensor,
+    q_scale: f32,
+) -> Result<Option<Tensor>> {
+    match q.device() {
+        Device::Cuda(dev) => {
+            let q_c = ensure_contiguous(q)?;
+            let k_c = ensure_contiguous(k)?;
+            let v_c = ensure_contiguous(v)?;
+            let g_c = ensure_f32_contiguous(g)?;
+            let beta_c = ensure_f32_contiguous(beta)?;
+
+            let (total_tokens, num_k_heads, k_dim) = q_c.dims3()?;
+            let num_v_heads = v_c.dim(1)?;
+            let v_dim = v_c.dim(2)?;
+            let batch = slots.dim(0)?;
+
+            if num_v_heads % num_k_heads != 0 {
+                candle_core::bail!(
+                    "gated_delta_rule_prefill_flashinfer_gqa: num_v_heads {} not divisible by num_k_heads {}",
+                    num_v_heads,
+                    num_k_heads
+                );
+            }
+
+            let out = Tensor::zeros((total_tokens, num_v_heads, v_dim), q.dtype(), q.device())?;
+
+            let q_ptr = get_cuda_const_ptr(&q_c)?;
+            let k_ptr = get_cuda_const_ptr(&k_c)?;
+            let v_ptr = get_cuda_const_ptr(&v_c)?;
+            let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+            let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
+            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
+            let out_ptr = get_cuda_mut_ptr(&out)?;
+            let stream = *dev.cu_stream() as i64;
+
+            let status = match q.dtype() {
+                DType::BF16 => unsafe {
+                    ffi::gated_delta_rule_prefill_persistent_varlen_gqa_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        cu_ptr,
+                        total_tokens as c_int,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                DType::F16 => unsafe {
+                    ffi::gated_delta_rule_prefill_persistent_varlen_gqa_f16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr,
+                        cu_ptr,
+                        total_tokens as c_int,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                dt => candle_core::bail!(
+                    "gated_delta_rule_prefill_flashinfer_gqa: unsupported dtype {:?}",
+                    dt
+                ),
+            };
+
+            if status == 0 {
+                Ok(Some(out))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// GQA decode: q/k have num_k_heads, v/g/beta/state/out have num_v_heads.
 /// Fuses q_scale multiplication and exp(g) into the kernel.
 /// State is FP32.

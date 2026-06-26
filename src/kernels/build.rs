@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_common.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_cutlass_heuristic.cpp");
     println!("cargo:rerun-if-changed=src/gdn.cu");
-    // println!("cargo:rerun-if-changed=src/gdn_flashinfer_prefill.cu");
+    println!("cargo:rerun-if-changed=src/gdn_flashinfer_prefill.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         .source_dir("src")
         .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
-        .arg("-std=c++17")
+        .arg("-std=c++20")
         .arg("-O3");
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
@@ -173,6 +173,7 @@ fn main() -> Result<()> {
             }
             if compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
+                builder = builder.arg("-DFLAT_SM90A_ENABLED");
             }
         }
     }
@@ -336,7 +337,7 @@ fn main() -> Result<()> {
     }
 
     if !is_target_msvc {
-        builder = builder.arg("-Xcompiler").arg("-fPIC").arg("-std=c++17");
+        builder = builder.arg("-Xcompiler").arg("-fPIC").arg("-std=c++20");
     }
 
     println!("cargo:info={builder:?}");
