@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="8ac9437" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="8ac9437" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="ab2b2d6" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="ab2b2d6" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
