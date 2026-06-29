@@ -1,7 +1,8 @@
 // MambaCache: manages per-sequence conv and recurrent states for Mamba/GDN layers
 //
 // For hybrid models (e.g., Qwen3.5), GatedDeltaNet layers require:
-// - conv_state:  [max_batch, d_conv, conv_kernel_size - 1] per GDN layer
+// - conv_state:  [max_batch, conv_kernel_size - 1, d_conv] per GDN layer (GCU)
+//                [max_batch, d_conv, conv_kernel_size - 1] (CUDA/Metal)
 // - recurrent_state:
 //   - All backends: [max_batch, num_heads, key_head_dim, value_head_dim]
 //
@@ -271,7 +272,7 @@ fn scatter_rows_accel(dst: &Tensor, slots: &Tensor, src: &Tensor) -> Result<()> 
 }
 
 pub struct MambaCache {
-    /// Per-layer conv states: [max_batch, d_conv, conv_kernel_size - 1]
+    /// Per-layer conv states: [max_batch, kw-1, d_conv] (GCU) or [max_batch, d_conv, kw-1] (CUDA/Metal)
     conv_states: Vec<Tensor>,
     /// Per-layer recurrent states: [max_batch, num_heads, head_dim, head_dim]
     recurrent_states: Vec<Tensor>,
@@ -331,11 +332,11 @@ impl MambaCache {
         let mut recurrent_states = Vec::with_capacity(num_gdn_layers);
 
         for _ in 0..num_gdn_layers {
-            conv_states.push(Tensor::zeros(
-                (max_batch_size, d_conv, conv_kernel_size - 1),
-                conv_dtype,
-                device,
-            )?);
+            #[cfg(feature = "gcu")]
+            let conv_shape = (max_batch_size, conv_kernel_size - 1, d_conv);
+            #[cfg(not(feature = "gcu"))]
+            let conv_shape = (max_batch_size, d_conv, conv_kernel_size - 1);
+            conv_states.push(Tensor::zeros(conv_shape, conv_dtype, device)?);
             let recurrent_shape = (max_batch_size, num_heads, head_k_dim, head_v_dim);
             recurrent_states.push(Tensor::zeros(recurrent_shape, recurrent_dtype, device)?);
         }
@@ -560,7 +561,7 @@ impl MambaCache {
     }
 
     /// Get the conv state tensor for a given GDN layer and slot
-    /// Returns a view of shape [d_conv, conv_kernel_size - 1]
+    /// Returns a view of shape [kw-1, d_conv] (GCU) or [d_conv, kw-1] (CUDA/Metal)
     pub fn get_conv_state(&self, gdn_layer_idx: usize, slot: usize) -> Result<Tensor> {
         self.conv_states[gdn_layer_idx].i(slot)
     }
@@ -572,7 +573,7 @@ impl MambaCache {
     }
 
     /// Get mutable reference to the full conv state tensor for a layer
-    /// Shape: [max_batch, d_conv, conv_kernel_size - 1]
+    /// Shape: [max_batch, kw-1, d_conv] (GCU) or [max_batch, d_conv, kw-1] (CUDA/Metal)
     pub fn conv_state_mut(&mut self, gdn_layer_idx: usize) -> &mut Tensor {
         &mut self.conv_states[gdn_layer_idx]
     }
