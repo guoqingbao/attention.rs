@@ -283,6 +283,119 @@ template <typename T>
                 }
                 break;
             }
+            case 6: { // IQ2_XXS — 256 elements per block
+                device const block_iq2_xxs *blk = reinterpret_cast<device const block_iq2_xxs *>(block_ptr);
+                float d_val = float(blk->d);
+
+                for (int ib = int(simd_lane_id); ib < 8; ib += MOE_WARP_SIZE) {
+                    device const uint16_t *q2 = blk->qs + 4 * ib;
+                    const uint32_t aux32 = uint32_t(q2[2]) | (uint32_t(q2[3]) << 16);
+                    float db = d_val * (0.5f + float(aux32 >> 28)) * 0.25f;
+
+                    for (int il = 0; il < 4; il++) {
+                        uint8_t grid_idx = uint8_t((uint16_t(q2[il / 2]) >> (8 * (il % 2))) & 0xFF);
+                        uint64_t grid_val = iq2xxs_grid[grid_idx];
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+                        for (int j = 0; j < 8; j++) {
+                            int elem = 32 * ib + 8 * il + j;
+                            int k = k_base + elem;
+                            if (k < size_k) {
+                                uint8_t gv = uint8_t((grid_val >> (8 * j)) & 0xFF);
+                                float w = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                sum_f += float(x_ptr[k]) * w;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case 7: { // IQ2_XS — 256 elements per block
+                device const block_iq2_xs *blk = reinterpret_cast<device const block_iq2_xs *>(block_ptr);
+                float d_val = float(blk->d);
+
+                for (int ib = int(simd_lane_id); ib < 8; ib += MOE_WARP_SIZE) {
+                    device const uint16_t *q2 = blk->qs + 4 * ib;
+                    for (int il = 0; il < 4; il++) {
+                        uint64_t grid_val = iq2xs_grid[q2[il] & 511];
+                        float db = d_val * (0.5f + float((blk->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+                        const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+                        for (int j = 0; j < 8; j++) {
+                            int elem = 32 * ib + 8 * il + j;
+                            int k = k_base + elem;
+                            if (k < size_k) {
+                                uint8_t gv = uint8_t((grid_val >> (8 * j)) & 0xFF);
+                                float w = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                sum_f += float(x_ptr[k]) * w;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case 8: { // IQ3_XXS — 256 elements per block
+                device const block_iq3_xxs *blk = reinterpret_cast<device const block_iq3_xxs *>(block_ptr);
+                float d_val = float(blk->d);
+
+                for (int ib = int(simd_lane_id); ib < 8; ib += MOE_WARP_SIZE) {
+                    device const uint8_t *q3 = blk->qs + 8 * ib;
+                    device const uint8_t *gas_bytes = blk->qs + QK_K / 4 + 4 * ib;
+                    const uint32_t aux32 = uint32_t(gas_bytes[0]) | (uint32_t(gas_bytes[1]) << 8)
+                                         | (uint32_t(gas_bytes[2]) << 16) | (uint32_t(gas_bytes[3]) << 24);
+                    for (int il = 0; il < 4; il++) {
+                        float db = d_val * (0.5f + float(aux32 >> 28)) * 0.5f;
+                        uint32_t grid1_val = iq3xxs_grid[q3[2 * il + 0]];
+                        uint32_t grid2_val = iq3xxs_grid[q3[2 * il + 1]];
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+                        for (int j = 0; j < 4; j++) {
+                            int elem = 32 * ib + 8 * il + j;
+                            int k = k_base + elem;
+                            if (k < size_k) {
+                                uint8_t gv = uint8_t((grid1_val >> (8 * j)) & 0xFF);
+                                float w = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                sum_f += float(x_ptr[k]) * w;
+                            }
+                        }
+                        for (int j = 0; j < 4; j++) {
+                            int elem = 32 * ib + 8 * il + j + 4;
+                            int k = k_base + elem;
+                            if (k < size_k) {
+                                uint8_t gv = uint8_t((grid2_val >> (8 * j)) & 0xFF);
+                                float w = db * float(gv) * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                                sum_f += float(x_ptr[k]) * w;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case 9: { // IQ4_XS — 256 elements per block
+                device const block_iq4_xs *blk = reinterpret_cast<device const block_iq4_xs *>(block_ptr);
+                float d_val = float(blk->d);
+
+                for (int ib = int(simd_lane_id); ib < 8; ib += MOE_WARP_SIZE) {
+                    int sl = (blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+                    int sh = (blk->scales_h >> (2 * ib)) & 3;
+                    float db = d_val * float((sl | (sh << 4)) - 32);
+                    device const uint8_t *q4 = blk->qs + 16 * ib;
+                    for (int il = 0; il < 4; il++) {
+                        for (int j = 0; j < 4; j++) {
+                            int elem_lo = 32 * ib + 4 * il + j;
+                            int k_lo = k_base + elem_lo;
+                            if (k_lo < size_k) {
+                                float w = db * float(kvalues_iq4nl[q4[4 * il + j] & 0xf]);
+                                sum_f += float(x_ptr[k_lo]) * w;
+                            }
+                            int elem_hi = 32 * ib + 4 * il + j + 16;
+                            int k_hi = k_base + elem_hi;
+                            if (k_hi < size_k) {
+                                float w = db * float(kvalues_iq4nl[q4[4 * il + j] >> 4]);
+                                sum_f += float(x_ptr[k_hi]) * w;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -499,6 +612,72 @@ template <typename T>
                                         qh_val = (int(blk->qh[half_idx * 32 + (within_half % 32)]) >> qh_shift) & 3;
                                     }
                                     dq_val = float(blk->d) * float(sc) * float(int8_t((ql_val | (qh_val << 4))) - 32);
+                                    break;
+                                }
+                                case 6: { // IQ2_XXS
+                                    device const block_iq2_xxs *blk = reinterpret_cast<device const block_iq2_xxs *>(w_block);
+                                    int ib = elem_in_block / 32;
+                                    int il = (elem_in_block % 32) / 8;
+                                    int j  = elem_in_block % 8;
+                                    device const uint16_t *q2 = blk->qs + 4 * ib;
+                                    uint8_t grid_idx = uint8_t((uint16_t(q2[il / 2]) >> (8 * (il % 2))) & 0xFF);
+                                    uint64_t grid_val = iq2xxs_grid[grid_idx];
+                                    const uint32_t aux32 = uint32_t(q2[2]) | (uint32_t(q2[3]) << 16);
+                                    float db = float(blk->d) * (0.5f + float(aux32 >> 28)) * 0.25f;
+                                    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+                                    uint8_t gv = uint8_t((grid_val >> (8 * j)) & 0xFF);
+                                    dq_val = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                    break;
+                                }
+                                case 7: { // IQ2_XS
+                                    device const block_iq2_xs *blk = reinterpret_cast<device const block_iq2_xs *>(w_block);
+                                    int ib = elem_in_block / 32;
+                                    int il = (elem_in_block % 32) / 8;
+                                    int j  = elem_in_block % 8;
+                                    device const uint16_t *q2 = blk->qs + 4 * ib;
+                                    uint64_t grid_val = iq2xs_grid[q2[il] & 511];
+                                    float db = float(blk->d) * (0.5f + float((blk->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+                                    const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+                                    uint8_t gv = uint8_t((grid_val >> (8 * j)) & 0xFF);
+                                    dq_val = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                    break;
+                                }
+                                case 8: { // IQ3_XXS
+                                    device const block_iq3_xxs *blk = reinterpret_cast<device const block_iq3_xxs *>(w_block);
+                                    int ib = elem_in_block / 32;
+                                    int il = (elem_in_block % 32) / 8;
+                                    int j  = elem_in_block % 8;
+                                    device const uint8_t *q3 = blk->qs + 8 * ib;
+                                    device const uint8_t *gas_bytes = blk->qs + QK_K / 4 + 4 * ib;
+                                    const uint32_t aux32 = uint32_t(gas_bytes[0]) | (uint32_t(gas_bytes[1]) << 8)
+                                                         | (uint32_t(gas_bytes[2]) << 16) | (uint32_t(gas_bytes[3]) << 24);
+                                    float db = float(blk->d) * (0.5f + float(aux32 >> 28)) * 0.5f;
+                                    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+                                    if (j < 4) {
+                                        uint32_t gval = iq3xxs_grid[q3[2 * il + 0]];
+                                        uint8_t gv = uint8_t((gval >> (8 * j)) & 0xFF);
+                                        dq_val = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                    } else {
+                                        uint32_t gval = iq3xxs_grid[q3[2 * il + 1]];
+                                        uint8_t gv = uint8_t((gval >> (8 * (j - 4))) & 0xFF);
+                                        dq_val = db * float(gv) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                                    }
+                                    break;
+                                }
+                                case 9: { // IQ4_XS
+                                    device const block_iq4_xs *blk = reinterpret_cast<device const block_iq4_xs *>(w_block);
+                                    int ib = elem_in_block / 32;
+                                    int il = (elem_in_block % 32) / 8;
+                                    int j_in = elem_in_block % 8;
+                                    int sl = (blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+                                    int sh = (blk->scales_h >> (2 * ib)) & 3;
+                                    float db = float(blk->d) * float((sl | (sh << 4)) - 32);
+                                    device const uint8_t *q4 = blk->qs + 16 * ib;
+                                    if (j_in < 4) {
+                                        dq_val = db * float(kvalues_iq4nl[q4[4 * il + j_in] & 0xf]);
+                                    } else {
+                                        dq_val = db * float(kvalues_iq4nl[q4[4 * il + (j_in - 4)] >> 4]);
+                                    }
                                     break;
                                 }
                                 default:

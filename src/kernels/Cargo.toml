@@ -1,6 +1,6 @@
 [package]
 name = "kernels"
-version = "0.5.9"
+version = "0.6.3"
 edition = "2021"
 description = "Attention, MoE and GEMM kernels for Rust"
 categories = ["science"]
@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 
 [build-dependencies]
-cudaforge = "0.1.5"
+cudaforge = "0.1.6"
 anyhow = { version = "1", features = ["backtrace"] }
 sha2 = "0.10"
 ureq = { version = "2.10", default-features = true }

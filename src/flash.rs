@@ -278,7 +278,7 @@ pub fn flash_prefill(
 }
 
 pub const SPLIT_K_THRESHOLD: usize = 1024;
-pub const NUM_SPLITS: u32 = 8;
+pub const NUM_SPLITS: u32 = 16;
 pub const TQ_NUM_SPLITS: u32 = 16;
 
 #[cfg(feature = "cuda")]

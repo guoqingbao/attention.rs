@@ -124,6 +124,22 @@ __forceinline__ __device__ void dequantize_block_warp(
             dequantize_block_q6_K<T>(quant_in, dequant_out);
             break;
         }
+        case 6: { // IQ2_XXS
+            dequantize_block_iq2_xxs<T>(quant_in, dequant_out);
+            break;
+        }
+        case 7: { // IQ2_XS
+            dequantize_block_iq2_xs<T>(quant_in, dequant_out);
+            break;
+        }
+        case 8: { // IQ3_XXS
+            dequantize_block_iq3_xxs<T>(quant_in, dequant_out);
+            break;
+        }
+        case 9: { // IQ4_XS
+            dequantize_block_iq4_xs<T>(quant_in, dequant_out);
+            break;
+        }
         default:
             break;
     }
@@ -377,6 +393,38 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
+    } else if (gguf_type == 6) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_IQ2_XXS, block_iq2_xxs, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
+    } else if (gguf_type == 7) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_IQ2_XS, block_iq2_xs, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
+    } else if (gguf_type == 8) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_IQ3_XXS, block_iq3_xxs, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
+    } else if (gguf_type == 9) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_IQ4_XS, block_iq4_xs, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
     }
 
 
@@ -419,6 +467,14 @@ extern "C" void moe_gemm_gguf_prefill(
         block_size_bytes = sizeof(block_q3_K);
     } else if (gguf_type == 4) {//Q5K: 4,
         block_size_bytes = sizeof(block_q5_K);
+    } else if (gguf_type == 6) {
+        block_size_bytes = sizeof(block_iq2_xxs);
+    } else if (gguf_type == 7) {
+        block_size_bytes = sizeof(block_iq2_xs);
+    } else if (gguf_type == 8) {
+        block_size_bytes = sizeof(block_iq3_xxs);
+    } else if (gguf_type == 9) {
+        block_size_bytes = sizeof(block_iq4_xs);
     }
 
     // 1. A tile: [M_BLK, qk] (dequantized)

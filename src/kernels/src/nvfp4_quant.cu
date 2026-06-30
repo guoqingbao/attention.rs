@@ -24,6 +24,118 @@
 static constexpr int NVFP4_BLOCK_SIZE = 16;
 
 // ============================================================================
+// Online input scale: compute per-tensor amax(|x|) / 6.0 for dynamic
+// activation quantization. This replaces the static checkpoint input_scale
+// to adapt to activation distributions that change with sequence length.
+// Returns input_scale in output[0] and 1/input_scale in output[1].
+// ============================================================================
+
+template <typename T>
+__global__ void nvfp4_compute_online_input_scale_kernel(
+    const T* __restrict__ input,
+    float* __restrict__ output,   // [2]: output[0] = input_scale, output[1] = 1/input_scale
+    int num_elements)
+{
+  __shared__ float s_max[1024];
+  int tid = threadIdx.x;
+  int block_size = blockDim.x;
+
+  float local_max = 0.0f;
+  for (int i = blockIdx.x * block_size + tid; i < num_elements; i += gridDim.x * block_size) {
+    float v;
+    if constexpr (std::is_same_v<T, half>) {
+      v = fabsf(__half2float(input[i]));
+    } else {
+      v = fabsf(__bfloat162float(input[i]));
+    }
+    local_max = fmaxf(local_max, v);
+  }
+
+  s_max[tid] = local_max;
+  __syncthreads();
+
+  for (int stride = block_size / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicMax(reinterpret_cast<int*>(output), __float_as_int(s_max[0]));
+  }
+
+  __threadfence();
+
+  if (tid == 0 && blockIdx.x == 0) {
+    // Spin until all blocks have written
+    // Use a simple approach: launch with gridDim.x=1 for correctness
+  }
+}
+
+// Single-block version for simplicity and correctness
+template <typename T>
+__global__ void nvfp4_compute_online_input_scale_single_block_kernel(
+    const T* __restrict__ input,
+    float* __restrict__ output,   // [2]: output[0] = input_scale, output[1] = 1/input_scale
+    int num_elements)
+{
+  __shared__ float s_max[1024];
+  int tid = threadIdx.x;
+  int block_size = blockDim.x;
+
+  float local_max = 0.0f;
+  for (int i = tid; i < num_elements; i += block_size) {
+    float v;
+    if constexpr (std::is_same_v<T, half>) {
+      v = fabsf(__half2float(input[i]));
+    } else {
+      v = fabsf(__bfloat162float(input[i]));
+    }
+    local_max = fmaxf(local_max, v);
+  }
+
+  s_max[tid] = local_max;
+  __syncthreads();
+
+  for (int stride = block_size / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    float amax = s_max[0];
+    float input_scale = __fdiv_rn(amax, 6.0f);
+    if (input_scale < 1e-12f) input_scale = 1.0f;
+    float input_scale_inv = __fdiv_rn(1.0f, input_scale);
+    output[0] = input_scale;
+    output[1] = input_scale_inv;
+  }
+}
+
+extern "C" {
+
+void nvfp4_compute_online_input_scale_f16(
+    const void* input, float* output, int num_elements, int64_t stream)
+{
+  nvfp4_compute_online_input_scale_single_block_kernel<half>
+      <<<1, 1024, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const half*>(input), output, num_elements);
+}
+
+void nvfp4_compute_online_input_scale_bf16(
+    const void* input, float* output, int num_elements, int64_t stream)
+{
+  nvfp4_compute_online_input_scale_single_block_kernel<nv_bfloat16>
+      <<<1, 1024, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const nv_bfloat16*>(input), output, num_elements);
+}
+
+}  // extern "C"
+
+// ============================================================================
 // Hardware FP4 conversion (SM100+ / Blackwell)
 // Uses PTX cvt.rn.satfinite.e2m1x2.f32 for precise round-to-nearest-even
 // ============================================================================
@@ -426,6 +538,7 @@ __global__ void nvfp4_moe_build_metadata_kernel(
   }
 }
 
+
 template <typename InType>
 __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
     const InType* __restrict__ input,        // [total_rows, K]
@@ -628,6 +741,7 @@ void nvfp4_moe_build_metadata(
       K);
 }
 
+
 void nvfp4_quantize_activation_grouped_f16(
     const void* input,
     void* output,
@@ -715,6 +829,12 @@ void nvfp4_moe_scatter_bf16(
 #else  // !ENABLE_FP4
 
 extern "C" {
+
+void nvfp4_compute_online_input_scale_f16(
+    const void*, float*, int, int64_t) {}
+
+void nvfp4_compute_online_input_scale_bf16(
+    const void*, float*, int, int64_t) {}
 
 void nvfp4_quantize_activation_f16(
     const void*, void*, void*, void*, float, int, int, int, int, int64_t) {}

@@ -1,6 +1,6 @@
 [package]
 name = "attention-rs"
-version = "0.6.0"
+version = "0.6.3"
 edition = "2021"
 description = "High-performance LLM attention kernels and operations (PagedAttention, Flahinfer, Mamba, MoE, RoPE) for Candle, optimized for CUDA and Metal."
 repository = "https://github.com/guoqingbao/attention.rs"
@@ -21,9 +21,10 @@ tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
 gcu-kernels = {path = "./src/gcu-kernels", version="0.1.6", optional = true}
-kernels = { path = "./src/kernels", version="0.5.9", optional = true}
+kernels = { path = "./src/kernels", version="0.6.3", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.2.4", optional = true}
+flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "a29658b", optional = true }
 ureq = { version = "2.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 
@@ -32,6 +33,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "dep:gcu-kernels"]
 graph = ["candle-core/graph"]
 flashattn = []
+flash-decoding = ["dep:flashattn-rs", "flashattn-rs/flash-decoding"]
 no-marlin = ["dep:kernels", "kernels/no-marlin"]
 no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]
