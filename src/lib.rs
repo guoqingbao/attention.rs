@@ -412,18 +412,26 @@ impl PagedAttention {
     ) -> Result<Tensor> {
         let (query, key, value, attention_heads, key_value_heads, head_size) =
             Self::batch_major_qkv(query, key, value)?;
-        fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
+        fn repeat_kv_chunked(x: &Tensor, n_rep: usize, chunk_size: usize) -> Result<Tensor> {
             if n_rep == 1 {
-                Ok(x)
-            } else {
-                let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
-                Tensor::cat(&vec![&x; n_rep], 2)?.reshape((
+                return Ok(x.clone());
+            }
+            let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
+            let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+            let mut chunks = Vec::new();
+            for c in 0..num_chunks {
+                let offset = c * chunk_size;
+                let len = chunk_size.min(seq_len - offset);
+                let chunk = x.narrow(2, offset, len)?.contiguous()?;
+                let expanded = Tensor::cat(&vec![&chunk; n_rep], 1)?.reshape((
                     b_sz,
                     n_kv_head * n_rep,
-                    seq_len,
+                    len,
                     head_dim,
-                ))
+                ))?;
+                chunks.push(expanded);
             }
+            Tensor::cat(&chunks, 2)
         }
         let indices = &input_metadata
             .cu_seqlens_q
@@ -434,35 +442,35 @@ impl PagedAttention {
 
         let mut vec_attn = Vec::new();
         let mut start = 0usize;
-        //chunked attention for each sequence
+        let chunk_size = 1024;
         for (i, seqlen) in seqlens.iter().enumerate() {
             let seq_len = (**seqlen as usize - start) as usize;
-            let chunk_size = 1024;
             let mut attn_chunks = vec![];
 
-            let query_seq = query.narrow(2, start, seq_len)?.contiguous()?;
-            let key_seq = key.narrow(2, start, seq_len)?.contiguous()?;
-            let value_seq = value.narrow(2, start, seq_len)?.contiguous()?;
+            let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+            let key_seq_raw = key.narrow(2, start, seq_len)?.contiguous()?;
+            let value_seq_raw = value.narrow(2, start, seq_len)?.contiguous()?;
 
             let key_seq = if key_value_heads != attention_heads {
-                repeat_kv(key_seq, attention_heads / key_value_heads)?
+                repeat_kv_chunked(&key_seq_raw, attention_heads / key_value_heads, chunk_size)?
             } else {
-                key_seq
+                key_seq_raw.clone()
             };
-
             let value_seq = if key_value_heads != attention_heads {
-                repeat_kv(value_seq, attention_heads / key_value_heads)?
+                repeat_kv_chunked(
+                    &value_seq_raw,
+                    attention_heads / key_value_heads,
+                    chunk_size,
+                )?
             } else {
-                value_seq
+                value_seq_raw.clone()
             };
-
-            let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
 
             for c in 0..num_chunks {
                 let offset = c * chunk_size;
                 let len = chunk_size.min(seq_len - offset);
-                //chunk at query is correct for the following
-                let q_chunk = query_seq.narrow(2, offset, len)?.contiguous()?;
+                let q_chunk = query.narrow(2, start + offset, len)?.contiguous()?;
                 let mut att = (q_chunk.matmul(&key_seq.t()?)? * f64::from(self.scale))?;
 
                 if let Some(sc) = softcapping {
@@ -478,15 +486,15 @@ impl PagedAttention {
                     .to_dtype(att.dtype())?;
 
                 let att_chunk = att.matmul(&value_seq)?;
-                attn_chunks.push(att_chunk);
+                attn_chunks.push(att_chunk.transpose(1, 2)?.contiguous()?);
             }
 
-            let att = Tensor::cat(&attn_chunks, 2)?.contiguous()?;
+            let att = Tensor::cat(&attn_chunks, 1)?.contiguous()?;
             vec_attn.push(att);
 
             start = **seqlen as usize;
         }
-        Tensor::cat(&vec_attn, 2)?.contiguous()?.transpose(1, 2)
+        Tensor::cat(&vec_attn, 1)
     }
 
     #[cfg(all(feature = "flashattn", feature = "gcu"))]

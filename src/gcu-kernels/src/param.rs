@@ -506,9 +506,10 @@ pub fn build_kvcache_params(
     /* ---------------- SMALL_SIZE heuristic ---------------- */
     let total_task = batch * kv_num_heads;
     let _threads = (dim_blocks.x * dim_threads.x * 2) as i32;
-    // Use a large SMALL_SIZE to keep decode in the single-thread-per-task path
-    // which is stable; the split-KV large path has issues on current GCU firmware.
-    let small_size = if total_task >= 24 { 8192 } else { 8192 };
+    // Both the splitkv multi-thread path and the largekv kernel have issues on
+    // GCU300 (multi-thread hangs, largekv has precision loss). Force all decode
+    // through the splitkv single-thread path which is numerically stable.
+    let small_size = 1048576;
 
     let data_type = match query.dtype() {
         DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
