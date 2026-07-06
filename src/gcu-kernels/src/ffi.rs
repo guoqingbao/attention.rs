@@ -1,8 +1,9 @@
 use crate::param::{dim3, FWD_KVCACHE_ATTN_OP_PARAS, VARLEN_ATTN_FWD_OP_PARAS};
 use candle_core::gcu_backend::ubridge::gcu_device::driv;
 use core::ffi::{c_int, c_void};
-#[link(name = "flashkernels")] // links with libflashkernels.so
+#[cfg(feature = "flashattn")]
 extern "C" {
+    #[link(name = "flashkernels")]
     pub fn flash_attn_fwd_host(
         numBlocks: dim3,
         numThreads: dim3,
@@ -18,6 +19,7 @@ extern "C" {
         stream: driv::topsStream_t,
     ) -> i32;
 
+    #[link(name = "flashkernels")]
     pub fn varlen_attn_fwd_host(
         numBlocks: dim3,
         numDimBlocks: dim3,
@@ -37,6 +39,7 @@ extern "C" {
         stream: driv::topsStream_t,
     ) -> i32;
 
+    #[link(name = "flashkernels")]
     pub fn varlen_kvpacked_attn_fwd_host(
         numBlocks: dim3,
         dimBlocks: dim3,
@@ -53,6 +56,7 @@ extern "C" {
         stream: driv::topsStream_t,
     ) -> i32;
 
+    #[link(name = "flashkernels")]
     pub fn varlen_qkvpacked_attn_fwd_host(
         numBlocks: dim3,
         dimBlocks: dim3,
@@ -66,6 +70,7 @@ extern "C" {
         stream: driv::topsStream_t,
     ) -> i32;
 
+    #[link(name = "flashkernels")]
     pub fn fwd_kvcache_attn_host(
         dimBlocks: dim3,
         dimThreads: dim3,
@@ -86,26 +91,4 @@ extern "C" {
         params: FWD_KVCACHE_ATTN_OP_PARAS,
         stream: driv::topsStream_t,
     ) -> i32;
-
-    pub fn reshape_and_cache_flash_host(
-        dimBlocks: dim3,
-        dimThreads: dim3,
-        key: *const c_void,          // [num_tokens, num_heads, head_size]
-        value: *const c_void,        // [num_tokens, num_heads, head_size]
-        slot_mapping: *const c_void, // [num_tokens]
-        key_cache: *const c_void,    // [num_blocks, block_size, num_heads, head_size]
-        value_cache: *const c_void,  // [num_blocks, block_size, num_heads, head_size]
-        dataType: i32,
-        num_tokens: c_int,
-        num_heads: c_int,
-        head_size: c_int,
-        num_blocks: c_int,
-        block_size: c_int,
-        key_stride: c_int,
-        value_stride: c_int,
-        block_stride: c_int,
-        page_stride: c_int,
-        head_stride: c_int,
-        stream: driv::topsStream_t,
-    );
 }

@@ -1,4 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rustc-link-lib=dylib=flashkernels");
+    if cfg!(feature = "flashattn") {
+        println!("cargo:rustc-link-lib=dylib=flashkernels");
+    }
 }

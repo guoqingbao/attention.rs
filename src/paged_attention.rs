@@ -1560,6 +1560,7 @@ fn gcu_update_cache<
     slot_mapping: &Tensor,
 ) -> Result<()> {
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::ubridge::ffi::{dim3, reshape_and_cache_flash_host};
     use candle::Storage;
     let dev = key.device().as_gcu_device()?;
     let (k, k_l) = key.storage_and_layout();
@@ -1687,7 +1688,7 @@ fn gcu_update_cache<
         let head_stride = kc_l.stride()[2];
         let stream = dev.stream_inner().expect("Unable to obtain stream");
 
-        use gcu_kernels::param::{dim3, topsopDataType};
+        use gcu_kernels::param::topsopDataType;
         use std::ffi::{c_int, c_void};
         let data_type = match key.dtype() {
             DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
@@ -1696,7 +1697,7 @@ fn gcu_update_cache<
         };
 
         unsafe {
-            gcu_kernels::ffi::reshape_and_cache_flash_host(
+            reshape_and_cache_flash_host(
                 dim3 { x: 2, y: 1, z: 1 },
                 dim3 { x: 12, y: 1, z: 1 },
                 k.device_ptr() as *const c_void,
