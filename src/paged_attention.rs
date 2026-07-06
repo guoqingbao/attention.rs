@@ -1601,7 +1601,7 @@ fn gcu_update_cache<
         candle::bail!("paged-attention expects input tensors of rank 3 (k: {k_l:?}, v: {v_l:?})")
     }
 
-    #[cfg(feature = "flashattn")]
+    #[cfg(any(feature = "flashattn", all(feature = "aten", feature = "gcu")))]
     if kc_rank != 4 {
         candle::bail!(
             "flash-attention expects `key_cache` tensor to be of rank 4 \
@@ -1609,7 +1609,7 @@ fn gcu_update_cache<
         )
     }
 
-    #[cfg(not(feature = "flashattn"))]
+    #[cfg(not(any(feature = "flashattn", all(feature = "aten", feature = "gcu"))))]
     if kc_rank != 5 {
         candle::bail!(
             "paged-attention expects `key_cache` tensor to be of rank 5 \
@@ -1642,14 +1642,14 @@ fn gcu_update_cache<
         candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
     }
 
-    #[cfg(feature = "flashattn")]
+    #[cfg(any(feature = "flashattn", all(feature = "aten", feature = "gcu")))]
     let (num_blocks, block_size, _x) = {
         // [num_blocks, block_size, num_heads, head_size]
         let (num_blocks, block_size, _, _) = kc_l.shape().dims4()?;
         (num_blocks, block_size, 1)
     };
 
-    #[cfg(not(feature = "flashattn"))]
+    #[cfg(not(any(feature = "flashattn", all(feature = "aten", feature = "gcu"))))]
     let (num_blocks, block_size, x) = {
         let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
         if num_heads_kc != num_heads || head_size_kc != head_size / x {
@@ -1680,7 +1680,7 @@ fn gcu_update_cache<
     let key_stride = k_l.stride()[0] as i32;
     let value_stride = v_l.stride()[0] as i32;
 
-    #[cfg(feature = "flashattn")]
+    #[cfg(any(feature = "flashattn", all(feature = "aten", feature = "gcu")))]
     {
         let block_stride = kc_l.stride()[0];
         let page_stride = kc_l.stride()[1];
@@ -1720,7 +1720,7 @@ fn gcu_update_cache<
         }
     }
 
-    #[cfg(not(feature = "flashattn"))]
+    #[cfg(not(any(feature = "flashattn", all(feature = "aten", feature = "gcu"))))]
     {
         use candle::gcu_backend::ubridge;
         use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;

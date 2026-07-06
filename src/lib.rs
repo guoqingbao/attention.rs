@@ -412,6 +412,25 @@ impl PagedAttention {
     ) -> Result<Tensor> {
         let (query, key, value, attention_heads, key_value_heads, head_size) =
             Self::batch_major_qkv(query, key, value)?;
+
+        #[cfg(all(feature = "aten", feature = "gcu"))]
+        {
+            if softcapping.is_none() {
+                if let Ok(result) = self.aten_efficient_attention_prefill(
+                    &query,
+                    &key,
+                    &value,
+                    attention_heads,
+                    key_value_heads,
+                    head_size,
+                    attention_mask,
+                    input_metadata,
+                ) {
+                    return Ok(result);
+                }
+            }
+        }
+
         fn repeat_kv_chunked(x: &Tensor, n_rep: usize, chunk_size: usize) -> Result<Tensor> {
             if n_rep == 1 {
                 return Ok(x.clone());
@@ -497,7 +516,156 @@ impl PagedAttention {
         Tensor::cat(&vec_attn, 1)
     }
 
-    #[cfg(all(feature = "flashattn", feature = "gcu"))]
+    #[cfg(all(feature = "aten", feature = "gcu"))]
+    fn aten_efficient_attention_prefill(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attention_heads: usize,
+        key_value_heads: usize,
+        head_size: usize,
+        attention_mask: Option<&Vec<Tensor>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        use candle_core::gcu_backend::ubridge;
+        use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
+        use candle_core::gcu_backend::WrapErr;
+
+        let dtype_code: i32 = match query.dtype() {
+            candle_core::DType::F16 => 4,
+            candle_core::DType::BF16 => 5,
+            candle_core::DType::F32 => 8,
+            _ => return candle_core::bail!("unsupported dtype for aten efficient attention"),
+        };
+
+        let dev = query.device().as_gcu_device()?;
+        let stream = dev
+            .stream_inner()
+            .expect("unable to obtain stream for aten efficient attention");
+
+        let indices = &input_metadata
+            .cu_seqlens_q
+            .as_ref()
+            .unwrap()
+            .to_vec1::<u32>()?[1..];
+        let seqlens: Vec<_> = indices.iter().map(|x| *x as usize).collect();
+
+        let is_causal = if attention_mask.is_some() { 0i32 } else { 1i32 };
+
+        let mut vec_attn = Vec::new();
+        let mut start = 0usize;
+        for (_i, &seqlen) in seqlens.iter().enumerate() {
+            let seq_len = seqlen - start;
+
+            // query/key/value: [1, num_heads, total_seq, head_size]
+            // narrow along seq dim (dim=2), then transpose to [1, seq, heads, head_size]
+            let q_seq = query
+                .narrow(2, start, seq_len)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let k_seq = key
+                .narrow(2, start, seq_len)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let v_seq = value
+                .narrow(2, start, seq_len)?
+                .transpose(1, 2)?
+                .contiguous()?;
+
+            let out_el = 1 * seq_len * attention_heads * head_size;
+
+            macro_rules! run_efficient_attn {
+                ($dt:ty) => {{
+                    let (q_s, q_l) = q_seq.storage_and_layout();
+                    let (k_s, k_l) = k_seq.storage_and_layout();
+                    let (v_s, v_l) = v_seq.storage_and_layout();
+                    let q_gcu = match &*q_s {
+                        candle_core::Storage::Gcu(s) => s,
+                        _ => return candle_core::bail!("expected GCU storage"),
+                    };
+                    let k_gcu = match &*k_s {
+                        candle_core::Storage::Gcu(s) => s,
+                        _ => return candle_core::bail!("expected GCU storage"),
+                    };
+                    let v_gcu = match &*v_s {
+                        candle_core::Storage::Gcu(s) => s,
+                        _ => return candle_core::bail!("expected GCU storage"),
+                    };
+                    let q_slice = q_gcu.as_gcu_slice::<$dt>()?;
+                    let k_slice = k_gcu.as_gcu_slice::<$dt>()?;
+                    let v_slice = v_gcu.as_gcu_slice::<$dt>()?;
+                    let q_ptr = q_slice.slice(q_l.start_offset()..).device_ptr();
+                    let k_ptr = k_slice.slice(k_l.start_offset()..).device_ptr();
+                    let v_ptr = v_slice.slice(v_l.start_offset()..).device_ptr();
+
+                    let out_buf = dev.alloc::<$dt>(out_el).w()?;
+                    let out_ptr = out_buf.device_ptr();
+
+                    let ret = unsafe {
+                        ubridge::ffi::topsaten_efficient_attention(
+                            out_ptr as *mut std::ffi::c_void,
+                            q_ptr as *const std::ffi::c_void,
+                            k_ptr as *const std::ffi::c_void,
+                            v_ptr as *const std::ffi::c_void,
+                            std::ptr::null::<std::ffi::c_void>(),
+                            1i32,
+                            seq_len as i32,
+                            seq_len as i32,
+                            attention_heads as i32,
+                            key_value_heads as i32,
+                            head_size as i32,
+                            self.scale as f32,
+                            is_causal,
+                            0i32,
+                            dtype_code,
+                            stream as *const std::ffi::c_void,
+                        )
+                    };
+                    if ret != 0 {
+                        return candle_core::bail!(
+                            "topsaten_efficient_attention failed with code {ret}"
+                        );
+                    }
+                    out_buf
+                }};
+            }
+
+            let out_storage = match query.dtype() {
+                candle_core::DType::F16 => {
+                    let buf = run_efficient_attn!(half::f16);
+                    candle_core::gcu_backend::GcuStorageSlice::F16(buf)
+                }
+                candle_core::DType::BF16 => {
+                    let buf = run_efficient_attn!(half::bf16);
+                    candle_core::gcu_backend::GcuStorageSlice::BF16(buf)
+                }
+                candle_core::DType::F32 => {
+                    let buf = run_efficient_attn!(f32);
+                    candle_core::gcu_backend::GcuStorageSlice::F32(buf)
+                }
+                _ => return candle_core::bail!("unsupported dtype for aten efficient attention"),
+            };
+
+            let gcu_storage = candle_core::gcu_backend::GcuStorage {
+                slice: out_storage,
+                device: dev.clone(),
+            };
+            let out_shape =
+                candle_core::Shape::from((1usize, seq_len, attention_heads * head_size));
+            let out_tensor = candle_core::Tensor::from_storage(
+                candle_core::Storage::Gcu(gcu_storage),
+                out_shape,
+            )?;
+
+            vec_attn.push(out_tensor);
+
+            start = seqlen;
+        }
+        Tensor::cat(&vec_attn, 1)
+    }
+
+    #[cfg(all(any(feature = "flashattn", feature = "aten"), feature = "gcu"))]
     pub fn flash_var_len(
         &self,
         query: &Tensor,
@@ -588,7 +756,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(all(feature = "flashattn", feature = "gcu"))]
+    #[cfg(all(any(feature = "flashattn", feature = "aten"), feature = "gcu"))]
     pub fn flash_forward(
         &self,
         query: &Tensor,
@@ -1003,7 +1171,7 @@ impl PagedAttention {
             }
         } // end if !force_native_flash (flashinfer)
 
-        #[cfg(all(feature = "flashattn", feature = "gcu"))]
+        #[cfg(all(any(feature = "flashattn", feature = "aten"), feature = "gcu"))]
         {
             return self.flash_forward(
                 query,
