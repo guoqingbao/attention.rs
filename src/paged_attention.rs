@@ -1681,7 +1681,7 @@ fn gcu_update_cache<
     let key_stride = k_l.stride()[0] as i32;
     let value_stride = v_l.stride()[0] as i32;
 
-    #[cfg(any(feature = "flashattn", all(feature = "aten", feature = "gcu")))]
+    #[cfg(any(feature = "flashattn", feature = "aten"))]
     {
         let block_stride = kc_l.stride()[0];
         let page_stride = kc_l.stride()[1];
@@ -1693,6 +1693,7 @@ fn gcu_update_cache<
         let data_type = match key.dtype() {
             DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
             DType::BF16 => topsopDataType::TOPSOP_DATA_BF16,
+            DType::F32 => topsopDataType::TOPSOP_DATA_FP32,
             _ => candle_core::bail!("Unsupport data type for flash attention!"),
         };
 
@@ -1721,7 +1722,7 @@ fn gcu_update_cache<
         }
     }
 
-    #[cfg(not(any(feature = "flashattn", all(feature = "aten", feature = "gcu"))))]
+    #[cfg(not(any(feature = "flashattn", feature = "aten")))]
     {
         use candle::gcu_backend::ubridge;
         use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;

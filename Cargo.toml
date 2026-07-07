@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="5d2ae20" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="5d2ae20" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="7c56c6f" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="7c56c6f" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
@@ -39,4 +39,4 @@ metal-flash = ["metal"]
 cutlass = ["dep:kernels", "kernels/cutlass"]
 flash = ["cuda", "dep:kernels", "kernels/flash"]
 flashinfer = ["cuda", "dep:kernels", "kernels/flashinfer"]
-aten = ["candle-core/aten", "candle-nn/aten"]
+aten = ["candle-core/aten", "candle-nn/aten", "gcu-kernels/aten"]
