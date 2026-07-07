@@ -87,7 +87,6 @@ fn main() -> Result<()> {
         .source_dir("src")
         .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
-        .arg("-std=c++20")
         .arg("-O3");
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
@@ -339,7 +338,12 @@ fn main() -> Result<()> {
     }
 
     if !is_target_msvc {
-        builder = builder.arg("-Xcompiler").arg("-fPIC").arg("-std=c++20");
+        builder = builder.arg("-Xcompiler").arg("-fPIC");
+        if compute_cap >= 90 {
+            builder = builder.arg("-std=c++20");
+        } else {
+            builder = builder.arg("-std=c++17");
+        }
     }
 
     println!("cargo:info={builder:?}");
