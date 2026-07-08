@@ -1094,6 +1094,9 @@ impl ReshapeCache {
             Storage::Metal(s) => s,
             _ => candle_core::bail!("slot_mapping must be a metal tensor"),
         };
+        if slot_mapping.dtype() != DType::I64 {
+            candle_core::bail!("slot_mapping must be of i64 dtype");
+        }
 
         let k_rank = k_l.stride().len();
         let v_rank = v_l.stride().len();

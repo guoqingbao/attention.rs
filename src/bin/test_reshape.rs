@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use candle_core::{Tensor, Device};
+    use candle_core::{Device, Tensor};
     let device = Device::Cpu;
     let key = Tensor::zeros((1, 8, 61, 128), candle_core::DType::F32, &device)?;
     let key_t = key.transpose(1, 2)?;

@@ -264,7 +264,7 @@ pub fn flash_prefill_metal(
             head_dim as i32,
             block_size,
             softcap,
-            (num_q_heads * head_dim) as i32,
+            q_l.stride()[0] as i32,
             sw,
             total_num_blocks,
             kv_block_stride,
@@ -296,6 +296,30 @@ pub fn flash_decode_metal(
     let device = get_metal_device(query)?;
     let num_seqs = query.dim(0)? as i32;
     let block_size = key_cache.dim(1)? as i32;
+
+    // The decode kernel is only instantiated for matching (T, CACHE_T)
+    // pairs in the non-quantized case (bf16/bf16, f16/f16 - no variant
+    // accepts an f32 query against an f16/bf16 cache). Cast query (and the
+    // output buffer written into by the kernel) to the cache's own dtype
+    // so dispatch always resolves to a real, correctly-typed kernel; cast
+    // the result back to the original dtype before returning so callers
+    // see their expected compute dtype. Mirrors the fix applied to
+    // flash_reshape_and_cache_metal's key/value dtype handling. Skipped
+    // for the fp8-quantized cache case (cache dtype is u8, not a numeric
+    // type query can be meaningfully cast into - the kernel's own
+    // k_scale/v_scale dequantization handles that source/cache dtype
+    // mismatch intentionally).
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+    let orig_dtype = query.dtype();
+    let query_cast;
+    let query: &Tensor = if quantized_cache || query.dtype() == key_cache.dtype() {
+        query
+    } else {
+        query_cast = query.to_dtype(key_cache.dtype())?;
+        &query_cast
+    };
+    let output_buf = Tensor::zeros_like(query)?;
+    let output = &output_buf;
     let ty = metal_dtype(query.dtype());
 
     let (q_s, q_l) = query.storage_and_layout();
@@ -349,7 +373,11 @@ pub fn flash_decode_metal(
     };
 
     let max_blocks_per_seq = block_tables.dim(1)? as i32;
-    let q_stride = (num_q_heads * head_dim) as i32;
+    // Not necessarily num_q_heads * head_dim: query may be a non-contiguous
+    // view (e.g. packed from a larger QKV buffer) - use its real per-seq
+    // stride, matching the fix applied to flash_reshape_and_cache_metal's
+    // key/value stride handling.
+    let q_stride = q_l.stride()[0] as i32;
     let sw = sliding_window.unwrap_or(0) as i32;
 
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD;
@@ -434,7 +462,7 @@ pub fn flash_decode_metal(
         .map_err(|e| candle::Error::Msg(format!("flash_attention_decode: {e}")))?;
     }
 
-    Ok(output.clone())
+    output.to_dtype(orig_dtype)
 }
 
 pub fn flash_tq_store_k8v4_metal(
@@ -1219,7 +1247,7 @@ pub fn flash_tq3_prefill_metal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, DType, Tensor};
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn test_metal_flash_stride_and_dtype() {
@@ -1236,8 +1264,10 @@ mod tests {
         let num_blocks = 1;
         let block_size = 32;
 
-        let key_cache = Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
-        let value_cache = Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
+        let key_cache =
+            Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
+        let value_cache =
+            Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
 
         // Pass slot_mapping as U32 to test the automatic promotion to I64 inside the dispatch
         let slot_mapping = Tensor::arange(0u32, 10u32, &device).unwrap();
@@ -1252,6 +1282,10 @@ mod tests {
             &slot_mapping,
         );
 
-        assert!(res.is_ok(), "Failed to execute flash_reshape_and_cache_metal: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "Failed to execute flash_reshape_and_cache_metal: {:?}",
+            res.err()
+        );
     }
 }
