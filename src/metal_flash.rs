@@ -31,6 +31,25 @@ pub fn flash_reshape_and_cache_metal(
     let device = get_metal_device(key)?;
     let (num_tokens, num_kv_heads, head_dim) = key.dims3()?;
     let block_size = key_cache.dim(1)?;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
+    // flash_reshape_and_cache is only instantiated for matching (T, CACHE_T)
+    // pairs in the non-quantized case (bf16/bf16, f16/f16 - no f32/f32
+    // variant exists). Cast the source key/value to the cache's own dtype
+    // so dispatch always resolves to a real kernel, regardless of what
+    // dtype the model's own compute pipeline uses upstream (e.g. F32
+    // compute feeding an F16 KV cache on Metal). The quantized (fp8) path
+    // intentionally keeps a bf16/f16 source against a u8 cache, so it's
+    // left untouched.
+    let (key, value) = if quantized_cache {
+        (key.clone(), value.clone())
+    } else {
+        (
+            key.to_dtype(key_cache.dtype())?,
+            value.to_dtype(value_cache.dtype())?,
+        )
+    };
+    let key = &key;
+    let value = &value;
     let ty = metal_dtype(key.dtype());
 
     let (key_s, key_l) = key.storage_and_layout();
@@ -53,7 +72,12 @@ pub fn flash_reshape_and_cache_metal(
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
-    let (sm_s, sm_l) = slot_mapping.storage_and_layout();
+    let slot_mapping_i64 = if slot_mapping.dtype() != candle_core::DType::I64 {
+        slot_mapping.to_dtype(candle_core::DType::I64)?
+    } else {
+        slot_mapping.clone()
+    };
+    let (sm_s, sm_l) = slot_mapping_i64.storage_and_layout();
     let sm_s = match &*sm_s {
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
@@ -95,13 +119,15 @@ pub fn flash_reshape_and_cache_metal(
         vc_s.buffer(),
         vc_l.start_offset() * value_cache.dtype().size_in_bytes(),
         sm_s.buffer(),
-        sm_l.start_offset() * slot_mapping.dtype().size_in_bytes(),
+        sm_l.start_offset() * slot_mapping_i64.dtype().size_in_bytes(),
         num_tokens as i32,
         num_kv_heads as i32,
         head_dim as i32,
         block_size as i32,
-        ks_storage,
-        vs_storage,
+        key_l.stride()[0] as i32,
+        val_l.stride()[0] as i32,
+        ks_storage.map(|s| s.buffer().clone()),
+        vs_storage.map(|s| s.buffer().clone()),
     )
     .map_err(|e| candle::Error::Msg(format!("flash_reshape_and_cache_metal: {e}")))?;
 
@@ -1188,4 +1214,44 @@ pub fn flash_tq3_prefill_metal(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, DType, Tensor};
+
+    #[test]
+    fn test_metal_flash_stride_and_dtype() {
+        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        if !device.is_metal() {
+            return;
+        }
+
+        // Test non-contiguous slicing ensuring stride is utilized
+        let qkv = Tensor::zeros((10, 3, 128), DType::F16, &device).unwrap();
+        let key = qkv.narrow(1, 1, 1).unwrap(); // shape [10, 1, 128]
+        let value = qkv.narrow(1, 2, 1).unwrap();
+
+        let num_blocks = 1;
+        let block_size = 32;
+
+        let key_cache = Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
+        let value_cache = Tensor::zeros((num_blocks, block_size, 1, 128), DType::F16, &device).unwrap();
+
+        // Pass slot_mapping as U32 to test the automatic promotion to I64 inside the dispatch
+        let slot_mapping = Tensor::arange(0u32, 10u32, &device).unwrap();
+
+        let res = flash_reshape_and_cache_metal(
+            &key,
+            &value,
+            &key_cache,
+            &value_cache,
+            None,
+            None,
+            &slot_mapping,
+        );
+
+        assert!(res.is_ok(), "Failed to execute flash_reshape_and_cache_metal: {:?}", res.err());
+    }
 }

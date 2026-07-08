@@ -1194,6 +1194,28 @@ impl PagedAttention {
             let tq_mode_metal = get_turboquant_mode();
 
             if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
+                if std::env::var("DEBUGPROBE_NAN_CHECK").is_ok() {
+                    let kf = key_p
+                        .to_dtype(candle_core::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let vf = value_p
+                        .to_dtype(candle_core::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let k_nan = kf.iter().filter(|v| v.is_nan()).count();
+                    let v_nan = vf.iter().filter(|v| v.is_nan()).count();
+                    if k_nan > 0 || v_nan > 0 {
+                        eprintln!(
+                            "DEBUGPROBE_NAN layer={} key_p dtype={:?} shape={:?} k_nan={k_nan}/{} v_nan={v_nan}/{}",
+                            self.layer_idx,
+                            key_p.dtype(),
+                            key_p.shape(),
+                            kf.len(),
+                            vf.len()
+                        );
+                    }
+                }
                 // Standard cache write: needed for BF16/FP8 and Turbo8 (K in FP8 cache)
                 // Turbo4/3 use TQ buffers exclusively (standard cache is 1-block dummy)
                 let tq_uses_std = matches!(tq_mode_metal, None | Some(TurboquantMode::Turbo8));
