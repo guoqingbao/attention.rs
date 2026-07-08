@@ -22,6 +22,14 @@
 #include <cmath>
 
 static constexpr int NVFP4_BLOCK_SIZE = 16;
+// SM120 CUTLASS FP4 kernels produce NaN when E4M3 block scale hits uint8 127
+// (max finite = 448.0). Clamp to 126 (= 416.0, <2% precision loss).
+// See: sgl-project/sglang#22927
+static constexpr uint8_t NVFP4_E4M3_SCALE_MAX = 126;
+
+__device__ __forceinline__ uint8_t clamp_nvfp4_e4m3_scale(uint8_t bits) {
+  return bits > NVFP4_E4M3_SCALE_MAX ? NVFP4_E4M3_SCALE_MAX : bits;
+}
 
 // ============================================================================
 // Online input scale: compute per-tensor amax(|x|) / 6.0 for dynamic
@@ -248,8 +256,13 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
-  uint8_t fp8_scale_bits = fp8_sf.__x;
-  SFValue = static_cast<float>(fp8_sf);
+  uint8_t fp8_scale_bits = clamp_nvfp4_e4m3_scale(fp8_sf.__x);
+  if (fp8_scale_bits != fp8_sf.__x) {
+    fp8_sf.__x = fp8_scale_bits;
+    SFValue = static_cast<float>(fp8_sf);
+  } else {
+    SFValue = static_cast<float>(fp8_sf);
+  }
 
   float outputScale = SFValue != 0.0f
       ? __fdiv_rn(SFScaleVal, SFValue)
@@ -304,7 +317,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
       }
       if (biased_exp > 15) { biased_exp = 15; mant3 = 7; }
 
-      fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
+      fp8_scale_bits = clamp_nvfp4_e4m3_scale((sign << 7) | (biased_exp << 3) | mant3);
 
       float recon_mantissa = 1.0f + mant3 / 8.0f;
       float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
@@ -584,8 +597,13 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
 
   __nv_fp8_e4m3 fp8_sf = __nv_fp8_e4m3(SFValue);
-  uint8_t fp8_scale_bits = fp8_sf.__x;
-  SFValue = static_cast<float>(fp8_sf);
+  uint8_t fp8_scale_bits = clamp_nvfp4_e4m3_scale(fp8_sf.__x);
+  if (fp8_scale_bits != fp8_sf.__x) {
+    fp8_sf.__x = fp8_scale_bits;
+    SFValue = static_cast<float>(fp8_sf);
+  } else {
+    SFValue = static_cast<float>(fp8_sf);
+  }
 
   float outputScale = SFValue != 0.0f
       ? __fdiv_rn(SFScaleVal, SFValue)
@@ -629,7 +647,7 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
         }
       }
       if (biased_exp > 15) { biased_exp = 15; mant3 = 7; }
-      fp8_scale_bits = (sign << 7) | (biased_exp << 3) | mant3;
+      fp8_scale_bits = clamp_nvfp4_e4m3_scale((sign << 7) | (biased_exp << 3) | mant3);
       float recon_mantissa = 1.0f + mant3 / 8.0f;
       float quant_scale = recon_mantissa * powf(2.0f, biased_exp - 7);
       if (sign) quant_scale = -quant_scale;
