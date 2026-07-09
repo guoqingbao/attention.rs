@@ -24,6 +24,23 @@ struct PagedAttention {
     sliding_window: i32,
 }
 
+/// Validate attention scale parameters to prevent invalid inputs
+/// The CUDA kernels have built-in numeric stability guards (expf clamping),
+/// so we only validate for physically impossible values here.
+fn validate_attention_params(scale: f32, softcap: f32) -> Result<()> {
+    // Scale must be positive - zero or negative scale would cause attention collapse
+    if scale <= 0.0 {
+        candle::bail!("softmax_scale must be positive, got {}", scale);
+    }
+    
+    // Softcap cannot be negative (0 means disabled, >0 enables softcapping)
+    if softcap < 0.0 {
+        candle::bail!("softcap cannot be negative, got {}", softcap);
+    }
+    
+    Ok(())
+}
+
 impl PagedAttention {
     #[cfg(feature = "cuda")]
     fn cuda_fwd_t<
@@ -244,6 +261,9 @@ impl PagedAttention {
             };
 
             unsafe {
+                // Validate parameters before kernel launch
+                validate_attention_params(self.softmax_scale, self.softcapping)?;
+
                 // Calculate shared memory requirement for optimized kernel:
                 // smem_size = 64 (SeqInfo) + 2 * head_size * block_size * sizeof(cache_t)
                 // sizeof(cache_t) = 2 for fp16/bf16, 1 for fp8
