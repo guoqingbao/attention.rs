@@ -2483,15 +2483,17 @@ pub fn flash_reshape_and_cache_metal(
     num_heads: i32,
     head_size: i32,
     block_size: i32,
-    k_scale: Option<MetalStorage>,
-    v_scale: Option<MetalStorage>,
+    key_stride: i32,
+    value_stride: i32,
+    k_scale: Option<Buffer>,
+    v_scale: Option<Buffer>,
 ) -> Result<(), MetalKernelError> {
     let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     let type_prefix = match ty {
         PagedAttentionDType::BF16 => "bf16",
         PagedAttentionDType::F16 => "f16",
-        PagedAttentionDType::F32 => "bf16",
+        PagedAttentionDType::F32 => "f32",
     };
     let cache_suffix = if quantized_cache {
         "_fp8"
@@ -2499,7 +2501,7 @@ pub fn flash_reshape_and_cache_metal(
         match ty {
             PagedAttentionDType::BF16 => "_bf16",
             PagedAttentionDType::F16 => "_f16",
-            PagedAttentionDType::F32 => "_bf16",
+            PagedAttentionDType::F32 => "_f32",
         }
     };
     let name = format!("flash_reshape_cache_{}{}", type_prefix, cache_suffix);
@@ -2516,31 +2518,40 @@ pub fn flash_reshape_and_cache_metal(
     encoder.set_buffer(4, Some(slot_mapping), slot_mapping_offset as NSUInteger);
     encoder.set_bytes(
         5,
-        size_of_val(&num_tokens),
+        size_of_val(&num_tokens) as NSUInteger,
         &num_tokens as *const _ as *const c_void,
     );
     encoder.set_bytes(
         6,
-        size_of_val(&num_heads),
+        size_of_val(&num_heads) as NSUInteger,
         &num_heads as *const _ as *const c_void,
     );
     encoder.set_bytes(
         7,
-        size_of_val(&head_size),
+        size_of_val(&head_size) as NSUInteger,
         &head_size as *const _ as *const c_void,
     );
     encoder.set_bytes(
         8,
-        size_of_val(&block_size),
+        size_of_val(&block_size) as NSUInteger,
         &block_size as *const _ as *const c_void,
     );
-    if let Some(ks) = k_scale {
-        encoder.set_buffer(9, Some(ks.buffer()), 0);
+    encoder.set_bytes(
+        9,
+        size_of_val(&key_stride) as NSUInteger,
+        &key_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&value_stride) as NSUInteger,
+        &value_stride as *const _ as *const c_void,
+    );
+    if let Some(ks) = &k_scale {
+        encoder.set_buffer(11, Some(ks), 0);
     }
-    if let Some(vs) = v_scale {
-        encoder.set_buffer(10, Some(vs.buffer()), 0);
+    if let Some(vs) = &v_scale {
+        encoder.set_buffer(12, Some(vs), 0);
     }
-
     let thread_groups_count = MTLSize {
         width: num_tokens as u64,
         height: 1,

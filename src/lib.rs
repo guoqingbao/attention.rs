@@ -12,6 +12,8 @@ pub mod paged_attention;
 pub mod scale_update;
 #[cfg(feature = "cuda")]
 pub mod workspace;
+#[cfg(feature = "metal-flash")]
+use candle_core::DType;
 use candle_core::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use paged_attention::convert_to_fp8;
@@ -44,8 +46,70 @@ pub mod swiglu;
 #[cfg(feature = "flash")]
 pub mod flash;
 
-#[cfg(feature = "metal")]
+#[cfg(feature = "metal-flash")]
 pub mod metal_flash;
+
+#[cfg(feature = "metal-flash")]
+fn metal_flash_supported_cache_dtype(dtype: DType, op: &str) -> Result<DType> {
+    match dtype {
+        DType::F16 | DType::BF16 => Ok(dtype),
+        dtype => {
+            candle_core::bail!("{op} only supports F16/BF16 non-quantized KV cache, got {dtype:?}")
+        }
+    }
+}
+
+#[cfg(feature = "metal-flash")]
+fn metal_flash_supported_quantized_source_dtype(dtype: DType) -> Result<DType> {
+    match dtype {
+        DType::F16 | DType::BF16 => Ok(dtype),
+        DType::F32 => Ok(DType::BF16),
+        dtype => candle_core::bail!(
+            "Metal FP8/TurboQuant flash only supports F16/BF16/F32 sources, got {dtype:?}"
+        ),
+    }
+}
+
+#[cfg(feature = "metal-flash")]
+fn metal_flash_cache_kernel_dtype(
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    op: &str,
+) -> Result<DType> {
+    let key_dtype = metal_flash_supported_cache_dtype(key_cache.dtype(), op)?;
+    let value_dtype = metal_flash_supported_cache_dtype(value_cache.dtype(), op)?;
+    if key_dtype != value_dtype {
+        candle_core::bail!(
+            "{op} requires matching key/value cache dtypes, got {:?} and {:?}",
+            key_cache.dtype(),
+            value_cache.dtype()
+        );
+    }
+    Ok(key_dtype)
+}
+
+#[cfg(feature = "metal-flash")]
+fn metal_flash_standard_kernel_dtype(
+    source_dtype: DType,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    quantized_cache: bool,
+) -> Result<DType> {
+    if quantized_cache {
+        metal_flash_supported_quantized_source_dtype(source_dtype)
+    } else {
+        metal_flash_cache_kernel_dtype(key_cache, value_cache, "metal-flash")
+    }
+}
+
+#[cfg(feature = "metal-flash")]
+fn metal_flash_cast_contiguous(t: &Tensor, dtype: DType) -> Result<Tensor> {
+    if t.dtype() == dtype {
+        t.contiguous()
+    } else {
+        t.to_dtype(dtype)?.contiguous()
+    }
+}
 
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
@@ -1185,24 +1249,40 @@ impl PagedAttention {
         }
 
         // Metal flash attention path
-        #[cfg(feature = "metal")]
+        #[cfg(feature = "metal-flash")]
         {
             let (query_p, key_p, value_p, attention_heads_p, key_value_heads_p, head_size_p) =
                 Self::packed_qkv(query, key, value)?;
+            let orig_query_dtype = query_p.dtype();
 
             let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+            let slot_mapping = if slot_mapping.dtype() == DType::I64 {
+                slot_mapping.contiguous()?
+            } else {
+                slot_mapping.to_dtype(DType::I64)?.contiguous()?
+            };
             let tq_mode_metal = get_turboquant_mode();
+            let fp8_cache_metal = self.k_scale.is_some() && self.v_scale.is_some();
 
-            if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
+            if let (Some(key_cache), Some(value_cache)) = (key_cache.as_ref(), value_cache.as_ref())
+            {
                 // Standard cache write: needed for BF16/FP8 and Turbo8 (K in FP8 cache)
                 // Turbo4/3 use TQ buffers exclusively (standard cache is 1-block dummy)
                 let tq_uses_std = matches!(tq_mode_metal, None | Some(TurboquantMode::Turbo8));
                 if tq_uses_std {
+                    let dtype = metal_flash_standard_kernel_dtype(
+                        key_p.dtype(),
+                        key_cache,
+                        value_cache,
+                        fp8_cache_metal,
+                    )?;
+                    let key_metal = metal_flash_cast_contiguous(&key_p, dtype)?;
+                    let value_metal = metal_flash_cast_contiguous(&value_p, dtype)?;
                     crate::metal_flash::flash_reshape_and_cache_metal(
-                        &key_p,
-                        &value_p,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
+                        &key_metal,
+                        &value_metal,
+                        key_cache,
+                        value_cache,
                         self.k_scale.as_ref(),
                         self.v_scale.as_ref(),
                         &slot_mapping,
@@ -1210,9 +1290,11 @@ impl PagedAttention {
                 }
                 // TurboQuant Turbo8: additionally write 4-bit V
                 if matches!(tq_mode_metal, Some(TurboquantMode::Turbo8)) {
+                    let dtype = metal_flash_supported_quantized_source_dtype(value_p.dtype())?;
+                    let value_metal = metal_flash_cast_contiguous(&value_p, dtype)?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq_store_k8v4_metal(
-                            &value_p,
+                            &value_metal,
                             &tq.v_absmax,
                             &tq.v_quant,
                             &slot_mapping,
@@ -1223,10 +1305,13 @@ impl PagedAttention {
                 }
                 // TurboQuant Turbo4: WHT K + 4-bit V store
                 if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
+                    let dtype = metal_flash_supported_quantized_source_dtype(key_p.dtype())?;
+                    let key_metal = metal_flash_cast_contiguous(&key_p, dtype)?;
+                    let value_metal = metal_flash_cast_contiguous(&value_p, dtype)?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq4_store_metal(
-                            &key_p,
-                            &value_p,
+                            &key_metal,
+                            &value_metal,
                             tq.k_absmax.as_ref().unwrap(),
                             tq.k_quant.as_ref().unwrap(),
                             &tq.v_absmax,
@@ -1240,10 +1325,13 @@ impl PagedAttention {
 
                 // TurboQuant Turbo3: WHT K + 3-bit K / 4-bit V store
                 if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                    let dtype = metal_flash_supported_quantized_source_dtype(key_p.dtype())?;
+                    let key_metal = metal_flash_cast_contiguous(&key_p, dtype)?;
+                    let value_metal = metal_flash_cast_contiguous(&value_p, dtype)?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq3_store_metal(
-                            &key_p,
-                            &value_p,
+                            &key_metal,
+                            &value_metal,
                             tq.k_absmax.as_ref().unwrap(),
                             tq.k_quant.as_ref().unwrap(),
                             &tq.v_absmax,
@@ -1269,13 +1357,21 @@ impl PagedAttention {
 
             let block_tables = input_metadata.block_tables.as_ref().unwrap();
             let context_lens = input_metadata.context_lens.as_ref().unwrap();
+            let Some(key_cache) = key_cache.as_ref() else {
+                candle_core::bail!("metal-flash requires key_cache for paged attention")
+            };
+            let Some(value_cache) = value_cache.as_ref() else {
+                candle_core::bail!("metal-flash requires value_cache for paged attention")
+            };
 
             if input_metadata.is_prefill {
                 // Turbo4: prefill reads from TQ4 buffers (4-bit K + 4-bit V)
                 if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
+                    let dtype = metal_flash_supported_quantized_source_dtype(query_p.dtype())?;
+                    let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq4_prefill_metal(
-                            &query_p,
+                            &query_metal,
                             tq.k_absmax.as_ref().unwrap(),
                             tq.k_quant.as_ref().unwrap(),
                             &tq.v_absmax,
@@ -1292,15 +1388,17 @@ impl PagedAttention {
                             input_metadata.max_seqlen_q,
                         )
                     }) {
-                        return r;
+                        return r?.to_dtype(orig_query_dtype);
                     }
                 }
 
                 // Turbo3: prefill reads from TQ3 buffers (3-bit K + 4-bit V)
                 if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                    let dtype = metal_flash_supported_quantized_source_dtype(query_p.dtype())?;
+                    let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::metal_flash::flash_tq3_prefill_metal(
-                            &query_p,
+                            &query_metal,
                             tq.k_absmax.as_ref().unwrap(),
                             tq.k_quant.as_ref().unwrap(),
                             &tq.v_absmax,
@@ -1317,13 +1415,20 @@ impl PagedAttention {
                             input_metadata.max_seqlen_q,
                         )
                     }) {
-                        return r;
+                        return r?.to_dtype(orig_query_dtype);
                     }
                 }
+                let dtype = metal_flash_standard_kernel_dtype(
+                    query_p.dtype(),
+                    key_cache,
+                    value_cache,
+                    fp8_cache_metal,
+                )?;
+                let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
                 return crate::metal_flash::flash_prefill_metal(
-                    &query_p,
-                    key_cache.as_ref().unwrap(),
-                    value_cache.as_ref().unwrap(),
+                    &query_metal,
+                    key_cache,
+                    value_cache,
                     block_tables,
                     context_lens,
                     attention_heads_p,
@@ -1336,17 +1441,19 @@ impl PagedAttention {
                     self.v_scale.as_ref(),
                     input_metadata.cu_seqlens_q.as_ref(),
                     input_metadata.max_seqlen_q,
-                );
+                )?
+                .to_dtype(orig_query_dtype);
             }
-
-            let output = query_p.zeros_like()?;
 
             // Turbo8 decode: use TQ k8v4 decode kernel (FP8 K + 4-bit V)
             if matches!(tq_mode_metal, Some(TurboquantMode::Turbo8)) {
+                let dtype = metal_flash_supported_quantized_source_dtype(query_p.dtype())?;
+                let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
+                let output = query_metal.zeros_like()?;
                 if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                     crate::metal_flash::flash_tq_decode_k8v4_metal(
-                        &query_p,
-                        key_cache.as_ref().unwrap(),
+                        &query_metal,
+                        key_cache,
                         &tq.v_absmax,
                         &tq.v_quant,
                         block_tables,
@@ -1362,15 +1469,18 @@ impl PagedAttention {
                         self.sliding_window,
                     )
                 }) {
-                    return r;
+                    return r?.to_dtype(orig_query_dtype);
                 }
             }
 
             // Turbo4 decode: use TQ4 decode kernel (4-bit WHT K + 4-bit V)
             if matches!(tq_mode_metal, Some(TurboquantMode::Turbo4)) {
+                let dtype = metal_flash_supported_quantized_source_dtype(query_p.dtype())?;
+                let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
+                let output = query_metal.zeros_like()?;
                 if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                     crate::metal_flash::flash_tq4_decode_metal(
-                        &query_p,
+                        &query_metal,
                         tq.k_absmax.as_ref().unwrap(),
                         tq.k_quant.as_ref().unwrap(),
                         &tq.v_absmax,
@@ -1386,15 +1496,18 @@ impl PagedAttention {
                         self.sliding_window,
                     )
                 }) {
-                    return r;
+                    return r?.to_dtype(orig_query_dtype);
                 }
             }
 
             // Turbo3 decode: use TQ3 decode kernel (3-bit WHT K + 4-bit V)
             if matches!(tq_mode_metal, Some(TurboquantMode::Turbo3)) {
+                let dtype = metal_flash_supported_quantized_source_dtype(query_p.dtype())?;
+                let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
+                let output = query_metal.zeros_like()?;
                 if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                     crate::metal_flash::flash_tq3_decode_metal(
-                        &query_p,
+                        &query_metal,
                         tq.k_absmax.as_ref().unwrap(),
                         tq.k_quant.as_ref().unwrap(),
                         &tq.v_absmax,
@@ -1410,14 +1523,22 @@ impl PagedAttention {
                         self.sliding_window,
                     )
                 }) {
-                    return r;
+                    return r?.to_dtype(orig_query_dtype);
                 }
             }
 
+            let dtype = metal_flash_standard_kernel_dtype(
+                query_p.dtype(),
+                key_cache,
+                value_cache,
+                fp8_cache_metal,
+            )?;
+            let query_metal = metal_flash_cast_contiguous(&query_p, dtype)?;
+            let output = query_metal.zeros_like()?;
             return crate::metal_flash::flash_decode_metal(
-                &query_p,
-                key_cache.as_ref().unwrap(),
-                value_cache.as_ref().unwrap(),
+                &query_metal,
+                key_cache,
+                value_cache,
                 block_tables,
                 context_lens,
                 &output,
@@ -1430,7 +1551,8 @@ impl PagedAttention {
                 self.sliding_window,
                 self.k_scale.as_ref(),
                 self.v_scale.as_ref(),
-            );
+            )?
+            .to_dtype(orig_query_dtype);
         }
 
         let mut att = if input_metadata.is_prefill && input_metadata.block_tables.is_none() {

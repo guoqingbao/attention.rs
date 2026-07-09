@@ -495,12 +495,15 @@ template <typename T, typename cache_t, bool is_fp8>
     const constant int& num_kv_heads [[buffer(6)]],
     const constant int& head_dim [[buffer(7)]],
     const constant int& block_size [[buffer(8)]],
-    device const float* k_scales [[buffer(9)]],
-    device const float* v_scales [[buffer(10)]],
+    const constant int& key_stride [[buffer(9)]],
+    const constant int& value_stride [[buffer(10)]],
+    device const float* k_scales [[buffer(11)]],
+    device const float* v_scales [[buffer(12)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
 ) {
     const int token_idx = tgid.x;
+    const int head_idx = tgid.y;
     if (token_idx >= num_tokens) return;
 
     const long slot = slot_mapping[token_idx];
@@ -512,9 +515,9 @@ template <typename T, typename cache_t, bool is_fp8>
     const int thread_idx = tid.x;
     const int stride = num_kv_heads * head_dim;
 
-    // Input: [num_tokens, num_kv_heads, head_dim]
-    device const T* k_in = key + token_idx * stride;
-    device const T* v_in = value + token_idx * stride;
+    // Input: [num_tokens, num_kv_heads, head_dim] but with custom strides
+    device const T* k_in = key + token_idx * key_stride;
+    device const T* v_in = value + token_idx * value_stride;
 
     // Cache: [num_blocks, block_size, num_kv_heads, head_dim]
     int cache_offset = (block_idx * block_size + block_offset) * stride;
@@ -833,6 +836,7 @@ template [[host_name("flash_reshape_cache_" SUFFIX)]] \
 [[kernel]] void flash_reshape_and_cache<T, CACHE_T, IS_FP8>( \
     device const T*, device const T*, device CACHE_T*, device CACHE_T*, \
     device const long*, const constant int&, const constant int&, \
+    const constant int&, const constant int&, \
     const constant int&, const constant int&, \
     device const float*, device const float*, \
     uint3, uint3);
