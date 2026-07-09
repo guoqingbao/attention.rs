@@ -803,7 +803,43 @@ impl MambaCache {
         self.preserved_prefix_states.remove(&hash);
     }
 
+    fn normalize_prefix_lru(&mut self) {
+        let device_hashes = self.prefix_states.keys().copied().collect::<HashSet<_>>();
+
+        let mut seen = HashSet::new();
+        self.prefix_lru.retain(|hash| {
+            device_hashes.contains(hash)
+                && !self.preserved_prefix_states.contains(hash)
+                && seen.insert(*hash)
+        });
+
+        let mut seen_preserved = HashSet::new();
+        self.preserved_prefix_lru.retain(|hash| {
+            device_hashes.contains(hash)
+                && self.preserved_prefix_states.contains(hash)
+                && seen_preserved.insert(*hash)
+        });
+
+        let queued = self
+            .prefix_lru
+            .iter()
+            .chain(self.preserved_prefix_lru.iter())
+            .copied()
+            .collect::<HashSet<_>>();
+        for hash in device_hashes {
+            if queued.contains(&hash) {
+                continue;
+            }
+            if self.preserved_prefix_states.contains(&hash) {
+                self.preserved_prefix_lru.push_back(hash);
+            } else {
+                self.prefix_lru.push_back(hash);
+            }
+        }
+    }
+
     fn make_room_for_prefix_state(&mut self) -> bool {
+        self.normalize_prefix_lru();
         while self.prefix_states.len() >= self.prefix_cache_capacity {
             if let Some(hash) = self.prefix_lru.pop_front() {
                 self.evict_device_prefix_state(hash);
@@ -811,6 +847,13 @@ impl MambaCache {
             }
 
             let Some(hash) = self.preserved_prefix_lru.pop_front() else {
+                tracing::info!(
+                    "MambaCache: device prefix snapshot eviction could not make room (device snapshots {}/{}, cpu snapshots {}/{})",
+                    self.prefix_states.len(),
+                    self.prefix_cache_capacity,
+                    self.cpu_prefix_states.len(),
+                    self.cpu_prefix_cache_capacity
+                );
                 return false;
             };
             self.evict_device_prefix_state(hash);
@@ -819,6 +862,7 @@ impl MambaCache {
     }
 
     fn evict_prefix_states_if_needed(&mut self) {
+        self.normalize_prefix_lru();
         while self.prefix_states.len() > self.prefix_cache_capacity {
             if let Some(hash) = self.prefix_lru.pop_front() {
                 self.evict_device_prefix_state(hash);
@@ -856,19 +900,12 @@ impl MambaCache {
         self.cpu_prefix_states.remove(&hash)
     }
 
-    fn drop_cpu_prefix_state(&mut self, hash: u64) {
+    fn drop_cpu_prefix_state(&mut self, hash: u64) -> bool {
         let existed = self.remove_cpu_prefix_state(hash).is_some();
         if !self.prefix_states.contains_key(&hash) {
             self.preserved_prefix_states.remove(&hash);
         }
-        if existed {
-            tracing::info!(
-                "MambaCache: dropped CPU prefix snapshot {} (cpu snapshots {}/{})",
-                hash,
-                self.cpu_prefix_states.len(),
-                self.cpu_prefix_cache_capacity
-            );
-        }
+        existed
     }
 
     fn normalize_cpu_prefix_lru(&mut self) {
@@ -926,16 +963,32 @@ impl MambaCache {
             .max(1);
         let target_len = self.cpu_prefix_cache_capacity.saturating_sub(target_free);
 
+        let before = self.cpu_prefix_states.len();
+        let mut dropped = 0usize;
         while self.cpu_prefix_states.len() > target_len {
             if let Some(hash) = self.cpu_prefix_lru.pop_front() {
-                self.drop_cpu_prefix_state(hash);
+                if self.drop_cpu_prefix_state(hash) {
+                    dropped += 1;
+                }
                 continue;
             }
 
             let Some(hash) = self.cpu_preserved_prefix_lru.pop_front() else {
                 return false;
             };
-            self.drop_cpu_prefix_state(hash);
+            if self.drop_cpu_prefix_state(hash) {
+                dropped += 1;
+            }
+        }
+
+        if dropped > 0 {
+            tracing::info!(
+                "MambaCache: dropped {} CPU prefix snapshot(s) by LRU (cpu snapshots {}/{}, before {})",
+                dropped,
+                self.cpu_prefix_states.len(),
+                self.cpu_prefix_cache_capacity,
+                before
+            );
         }
 
         self.cpu_prefix_states.len() < self.cpu_prefix_cache_capacity
@@ -979,6 +1032,14 @@ impl MambaCache {
         }
         if self.cpu_prefix_states.contains_key(&hash) {
             self.touch_cpu_prefix_state(hash);
+            tracing::info!(
+                "MambaCache: refreshed existing CPU prefix snapshot {} after device eviction (device snapshots {}/{}, cpu snapshots {}/{})",
+                hash,
+                self.prefix_states.len(),
+                self.prefix_cache_capacity,
+                self.cpu_prefix_states.len(),
+                self.cpu_prefix_cache_capacity
+            );
             return true;
         }
         if !self.make_room_for_cpu_prefix_state() {
