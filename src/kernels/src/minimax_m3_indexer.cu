@@ -90,6 +90,79 @@ __global__ void minimax_m3_indexer_kernel(
   }
 }
 
+// Hopper/Blackwell fast path: one CTA scores one (token, index-head) row.
+// The 128-token M3 block is evaluated cooperatively instead of assigning one
+// thread to an entire block, which was the dominant prefill bottleneck.
+template <typename T>
+__global__ __launch_bounds__(256) void minimax_m3_indexer_sm90_kernel(
+    const T* __restrict__ q, const T* __restrict__ k,
+    int32_t* __restrict__ topk_out, const uint32_t* __restrict__ cu_seqlens,
+    int total_tokens, int batch_size, int n_heads, int head_dim, int topk,
+    int block_size, float scale) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= total_tokens * n_heads) return;
+
+  const int token = row / n_heads;
+  const int head = row % n_heads;
+  const int seq = m3_find_sequence(cu_seqlens, batch_size, token);
+  const int seq_start = static_cast<int>(cu_seqlens[seq]);
+  const int seq_end = static_cast<int>(cu_seqlens[seq + 1]);
+  const int seq_len = seq_end - seq_start;
+  const int local_token = token - seq_start;
+  const int num_blocks = (seq_len + block_size - 1) / block_size;
+  const int q_base = (token * n_heads + head) * head_dim;
+
+  extern __shared__ float smem[];
+  float* q_smem = smem;
+  float* scores = q_smem + head_dim;
+  float* reduce = scores + num_blocks;
+  for (int d = tid; d < head_dim; d += blockDim.x)
+    q_smem[d] = m3_load(q + q_base + d);
+  __syncthreads();
+
+  for (int block = 0; block < num_blocks; ++block) {
+    const int begin = block * block_size;
+    const int end = min(begin + block_size, local_token + 1);
+    float dot = -FLT_MAX;
+    const int pos = begin + tid;
+    if (pos < end) {
+      const int k_base = (seq_start + pos) * head_dim;
+      dot = 0.0f;
+      #pragma unroll 4
+      for (int d = 0; d < head_dim; ++d)
+        dot += q_smem[d] * m3_load(k + k_base + d);
+    }
+    reduce[tid] = dot;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+      __syncthreads();
+    }
+    if (tid == 0)
+      scores[block] = block == local_token / block_size ? FLT_MAX : reduce[0] * scale;
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const int actual_topk = min(topk, num_blocks);
+    int32_t* out = topk_out + (static_cast<size_t>(token) * n_heads * topk) + head * topk;
+    for (int i = 0; i < actual_topk; ++i) {
+      float best = -FLT_MAX;
+      int best_idx = -1;
+      for (int block = 0; block < num_blocks; ++block) {
+        if (scores[block] > best) {
+          best = scores[block];
+          best_idx = block;
+        }
+      }
+      out[i] = best_idx;
+      scores[best_idx] = -FLT_MAX;
+    }
+    for (int i = actual_topk; i < topk; ++i) out[i] = -1;
+  }
+}
+
 extern "C" cudaError_t minimax_m3_indexer_prefill(
     const void* q, const void* k, int32_t* topk_out, const void* cu_seqlens_,
     int total_tokens, int batch_size, int n_heads, int head_dim, int topk,
@@ -102,16 +175,38 @@ extern "C" cudaError_t minimax_m3_indexer_prefill(
   dim3 grid(total_tokens * n_heads);
   dim3 block(256);
   const auto* cu_seqlens = reinterpret_cast<const uint32_t*>(cu_seqlens_);
+  int device = 0;
+  int major = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  const bool sm90_fast = major >= 9 && head_dim == 128 && block_size == 128;
+  const size_t sm90_smem = (static_cast<size_t>(head_dim) +
+      static_cast<size_t>((max_seq_len + block_size - 1) / block_size) + 256) * sizeof(float);
   switch (dtype) {
-    case 0: minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
-        reinterpret_cast<const __half*>(q), reinterpret_cast<const __half*>(k), topk_out,
-        cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale); break;
-    case 1: minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), topk_out,
-        cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale); break;
-    case 2: minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
-        reinterpret_cast<const float*>(q), reinterpret_cast<const float*>(k), topk_out,
-        cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale); break;
+    case 0:
+      if (sm90_fast) minimax_m3_indexer_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<const __half*>(q), reinterpret_cast<const __half*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      else minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
+          reinterpret_cast<const __half*>(q), reinterpret_cast<const __half*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      break;
+    case 1:
+      if (sm90_fast) minimax_m3_indexer_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      else minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      break;
+    case 2:
+      if (sm90_fast) minimax_m3_indexer_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<const float*>(q), reinterpret_cast<const float*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      else minimax_m3_indexer_kernel<<<grid, block, smem, stream>>>(
+          reinterpret_cast<const float*>(q), reinterpret_cast<const float*>(k), topk_out,
+          cu_seqlens, total_tokens, batch_size, n_heads, head_dim, topk, block_size, scale);
+      break;
     default: return cudaErrorInvalidValue;
   }
   return cudaGetLastError();

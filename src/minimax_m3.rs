@@ -76,16 +76,16 @@ pub fn minimax_m3_indexer_prefill(
     let output = Tensor::zeros((tokens, heads, topk_blocks), DType::U32, q.device())?;
     let dev = q.device().as_cuda_device()?;
     let stream = *dev.cu_stream() as i64;
-    let out_ptr = {
+    let out_ptr: *mut core::ffi::c_int = {
         let (storage, layout) = output.storage_and_layout();
         match &*storage {
-            Storage::Cuda(s) => Ok(*s
+            Storage::Cuda(s) => *s
                 .as_cuda_slice::<u32>()?
                 .slice(layout.start_offset()..)
-                .device_ptr() as *mut core::ffi::c_int),
+                .device_ptr() as *mut core::ffi::c_int,
             _ => candle_core::bail!("MiniMax M3 index output must be CUDA"),
         }
-    }?;
+    };
     let ret = unsafe {
         crate::kernels::ffi::minimax_m3_indexer_prefill(
             cuda_ptr(&q)?,
@@ -146,37 +146,37 @@ pub fn minimax_m3_sparse_attention_prefill(
     let output = Tensor::zeros(q.shape(), q.dtype(), q.device())?;
     let dev = q.device().as_cuda_device()?;
     let stream = *dev.cu_stream() as i64;
-    let out_ptr = {
+    let out_ptr: *mut core::ffi::c_void = {
         let (storage, layout) = output.storage_and_layout();
         match (&*storage, output.dtype()) {
-            (Storage::Cuda(s), DType::F16) => Ok(*s
+            (Storage::Cuda(s), DType::F16) => *s
                 .as_cuda_slice::<half::f16>()?
                 .slice(layout.start_offset()..)
                 .device_ptr()
-                as *mut core::ffi::c_void),
-            (Storage::Cuda(s), DType::BF16) => Ok(*s
+                as *mut core::ffi::c_void,
+            (Storage::Cuda(s), DType::BF16) => *s
                 .as_cuda_slice::<half::bf16>()?
                 .slice(layout.start_offset()..)
                 .device_ptr()
-                as *mut core::ffi::c_void),
-            (Storage::Cuda(s), DType::F32) => Ok(*s
+                as *mut core::ffi::c_void,
+            (Storage::Cuda(s), DType::F32) => *s
                 .as_cuda_slice::<f32>()?
                 .slice(layout.start_offset()..)
                 .device_ptr()
-                as *mut core::ffi::c_void),
+                as *mut core::ffi::c_void,
             _ => candle_core::bail!("MiniMax M3 output must be CUDA F16/BF16/F32"),
         }
-    }?;
-    let topk_ptr = {
+    };
+    let topk_ptr: *const core::ffi::c_int = {
         let (storage, layout) = topk.storage_and_layout();
         match &*storage {
-            Storage::Cuda(s) => Ok(*s
+            Storage::Cuda(s) => *s
                 .as_cuda_slice::<u32>()?
                 .slice(layout.start_offset()..)
-                .device_ptr() as *const core::ffi::c_int),
+                .device_ptr() as *const core::ffi::c_int,
             _ => candle_core::bail!("MiniMax M3 top-k must be CUDA"),
         }
-    }?;
+    };
     let ret = unsafe {
         crate::kernels::ffi::minimax_m3_sparse_attention_prefill(
             out_ptr,

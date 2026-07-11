@@ -115,6 +115,114 @@ __global__ void minimax_m3_sparse_attention_kernel(
   }
 }
 
+__device__ inline float m3a_warp_sum(float value) {
+  for (int offset = 16; offset > 0; offset >>= 1)
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  return value;
+}
+
+// Hopper/Blackwell path. Four producer warps compute QK scores while four
+// consumer warps accumulate V. The Q vector and probabilities stay in shared
+// memory, avoiding the repeated full-head dot products in the fallback path.
+template <typename T>
+__global__ __launch_bounds__(256) void minimax_m3_sparse_attention_sm90_kernel(
+    T* __restrict__ out, const T* __restrict__ q, const T* __restrict__ k,
+    const T* __restrict__ v, const int32_t* __restrict__ topk,
+    const uint32_t* __restrict__ cu_seqlens, int total_tokens, int batch_size,
+    int num_heads, int num_kv_heads, int head_dim, int topk_blocks,
+    int block_size, float scale) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= total_tokens * num_heads) return;
+
+  const int token = row / num_heads;
+  const int head = row % num_heads;
+  const int seq = m3a_find_sequence(cu_seqlens, batch_size, token);
+  const int seq_start = static_cast<int>(cu_seqlens[seq]);
+  const int local_token = token - seq_start;
+  const int kv_head = head / (num_heads / num_kv_heads);
+  const int q_base = (token * num_heads + head) * head_dim;
+  const int topk_base = (token * num_kv_heads + kv_head) * topk_blocks;
+  const int candidates = topk_blocks * block_size;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  extern __shared__ float smem[];
+  float* q_smem = smem;
+  float* probs = q_smem + head_dim;
+  float* reduce = probs + candidates;
+  for (int d = tid; d < head_dim; d += blockDim.x)
+    q_smem[d] = m3a_load(q + q_base + d);
+  __syncthreads();
+
+  // Producer warps 0..3 process four selected positions per iteration.
+  for (int base = 0; base < candidates; base += 4) {
+    const int candidate = base + warp;
+    if (warp < 4 && candidate < candidates) {
+      const int slot = candidate / block_size;
+      const int within_block = candidate - slot * block_size;
+      const int selected_block = topk[topk_base + slot];
+      const int pos = selected_block * block_size + within_block;
+      float dot = 0.0f;
+      if (selected_block >= 0 && pos <= local_token) {
+        const int k_base = ((seq_start + pos) * num_kv_heads + kv_head) * head_dim;
+        #pragma unroll 4
+        for (int d = lane; d < head_dim; d += 32)
+          dot += q_smem[d] * m3a_load(k + k_base + d);
+        dot = m3a_warp_sum(dot) * scale;
+      } else {
+        dot = -FLT_MAX;
+      }
+      if (lane == 0) probs[candidate] = dot;
+    }
+  }
+  __syncthreads();
+
+  float local_max = -FLT_MAX;
+  for (int candidate = tid; candidate < candidates; candidate += blockDim.x)
+    local_max = fmaxf(local_max, probs[candidate]);
+  reduce[tid] = local_max;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    __syncthreads();
+  }
+  const float qk_max = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int candidate = tid; candidate < candidates; candidate += blockDim.x) {
+    const float raw = probs[candidate];
+    const float prob = raw == -FLT_MAX ? 0.0f : expf(raw - qk_max);
+    probs[candidate] = prob;
+    local_sum += prob;
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) reduce[tid] += reduce[tid + stride];
+    __syncthreads();
+  }
+  const float denom = reduce[0];
+
+  // Consumer warps 4..7 own the 128 output elements.
+  if (warp >= 4) {
+    const int d = (warp - 4) * 32 + lane;
+    if (d < head_dim) {
+      float acc = 0.0f;
+      for (int candidate = 0; candidate < candidates; ++candidate) {
+        const float prob = probs[candidate];
+        if (prob == 0.0f) continue;
+        const int slot = candidate / block_size;
+        const int within_block = candidate - slot * block_size;
+        const int pos = topk[topk_base + slot] * block_size + within_block;
+        const int v_base = ((seq_start + pos) * num_kv_heads + kv_head) * head_dim;
+        acc += prob * m3a_load(v + v_base + d);
+      }
+      m3a_store(out + q_base + d, acc / denom);
+    }
+  }
+}
+
 extern "C" cudaError_t minimax_m3_sparse_attention_prefill(
     void* out, const void* q, const void* k, const void* v, const int32_t* topk,
     const void* cu_seqlens_, int total_tokens, int batch_size, int num_heads,
@@ -128,22 +236,50 @@ extern "C" cudaError_t minimax_m3_sparse_attention_prefill(
   dim3 grid(total_tokens * num_heads);
   dim3 block(256);
   const auto* cu_seqlens = reinterpret_cast<const uint32_t*>(cu_seqlens_);
+  int device = 0;
+  int major = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  const bool sm90_fast = major >= 9 && head_dim == 128 && block_size == 128;
+  const size_t sm90_smem = (static_cast<size_t>(head_dim) +
+      static_cast<size_t>(topk_blocks) * block_size + 256) * sizeof(float);
   switch (dtype) {
-    case 0: minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<__half*>(out), reinterpret_cast<const __half*>(q),
-        reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(v), topk,
-        cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
-        topk_blocks, block_size, scale); break;
-    case 1: minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<__nv_bfloat16*>(out), reinterpret_cast<const __nv_bfloat16*>(q),
-        reinterpret_cast<const __nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v), topk,
-        cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
-        topk_blocks, block_size, scale); break;
-    case 2: minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<float*>(out), reinterpret_cast<const float*>(q),
-        reinterpret_cast<const float*>(k), reinterpret_cast<const float*>(v), topk,
-        cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
-        topk_blocks, block_size, scale); break;
+    case 0:
+      if (sm90_fast) minimax_m3_sparse_attention_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<__half*>(out), reinterpret_cast<const __half*>(q),
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      else minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<__half*>(out), reinterpret_cast<const __half*>(q),
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      break;
+    case 1:
+      if (sm90_fast) minimax_m3_sparse_attention_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<__nv_bfloat16*>(out), reinterpret_cast<const __nv_bfloat16*>(q),
+          reinterpret_cast<const __nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      else minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16*>(out), reinterpret_cast<const __nv_bfloat16*>(q),
+          reinterpret_cast<const __nv_bfloat16*>(k), reinterpret_cast<const __nv_bfloat16*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      break;
+    case 2:
+      if (sm90_fast) minimax_m3_sparse_attention_sm90_kernel<<<grid, block, sm90_smem, stream>>>(
+          reinterpret_cast<float*>(out), reinterpret_cast<const float*>(q),
+          reinterpret_cast<const float*>(k), reinterpret_cast<const float*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      else minimax_m3_sparse_attention_kernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<float*>(out), reinterpret_cast<const float*>(q),
+          reinterpret_cast<const float*>(k), reinterpret_cast<const float*>(v), topk,
+          cu_seqlens, total_tokens, batch_size, num_heads, num_kv_heads, head_dim,
+          topk_blocks, block_size, scale);
+      break;
     default: return cudaErrorInvalidValue;
   }
   return cudaGetLastError();
