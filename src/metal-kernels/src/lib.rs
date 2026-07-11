@@ -1226,14 +1226,14 @@ pub fn call_fp8_matmul(
     );
 
     if is_gemv {
-        // Grid: (N * 32, M, 1)
+        // Eight SIMD groups share each activation tile.
         let thread_group_size = MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         };
         let thread_groups_count = MTLSize {
-            width: n as u64, // (N * 32) / 32 = N
+            width: (n as u64 + 7) / 8,
             height: m as u64,
             depth: 1,
         };
@@ -1385,7 +1385,7 @@ pub fn call_moe_gemm(
         let thread_groups_count = MTLSize {
             width: (size_n as u64 + BLOCK_N - 1) / BLOCK_N,
             height: (size_m as u64 + BLOCK_M - 1) / BLOCK_M,
-            depth: 1,
+            depth: num_experts as u64,
         };
         encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     }
@@ -2199,9 +2199,9 @@ pub fn flash_attention_decode(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Shared memory: q_shared(HEAD_DIM) + sg_max(NUM_SIMD_GROUPS) + sg_sum(NUM_SIMD_GROUPS) + sg_out(NUM_SIMD_GROUPS * HEAD_DIM)
+    // Shared memory: s_m[NUM_SIMD_GROUPS] + s_l[NUM_SIMD_GROUPS] + s_o[NUM_SIMD_GROUPS * HEAD_DIM]
     let num_simd_groups = (NUM_THREADS / 32) as u64;
-    let smem_size = ((head_size as u64) + num_simd_groups * 2 + num_simd_groups * head_size as u64)
+    let smem_size = (num_simd_groups * 2 + num_simd_groups * head_size as u64)
         * std::mem::size_of::<f32>() as u64;
     encoder.set_threadgroup_memory_length(0, smem_size);
 

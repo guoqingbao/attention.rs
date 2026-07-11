@@ -106,7 +106,7 @@ template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
     constant     int     &size_n          [[ buffer(9) ]],
     constant     int     &size_k          [[ buffer(10) ]],
     constant     int     &has_topk_weights[[ buffer(11) ]],
-    uint2 gid            [[ threadgroup_position_in_grid ]],
+    uint3 gid            [[ threadgroup_position_in_grid ]],
     uint  lane_id        [[ thread_index_in_simdgroup ]]
 ) {
     threadgroup half s_a[BLOCK_M][BLOCK_K];
@@ -122,8 +122,24 @@ template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
         }
     }
 
+    const int target_expert = int(gid.z);
+    // expert_ids is sorted. Find this expert's half-open route range so every
+    // matrix tile has one B matrix and remains valid across expert boundaries.
+    int lo = 0, hi = size_m;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (expert_ids[mid] < target_expert) lo = mid + 1; else hi = mid;
+    }
+    const int expert_begin = lo;
+    hi = size_m;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (expert_ids[mid] <= target_expert) lo = mid + 1; else hi = mid;
+    }
+    const int expert_end = lo;
     int global_col_base = gid.x * BLOCK_N;
-    int global_row_base = gid.y * BLOCK_M;
+    int global_row_base = expert_begin + int(gid.y) * BLOCK_M;
+    if (global_row_base >= expert_end) return;
 
     int tid = lane_id;
 
@@ -132,7 +148,7 @@ template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
     int expert_ids_local[BLOCK_M];
     for (int i = 0; i < BLOCK_M; ++i) {
         int m = global_row_base + i;
-        if (m < size_m) {
+        if (m < expert_end) {
             token_ids_local[i] = sorted_token_ids[m] / topk;
             expert_ids_local[i] = expert_ids[m];
         } else {
@@ -154,22 +170,10 @@ template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Load B tile: weight rows selected by expert_ids
-        // For simplicity in the tiled kernel, we load from the first valid
-        // expert in the tile. Since sorted tokens are grouped by expert,
-        // all rows in a tile typically share the same expert.
-        int ref_expert = -1;
-        for (int i = 0; i < BLOCK_M; ++i) {
-            if (expert_ids_local[i] >= 0) {
-                ref_expert = expert_ids_local[i];
-                break;
-            }
-        }
-
         int n_local = tid;
         int gn = global_col_base + n_local;
-        if (ref_expert >= 0 && gn < size_n) {
-            device const T* w_row = weights + ((long)ref_expert * size_n + gn) * size_k + k;
+        if (target_expert < num_experts && gn < size_n) {
+            device const T* w_row = weights + ((long)target_expert * size_n + gn) * size_k + k;
             #pragma unroll
             for (int j = 0; j < BLOCK_K; ++j) {
                 s_b[j][n_local] = (k + j < size_k) ? static_cast<half>(float(w_row[j])) : 0.0h;
@@ -217,7 +221,7 @@ template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K>
     int local_r = tid;
     int global_r = global_row_base + local_r;
 
-    if (local_r < BLOCK_M && global_r < size_m) {
+    if (local_r < BLOCK_M && global_r < expert_end) {
         int token_id = sorted_token_ids[global_r];
         int eid = expert_ids[global_r];
         if (eid >= 0 && eid < num_experts) {
@@ -265,7 +269,7 @@ void moe_gemm_kernel<half, 32, 32, 32>(
     device half*,
     constant int&, constant int&, constant int&,
     constant int&, constant int&, constant int&,
-    uint2, uint);
+    uint3, uint);
 
 #if defined(__HAVE_BFLOAT__)
 template [[host_name("moe_gemm_bfloat16_32_32_32")]] [[kernel]]
@@ -275,5 +279,5 @@ void moe_gemm_kernel<bfloat16_t, 32, 32, 32>(
     device bfloat16_t*,
     constant int&, constant int&, constant int&,
     constant int&, constant int&, constant int&,
-    uint2, uint);
+    uint3, uint);
 #endif
