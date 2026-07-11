@@ -216,6 +216,22 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
 
 static constexpr int NVFP4_QUANT_MAX_THREADS = 512;
 
+// A quantization block is exactly 32 bytes and every row/block starts on that
+// alignment. Two vector transactions replace sixteen scalar activation loads.
+template <typename InType>
+__device__ __forceinline__ void load_nvfp4_block(const InType* ptr,
+                                                 float (&vals)[16]) {
+  const uint4 lo = __ldg(reinterpret_cast<const uint4*>(ptr));
+  const uint4 hi = __ldg(reinterpret_cast<const uint4*>(ptr + 8));
+  const InType* lo_values = reinterpret_cast<const InType*>(&lo);
+  const InType* hi_values = reinterpret_cast<const InType*>(&hi);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    vals[i] = static_cast<float>(lo_values[i]);
+    vals[8 + i] = static_cast<float>(hi_values[i]);
+  }
+}
+
 template <typename InType>
 __global__ void nvfp4_quantize_activation_hw_kernel(
     const InType* __restrict__ input,   // [M, K]
@@ -236,14 +252,7 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
 
   float vals[16];
-  for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
-    int k_idx = k_start + i;
-    if (k_idx < K) {
-      vals[i] = static_cast<float>(input[in_base + k_idx]);
-    } else {
-      vals[i] = 0.0f;
-    }
-  }
+  load_nvfp4_block(input + in_base + k_start, vals);
 
   float vecMax = 0.0f;
   for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
@@ -582,9 +591,7 @@ __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
   int k_start = block_idx * NVFP4_BLOCK_SIZE;
   int64_t in_base = static_cast<int64_t>(row) * K + k_start;
   float vals[16];
-  for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
-    vals[i] = static_cast<float>(input[in_base + i]);
-  }
+  load_nvfp4_block(input + in_base, vals);
 
   float vecMax = 0.0f;
   for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {

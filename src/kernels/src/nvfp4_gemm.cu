@@ -143,6 +143,16 @@ __device__ __forceinline__ uint2 load_uint2_safe(const uint8_t *ptr) {
 #endif
 }
 
+__device__ __forceinline__ uint4 load_uint4_safe(const uint8_t *ptr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  uint4 v;
+  memcpy(&v, ptr, sizeof(uint4));
+  return v;
+#else
+  return *reinterpret_cast<const uint4 *>(ptr);
+#endif
+}
+
 #ifdef NVFP4_HW_DEQUANT
 // --- Blackwell hardware path (SM100+) ---
 // Converts 8 packed FP4 values (one uint32 = 8 nibbles) to 8 floats using
@@ -196,6 +206,16 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
     acc = fmaf(input[8 + i * 2 + 1], f2.y, acc);
   }
   return acc * scale;
+}
+
+// Blackwell decode processes the two adjacent NVFP4 scale blocks owned by a
+// lane as one 128-bit transaction. This halves weight/scale load instructions
+// compared with issuing two independent 16-element blocks.
+__device__ __forceinline__ float hw_dot_32(uint4 packed, float2 scales,
+                                           const float *input) {
+  const uint2 lo = make_uint2(packed.x, packed.y);
+  const uint2 hi = make_uint2(packed.z, packed.w);
+  return hw_dot_16(lo, scales.x, input) + hw_dot_16(hi, scales.y, input + 16);
 }
 #endif // NVFP4_HW_DEQUANT
 
@@ -292,24 +312,21 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
 #ifdef NVFP4_HW_DEQUANT
     if (!force_lut) {
-      // --- Blackwell hardware path: fused dequant + dot product ---
-      {
-        float block_scale =
-            fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
-        uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
-        const float *in = s_input + (k + (k / WARP_SIZE));
-        acc += hw_dot_16(w_vec, block_scale, in);
-      }
-
-      int k2 = k + NVFP4_BLOCK_SIZE;
-      if (k2 < K) {
-        float block_scale2 =
-            fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
-        uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
-        acc += hw_dot_16(w_vec2, block_scale2, in2);
+      // --- Blackwell hardware path: paired scale conversion + 128-bit load ---
+      const int scale_idx = k / NVFP4_BLOCK_SIZE;
+      const float *in = s_input + (k + (k / WARP_SIZE));
+      if (k + NVFP4_BLOCK_SIZE < K) {
+        const uint16_t scale_pair = __ldg(
+            reinterpret_cast<const uint16_t *>(w_scale_row + scale_idx));
+        float2 block_scales = fp8x2_scale_to_float2(scale_pair);
+        block_scales.x *= weight_global_scale;
+        block_scales.y *= weight_global_scale;
+        const uint4 w_vec = load_uint4_safe(w_row + k / 2);
+        acc += hw_dot_32(w_vec, block_scales, in);
+      } else {
+        const float block_scale = fp8_scale_to_float(__ldg(&w_scale_row[scale_idx])) *
+                                  weight_global_scale;
+        acc += hw_dot_16(load_uint2_safe(w_row + k / 2), block_scale, in);
       }
     } else
 #endif
@@ -319,7 +336,15 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
           weight_global_scale * 0.5f;
 
-      uint2 w_vec = load_uint2_safe(w_row + k / 2);
+      const bool has_second = k + NVFP4_BLOCK_SIZE < K;
+      uint4 w_pair;
+      if (has_second) {
+        w_pair = load_uint4_safe(w_row + k / 2);
+      } else {
+        const uint2 tail = load_uint2_safe(w_row + k / 2);
+        w_pair = make_uint4(tail.x, tail.y, 0, 0);
+      }
+      const uint2 w_vec = make_uint2(w_pair.x, w_pair.y);
       const float *in = s_input + (k + (k / WARP_SIZE));
 
       float partial = 0.0f;
@@ -345,12 +370,12 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       acc = fmaf(partial, block_scale, acc);
 
       int k2 = k + NVFP4_BLOCK_SIZE;
-      if (k2 < K) {
+      if (has_second) {
         float block_scale2 =
             dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
             weight_global_scale * 0.5f;
 
-        uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+        const uint2 w_vec2 = make_uint2(w_pair.z, w_pair.w);
         const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
         float partial2 = 0.0f;
@@ -536,6 +561,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
                         const float *__restrict__ weight_global_scales,
                         const T *__restrict__ biases,
                         const uint32_t *__restrict__ indices,
+                        const float *__restrict__ topk_weights,
                         T *__restrict__ output, int num_tokens, int topk,
                         int num_experts, int N, int K, bool has_bias,
                         bool input_has_topk_dim, bool force_lut) {
@@ -637,21 +663,19 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 
 #ifdef NVFP4_HW_DEQUANT
       if (!force_lut) {
-        float block_scale =
-            fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-            global_scale;
-        uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+        const int scale_idx = k / NVFP4_BLOCK_SIZE;
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
-        acc += hw_dot_16(w_vec, block_scale, in);
-
-        int k2 = k + NVFP4_BLOCK_SIZE;
-        if (k2 < K) {
-          float block_scale2 =
-              fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-              global_scale;
-          uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-          const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
-          acc += hw_dot_16(w_vec2, block_scale2, in2);
+        if (k + NVFP4_BLOCK_SIZE < K) {
+          const uint16_t scale_pair = __ldg(
+              reinterpret_cast<const uint16_t *>(w_scale_row + scale_idx));
+          float2 block_scales = fp8x2_scale_to_float2(scale_pair);
+          block_scales.x *= global_scale;
+          block_scales.y *= global_scale;
+          acc += hw_dot_32(load_uint4_safe(w_row + k / 2), block_scales, in);
+        } else {
+          const float block_scale = fp8_scale_to_float(__ldg(&w_scale_row[scale_idx])) *
+                                    global_scale;
+          acc += hw_dot_16(load_uint2_safe(w_row + k / 2), block_scale, in);
         }
       } else
 #endif
@@ -661,7 +685,15 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
             dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             global_scale * 0.5f;
 
-        uint2 w_vec = load_uint2_safe(w_row + k / 2);
+        const bool has_second = k + NVFP4_BLOCK_SIZE < K;
+        uint4 w_pair;
+        if (has_second) {
+          w_pair = load_uint4_safe(w_row + k / 2);
+        } else {
+          const uint2 tail = load_uint2_safe(w_row + k / 2);
+          w_pair = make_uint4(tail.x, tail.y, 0, 0);
+        }
+        const uint2 w_vec = make_uint2(w_pair.x, w_pair.y);
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
 
         float partial = 0.0f;
@@ -687,12 +719,12 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         acc = fmaf(partial, block_scale, acc);
 
         int k2 = k + NVFP4_BLOCK_SIZE;
-        if (k2 < K) {
+        if (has_second) {
           float block_scale2 =
               dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
               global_scale * 0.5f;
 
-          uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+          const uint2 w_vec2 = make_uint2(w_pair.z, w_pair.w);
           const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
 
           float partial2 = 0.0f;
@@ -733,6 +765,10 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         } else {
           acc += __bfloat162float(__ldg(&bias_row[n_idx]));
         }
+      }
+
+      if (topk_weights != nullptr) {
+        acc *= __ldg(&topk_weights[token_idx * topk + expert_slot]);
       }
 
       size_t out_idx =
@@ -1020,7 +1056,7 @@ extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,
 extern "C" void nvfp4_indexed_moe_gemm_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
     const float *weight_global_scales, const __half *biases,
-    const uint32_t *indices, __half *output, int num_tokens, int topk,
+    const uint32_t *indices, const float *topk_weights, __half *output, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     bool force_lut, cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
@@ -1034,7 +1070,7 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
-      output, num_tokens, topk, num_experts, N, K, has_bias,
+      topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
 
@@ -1043,7 +1079,7 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const float *weight_global_scales,
     const __nv_bfloat16 *biases, const uint32_t *indices,
-    __nv_bfloat16 *output, int num_tokens, int topk, int num_experts, int N,
+    const float *topk_weights, __nv_bfloat16 *output, int num_tokens, int topk, int num_experts, int N,
     int K, bool has_bias, bool input_has_topk_dim, bool force_lut,
     cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
@@ -1057,14 +1093,14 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
-      output, num_tokens, topk, num_experts, N, K, has_bias,
+      topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
 #else
 extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
                                              const uint8_t *, const float *,
                                              const void *, const uint32_t *,
-                                             void *, int, int, int, int, int,
+                                             const float *, void *, int, int, int, int, int,
                                              bool, bool, bool, cudaStream_t) {}
 #endif
 

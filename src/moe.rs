@@ -1456,6 +1456,12 @@ pub fn moe_gemm_nvfp4(
         } else {
             std::ptr::null()
         };
+        let topk_weights_ptr = if let Some(tw) = topk_weights {
+            let (tw_s, _) = tw.storage_and_layout();
+            cuda_ptr(&tw_s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
 
         unsafe {
             match dtype {
@@ -1466,6 +1472,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    topk_weights_ptr,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     num_tokens as i32,
                     topk as i32,
@@ -1484,6 +1491,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    topk_weights_ptr,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     num_tokens as i32,
                     topk as i32,
@@ -1500,10 +1508,6 @@ pub fn moe_gemm_nvfp4(
         }
     }
 
-    if let Some(tw) = topk_weights {
-        let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
-        return Ok(output.broadcast_mul(&tw)?);
-    }
     Ok(output)
 }
 
