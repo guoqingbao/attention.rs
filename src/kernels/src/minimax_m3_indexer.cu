@@ -92,10 +92,11 @@ __global__ void minimax_m3_indexer_kernel(
 }
 
 // Hopper/Blackwell tensor-core path. A CTA computes a complete 128-query tile
-// against one 128-key block at a time. The eight warps each issue a 16x16x128
-// WMMA and keep every query row's block top-k resident in shared memory. The
-// grid maps (sequence, query-tile, head), so ragged batches are processed by a
-// single launch without per-sequence host dispatch.
+// against one 128-key block at a time. The eight warps each accumulate a
+// 16x16 GEMM via WMMA 16x16x16 tiles over the 128-dim head axis, and keep
+// every query row's block top-k resident in shared memory. The grid maps
+// (sequence, query-tile, head), so ragged batches are processed by a single
+// launch without per-sequence host dispatch.
 template <typename T>
 __global__ __launch_bounds__(256, 1) void minimax_m3_indexer_sm90_wmma_kernel(
     const T* __restrict__ q, const T* __restrict__ k,
@@ -105,6 +106,7 @@ __global__ __launch_bounds__(256, 1) void minimax_m3_indexer_sm90_wmma_kernel(
   constexpr int TILE = 128;
   constexpr int MMA_M = 16;
   constexpr int MMA_N = 16;
+  constexpr int MMA_K = 16;  // WMMA only specializes 16x16x16 for fp16/bf16
   constexpr int TOPK = 16;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -159,17 +161,21 @@ __global__ __launch_bounds__(256, 1) void minimax_m3_indexer_sm90_wmma_kernel(
       __syncthreads();
 
       using namespace nvcuda;
-      wmma::fragment<wmma::matrix_a, MMA_M, MMA_N, TILE, T,
+      wmma::fragment<wmma::matrix_a, MMA_M, MMA_N, MMA_K, T,
                      wmma::row_major> a_frag;
-      wmma::fragment<wmma::matrix_b, MMA_M, MMA_N, TILE, T,
+      wmma::fragment<wmma::matrix_b, MMA_M, MMA_N, MMA_K, T,
                      wmma::col_major> b_frag;
-      wmma::fragment<wmma::accumulator, MMA_M, MMA_N, TILE, float> c_frag;
+      wmma::fragment<wmma::accumulator, MMA_M, MMA_N, MMA_K, float> c_frag;
       wmma::fill_fragment(c_frag, 0.0f);
-      wmma::load_matrix_sync(a_frag, q_smem + warp * MMA_M * TILE, TILE);
+      // Accumulate Q[16,128] @ K^T[128,16] in WMMA_K=16 chunks.
       // K is [16, 128] row-major; viewing the same bytes as [128, 16]
       // column-major supplies K^T without a shared-memory transpose.
-      wmma::load_matrix_sync(b_frag, k_smem, TILE);
-      wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      #pragma unroll
+      for (int k = 0; k < TILE; k += MMA_K) {
+        wmma::load_matrix_sync(a_frag, q_smem + warp * MMA_M * TILE + k, TILE);
+        wmma::load_matrix_sync(b_frag, k_smem + k, TILE);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
       wmma::store_matrix_sync(mma_scores + warp * MMA_M * MMA_N, c_frag,
                               MMA_N, wmma::mem_row_major);
       __syncthreads();
