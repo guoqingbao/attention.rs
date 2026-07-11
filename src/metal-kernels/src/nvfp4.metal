@@ -60,12 +60,7 @@ METAL_FUNC float fp8e4m3_to_float(uchar bits) {
 }
 
 METAL_FUNC float simdgroup_reduce_sum(float v) {
-  v += simd_shuffle_xor(v, ushort(16));
-  v += simd_shuffle_xor(v, ushort(8));
-  v += simd_shuffle_xor(v, ushort(4));
-  v += simd_shuffle_xor(v, ushort(2));
-  v += simd_shuffle_xor(v, ushort(1));
-  return v;
+  return simd_sum(v);
 }
 
 // Process one tile of 32 elements per lane (2 NVFP4 blocks of 16).
