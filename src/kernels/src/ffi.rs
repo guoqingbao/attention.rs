@@ -3182,6 +3182,44 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    // MiniMax M3 block indexer and sparse GQA prefill kernels.
+    pub fn minimax_m3_indexer_prefill(
+        q: *const c_void,
+        k: *const c_void,
+        topk_out: *mut c_int,
+        cu_seqlens: *const c_void,
+        total_tokens: c_int,
+        batch_size: c_int,
+        n_heads: c_int,
+        head_dim: c_int,
+        topk: c_int,
+        block_size: c_int,
+        max_seq_len: c_int,
+        scale: f32,
+        dtype: u32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn minimax_m3_sparse_attention_prefill(
+        out: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        topk: *const c_int,
+        cu_seqlens: *const c_void,
+        total_tokens: c_int,
+        batch_size: c_int,
+        num_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        topk_blocks: c_int,
+        block_size: c_int,
+        max_seq_len: c_int,
+        scale: f32,
+        dtype: u32,
+        stream: i64,
+    ) -> c_int;
+
     // =========================================================================
     // FlashInfer MLA decode (plan + run)
     // =========================================================================
