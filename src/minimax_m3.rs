@@ -149,21 +149,21 @@ pub fn minimax_m3_sparse_attention_prefill(
     let out_ptr: *mut core::ffi::c_void = {
         let (storage, layout) = output.storage_and_layout();
         match (&*storage, output.dtype()) {
-            (Storage::Cuda(s), DType::F16) => *s
-                .as_cuda_slice::<half::f16>()?
-                .slice(layout.start_offset()..)
-                .device_ptr()
-                as *mut core::ffi::c_void,
-            (Storage::Cuda(s), DType::BF16) => *s
-                .as_cuda_slice::<half::bf16>()?
-                .slice(layout.start_offset()..)
-                .device_ptr()
-                as *mut core::ffi::c_void,
-            (Storage::Cuda(s), DType::F32) => *s
-                .as_cuda_slice::<f32>()?
-                .slice(layout.start_offset()..)
-                .device_ptr()
-                as *mut core::ffi::c_void,
+            (Storage::Cuda(s), DType::F16) => {
+                *s.as_cuda_slice::<half::f16>()?
+                    .slice(layout.start_offset()..)
+                    .device_ptr() as *mut core::ffi::c_void
+            }
+            (Storage::Cuda(s), DType::BF16) => {
+                *s.as_cuda_slice::<half::bf16>()?
+                    .slice(layout.start_offset()..)
+                    .device_ptr() as *mut core::ffi::c_void
+            }
+            (Storage::Cuda(s), DType::F32) => {
+                *s.as_cuda_slice::<f32>()?
+                    .slice(layout.start_offset()..)
+                    .device_ptr() as *mut core::ffi::c_void
+            }
             _ => candle_core::bail!("MiniMax M3 output must be CUDA F16/BF16/F32"),
         }
     };
