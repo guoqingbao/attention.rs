@@ -769,26 +769,81 @@ pub fn gated_delta_rule_decode_slots_gqa(
     let q_c = ensure_contiguous(q)?;
     let k_c = ensure_contiguous(k)?;
     let v_c = ensure_contiguous(v)?;
-    let g_c = ensure_contiguous(g)?;
-    let beta_c = ensure_contiguous(beta)?;
+    let g_c = if g.dtype() == DType::F32 {
+        ensure_contiguous(g)?
+    } else {
+        g.to_dtype(DType::F32)?.contiguous()?
+    };
+    let beta_c = if beta.dtype() == DType::F32 {
+        ensure_contiguous(beta)?
+    } else {
+        beta.to_dtype(DType::F32)?.contiguous()?
+    };
+    let slots_c = if slots.dtype() == DType::I64 {
+        ensure_contiguous(slots)?
+    } else {
+        candle_core::bail!("metal gated_delta_rule_decode_slots_gqa expects I64 slots");
+    };
 
     let (batch, num_k_heads, k_dim) = q_c.dims3()?;
     let num_v_heads = v_c.dim(1)?;
-    let kv_group_size = num_v_heads / num_k_heads;
+    let v_dim = v_c.dim(2)?;
+    if num_v_heads % num_k_heads != 0 {
+        candle_core::bail!(
+            "metal gated_delta_rule_decode_slots_gqa: num_v_heads {} not divisible by num_k_heads {}",
+            num_v_heads,
+            num_k_heads
+        );
+    }
+    if state.dtype() != DType::F32 || !state.is_contiguous() {
+        candle_core::bail!(
+            "metal gated_delta_rule_decode_slots_gqa expects contiguous F32 state, got {:?}",
+            state.dtype()
+        );
+    }
 
-    let q_exp = q_c
-        .unsqueeze(2)?
-        .broadcast_as((batch, num_k_heads, kv_group_size, k_dim))?
-        .reshape((batch, num_v_heads, k_dim))?
-        .contiguous()?;
-    let k_exp = k_c
-        .unsqueeze(2)?
-        .broadcast_as((batch, num_k_heads, kv_group_size, k_dim))?
-        .reshape((batch, num_v_heads, k_dim))?
-        .contiguous()?;
-    let q_scaled = (q_exp * q_scale as f64)?;
-
-    gated_delta_rule_decode_slots(&q_scaled, &k_exp, &v_c, &g_c, &beta_c, state, slots)
+    let out = Tensor::zeros((batch, num_v_heads, v_dim), q_c.dtype(), q_c.device())?;
+    let q_m = get_metal_slice(&q_c)?;
+    let k_m = get_metal_slice(&k_c)?;
+    let v_m = get_metal_slice(&v_c)?;
+    let g_m = get_metal_slice(&g_c)?;
+    let beta_m = get_metal_slice(&beta_c)?;
+    let state_m = get_metal_slice(state)?;
+    let slots_m = get_metal_slice_with_dtype_size(&slots_c, std::mem::size_of::<i64>())?;
+    let out_m = get_metal_slice(&out)?;
+    let dev = q_m.storage.device();
+    let command_buffer = dev.command_buffer()?;
+    command_buffer.set_label("gdn-decode-slots-gqa");
+    metal_kernels::call_gdn_gated_delta_rule_decode_slots_gqa(
+        dev.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        q_c.dtype(),
+        q_m.storage.buffer(),
+        q_m.offset_in_bytes,
+        k_m.storage.buffer(),
+        k_m.offset_in_bytes,
+        v_m.storage.buffer(),
+        v_m.offset_in_bytes,
+        g_m.storage.buffer(),
+        g_m.offset_in_bytes,
+        beta_m.storage.buffer(),
+        beta_m.offset_in_bytes,
+        state_m.storage.buffer(),
+        state_m.offset_in_bytes,
+        slots_m.storage.buffer(),
+        slots_m.offset_in_bytes,
+        out_m.storage.buffer(),
+        out_m.offset_in_bytes,
+        batch as i32,
+        num_v_heads as i32,
+        num_k_heads as i32,
+        k_dim as i32,
+        v_dim as i32,
+        q_scale,
+    )
+    .map_err(candle_core::Error::wrap)?;
+    Ok(out)
 }
 
 #[cfg(feature = "metal")]
@@ -2489,6 +2544,25 @@ pub fn gated_delta_rule_decode_slots_gqa(
                         state_ptr,
                         slots_ptr,
                         out_ptr,
+                        batch as c_int,
+                        num_v_heads as c_int,
+                        num_k_heads as c_int,
+                        k_dim as c_int,
+                        v_dim as c_int,
+                        q_scale,
+                        stream,
+                    )
+                },
+                DType::F32 => unsafe {
+                    ffi::gated_delta_rule_decode_slots_gqa_f32(
+                        q_ptr as *const f32,
+                        k_ptr as *const f32,
+                        v_ptr as *const f32,
+                        g_ptr,
+                        beta_ptr,
+                        state_ptr,
+                        slots_ptr,
+                        out_ptr as *mut f32,
                         batch as c_int,
                         num_v_heads as c_int,
                         num_k_heads as c_int,

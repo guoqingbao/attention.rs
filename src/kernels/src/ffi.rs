@@ -2249,6 +2249,23 @@ extern "C" {
         q_scale: f32,
         stream: i64,
     );
+    pub fn gated_delta_rule_decode_slots_gqa_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut f32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        stream: i64,
+    );
 
     // Grouped-Query varlen recurrence (num_k_heads != num_v_heads, fused q_scale)
     pub fn gated_delta_rule_recurrence_varlen_gqa_bf16(

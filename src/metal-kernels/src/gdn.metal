@@ -499,6 +499,88 @@ kernel void gated_delta_rule_decode_slots_kernel(
     out[bh * v_dim + v_idx] = gdn_from_float<T>(y);
 }
 
+// GQA decode specialization. Keeping q/k in their compact num_k_heads layout
+// avoids materializing repeated heads, while decay exponentiation and q scaling
+// are folded into the recurrence. State and all recurrence arithmetic stay F32.
+template <typename T, uint BK>
+kernel void gated_delta_rule_decode_slots_gqa_kernel(
+    const device T* q [[buffer(0)]],
+    const device T* k [[buffer(1)]],
+    const device T* v [[buffer(2)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
+    device float* state [[buffer(5)]],
+    const device int64_t* slots [[buffer(6)]],
+    device T* out [[buffer(7)]],
+    constant int& batch [[buffer(8)]],
+    constant int& num_v_heads [[buffer(9)]],
+    constant int& num_k_heads [[buffer(10)]],
+    constant int& k_dim [[buffer(11)]],
+    constant int& v_dim [[buffer(12)]],
+    constant float& q_scale [[buffer(13)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    const uint tid = tid3.x;
+    const uint v_idx = tgid.x * GDN_REC_THREADS + tid;
+    const uint bh = tgid.y;
+    if (bh >= static_cast<uint>(batch * num_v_heads) || v_idx >= static_cast<uint>(v_dim)) {
+        return;
+    }
+
+    const uint b = bh / num_v_heads;
+    const uint v_head_idx = bh % num_v_heads;
+    const uint kv_group_size = num_v_heads / num_k_heads;
+    const uint k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[b];
+    if (slot < 0) {
+        return;
+    }
+
+    threadgroup float k_shared[BK];
+    threadgroup float q_shared[BK];
+    threadgroup float scalars[2];
+
+    const uint qk_base = (b * num_k_heads + k_head_idx) * k_dim;
+    for (uint j = tid; j < static_cast<uint>(k_dim); j += GDN_REC_THREADS) {
+        k_shared[j] = gdn_to_float(k[qk_base + j]);
+        q_shared[j] = gdn_to_float(q[qk_base + j]) * q_scale;
+    }
+    if (tid == 0) {
+        scalars[0] = exp(g[bh]);
+        scalars[1] = beta[bh];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* state_head = state +
+        ((static_cast<uint>(slot) * num_v_heads + v_head_idx) * k_dim * v_dim);
+    float s[BK];
+    for (uint j = 0; j < BK; ++j) {
+        s[j] = j < static_cast<uint>(k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
+    }
+
+    const float decay = scalars[0];
+    float kv_mem = 0.0f;
+    for (uint j = 0; j < BK; ++j) {
+        if (j < static_cast<uint>(k_dim)) {
+            s[j] *= decay;
+            kv_mem += s[j] * k_shared[j];
+        }
+    }
+
+    const uint v_base = bh * v_dim;
+    const float delta = (gdn_to_float(v[v_base + v_idx]) - kv_mem) * scalars[1];
+    float y = 0.0f;
+    for (uint j = 0; j < BK; ++j) {
+        if (j < static_cast<uint>(k_dim)) {
+            s[j] += k_shared[j] * delta;
+            y += s[j] * q_shared[j];
+            state_head[j * v_dim + v_idx] = s[j];
+        }
+    }
+    out[v_base + v_idx] = gdn_from_float<T>(y);
+}
+
 template <typename T, uint BK>
 kernel void gated_delta_rule_recurrence_varlen_kernel(
     const device T* q [[buffer(0)]],
@@ -974,6 +1056,33 @@ template [[host_name("gdn_gated_delta_rule_recurrence_varlen_gqa_" #type "_k" #b
     constant float& q_scale [[buffer(15)]], \
     uint3 tid3 [[thread_position_in_threadgroup]], \
     uint3 tgid [[threadgroup_position_in_grid]]);
+
+#define INSTANTIATE_DECODE_GQA(type, bk) \
+template [[host_name("gdn_gated_delta_rule_decode_slots_gqa_" #type "_k" #bk)]] \
+[[kernel]] void gated_delta_rule_decode_slots_gqa_kernel<type, bk>( \
+    const device type* q [[buffer(0)]], \
+    const device type* k [[buffer(1)]], \
+    const device type* v [[buffer(2)]], \
+    const device float* g [[buffer(3)]], \
+    const device float* beta [[buffer(4)]], \
+    device float* state [[buffer(5)]], \
+    const device int64_t* slots [[buffer(6)]], \
+    device type* out [[buffer(7)]], \
+    constant int& batch [[buffer(8)]], \
+    constant int& num_v_heads [[buffer(9)]], \
+    constant int& num_k_heads [[buffer(10)]], \
+    constant int& k_dim [[buffer(11)]], \
+    constant int& v_dim [[buffer(12)]], \
+    constant float& q_scale [[buffer(13)]], \
+    uint3 tid3 [[thread_position_in_threadgroup]], \
+    uint3 tgid [[threadgroup_position_in_grid]]);
+
+INSTANTIATE_DECODE_GQA(float, 64)
+INSTANTIATE_DECODE_GQA(float, 128)
+INSTANTIATE_DECODE_GQA(half, 64)
+INSTANTIATE_DECODE_GQA(half, 128)
+INSTANTIATE_DECODE_GQA(bfloat16_t, 64)
+INSTANTIATE_DECODE_GQA(bfloat16_t, 128)
 
 INSTANTIATE_VARLEN_GQA(float, 64)
 INSTANTIATE_VARLEN_GQA(float, 128)
