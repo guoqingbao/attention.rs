@@ -191,20 +191,26 @@ extern "C" __global__ void flash_decode_paged_fp8(
             for (int b = 0; b < BC; b++)
                 kv_off[b] = page_base + (unsigned long long)(block_offset_start + processed + b) * head_stride_kv;
 
+            float dots[BC] = {0.f};
+            // Accumulate the independent positions together so FP8 conversion
+            // and arithmetic latency can overlap. Per-position accumulation
+            // order remains g=0..N, preserving the previous FP32 result.
             #pragma unroll
-            for (int b = 0; b < BC; b++) {
-                const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
-                float dot = 0.f;
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
                 #pragma unroll
-                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                for (int b = 0; b < BC; b++) {
+                    const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
                     float kf0, kf1, kf2, kf3;
                     fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
-                    dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+                    dots[b] += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
                 }
+            }
+            #pragma unroll
+            for (int b = 0; b < BC; b++) {
                 #pragma unroll
                 for (int off = WARP_SIZE/2; off > 0; off >>= 1)
-                    dot += __shfl_xor_sync(0xffffffff, dot, off);
-                scores[b] = dot * inv_sqrt_d;
+                    dots[b] += __shfl_xor_sync(0xffffffff, dots[b], off);
+                scores[b] = dots[b] * inv_sqrt_d;
                 if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
             }
 
@@ -416,20 +422,23 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
             for (int b = 0; b < BC; b++)
                 kv_off[b] = page_base + (unsigned long long)(block_offset_start + processed + b) * head_stride_kv;
 
+            float dots[BC] = {0.f};
             #pragma unroll
-            for (int b = 0; b < BC; b++) {
-                const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
-                float dot = 0.f;
+            for (int g = 0; g < VEC_FP8 / 4; g++) {
                 #pragma unroll
-                for (int g = 0; g < VEC_FP8 / 4; g++) {
+                for (int b = 0; b < BC; b++) {
+                    const unsigned int* k32 = (const unsigned int*)((const __nv_fp8_storage_t*)K_cache + kv_off[b]);
                     float kf0, kf1, kf2, kf3;
                     fp8x4_to_f32x4(__ldg(k32 + g), k_scale, kf0, kf1, kf2, kf3);
-                    dot += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
+                    dots[b] += q_reg[g*4]*kf0 + q_reg[g*4+1]*kf1 + q_reg[g*4+2]*kf2 + q_reg[g*4+3]*kf3;
                 }
+            }
+            #pragma unroll
+            for (int b = 0; b < BC; b++) {
                 #pragma unroll
                 for (int off = WARP_SIZE/2; off > 0; off >>= 1)
-                    dot += __shfl_xor_sync(0xffffffff, dot, off);
-                scores[b] = dot * inv_sqrt_d;
+                    dots[b] += __shfl_xor_sync(0xffffffff, dots[b], off);
+                scores[b] = dots[b] * inv_sqrt_d;
                 if (softcap > 0.f) scores[b] = softcap * tanhf(scores[b] / softcap);
             }
 
