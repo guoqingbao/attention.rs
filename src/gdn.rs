@@ -2403,7 +2403,7 @@ pub fn gated_rmsnorm_silu_mul(
     x: &Tensor,
     z: &Tensor,
     norm_weight: &Tensor,
-    norm_bias: Option<&Tensor>,
+    _norm_bias: Option<&Tensor>,
     _eps: f64,
     group_size: usize,
 ) -> Result<Tensor> {
@@ -2434,23 +2434,7 @@ pub fn gated_rmsnorm_silu_mul(
         );
     }
 
-    // GCU Choreo kernel does not support bias parameter.
-    // Qwen3.5/Qwen3Next models have no norm.bias, so this branch is never
-    // taken.  If a model with bias is used, the kernel must be updated to
-    // compute (RMSNorm(x) * gamma + bias) * silu(z) correctly — a simple
-    // broadcast_add here would be mathematically wrong.
-    if let Some(bias) = norm_bias {
-        // Correct: out = kernel_out + bias * silu(z)
-        // kernel_out = RMSNorm(x) * gamma * silu(z)
-        // target     = (RMSNorm(x) * gamma + bias) * silu(z)
-        //            = kernel_out + bias * silu(z)
-        let silu_z = z_c.to_dtype(DType::F32)?.silu()?;
-        let bias_expanded = bias.broadcast_as((rows, value_dim))?;
-        let correction = bias_expanded.to_dtype(DType::F32)?.broadcast_mul(&silu_z)?;
-        Ok(output.to_dtype(DType::F32)?.broadcast_add(&correction)?.to_dtype(DType::BF16)?)
-    } else {
-        Ok(output)
-    }
+    Ok(output)
 }
 
 /// GCU gated_delta_rule_recurrence
@@ -2738,108 +2722,6 @@ pub fn gated_delta_rule_decode_slots_gqa(
     }
 }
 
-/// GCU Fused GDN Decode Recurrence + Post kernel.
-///
-/// Fuses the following into a single Choreo kernel launch:
-///   1. GDN gating: g = -exp(a_log) * softplus(a + dt_bias), beta = sigmoid(b)
-///   2. GQA recurrence with state update and q_scale
-///   3. RMSNorm on per-head output
-///   4. SiLU(z) gating multiply
-///
-/// Q/K have num_k_heads (GQA-indexed, not expanded).
-/// V/A/B/Z have num_v_heads dimension.
-/// Expected to replace: fused_gdn_gating + gated_delta_rule_decode_slots_gqa
-///                      + reshape_output + gated_rmsnorm_silu_mul
-#[cfg(feature = "gcu")]
-pub fn gated_delta_rule_decode_recurrence_post_fused(
-    q: &Tensor,         // [batch, num_k_heads, k_dim] L2-normalized
-    k: &Tensor,         // [batch, num_k_heads, k_dim] L2-normalized
-    v: &Tensor,         // [batch, num_v_heads, v_dim] raw from conv
-    a: &Tensor,         // [batch, num_v_heads] activation
-    b: &Tensor,         // [batch, num_v_heads] activation
-    a_log: &Tensor,     // [num_v_heads] F32 model weight
-    dt_bias: &Tensor,   // [num_v_heads] F32 model weight
-    z: &Tensor,         // [batch, value_dim] BF16 gate
-    state: &mut Tensor, // [max_slots, num_v_heads, k_dim, v_dim] F32
-    slots: &Tensor,     // [batch] I64
-    norm_weight: &Tensor, // [v_dim=128] F32 RMSNorm weight
-    q_scale: f32,
-) -> Result<Tensor> {
-    use candle::gcu_backend::ubridge::ffi;
-    use candle::gcu_backend::WrapErr;
-
-    let (batch, num_k_heads, k_dim) = q.dims3()?;
-    let num_v_heads = v.dim(1)?;
-    let v_dim = v.dim(2)?;
-    let value_dim = z.dim(1)?;
-    let max_slots = state.dim(0)? as i32;
-
-    if num_v_heads % num_k_heads != 0 {
-        candle_core::bail!(
-            "gated_delta_rule_decode_recurrence_post_fused: num_v_heads {} not divisible by num_k_heads {}",
-            num_v_heads,
-            num_k_heads
-        );
-    }
-    if value_dim != num_v_heads * v_dim {
-        candle_core::bail!(
-            "gated_delta_rule_decode_recurrence_post_fused: value_dim {} != num_v_heads {} * v_dim {}",
-            value_dim, num_v_heads, v_dim
-        );
-    }
-
-    let q_c = ensure_contiguous_gcu(q)?;
-    let k_c = ensure_contiguous_gcu(k)?;
-    let v_c = ensure_contiguous_gcu(v)?;
-    let a_c = ensure_contiguous_gcu(a)?;
-    let b_c = ensure_contiguous_gcu(b)?;
-    let a_log_c = ensure_contiguous_gcu(a_log)?;
-    let dt_c = ensure_contiguous_gcu(dt_bias)?;
-    let z_c = ensure_contiguous_gcu(z)?;
-    let slots_c = ensure_contiguous_gcu(slots)?;
-    let nw_c = ensure_contiguous_gcu(norm_weight)?;
-
-    let dev = q_c.device().as_gcu_device()?;
-    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
-
-    match q_c.dtype() {
-        DType::BF16 => {
-            let out = Tensor::zeros((batch, value_dim), DType::BF16, q_c.device())?;
-            unsafe {
-                ffi::gdn_decode_recurrence_post_fused_bf16(
-                    get_gcu_ptr::<bf16>(&q_c)?,
-                    get_gcu_ptr::<bf16>(&k_c)?,
-                    get_gcu_ptr::<bf16>(&v_c)?,
-                    get_gcu_ptr::<bf16>(&a_c)?,
-                    get_gcu_ptr::<bf16>(&b_c)?,
-                    get_gcu_ptr::<f32>(&a_log_c)?,
-                    get_gcu_ptr::<f32>(&dt_c)?,
-                    get_gcu_ptr::<bf16>(&z_c)?,
-                    get_gcu_ptr::<f32>(state)?,
-                    get_gcu_ptr::<i64>(&slots_c)? as *const i64,
-                    get_gcu_ptr::<f32>(&nw_c)?,
-                    q_scale,
-                    get_gcu_ptr::<bf16>(&out)? as *mut bf16,
-                    batch as i32,
-                    num_k_heads as i32,
-                    num_v_heads as i32,
-                    k_dim as i32,
-                    v_dim as i32,
-                    max_slots,
-                    2,
-                    12,
-                    stream,
-                );
-            }
-            Ok(out)
-        }
-        dt => candle_core::bail!(
-            "gated_delta_rule_decode_recurrence_post_fused: unsupported dtype {:?} on GCU (only BF16)",
-            dt
-        ),
-    }
-}
-
 /// GCU Fused GDN Decode L2Norm + Recurrence + Post kernel.
 ///
 /// Fuses the following into a single Choreo kernel launch:
@@ -2856,7 +2738,7 @@ pub fn gated_delta_rule_decode_recurrence_post_fused(
 /// Expected to replace: l2_norm_last_dim(q) + l2_norm_last_dim(k)
 ///                      + gated_delta_rule_decode_recurrence_post_fused
 #[cfg(feature = "gcu")]
-pub fn gated_delta_rule_decode_l2norm_recurrence_post_fused(
+pub fn gated_delta_rule_decode_recurrence_fused(
     q: &Tensor,         // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
     k: &Tensor,         // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
     v: &Tensor,         // [batch, num_v_heads, v_dim] raw from conv
@@ -2911,7 +2793,7 @@ pub fn gated_delta_rule_decode_l2norm_recurrence_post_fused(
         DType::BF16 => {
             let out = Tensor::zeros((batch, value_dim), DType::BF16, q_c.device())?;
             unsafe {
-                ffi::gdn_decode_l2norm_recurrence_post_fused_bf16(
+                ffi::gdn_decode_recurrence_fused_bf16(
                     get_gcu_ptr::<bf16>(&q_c)?,
                     get_gcu_ptr::<bf16>(&k_c)?,
                     get_gcu_ptr::<bf16>(&v_c)?,
@@ -2939,7 +2821,7 @@ pub fn gated_delta_rule_decode_l2norm_recurrence_post_fused(
             Ok(out)
         }
         dt => candle_core::bail!(
-            "gated_delta_rule_decode_l2norm_recurrence_post_fused: unsupported dtype {:?} on GCU (only BF16)",
+            "gated_delta_rule_decode_recurrence_fused: unsupported dtype {:?} on GCU (only BF16)",
             dt
         ),
     }
