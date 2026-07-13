@@ -2388,16 +2388,7 @@ pub fn l2_norm_last_dim(input: &Tensor, _eps: f64) -> Result<Tensor> {
     Ok(output)
 }
 
-/// GCU gated_rmsnorm_silu_mul: out = RMSNorm(x; gamma, eps) * silu(z)
-///
-/// The Choreo kernel fuses RMSNorm + silu(z) multiplication but does NOT
-/// support a bias parameter.  When `norm_bias` is present the correct
-/// formula is `out = (RMSNorm(x) * gamma + bias) * silu(z)`, which differs
-/// from `RMSNorm(x) * gamma * silu(z) + bias` by a factor of `silu(z)` on
-/// the bias term.  Since Qwen3.5/Qwen3Next linear-attn layers have no
-/// norm.bias (verified via safetensors index), this path is never taken
-/// in practice.  If a future model adds bias, the kernel must be updated
-/// to fuse it correctly.
+/// GCU gated_rmsnorm_silu_mul
 #[cfg(feature = "gcu")]
 pub fn gated_rmsnorm_silu_mul(
     x: &Tensor,
