@@ -8,11 +8,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="dd5d2dc" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="64cc242" }
 
 [build-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
 
 [features]
-flashattn = []
+flashattn = ["aten"]
 aten = []
+graph = ["candle-core/graph"]

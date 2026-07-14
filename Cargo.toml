@@ -12,8 +12,8 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="dd5d2dc" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="dd5d2dc" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="64cc242" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="64cc242" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
@@ -30,8 +30,8 @@ sha2 = { version = "0.10", optional = true }
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "dep:gcu-kernels"]
-graph = ["candle-core/graph"]
-flashattn = ["gcu-kernels/flashattn"]
+graph = ["candle-core/graph", "gcu-kernels/graph"]
+flashattn = ["aten"]
 no-marlin = ["dep:kernels", "kernels/no-marlin"]
 no-fp8-kvcache = ["dep:kernels", "kernels/no-fp8-kvcache"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal"]

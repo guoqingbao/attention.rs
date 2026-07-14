@@ -2730,16 +2730,16 @@ pub fn gated_delta_rule_decode_slots_gqa(
 ///                      + gated_delta_rule_decode_recurrence_post_fused
 #[cfg(feature = "gcu")]
 pub fn gated_delta_rule_decode_recurrence_fused(
-    q: &Tensor,         // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
-    k: &Tensor,         // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
-    v: &Tensor,         // [batch, num_v_heads, v_dim] raw from conv
-    a: &Tensor,         // [batch, num_v_heads] activation
-    b: &Tensor,         // [batch, num_v_heads] activation
-    a_log: &Tensor,     // [num_v_heads] F32 model weight
-    dt_bias: &Tensor,   // [num_v_heads] F32 model weight
-    z: &Tensor,         // [batch, value_dim] BF16 gate
-    state: &mut Tensor, // [max_slots, num_v_heads, k_dim, v_dim] F32
-    slots: &Tensor,     // [batch] I64
+    q: &Tensor,           // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
+    k: &Tensor,           // [batch, num_k_heads, k_dim] raw from conv (NOT L2-normalized)
+    v: &Tensor,           // [batch, num_v_heads, v_dim] raw from conv
+    a: &Tensor,           // [batch, num_v_heads] activation
+    b: &Tensor,           // [batch, num_v_heads] activation
+    a_log: &Tensor,       // [num_v_heads] F32 model weight
+    dt_bias: &Tensor,     // [num_v_heads] F32 model weight
+    z: &Tensor,           // [batch, value_dim] BF16 gate
+    state: &mut Tensor,   // [max_slots, num_v_heads, k_dim, v_dim] F32
+    slots: &Tensor,       // [batch] I64
     norm_weight: &Tensor, // [v_dim=128] F32 RMSNorm weight
     q_scale: f32,
 ) -> Result<Tensor> {

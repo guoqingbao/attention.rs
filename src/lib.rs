@@ -808,68 +808,55 @@ impl PagedAttention {
             &slot_mapping,
         )?;
 
-        if input_metadata.is_prefill {
-            return if input_metadata.block_tables.is_none() {
-                self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping)
-                // let (q_bm, k_bm, v_bm, _, _, _) = Self::batch_major_qkv(query, key, value)?;
-                // self.sdp_prefill(&q_bm, &k_bm, &v_bm, None, input_metadata, softcapping)
+        let softcap = Some(softcapping.unwrap_or(0.0f64) as f32);
+        let window_left = self.sliding_window.map(|w| w as i32);
+        let window_right = self.sliding_window.map(|_| 0i32);
+
+        // Aten topsfa (also used when `flashattn` is enabled — that feature
+        // implies `aten` on GCU; the libflashkernels host path is gone).
+        // both prefill and decode use varlen + paged KV +
+        // seqused_k. fwd_kvcache under GCU graph replay produced NaN logits.
+        if let Some(block_tables) = input_metadata.block_tables.as_ref() {
+            let context_lens = input_metadata.context_lens.as_ref().unwrap();
+            let max_seqlen_k = input_metadata
+                .max_seqlen_k
+                .max(input_metadata.max_context_len)
+                .max(1);
+            let (cu_seqlens_q, max_seqlen_q) = if input_metadata.is_prefill {
+                (
+                    input_metadata.cu_seqlens_q.as_ref().unwrap().clone(),
+                    input_metadata.max_seqlen_q.max(1),
+                )
             } else {
-                let block_tables = input_metadata.block_tables.as_ref().unwrap();
-                let context_lens = input_metadata.context_lens.as_ref().unwrap();
-                let cu_seqlens_q = input_metadata
-                    .cu_seqlens_q
-                    .as_ref()
-                    .unwrap()
-                    .to_vec1::<u32>()?;
-                let num_seqs = cu_seqlens_q.len() - 1;
-
-                let mut outputs = Vec::new();
-                for i in 0..num_seqs {
-                    let start = cu_seqlens_q[i] as usize;
-                    let end = cu_seqlens_q[i + 1] as usize;
-                    let seq_q_len = end - start;
-                    let q_seq = query_3d.narrow(0, start, seq_q_len)?.unsqueeze(0)?;
-                    let bt_seq = block_tables.get(i)?.unsqueeze(0)?;
-                    let cl_seq = context_lens.narrow(0, i, 1)?;
-
-                    let out = gcu_kernels::flash_attn_with_kvcache(
-                        &q_seq,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
-                        &cl_seq,
-                        &Some(bt_seq),
-                        self.scale as f32,
-                        Some(softcapping.unwrap_or(0.0f64) as f32),
-                        &None,
-                        None,
-                        None,
-                        true,
-                    )?;
-                    outputs.push(out.squeeze(0)?);
-                }
-                Ok(Tensor::cat(&outputs, 0)?)
+                // Decode: one query token per sequence. Prefer metadata (graph
+                // capture provides a persistent 0..bs buffer); else arange.
+                let cu = if let Some(cu) = input_metadata.cu_seqlens_q.as_ref() {
+                    cu.clone()
+                } else {
+                    let batch = query_3d.dim(0)?;
+                    Tensor::arange(0u32, (batch + 1) as u32, query_3d.device())?
+                };
+                (cu, input_metadata.max_seqlen_q.max(1))
             };
+            return gcu_kernels::flash_attn_varlen_paged(
+                &query_3d,
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                &cu_seqlens_q,
+                context_lens,
+                block_tables,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale as f32,
+                softcap,
+                window_left,
+                window_right,
+                true,
+            );
         }
 
-        let block_tables = input_metadata.block_tables.as_ref().unwrap();
-        let context_lens = input_metadata.context_lens.as_ref().unwrap();
-
-        let q_input = query_3d.unsqueeze(1)?;
-
-        let out = gcu_kernels::flash_attn_with_kvcache(
-            &q_input,
-            key_cache.as_ref().unwrap(),
-            value_cache.as_ref().unwrap(),
-            context_lens,
-            &Some(block_tables.clone()),
-            self.scale as f32,
-            Some(softcapping.unwrap_or(0.0f64) as f32),
-            &None,
-            None,
-            None,
-            false,
-        )?;
-        Ok(out)
+        // Pure prefill without paged tables: dense varlen.
+        self.flash_var_len(&query_3d, &key_3d, &value_3d, input_metadata, softcapping)
     }
 
     #[cfg(all(feature = "flashattn", not(feature = "gcu")))]

@@ -505,11 +505,25 @@ pub fn build_kvcache_params(
 
     /* ---------------- SMALL_SIZE heuristic ---------------- */
     let total_task = batch * kv_num_heads;
-    let _threads = (dim_blocks.x * dim_threads.x * 2) as i32;
-    // Both the splitkv multi-thread path and the largekv kernel have issues on
-    // GCU300 (multi-thread hangs, largekv has precision loss). Force all decode
-    // through the splitkv single-thread path which is numerically stable.
-    let small_size = 1048576;
+    let threads = (dim_blocks.x * dim_threads.x * 2) as i32;
+    // flashkernels kvcache dispatch: ctx_len > SMALL_SIZE selects the splitkv path.
+    // The previous 1048576 threshold kept long prompts (>8k) on the largekv path;
+    // restore a smaller threshold so long-context workloads use splitkv.
+    //
+    // Under CUDA/GCU graph capture the host dispatch runs once with the capture
+    // metadata (often seqlens=1). If that selects largekv while real decode has
+    // ctx_len > SMALL_SIZE, replay would execute the wrong kernels → NaNs.
+    // Force splitkv whenever the param cache / graph path is active.
+    #[cfg(feature = "graph")]
+    let small_size = if candle_core::is_param_cache_enabled() {
+        0
+    } else if total_task >= threads / 2 {
+        3072
+    } else {
+        512
+    };
+    #[cfg(not(feature = "graph"))]
+    let small_size = if total_task >= threads / 2 { 3072 } else { 512 };
 
     let data_type = match query.dtype() {
         DType::F16 => topsopDataType::TOPSOP_DATA_FP16,
