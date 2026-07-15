@@ -728,23 +728,17 @@ impl MambaCache {
     }
 
     fn cpu_prefix_spill_supported(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.conv_states
-                .first()
-                .map(|t| matches!(t.device(), Device::Cuda(_)))
-                .unwrap_or(false)
-        }
-        #[cfg(feature = "gcu")]
-        {
-            self.conv_states
-                .first()
-                .map(|t| matches!(t.device(), Device::Gcu(_)))
-                .unwrap_or(false)
-        }
-        #[cfg(not(any(feature = "cuda", feature = "gcu")))]
-        {
-            false
+        // Discrete-device GDN snapshots can spill/promote via Tensor::to_device
+        // (GCU↔CPU and CUDA↔CPU are both implemented in candle-core).
+        let Some(dev) = self.conv_states.first().map(|t| t.device()) else {
+            return false;
+        };
+        match dev {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => true,
+            #[cfg(feature = "gcu")]
+            Device::Gcu(_) => true,
+            _ => false,
         }
     }
 
@@ -1023,10 +1017,10 @@ impl MambaCache {
         let mut conv_states = Vec::with_capacity(snapshot.conv_states.len());
         let mut recurrent_states = Vec::with_capacity(snapshot.recurrent_states.len());
         for state in &snapshot.conv_states {
-            conv_states.push(state.to_device(device)?);
+            conv_states.push(state.contiguous()?.to_device(device)?);
         }
         for state in &snapshot.recurrent_states {
-            recurrent_states.push(state.to_device(device)?);
+            recurrent_states.push(state.contiguous()?.to_device(device)?);
         }
         Ok(PrefixStateSnapshot {
             conv_states,
@@ -1158,8 +1152,16 @@ impl MambaCache {
         let mut conv_states = Vec::with_capacity(self.num_gdn_layers);
         let mut recurrent_states = Vec::with_capacity(self.num_gdn_layers);
         for layer_idx in 0..self.num_gdn_layers {
-            conv_states.push(self.get_batch_conv_state(layer_idx, &slot_tensor)?);
-            recurrent_states.push(self.get_batch_recurrent_state(layer_idx, &slot_tensor)?);
+            // Materialize a dense snapshot so CPU spill / GCU promote via
+            // Tensor::to_device never carry a strided index_select layout.
+            conv_states.push(
+                self.get_batch_conv_state(layer_idx, &slot_tensor)?
+                    .contiguous()?,
+            );
+            recurrent_states.push(
+                self.get_batch_recurrent_state(layer_idx, &slot_tensor)?
+                    .contiguous()?,
+            );
         }
 
         self.prefix_states.insert(
@@ -1228,6 +1230,99 @@ impl MambaCache {
         self.preserved_prefix_lru.clear();
         self.cpu_prefix_lru.clear();
         self.cpu_preserved_prefix_lru.clear();
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "gcu"))]
+mod gcu_prefix_spill_tests {
+    use super::*;
+    use half::bf16;
+
+    #[test]
+    fn spill_promote_and_reuse_cpu_prefix_snapshots() -> Result<()> {
+        let device = Device::new_gcu(0)?;
+        let mut cache = MambaCache::new(
+            /*num_gdn_layers*/ 1,
+            /*max_batch_size*/ 2,
+            /*d_conv*/ 4,
+            /*conv_kernel_size*/ 4,
+            /*num_heads*/ 1,
+            /*head_k_dim*/ 2,
+            /*head_v_dim*/ 2,
+            DType::BF16,
+            DType::BF16,
+            &device,
+        )?;
+        // Device can hold 1 snapshot; CPU capacity becomes 4x (spill supported on GCU).
+        cache.set_prefix_cache_capacity(1);
+        assert!(cache.cpu_prefix_cache_capacity > 0);
+
+        cache.allocate_slot(1)?;
+        cache.allocate_slot(2)?;
+
+        // Seed distinct non-zero data into all slots, then capture seq1 as 0xA.
+        cache.conv_states[0] =
+            Tensor::full(bf16::from_f32(1.0), cache.conv_states[0].dims(), &device)?
+                .contiguous()?;
+        cache.recurrent_states[0] = Tensor::full(
+            bf16::from_f32(2.0),
+            cache.recurrent_states[0].dims(),
+            &device,
+        )?
+        .contiguous()?;
+
+        assert!(cache.capture_prefix_state(1, 0xA, false)?);
+        assert!(cache.prefix_states.contains_key(&0xA));
+        assert!(!cache.cpu_prefix_states.contains_key(&0xA));
+
+        // Overwrite active slots and capture another hash → force spill of 0xA to CPU.
+        cache.conv_states[0] =
+            Tensor::full(bf16::from_f32(3.0), cache.conv_states[0].dims(), &device)?
+                .contiguous()?;
+        assert!(cache.capture_prefix_state(2, 0xB, false)?);
+        assert!(cache.prefix_states.contains_key(&0xB));
+        assert!(
+            cache.cpu_prefix_states.contains_key(&0xA),
+            "expected 0xA to spill to CPU"
+        );
+        assert!(!cache.prefix_states.contains_key(&0xA));
+
+        // Clear active state; restore 0xA must promote CPU → GCU then write the slot.
+        cache.conv_states[0].zero_()?;
+        cache.recurrent_states[0].zero_()?;
+        assert!(cache.restore_prefix_state(1, 0xA)?);
+        assert!(
+            cache.prefix_states.contains_key(&0xA),
+            "promote should leave snapshot on device"
+        );
+        assert!(
+            !cache.cpu_prefix_states.contains_key(&0xA),
+            "CPU slot should be freed for reuse after promote"
+        );
+
+        let slot = cache.get_slot(1).unwrap();
+        let slot_t = Tensor::from_vec(vec![slot as i64], (1,), &device)?;
+        let restored_conv = cache.get_batch_conv_state(0, &slot_t)?.contiguous()?;
+        let conv_host = restored_conv
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        assert!(
+            conv_host.iter().all(|v| (*v - 1.0).abs() < 1e-3),
+            "restored conv should match spilled ones payload, got {:?}",
+            &conv_host[..conv_host.len().min(4)]
+        );
+
+        // CPU capacity reused: 0xB was spilled during 0xA promote; promote it back.
+        assert!(
+            cache.cpu_prefix_states.contains_key(&0xB),
+            "0xB should have been spilled to CPU when promoting 0xA"
+        );
+        assert!(cache.restore_prefix_state(2, 0xB)?);
+        assert!(cache.prefix_states.contains_key(&0xB));
+        assert!(!cache.cpu_prefix_states.contains_key(&0xB));
+
         Ok(())
     }
 }

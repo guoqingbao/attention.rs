@@ -839,3 +839,120 @@ pub fn copy_blocks(
     }
     dev.synchronize()
 }
+
+#[cfg(all(test, feature = "gcu"))]
+mod gcu_swap_tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use half::f16;
+    use std::collections::HashMap;
+
+    fn pattern_block(block: usize, elems: usize) -> Vec<f16> {
+        (0..elems)
+            .map(|i| f16::from_f32(((block * 1000) + i) as f32))
+            .collect()
+    }
+
+    fn fill_gpu_block(gpu: &Tensor, block: usize, elems: usize, tag: usize) -> Result<()> {
+        let data = pattern_block(tag, elems);
+        let src = Tensor::from_vec(data, (elems,), &Device::Cpu)?.to_device(gpu.device())?;
+        gpu.copy_(&src, block * elems)?;
+        Ok(())
+    }
+
+    #[test]
+    fn swap_out_in_roundtrip_and_cpu_slot_reuse() -> Result<()> {
+        let device = Device::new_gcu(0)?;
+        let num_gpu = 4;
+        let num_cpu = 2;
+        let block_elems = 8;
+
+        let gpu = Tensor::zeros((num_gpu, block_elems), DType::F16, &device)?;
+        let cpu = Tensor::zeros((num_cpu, block_elems), DType::F16, &Device::Cpu)?;
+
+        fill_gpu_block(&gpu, 0, block_elems, 0)?;
+        fill_gpu_block(&gpu, 1, block_elems, 1)?;
+
+        // Offload GPU{0,1} → CPU{0,1}.
+        let mut mapping = HashMap::new();
+        mapping.insert(0, 0);
+        mapping.insert(1, 1);
+        swap_blocks(&gpu, &cpu, &mapping)?;
+
+        let cpu_vals = cpu.to_vec2::<f16>()?;
+        assert_eq!(cpu_vals[0], pattern_block(0, block_elems));
+        assert_eq!(cpu_vals[1], pattern_block(1, block_elems));
+
+        // Clear GPU payloads so promote must come from CPU.
+        clear_blocks(&gpu, &vec![0, 1])?;
+        assert!(gpu
+            .narrow(0, 0, 2)?
+            .flatten_all()?
+            .to_vec1::<f16>()?
+            .iter()
+            .all(|v| *v == f16::from_f32(0.0)));
+
+        // Promote CPU{0,1} → GPU{2,3} (different physical IDs = remap reuse).
+        let mut promote = HashMap::new();
+        promote.insert(0, 2);
+        promote.insert(1, 3);
+        swap_blocks(&cpu, &gpu, &promote)?;
+
+        let gpu_vals = gpu.to_vec2::<f16>()?;
+        assert_eq!(gpu_vals[2], pattern_block(0, block_elems));
+        assert_eq!(gpu_vals[3], pattern_block(1, block_elems));
+
+        // Reuse CPU slots: offload a new GPU pattern into the same CPU blocks.
+        fill_gpu_block(&gpu, 0, block_elems, 10)?;
+        fill_gpu_block(&gpu, 1, block_elems, 11)?;
+        let mut reuse_out = HashMap::new();
+        reuse_out.insert(0, 0);
+        reuse_out.insert(1, 1);
+        swap_blocks(&gpu, &cpu, &reuse_out)?;
+        let cpu_reused = cpu.to_vec2::<f16>()?;
+        assert_eq!(cpu_reused[0], pattern_block(10, block_elems));
+        assert_eq!(cpu_reused[1], pattern_block(11, block_elems));
+
+        // Promote reused CPU slots back onto GPU{0,1}.
+        let mut reuse_in = HashMap::new();
+        reuse_in.insert(0, 0);
+        reuse_in.insert(1, 1);
+        swap_blocks(&cpu, &gpu, &reuse_in)?;
+        let gpu_reused = gpu.to_vec2::<f16>()?;
+        assert_eq!(gpu_reused[0], pattern_block(10, block_elems));
+        assert_eq!(gpu_reused[1], pattern_block(11, block_elems));
+
+        Ok(())
+    }
+
+    #[test]
+    fn copy_blocks_preserves_source_after_swap_out() -> Result<()> {
+        let device = Device::new_gcu(0)?;
+        let num_blocks = 3;
+        let block_elems = 4;
+        let mut key = Tensor::zeros((num_blocks, block_elems), DType::F16, &device)?;
+        let mut value = Tensor::zeros((num_blocks, block_elems), DType::F16, &device)?;
+        let cpu = Tensor::zeros((1, block_elems), DType::F16, &Device::Cpu)?;
+
+        let data = pattern_block(7, block_elems);
+        fill_gpu_block(&key, 0, block_elems, 7)?;
+        fill_gpu_block(&value, 0, block_elems, 7)?;
+
+        // Offload block 0 to CPU, then COW copy residual GPU block 0 → 1.
+        let mut offload = HashMap::new();
+        offload.insert(0, 0);
+        swap_blocks(&key, &cpu, &offload)?;
+
+        let mut mapping = HashMap::new();
+        mapping.insert(0, vec![1]);
+        copy_blocks(vec![&mut key], vec![&mut value], mapping)?;
+
+        let key_vals = key.to_vec2::<f16>()?;
+        let value_vals = value.to_vec2::<f16>()?;
+        let cpu_vals = cpu.to_vec2::<f16>()?;
+        assert_eq!(cpu_vals[0], data);
+        assert_eq!(key_vals[1], data);
+        assert_eq!(value_vals[1], data);
+        Ok(())
+    }
+}
