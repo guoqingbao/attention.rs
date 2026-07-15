@@ -735,7 +735,14 @@ impl MambaCache {
                 .map(|t| matches!(t.device(), Device::Cuda(_)))
                 .unwrap_or(false)
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "gcu")]
+        {
+            self.conv_states
+                .first()
+                .map(|t| matches!(t.device(), Device::Gcu(_)))
+                .unwrap_or(false)
+        }
+        #[cfg(not(any(feature = "cuda", feature = "gcu")))]
         {
             false
         }
@@ -768,7 +775,7 @@ impl MambaCache {
         }
         if self.cpu_prefix_cache_capacity > 0 {
             tracing::info!(
-                "MambaCache: CUDA CPU prefix snapshot spill enabled (device capacity {}, cpu capacity {})",
+                "MambaCache: CPU prefix snapshot spill enabled (device capacity {}, cpu capacity {})",
                 self.prefix_cache_capacity,
                 self.cpu_prefix_cache_capacity
             );

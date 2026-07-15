@@ -403,7 +403,178 @@ pub fn swap_blocks(
         }
     }
 
-    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    #[cfg(feature = "gcu")]
+    fn call_fwd<T: candle_core::gcu_backend::GcuDType + candle_core::WithDType>(
+        src: &Tensor,
+        dst: &Tensor,
+        block_mapping: &HashMap<usize, usize>,
+    ) -> Result<()> {
+        use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
+        use candle_core::gcu_backend::ubridge::gcu_device::driv;
+        use candle_core::gcu_backend::ubridge::prelude::tops::error::ToResult;
+        use candle_core::gcu_backend::WrapErr;
+        use std::ffi::c_void;
+        use std::slice;
+
+        let block_size_elements = src.elem_count() / src.dim(0)?;
+        let (src_storage, _) = src.storage_and_layout();
+        let (dst_storage, _) = dst.storage_and_layout();
+        let dtype_size = src.dtype().size_in_bytes();
+        let block_nbytes = block_size_elements * dtype_size;
+
+        match (src.device(), dst.device()) {
+            (Device::Cpu, Device::Gcu(dst_dev)) => {
+                let Storage::Cpu(src_storage) = &*src_storage else {
+                    candle_core::bail!("Invalid source kvcache storage!")
+                };
+                let Storage::Gcu(dst_storage) = &*dst_storage else {
+                    candle_core::bail!("Invalid dst kvcache storage!")
+                };
+                let cpu_num_blocks = src.dim(0)?;
+                let gpu_num_blocks = dst.dim(0)?;
+
+                let dst_base = dst_storage.as_gcu_slice::<T>()?.device_ptr() as u64;
+                let src_slice: &[T] = src_storage.as_slice()?;
+                let stream = dst_dev
+                    .stream_inner()
+                    .ok_or_else(|| candle_core::Error::msg("GCU stream unavailable for swap"))?;
+
+                for (src_block_number, dst_block_number) in block_mapping {
+                    assert!(
+                        *src_block_number < cpu_num_blocks,
+                        "Invalid cpu block {} / {}",
+                        src_block_number,
+                        cpu_num_blocks
+                    );
+                    assert!(
+                        *dst_block_number < gpu_num_blocks,
+                        "Invalid gpu block {} / {}",
+                        dst_block_number,
+                        gpu_num_blocks
+                    );
+                    let src_offset = src_block_number * block_size_elements;
+                    assert!(
+                        src_offset + block_size_elements <= src_slice.len(),
+                        "Invalid cpu kvcache block {} for offload",
+                        src_block_number
+                    );
+                    let dst_ptr = (dst_base + (*dst_block_number * block_nbytes) as u64)
+                        as driv::topsDeviceptr_t;
+                    unsafe {
+                        driv::topsMemcpyHtoDAsync(
+                            dst_ptr,
+                            src_slice[src_offset..src_offset + block_size_elements].as_ptr()
+                                as *mut c_void,
+                            block_nbytes,
+                            stream,
+                        )
+                        .to_result()
+                        .w()?
+                    }
+                }
+                dst_dev.synchronize()
+            }
+            (Device::Gcu(src_dev), Device::Cpu) => {
+                let Storage::Gcu(src_storage) = &*src_storage else {
+                    candle_core::bail!("Invalid source kvcache storage!")
+                };
+                let Storage::Cpu(dst_storage) = &*dst_storage else {
+                    candle_core::bail!("Invalid dst kvcache storage!")
+                };
+                let gpu_num_blocks = src.dim(0)?;
+                let cpu_num_blocks = dst.dim(0)?;
+
+                let src_base = src_storage.as_gcu_slice::<T>()?.device_ptr() as u64;
+                let dst_slice: &[T] = dst_storage.as_slice()?;
+                let ptr = dst_slice.as_ptr() as *mut u8;
+                let stream = src_dev
+                    .stream_inner()
+                    .ok_or_else(|| candle_core::Error::msg("GCU stream unavailable for swap"))?;
+
+                for (src_block_number, dst_block_number) in block_mapping {
+                    assert!(
+                        *src_block_number < gpu_num_blocks,
+                        "Invalid gpu block {} / {}",
+                        src_block_number,
+                        gpu_num_blocks
+                    );
+                    assert!(
+                        *dst_block_number < cpu_num_blocks,
+                        "Invalid cpu block {} / {}",
+                        dst_block_number,
+                        cpu_num_blocks
+                    );
+                    let src_ptr = (src_base + (*src_block_number * block_nbytes) as u64)
+                        as driv::topsDeviceptr_t;
+                    let dst_offset = dst_block_number * block_nbytes;
+                    let dst_bytes = unsafe {
+                        slice::from_raw_parts_mut(ptr.wrapping_add(dst_offset), block_nbytes)
+                    };
+                    unsafe {
+                        driv::topsMemcpyDtoHAsync(
+                            dst_bytes.as_mut_ptr() as *mut c_void,
+                            src_ptr,
+                            block_nbytes,
+                            stream,
+                        )
+                        .to_result()
+                        .w()?
+                    }
+                }
+                src_dev.synchronize()
+            }
+            (Device::Gcu(src_dev), Device::Gcu(dst_dev)) => {
+                let Storage::Gcu(src_storage) = &*src_storage else {
+                    candle_core::bail!("Invalid source kvcache storage!")
+                };
+                let Storage::Gcu(dst_storage) = &*dst_storage else {
+                    candle_core::bail!("Invalid dst kvcache storage!")
+                };
+                let remote_num_blocks = src.dim(0)?;
+                let local_num_blocks = dst.dim(0)?;
+
+                let src_base = src_storage.as_gcu_slice::<T>()?.device_ptr() as u64;
+                let dst_base = dst_storage.as_gcu_slice::<T>()?.device_ptr() as u64;
+                let stream = dst_dev
+                    .stream_inner()
+                    .ok_or_else(|| candle_core::Error::msg("GCU stream unavailable for swap"))?;
+
+                for (src_block_number, dst_block_number) in block_mapping {
+                    assert!(
+                        *src_block_number < remote_num_blocks,
+                        "Invalid remote block {} / {}",
+                        src_block_number,
+                        remote_num_blocks
+                    );
+                    assert!(
+                        *dst_block_number < local_num_blocks,
+                        "Invalid local block {} / {}",
+                        dst_block_number,
+                        local_num_blocks
+                    );
+                    let src_ptr = (src_base + (*src_block_number * block_nbytes) as u64)
+                        as driv::topsDeviceptr_t;
+                    let dst_ptr = (dst_base + (*dst_block_number * block_nbytes) as u64)
+                        as driv::topsDeviceptr_t;
+                    unsafe {
+                        driv::topsMemcpyDtoDAsync(dst_ptr, src_ptr, block_nbytes, stream)
+                            .to_result()
+                            .w()?
+                    }
+                }
+                // Keep src_dev referenced for same-device transfers.
+                let _ = src_dev;
+                dst_dev.synchronize()
+            }
+            (src, dst) => {
+                candle_core::bail!(
+                    "Tensors must be on either the GCU or CPU to swap, or GCU-GCU transfer, got {src:?} (src) and {dst:?} (dst)."
+                )
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "metal", feature = "cuda", feature = "gcu")))]
     fn call_fwd<T: candle_core::WithDType + Copy>(
         _: &Tensor,
         _: &Tensor,
@@ -524,7 +695,51 @@ pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    #[cfg(feature = "gcu")]
+    fn call_fwd<T: candle_core::gcu_backend::GcuDType + candle_core::WithDType>(
+        cache: &Tensor,
+        block_ids: &Vec<u32>,
+    ) -> Result<()> {
+        use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
+        use candle_core::gcu_backend::ubridge::gcu_device::driv;
+        use candle_core::gcu_backend::ubridge::prelude::tops::error::ToResult;
+        use candle_core::gcu_backend::WrapErr;
+
+        let block_size_elements = cache.elem_count() / cache.dim(0)?;
+        let (cache_storage, _) = cache.storage_and_layout();
+        let dtype_size = cache.dtype().size_in_bytes();
+        let block_nbytes = block_size_elements * dtype_size;
+        let dst_dev = cache.device().as_gcu_device()?;
+
+        let Storage::Gcu(cache_storage) = &*cache_storage else {
+            candle_core::bail!("Invalid kvcache storage!")
+        };
+
+        let num_blocks = cache.dim(0)?;
+        let cache_base = cache_storage.as_gcu_slice::<T>()?.device_ptr() as u64;
+        let stream = dst_dev
+            .stream_inner()
+            .ok_or_else(|| candle_core::Error::msg("GCU stream unavailable for clear_blocks"))?;
+
+        for block_number in block_ids {
+            assert!(
+                (*block_number as usize) < num_blocks,
+                "Invalid gpu block {} / {}",
+                block_number,
+                num_blocks
+            );
+            let ptr = (cache_base + (*block_number as usize * block_nbytes) as u64)
+                as driv::topsDeviceptr_t;
+            unsafe {
+                driv::topsMemsetD8Async(ptr, 0, block_nbytes, stream)
+                    .to_result()
+                    .w()?
+            }
+        }
+        dst_dev.synchronize()
+    }
+
+    #[cfg(not(any(feature = "metal", feature = "cuda", feature = "gcu")))]
     fn call_fwd<T: candle_core::WithDType + Copy>(
         _: &Tensor,
         _: &Vec<u32>,
@@ -536,8 +751,91 @@ pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
         DType::F16 => call_fwd::<f16>(cache, block_ids),
         DType::BF16 => call_fwd::<bf16>(cache, block_ids),
         DType::U8 => call_fwd::<u8>(cache, block_ids),
+        DType::F32 => call_fwd::<f32>(cache, block_ids),
         _ => {
-            candle_core::bail!("clear_blocks only accept f16/bf16/u8 kvcache dtypes!")
+            candle_core::bail!("clear_blocks only accept f16/bf16/f32/u8 kvcache dtypes!")
         }
     }
+}
+
+/// Device-side block copy used by the scheduler when forking / prefix-sharing KV blocks.
+///
+/// On GCU this uses UHHI `topsMemcpyDtoDAsync` (no dedicated copy kernel).
+#[cfg(feature = "gcu")]
+pub fn copy_blocks(
+    key_caches: Vec<&mut Tensor>,
+    value_caches: Vec<&mut Tensor>,
+    block_mapping: HashMap<usize, Vec<usize>>,
+) -> Result<()> {
+    use candle_core::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle_core::gcu_backend::ubridge::gcu_device::driv;
+    use candle_core::gcu_backend::ubridge::prelude::tops::error::ToResult;
+    use candle_core::gcu_backend::WrapErr;
+    use candle_core::DType;
+    use half::{bf16, f16};
+    use std::iter::zip;
+
+    if key_caches.is_empty() {
+        return Ok(());
+    }
+    let cache_dev = key_caches.first().unwrap().device();
+    let Device::Gcu(dev) = cache_dev else {
+        candle_core::bail!("Expected the key caches to be on a GCU device.")
+    };
+    if !cache_dev.same_device(value_caches.first().unwrap().device()) {
+        candle_core::bail!(
+            "`key` and `value` caches have different devices, got {:?} and {:?} respectively.",
+            cache_dev,
+            value_caches.first().unwrap().device()
+        )
+    }
+    if key_caches.first().unwrap().dtype() != value_caches.first().unwrap().dtype() {
+        candle_core::bail!(
+            "Key and value caches have different types, got {:?} and {:?}.",
+            key_caches.first().unwrap().dtype(),
+            value_caches.first().unwrap().dtype()
+        )
+    }
+
+    let stream = dev
+        .stream_inner()
+        .ok_or_else(|| candle_core::Error::msg("GCU stream unavailable for copy_blocks"))?;
+    let dtype = key_caches.first().unwrap().dtype();
+    let numel_per_block: usize = key_caches.first().unwrap().narrow(0, 0, 1)?.elem_count();
+    let block_nbytes = numel_per_block * dtype.size_in_bytes();
+
+    let copy_tensor_blocks = |cache: &Tensor| -> Result<()> {
+        let (storage, _) = cache.storage_and_layout();
+        let Storage::Gcu(storage) = &*storage else {
+            candle_core::bail!("Expected GCU kvcache storage")
+        };
+        let base = match cache.dtype() {
+            DType::BF16 => storage.as_gcu_slice::<bf16>()?.device_ptr() as u64,
+            DType::F16 => storage.as_gcu_slice::<f16>()?.device_ptr() as u64,
+            DType::F32 => storage.as_gcu_slice::<f32>()?.device_ptr() as u64,
+            DType::U8 => storage.as_gcu_slice::<u8>()?.device_ptr() as u64,
+            other => candle_core::bail!("copy_blocks unsupported dtype {other:?}"),
+        };
+        let num_blocks = cache.dim(0)?;
+        for (src_block, dst_blocks) in &block_mapping {
+            assert!(*src_block < num_blocks, "Invalid src block {src_block}");
+            let src_ptr = (base + (*src_block * block_nbytes) as u64) as driv::topsDeviceptr_t;
+            for dst_block in dst_blocks {
+                assert!(*dst_block < num_blocks, "Invalid dst block {dst_block}");
+                let dst_ptr = (base + (*dst_block * block_nbytes) as u64) as driv::topsDeviceptr_t;
+                unsafe {
+                    driv::topsMemcpyDtoDAsync(dst_ptr, src_ptr, block_nbytes, stream)
+                        .to_result()
+                        .w()?
+                }
+            }
+        }
+        Ok(())
+    };
+
+    for (key_cache, value_cache) in zip(&key_caches, &value_caches) {
+        copy_tensor_blocks(key_cache)?;
+        copy_tensor_blocks(value_cache)?;
+    }
+    dev.synchronize()
 }
