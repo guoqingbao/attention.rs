@@ -654,14 +654,15 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     const int bh = blockIdx.y;    // batch * num_v_heads
     const int tid = threadIdx.x;
     const int v_idx = v_tile * BV + tid;
-    if (v_idx >= v_dim || bh >= batch * num_v_heads) return;
+    if (bh >= batch * num_v_heads) return;
+    const bool v_valid = v_idx < v_dim;
 
     const int b = bh / num_v_heads;
     const int v_head_idx = bh % num_v_heads;
     const int kv_group_size = num_v_heads / num_k_heads;
     const int k_head_idx = v_head_idx / kv_group_size;
     const int64_t slot = slots[b];
-    if (slot < 0) return;
+    const bool slot_valid = slot >= 0;
 
     extern __shared__ float smem[];
     float* q_smem = smem;
@@ -682,25 +683,31 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     const float decay = scalars[0];
     const float beta_t = scalars[1];
 
-    float* state_head = state + ((slot * num_v_heads + v_head_idx) * k_dim * v_dim);
+    float* state_head = slot_valid
+        ? state + ((slot * num_v_heads + v_head_idx) * k_dim * v_dim)
+        : nullptr;
 
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
+        s_buf[j] = (v_valid && slot_valid && j < k_dim)
+            ? state_head[j * v_dim + v_idx]
+            : 0.0f;
     }
 
     float kv_mem = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && slot_valid && j < k_dim) {
             s_buf[j] *= decay;
             kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
         }
     }
 
     const T* v_bh = v + (b * num_v_heads + v_head_idx) * v_dim;
-    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+    const float delta = v_valid && slot_valid
+        ? (to_float(v_bh[v_idx]) - kv_mem) * beta_t
+        : 0.0f;
 
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
@@ -711,7 +718,7 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     float y = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && slot_valid && j < k_dim) {
             s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
             y = __fmaf_rn(s_buf[j], q_smem[j], y);
         }
@@ -719,12 +726,14 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
 
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && slot_valid && j < k_dim) {
             state_head[j * v_dim + v_idx] = s_buf[j];
         }
     }
 
-    out[(b * num_v_heads + v_head_idx) * v_dim + v_idx] = from_float<T>(y);
+    if (v_valid && slot_valid) {
+        out[(b * num_v_heads + v_head_idx) * v_dim + v_idx] = from_float<T>(y);
+    }
 }
 
 template <typename T>
@@ -777,6 +786,17 @@ extern "C" void gated_delta_rule_decode_slots_gqa_f16(
     const half* q, const half* k, const half* v,
     const float* g, const float* beta, float* state,
     const int64_t* slots, half* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, cudaStream_t stream) {
+    launch_gated_delta_rule_decode_slots_gqa(
+        q, k, v, g, beta, state, slots, out,
+        batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}
+
+extern "C" void gated_delta_rule_decode_slots_gqa_f32(
+    const float* q, const float* k, const float* v,
+    const float* g, const float* beta, float* state,
+    const int64_t* slots, float* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
     launch_gated_delta_rule_decode_slots_gqa(

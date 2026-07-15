@@ -1226,14 +1226,14 @@ pub fn call_fp8_matmul(
     );
 
     if is_gemv {
-        // Grid: (N * 32, M, 1)
+        // Eight SIMD groups share each activation tile.
         let thread_group_size = MTLSize {
-            width: 32,
+            width: 256,
             height: 1,
             depth: 1,
         };
         let thread_groups_count = MTLSize {
-            width: n as u64, // (N * 32) / 32 = N
+            width: (n as u64 + 7) / 8,
             height: m as u64,
             depth: 1,
         };
@@ -1385,7 +1385,7 @@ pub fn call_moe_gemm(
         let thread_groups_count = MTLSize {
             width: (size_n as u64 + BLOCK_N - 1) / BLOCK_N,
             height: (size_m as u64 + BLOCK_M - 1) / BLOCK_M,
-            depth: 1,
+            depth: num_experts as u64,
         };
         encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     }
@@ -2199,9 +2199,9 @@ pub fn flash_attention_decode(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Shared memory: q_shared(HEAD_DIM) + sg_max(NUM_SIMD_GROUPS) + sg_sum(NUM_SIMD_GROUPS) + sg_out(NUM_SIMD_GROUPS * HEAD_DIM)
+    // Shared memory: s_m[NUM_SIMD_GROUPS] + s_l[NUM_SIMD_GROUPS] + s_o[NUM_SIMD_GROUPS * HEAD_DIM]
     let num_simd_groups = (NUM_THREADS / 32) as u64;
-    let smem_size = ((head_size as u64) + num_simd_groups * 2 + num_simd_groups * head_size as u64)
+    let smem_size = (num_simd_groups * 2 + num_simd_groups * head_size as u64)
         * std::mem::size_of::<f32>() as u64;
     encoder.set_threadgroup_memory_length(0, smem_size);
 
@@ -2483,15 +2483,17 @@ pub fn flash_reshape_and_cache_metal(
     num_heads: i32,
     head_size: i32,
     block_size: i32,
-    k_scale: Option<MetalStorage>,
-    v_scale: Option<MetalStorage>,
+    key_stride: i32,
+    value_stride: i32,
+    k_scale: Option<Buffer>,
+    v_scale: Option<Buffer>,
 ) -> Result<(), MetalKernelError> {
     let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     let type_prefix = match ty {
         PagedAttentionDType::BF16 => "bf16",
         PagedAttentionDType::F16 => "f16",
-        PagedAttentionDType::F32 => "bf16",
+        PagedAttentionDType::F32 => "f32",
     };
     let cache_suffix = if quantized_cache {
         "_fp8"
@@ -2499,7 +2501,7 @@ pub fn flash_reshape_and_cache_metal(
         match ty {
             PagedAttentionDType::BF16 => "_bf16",
             PagedAttentionDType::F16 => "_f16",
-            PagedAttentionDType::F32 => "_bf16",
+            PagedAttentionDType::F32 => "_f32",
         }
     };
     let name = format!("flash_reshape_cache_{}{}", type_prefix, cache_suffix);
@@ -2516,31 +2518,40 @@ pub fn flash_reshape_and_cache_metal(
     encoder.set_buffer(4, Some(slot_mapping), slot_mapping_offset as NSUInteger);
     encoder.set_bytes(
         5,
-        size_of_val(&num_tokens),
+        size_of_val(&num_tokens) as NSUInteger,
         &num_tokens as *const _ as *const c_void,
     );
     encoder.set_bytes(
         6,
-        size_of_val(&num_heads),
+        size_of_val(&num_heads) as NSUInteger,
         &num_heads as *const _ as *const c_void,
     );
     encoder.set_bytes(
         7,
-        size_of_val(&head_size),
+        size_of_val(&head_size) as NSUInteger,
         &head_size as *const _ as *const c_void,
     );
     encoder.set_bytes(
         8,
-        size_of_val(&block_size),
+        size_of_val(&block_size) as NSUInteger,
         &block_size as *const _ as *const c_void,
     );
-    if let Some(ks) = k_scale {
-        encoder.set_buffer(9, Some(ks.buffer()), 0);
+    encoder.set_bytes(
+        9,
+        size_of_val(&key_stride) as NSUInteger,
+        &key_stride as *const _ as *const c_void,
+    );
+    encoder.set_bytes(
+        10,
+        size_of_val(&value_stride) as NSUInteger,
+        &value_stride as *const _ as *const c_void,
+    );
+    if let Some(ks) = &k_scale {
+        encoder.set_buffer(11, Some(ks), 0);
     }
-    if let Some(vs) = v_scale {
-        encoder.set_buffer(10, Some(vs.buffer()), 0);
+    if let Some(vs) = &v_scale {
+        encoder.set_buffer(12, Some(vs), 0);
     }
-
     let thread_groups_count = MTLSize {
         width: num_tokens as u64,
         height: 1,
@@ -3870,6 +3881,74 @@ pub fn call_gdn_gated_delta_rule_decode_slots(
     let thread_groups_count = MTLSize {
         width: ((v_dim as u64) + 63) / 64,
         height: (batch * heads) as u64,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_decode_slots_gqa(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch: i32,
+    num_v_heads: i32,
+    num_k_heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+    q_scale: f32,
+) -> Result<(), MetalKernelError> {
+    let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_decode_slots_gqa", ty, k_dim)?;
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q, q_offset),
+            (k, k_offset),
+            (v, v_offset),
+            (g, g_offset),
+            (beta, beta_offset),
+            (state, state_offset),
+            (slots, slots_offset),
+            (out, out_offset),
+            batch,
+            num_v_heads,
+            num_k_heads,
+            k_dim,
+            v_dim,
+            q_scale
+        )
+    );
+
+    let thread_group_size = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: ((v_dim as u64) + 63) / 64,
+        height: (batch * num_v_heads) as u64,
         depth: 1,
     };
     encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);

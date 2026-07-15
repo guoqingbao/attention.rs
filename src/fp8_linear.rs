@@ -105,7 +105,7 @@ pub fn fp8_matmul(
 ///
 /// # Arguments
 /// * `input` - Input tensor A of shape [M, K]
-/// * `weight` - Weight tensor B of shape [N, K] (stored as u8)
+/// * `weight` - Weight tensor B of shape [N, K] (stored as F8E4M3 or raw U8 bytes)
 /// * `weight_scale` - Scales for weight tensor
 /// * `block_size` - [block_size_y, block_size_x] for scaling
 ///
@@ -343,8 +343,8 @@ pub fn fp8_matmul_flashinfer(
     if input.dtype() != DType::BF16 {
         candle_core::bail!("fp8_matmul_flashinfer requires bf16 input");
     }
-    if weight.dtype() != DType::U8 || weight_scale.dtype() != DType::F32 {
-        candle_core::bail!("fp8_matmul_flashinfer requires u8 weights and f32 scales");
+    if !matches!(weight.dtype(), DType::U8 | DType::F8E4M3) || weight_scale.dtype() != DType::F32 {
+        candle_core::bail!("fp8_matmul_flashinfer requires F8E4M3/U8 weights and f32 scales");
     }
     if !input.is_contiguous() {
         candle_core::bail!("fp8_matmul_flashinfer requires contiguous input");

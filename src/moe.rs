@@ -11,7 +11,6 @@ use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
-#[cfg(feature = "cuda")]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }

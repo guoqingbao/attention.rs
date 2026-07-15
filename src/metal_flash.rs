@@ -100,8 +100,10 @@ pub fn flash_reshape_and_cache_metal(
         num_kv_heads as i32,
         head_dim as i32,
         block_size as i32,
-        ks_storage,
-        vs_storage,
+        key_l.stride()[0] as i32,
+        val_l.stride()[0] as i32,
+        ks_storage.map(|s| s.buffer().clone()),
+        vs_storage.map(|s| s.buffer().clone()),
     )
     .map_err(|e| candle::Error::Msg(format!("flash_reshape_and_cache_metal: {e}")))?;
 
@@ -238,7 +240,7 @@ pub fn flash_prefill_metal(
             head_dim as i32,
             block_size,
             softcap,
-            (num_q_heads * head_dim) as i32,
+            q_l.stride()[0] as i32,
             sw,
             total_num_blocks,
             kv_block_stride,
@@ -323,7 +325,7 @@ pub fn flash_decode_metal(
     };
 
     let max_blocks_per_seq = block_tables.dim(1)? as i32;
-    let q_stride = (num_q_heads * head_dim) as i32;
+    let q_stride = q_l.stride()[0] as i32;
     let sw = sliding_window.unwrap_or(0) as i32;
 
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD;
@@ -526,7 +528,7 @@ pub fn flash_tq_decode_k8v4_metal(
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
-    let (o_s, _) = output.storage_and_layout();
+    let (o_s, _o_l) = output.storage_and_layout();
     let o_s = match &*o_s {
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
@@ -543,7 +545,6 @@ pub fn flash_tq_decode_k8v4_metal(
     };
 
     let max_blocks_per_seq = block_tables.dim(1)? as i32;
-    let q_stride = (num_q_heads * head_dim) as i32;
     let sw = sliding_window.unwrap_or(0) as i32;
 
     let command_buffer = device.command_buffer()?;
@@ -574,7 +575,7 @@ pub fn flash_tq_decode_k8v4_metal(
         num_seqs,
         head_dim as i32,
         max_blocks_per_seq,
-        q_stride,
+        q_l.stride()[0] as i32,
         sw,
     )
     .map_err(|e| candle::Error::Msg(format!("flash_tq_decode_k8v4: {e}")))?;
@@ -716,14 +717,13 @@ pub fn flash_tq4_decode_metal(
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
-    let (o_s, _) = output.storage_and_layout();
+    let (o_s, _o_l) = output.storage_and_layout();
     let o_s = match &*o_s {
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
 
     let max_blocks_per_seq = block_tables.dim(1)? as i32;
-    let q_stride = (num_q_heads * head_dim) as i32;
     let sw = sliding_window.unwrap_or(0) as i32;
 
     let command_buffer = device.command_buffer()?;
@@ -753,7 +753,7 @@ pub fn flash_tq4_decode_metal(
         num_seqs,
         head_dim as i32,
         max_blocks_per_seq,
-        q_stride,
+        q_l.stride()[0] as i32,
         sw,
     )
     .map_err(|e| candle::Error::Msg(format!("flash_tq4_decode: {e}")))?;
@@ -1022,14 +1022,13 @@ pub fn flash_tq3_decode_metal(
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
-    let (o_s, _) = output.storage_and_layout();
+    let (o_s, _o_l) = output.storage_and_layout();
     let o_s = match &*o_s {
         candle::Storage::Metal(s) => s.clone(),
         _ => candle::bail!("Metal"),
     };
 
     let max_blocks_per_seq = block_tables.dim(1)? as i32;
-    let q_stride = (num_q_heads * head_dim) as i32;
     let sw = sliding_window.unwrap_or(0) as i32;
 
     let command_buffer = device.command_buffer()?;
@@ -1059,7 +1058,7 @@ pub fn flash_tq3_decode_metal(
         num_seqs,
         head_dim as i32,
         max_blocks_per_seq,
-        q_stride,
+        q_l.stride()[0] as i32,
         sw,
     )
     .map_err(|e| candle::Error::Msg(format!("flash_tq3_decode: {e}")))?;

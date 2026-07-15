@@ -270,7 +270,7 @@ pub fn nvfp4_matmul(
                     Storage::Cuda(c) => match dtype {
                         DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
                         DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
-                        DType::U8 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+                        DType::U8 | DType::F8E4M3 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
                         DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
                         _ => candle_core::bail!("unsupported dtype {:?}", dtype),
                     },
@@ -347,10 +347,12 @@ pub fn nvfp4_matmul(
                             cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
 
                         let (weight_s, _) = weight.storage_and_layout();
-                        let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const std::ffi::c_void;
+                        let weight_ptr =
+                            cuda_ptr(&weight_s, weight.dtype())? as *const std::ffi::c_void;
 
                         let (scale_s, _) = scale.storage_and_layout();
-                        let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const std::ffi::c_void;
+                        let scale_ptr =
+                            cuda_ptr(&scale_s, scale.dtype())? as *const std::ffi::c_void;
 
                         let (wscale_sw_s, _) = wscale_sw_ref.storage_and_layout();
                         let wscale_sw_ptr =
@@ -497,8 +499,8 @@ pub fn nvfp4_matmul(
                 let (output_s, _) = output.storage_and_layout();
 
                 let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
-                let weight_ptr = cuda_ptr(&weight_s, DType::U8)? as *const u8;
-                let scale_ptr = cuda_ptr(&scale_s, DType::U8)? as *const u8;
+                let weight_ptr = cuda_ptr(&weight_s, weight.dtype())? as *const u8;
+                let scale_ptr = cuda_ptr(&scale_s, scale.dtype())? as *const u8;
                 let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
 
                 let bias_ptr = if let Some(b) = bias {
