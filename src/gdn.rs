@@ -792,7 +792,7 @@ pub fn gated_delta_rule_decode_slots_gqa(
     let (batch, num_k_heads, k_dim) = q_c.dims3()?;
     let num_v_heads = v_c.dim(1)?;
     let v_dim = v_c.dim(2)?;
-    if num_v_heads % num_k_heads != 0 {
+    if num_v_heads < num_k_heads || num_v_heads % num_k_heads != 0 {
         candle_core::bail!(
             "metal gated_delta_rule_decode_slots_gqa: num_v_heads {} not divisible by num_k_heads {}",
             num_v_heads,
@@ -2976,6 +2976,94 @@ pub fn gated_delta_rule_recurrence_varlen(
             );
         },
         dt => candle_core::bail!("GCU gdn_recurrence_varlen unsupported dtype: {:?}", dt),
+    }
+    Ok(out)
+}
+
+/// GCU GQA varlen recurrence for prefill.
+///
+/// Q/K stay at `num_k_heads`; V, gating, output, and recurrent state stay at
+/// `num_v_heads`. The Choreo kernel performs the grouped-head lookup while it
+/// processes each value head, so callers do not need to materialize repeated
+/// Q/K tensors.
+#[cfg(all(feature = "gcu", not(feature = "cuda")))]
+pub fn gated_delta_rule_recurrence_varlen_gqa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    cu_seqlens: &Tensor,
+    q_scale: f32,
+) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::ffi;
+    use candle::gcu_backend::WrapErr;
+
+    let (total_tokens, num_k_heads, k_dim) = q.dims3()?;
+    let num_v_heads = v.dim(1)?;
+    let v_dim = v.dim(2)?;
+    let batch = slots.dim(0)?;
+    if num_v_heads < num_k_heads || num_v_heads % num_k_heads != 0 {
+        candle_core::bail!(
+            "gated_delta_rule_recurrence_varlen_gqa: num_v_heads {} is not divisible by num_k_heads {}",
+            num_v_heads,
+            num_k_heads
+        );
+    }
+    if q.dtype() != DType::BF16 {
+        candle_core::bail!(
+            "gated_delta_rule_recurrence_varlen_gqa: GCU kernel currently supports BF16 only, got {:?}",
+            q.dtype()
+        );
+    }
+
+    let q_c = ensure_contiguous_gcu(q)?;
+    let q_c = if q_scale == 1.0 {
+        q_c
+    } else {
+        q_c.affine(q_scale as f64, 0.0)?.contiguous()?
+    };
+    let k_c = ensure_contiguous_gcu(k)?;
+    let v_c = ensure_contiguous_gcu(v)?;
+    let g_c = g
+        .to_dtype(DType::F32)?
+        .exp()?
+        .to_dtype(DType::BF16)?
+        .contiguous()?;
+    let beta_c = ensure_contiguous_gcu(beta)?;
+    let slots_c = ensure_contiguous_gcu(slots)?;
+    let dev = q_c.device().as_gcu_device()?;
+    let out = Tensor::empty(
+        (total_tokens, num_v_heads, v_dim),
+        DType::BF16,
+        q_c.device(),
+        None,
+    )?;
+    let stream = dev.stream_inner().expect("GCU stream") as *const c_void;
+    unsafe {
+        ffi::gdn_recurrence_varlen_gqa_bf16(
+            get_gcu_ptr::<bf16>(&q_c)?,
+            get_gcu_ptr::<bf16>(&k_c)?,
+            get_gcu_ptr::<bf16>(&v_c)?,
+            get_gcu_ptr::<bf16>(&g_c)?,
+            get_gcu_ptr::<bf16>(&beta_c)?,
+            get_gcu_ptr::<f32>(state)?,
+            get_gcu_ptr::<i64>(&slots_c)? as *const i64,
+            get_gcu_ptr::<bf16>(&out)?,
+            get_gcu_ptr::<u32>(cu_seqlens)? as *const u32,
+            total_tokens as i32,
+            batch as i32,
+            num_k_heads as i32,
+            num_v_heads as i32,
+            k_dim as i32,
+            v_dim as i32,
+            state.dim(0)? as i32,
+            2,
+            12,
+            stream,
+        );
     }
     Ok(out)
 }

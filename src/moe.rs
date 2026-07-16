@@ -1269,48 +1269,72 @@ pub fn moe_gemm(
 /// and produce the sorted_token_ids + experts_ids + num_tokens_post_pad needed
 /// by invoke_fused_moe.
 #[cfg(feature = "gcu")]
-pub fn gcu_moe_align_block_size(
+pub fn gcu_moe_align_block_size_into(
     topk_ids: &Tensor,
     num_experts: usize,
     block_size: usize,
     token_num: usize,
     topk: usize,
+    sorted_ids: &Tensor,
+    experts_ids_buf: &Tensor,
+    num_tokens_post_pad: &Tensor,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
-    use candle::gcu_backend::WrapErr;
     use candle::Storage;
-
-    let dev = topk_ids.device().as_gcu_device()?;
-    let stream = dev.stream_inner().unwrap();
 
     let m = token_num * topk;
     let max_padded_num = m + num_experts * (block_size - 1);
     let max_block_num = max_padded_num / block_size;
+    if sorted_ids.dims() != [max_padded_num]
+        || experts_ids_buf.dims() != [max_block_num]
+        || num_tokens_post_pad.dims() != [1]
+    {
+        candle::bail!(
+            "invalid MoE workspace shapes: sorted={:?}, experts={:?}, padded={:?}, expected [{}, {}, 1]",
+            sorted_ids.shape(),
+            experts_ids_buf.shape(),
+            num_tokens_post_pad.shape(),
+            max_padded_num,
+            max_block_num
+        );
+    }
 
-    let sorted_ids = dev.alloc::<i32>(max_padded_num).w()?;
-    let experts_ids_buf = dev.alloc::<i32>(max_block_num).w()?;
-    let num_tokens_post_pad = dev.alloc::<i32>(1).w()?;
+    let dev = topk_ids.device().as_gcu_device()?;
+    let stream = dev.stream_inner().unwrap();
+    let get_i32_ptr = |t: &Tensor| -> Result<*mut i32> {
+        let (storage, layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Gcu(c) => {
+                let slice = c.as_gcu_slice::<i32>()?;
+                Ok(slice.slice(layout.start_offset()..).device_ptr() as *mut i32)
+            }
+            _ => candle::bail!("MoE workspace must be a GCU i32 tensor"),
+        }
+    };
+
+    let topk_ids = if topk_ids.dtype() == candle_core::DType::I32 {
+        topk_ids.clone()
+    } else {
+        topk_ids.to_dtype(candle_core::DType::I32)?
+    };
+    let (topk_storage, topk_layout) = topk_ids.storage_and_layout();
+    let topk_ptr = match &*topk_storage {
+        Storage::Gcu(c) => {
+            let slice = c.as_gcu_slice::<i32>()?;
+            slice.slice(topk_layout.start_offset()..).device_ptr() as *mut i32
+        }
+        _ => candle::bail!("topk_ids must be a GCU tensor"),
+    };
 
     #[cfg(feature = "aten")]
     {
         use candle::gcu_backend::ubridge::ffi::topsaten_moe_align_block_size;
-
-        let (topk_s, topk_l) = topk_ids.storage_and_layout();
-        let topk_ptr = match &*topk_s {
-            Storage::Gcu(c) => {
-                let s = c.as_gcu_slice::<i32>()?;
-                let s = s.slice(topk_l.start_offset()..);
-                s.device_ptr()
-            }
-            _ => candle::bail!("topk_ids must be a gcu tensor"),
-        };
-
         let ret = unsafe {
             topsaten_moe_align_block_size(
-                sorted_ids.device_ptr() as *mut i32,
-                experts_ids_buf.device_ptr() as *mut i32,
-                num_tokens_post_pad.device_ptr() as *mut i32,
-                topk_ptr as *mut i32,
+                get_i32_ptr(sorted_ids)?,
+                get_i32_ptr(experts_ids_buf)?,
+                get_i32_ptr(num_tokens_post_pad)?,
+                topk_ptr,
                 token_num as i32,
                 topk as i32,
                 num_experts as i32,
@@ -1326,32 +1350,14 @@ pub fn gcu_moe_align_block_size(
     #[cfg(not(feature = "aten"))]
     {
         use candle::gcu_backend::ubridge::ffi::moe_align_block_size;
-
-        let topk_ids_u32 = if topk_ids.dtype() != candle_core::DType::U32 {
-            topk_ids.to_dtype(candle_core::DType::U32)?
-        } else {
-            topk_ids.clone()
-        };
-        let topk_ids_flat = topk_ids_u32.flatten_all()?.contiguous()?;
-
-        let (topk_s, topk_l) = topk_ids_flat.storage_and_layout();
-        let topk_ptr = match &*topk_s {
-            Storage::Gcu(c) => {
-                let s = c.as_gcu_slice::<u32>()?;
-                let s = s.slice(topk_l.start_offset()..);
-                s.device_ptr()
-            }
-            _ => candle::bail!("topk_ids must be a gcu tensor"),
-        };
-
         unsafe {
             moe_align_block_size(
-                sorted_ids.device_ptr() as *mut i32,
-                experts_ids_buf.device_ptr() as *mut i32,
-                num_tokens_post_pad.device_ptr() as *mut i32,
+                get_i32_ptr(sorted_ids)?,
+                get_i32_ptr(experts_ids_buf)?,
+                get_i32_ptr(num_tokens_post_pad)?,
                 topk_ptr as *const i32,
-                std::ptr::null::<i32>(),
-                std::ptr::null::<i32>(),
+                std::ptr::null(),
+                std::ptr::null(),
                 num_experts as i32,
                 block_size as i32,
                 token_num as i32,
@@ -1361,24 +1367,45 @@ pub fn gcu_moe_align_block_size(
         }
     }
 
-    let sorted_ids_tensor = {
-        let s = candle::GcuStorage::wrap_gcu_slice(sorted_ids, dev.clone());
-        Tensor::from_storage(candle::Storage::Gcu(s), (max_padded_num,))?
-    };
-    let experts_ids_tensor = {
-        let s = candle::GcuStorage::wrap_gcu_slice(experts_ids_buf, dev.clone());
-        Tensor::from_storage(candle::Storage::Gcu(s), (max_block_num,))?
-    };
-    let num_tokens_post_pad_tensor = {
-        let s = candle::GcuStorage::wrap_gcu_slice(num_tokens_post_pad, dev.clone());
-        Tensor::from_storage(candle::Storage::Gcu(s), (1,))?
-    };
-
     Ok((
-        sorted_ids_tensor,
-        experts_ids_tensor,
-        num_tokens_post_pad_tensor,
+        sorted_ids.clone(),
+        experts_ids_buf.clone(),
+        num_tokens_post_pad.clone(),
     ))
+}
+
+#[cfg(feature = "gcu")]
+pub fn gcu_moe_align_block_size(
+    topk_ids: &Tensor,
+    num_experts: usize,
+    block_size: usize,
+    token_num: usize,
+    topk: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let m = token_num * topk;
+    let max_padded_num = m + num_experts * (block_size - 1);
+    let max_block_num = max_padded_num / block_size;
+    let sorted_ids = unsafe {
+        Tensor::empty_(
+            (max_padded_num,),
+            candle_core::DType::I32,
+            topk_ids.device(),
+        )?
+    };
+    let experts_ids_buf =
+        unsafe { Tensor::empty_((max_block_num,), candle_core::DType::I32, topk_ids.device())? };
+    let num_tokens_post_pad =
+        unsafe { Tensor::empty_((1,), candle_core::DType::I32, topk_ids.device())? };
+    gcu_moe_align_block_size_into(
+        topk_ids,
+        num_experts,
+        block_size,
+        token_num,
+        topk,
+        &sorted_ids,
+        &experts_ids_buf,
+        &num_tokens_post_pad,
+    )
 }
 
 #[cfg(all(not(feature = "cuda"), not(feature = "gcu")))]
