@@ -2736,7 +2736,6 @@ pub fn gated_delta_rule_decode_slots_gqa(
     match q_c.dtype() {
         DType::BF16 => {
             let out_f32 = Tensor::zeros((batch, num_v_heads, v_dim), DType::F32, q_c.device())?;
-            let qscale_dev = Tensor::new(&[q_scale], q_c.device())?.contiguous()?;
             unsafe {
                 ffi::gdn_decode_slots_gqa_bf16(
                     get_gcu_ptr::<bf16>(&q_c)?,
@@ -2746,7 +2745,7 @@ pub fn gated_delta_rule_decode_slots_gqa(
                     get_gcu_ptr::<f32>(&beta_f32)?,
                     get_gcu_ptr::<f32>(state)?,
                     get_gcu_ptr::<i64>(&slots_c)? as *const i64,
-                    get_gcu_ptr::<f32>(&qscale_dev)?,
+                    q_scale,
                     get_gcu_ptr::<f32>(&out_f32)?,
                     batch as i32,
                     num_v_heads as i32,
@@ -2950,6 +2949,8 @@ pub fn gated_delta_rule_recurrence_varlen(
                 max_slots,
                 2,
                 12,
+                1.0,
+                false,
                 stream,
             );
         },
@@ -3019,12 +3020,9 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
         );
     }
 
+    // The Ubridge prefill kernel applies q_scale while Q is already resident
+    // in local memory, avoiding a full-token affine allocation per GDN layer.
     let q_c = ensure_contiguous_gcu(q)?;
-    let q_c = if q_scale == 1.0 {
-        q_c
-    } else {
-        q_c.affine(q_scale as f64, 0.0)?.contiguous()?
-    };
     let k_c = ensure_contiguous_gcu(k)?;
     let v_c = ensure_contiguous_gcu(v)?;
     let g_c = g
@@ -3062,6 +3060,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
             state.dim(0)? as i32,
             2,
             12,
+            q_scale,
             stream,
         );
     }

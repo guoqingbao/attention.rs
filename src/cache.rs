@@ -587,9 +587,10 @@ pub fn swap_blocks(
         DType::F16 => call_fwd::<f16>(src, dst, block_mapping),
         DType::BF16 => call_fwd::<bf16>(src, dst, block_mapping),
         DType::U8 => call_fwd::<u8>(src, dst, block_mapping),
+        DType::I8 => call_fwd::<i8>(src, dst, block_mapping),
         DType::F32 => call_fwd::<f32>(src, dst, block_mapping),
         _ => {
-            candle_core::bail!("swap_blocks only accept f16/bf16/f32/u8 kvcache dtypes!")
+            candle_core::bail!("swap_blocks only accept f16/bf16/f32/u8/i8 kvcache dtypes!")
         }
     }
 }
@@ -751,9 +752,10 @@ pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
         DType::F16 => call_fwd::<f16>(cache, block_ids),
         DType::BF16 => call_fwd::<bf16>(cache, block_ids),
         DType::U8 => call_fwd::<u8>(cache, block_ids),
+        DType::I8 => call_fwd::<i8>(cache, block_ids),
         DType::F32 => call_fwd::<f32>(cache, block_ids),
         _ => {
-            candle_core::bail!("clear_blocks only accept f16/bf16/f32/u8 kvcache dtypes!")
+            candle_core::bail!("clear_blocks only accept f16/bf16/f32/u8/i8 kvcache dtypes!")
         }
     }
 }
@@ -814,6 +816,7 @@ pub fn copy_blocks(
             DType::F16 => storage.as_gcu_slice::<f16>()?.device_ptr() as u64,
             DType::F32 => storage.as_gcu_slice::<f32>()?.device_ptr() as u64,
             DType::U8 => storage.as_gcu_slice::<u8>()?.device_ptr() as u64,
+            DType::I8 => storage.as_gcu_slice::<i8>()?.device_ptr() as u64,
             other => candle_core::bail!("copy_blocks unsupported dtype {other:?}"),
         };
         let num_blocks = cache.dim(0)?;

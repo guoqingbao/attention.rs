@@ -1553,6 +1553,151 @@ pub fn gcu_paged_attention<
 }
 
 #[cfg(feature = "gcu")]
+fn gcu_update_int8_cache<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: &Tensor,
+    v_scale: &Tensor,
+    slot_mapping: &Tensor,
+) -> Result<()> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle::gcu_backend::WrapErr;
+    use candle::Storage;
+    use std::ffi::c_void;
+
+    let key = key.contiguous()?;
+    let value = value.contiguous()?;
+    let slot_mapping = if slot_mapping.dtype() == DType::I32 {
+        slot_mapping.contiguous()?
+    } else {
+        slot_mapping.to_dtype(DType::I32)?.contiguous()?
+    };
+    let k_scale = k_scale.contiguous()?;
+    let v_scale = v_scale.contiguous()?;
+    if k_scale.dtype() != DType::F32 || v_scale.dtype() != DType::F32 {
+        candle::bail!("int8 KV cache scales must be F32");
+    }
+
+    let input_dtype = key.dtype();
+    let scale_len = k_scale.elem_count();
+    let (num_tokens, num_heads, head_size) = key.dims3()?;
+    if value.dims3()? != (num_tokens, num_heads, head_size) {
+        candle::bail!(
+            "shape mismatch key {:?} and value {:?}",
+            key.shape(),
+            value.shape()
+        );
+    }
+    let (num_blocks, block_size, cache_heads, cache_head_size) = key_cache.dims4()?;
+    if value_cache.dims4()? != (num_blocks, block_size, cache_heads, cache_head_size)
+        || cache_heads != num_heads
+        || cache_head_size != head_size
+    {
+        candle::bail!(
+            "int8 KV cache shape mismatch: key {:?}, value {:?}, input {:?}",
+            key_cache.shape(),
+            value_cache.shape(),
+            key.shape()
+        );
+    }
+    if slot_mapping.dim(0)? != num_tokens {
+        candle::bail!("slot_mapping length must be {num_tokens}");
+    }
+    if scale_len != v_scale.elem_count() || (scale_len != 1 && scale_len != num_heads) {
+        candle::bail!("int8 KV cache scales must be scalar or per KV head");
+    }
+
+    let dev = key.device().as_gcu_device()?;
+    let (key_storage, key_layout) = key.storage_and_layout();
+    let (value_storage, value_layout) = value.storage_and_layout();
+    let (cache_key_storage, cache_key_layout) = key_cache.storage_and_layout();
+    let (cache_value_storage, cache_value_layout) = value_cache.storage_and_layout();
+    let (slot_storage, slot_layout) = slot_mapping.storage_and_layout();
+    let (k_scale_storage, k_scale_layout) = k_scale.storage_and_layout();
+    let (v_scale_storage, v_scale_layout) = v_scale.storage_and_layout();
+    let key_view = match &*key_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<T>()?
+            .slice(key_layout.start_offset()..),
+        _ => candle::bail!("key must be a GCU tensor"),
+    };
+    let value_view = match &*value_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<T>()?
+            .slice(value_layout.start_offset()..),
+        _ => candle::bail!("value must be a GCU tensor"),
+    };
+    let key_cache_view = match &*cache_key_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<i8>()?
+            .slice(cache_key_layout.start_offset()..),
+        _ => candle::bail!("key_cache must be a GCU tensor"),
+    };
+    let value_cache_view = match &*cache_value_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<i8>()?
+            .slice(cache_value_layout.start_offset()..),
+        _ => candle::bail!("value_cache must be a GCU tensor"),
+    };
+    let slot_mapping_view = match &*slot_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<i32>()?
+            .slice(slot_layout.start_offset()..),
+        _ => candle::bail!("slot_mapping must be a GCU tensor"),
+    };
+    let k_scale_view = match &*k_scale_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<f32>()?
+            .slice(k_scale_layout.start_offset()..),
+        _ => candle::bail!("k_scale must be a GCU tensor"),
+    };
+    let v_scale_view = match &*v_scale_storage {
+        Storage::Gcu(storage) => storage
+            .as_gcu_slice::<f32>()?
+            .slice(v_scale_layout.start_offset()..),
+        _ => candle::bail!("v_scale must be a GCU tensor"),
+    };
+    let stream = dev.stream_inner().expect("Unable to obtain stream");
+    let input_dtype_code = match input_dtype {
+        DType::F16 => 4,
+        DType::BF16 => 5,
+        DType::F32 => 8,
+        dtype => candle::bail!("unsupported int8 KV input dtype {dtype:?}"),
+    };
+    let ret = unsafe {
+        candle::gcu_backend::ubridge::ffi::tops_reshape_and_cache_flash_int8kv(
+            key_cache_view.device_ptr() as *mut c_void,
+            value_cache_view.device_ptr() as *mut c_void,
+            key_view.device_ptr() as *const c_void,
+            value_view.device_ptr() as *const c_void,
+            slot_mapping_view.device_ptr() as *const c_void,
+            k_scale_view.device_ptr() as *const c_void,
+            v_scale_view.device_ptr() as *const c_void,
+            std::ptr::null(),
+            std::ptr::null(),
+            num_tokens as i32,
+            num_heads as i32,
+            head_size as i32,
+            num_blocks as i32,
+            block_size as i32,
+            key_layout.stride()[0] as i32,
+            value_layout.stride()[0] as i32,
+            scale_len as i32,
+            input_dtype_code,
+            stream as *const c_void,
+        )
+    };
+    if ret != 0 {
+        candle::bail!("tops_reshape_and_cache_flash_int8kv failed with code {ret}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gcu")]
 fn gcu_update_cache<
     T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
 >(
@@ -1758,11 +1903,48 @@ pub fn reshape_and_cache(
     value: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
-    _: Option<&Tensor>,
-    _: Option<&Tensor>,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
     use half::{bf16, f16};
+    if key_cache.dtype() == DType::I8 || value_cache.dtype() == DType::I8 {
+        let k_scale = k_scale
+            .ok_or_else(|| candle::Error::msg("int8 KV cache requires a key quantization scale"))?;
+        let v_scale = v_scale.ok_or_else(|| {
+            candle::Error::msg("int8 KV cache requires a value quantization scale")
+        })?;
+        return match key.dtype() {
+            DType::F16 => gcu_update_int8_cache::<f16>(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+            ),
+            DType::BF16 => gcu_update_int8_cache::<bf16>(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+            ),
+            DType::F32 => gcu_update_int8_cache::<f32>(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+            ),
+            dt => candle::bail!("unsupported int8 KV input dtype {dt:?}"),
+        };
+    }
     match key.dtype() {
         DType::F16 => gcu_update_cache::<f16>(key, value, key_cache, value_cache, slot_mapping),
         DType::BF16 => gcu_update_cache::<bf16>(key, value, key_cache, value_cache, slot_mapping),

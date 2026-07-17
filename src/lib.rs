@@ -14,7 +14,7 @@ pub mod scale_update;
 pub mod workspace;
 #[cfg(feature = "metal-flash")]
 use candle_core::DType;
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use paged_attention::convert_to_fp8;
 use paged_attention::{paged_attention, reshape_and_cache};
@@ -861,6 +861,9 @@ impl PagedAttention {
         } else {
             value.clone()
         };
+        let int8_kv_cache = key_cache
+            .as_ref()
+            .is_some_and(|cache| cache.dtype() == DType::I8);
 
         reshape_and_cache(
             &key_3d,
@@ -902,6 +905,47 @@ impl PagedAttention {
                 };
                 (cu, input_metadata.max_seqlen_q.max(1))
             };
+            if int8_kv_cache {
+                return match query_3d.dtype() {
+                    DType::F16 => gcu_kernels::flash_attn_varlen_int8kv::<half::f16>(
+                        &query_3d,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        &cu_seqlens_q,
+                        context_lens,
+                        block_tables,
+                        self.k_scale.as_ref().unwrap(),
+                        self.v_scale.as_ref().unwrap(),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        self.scale as f32,
+                        softcap,
+                        window_left,
+                        window_right,
+                        true,
+                    ),
+                    DType::BF16 => gcu_kernels::flash_attn_varlen_int8kv::<half::bf16>(
+                        &query_3d,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        &cu_seqlens_q,
+                        context_lens,
+                        block_tables,
+                        self.k_scale.as_ref().unwrap(),
+                        self.v_scale.as_ref().unwrap(),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        self.scale as f32,
+                        softcap,
+                        window_left,
+                        window_right,
+                        true,
+                    ),
+                    dtype => candle_core::bail!(
+                        "int8 KV attention requires F16 or BF16 query, got {dtype:?}"
+                    ),
+                };
+            }
             return gcu_kernels::flash_attn_varlen_paged(
                 &query_3d,
                 key_cache.as_ref().unwrap(),

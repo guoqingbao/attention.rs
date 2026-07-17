@@ -546,6 +546,119 @@ fn flash_attn_varlen_paged_func<
     }
 }
 
+/// Varlen paged attention backed by the GCU int8-KV FlashAttention operator.
+///
+/// The cache uses the flash layout `[blocks, block_size, kv_heads, head_dim]`.
+/// `k_scale` and `v_scale` are reciprocal dequantization scales, one per KV
+/// head (or a single broadcastable value).
+pub fn flash_attn_varlen_int8kv<
+    T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
+>(
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    cu_seqlens_q: &Tensor,
+    seqused_k: &Tensor,
+    block_table: &Tensor,
+    k_scale: &Tensor,
+    v_scale: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    window_size_left: Option<i32>,
+    window_size_right: Option<i32>,
+    causal: bool,
+) -> Result<Tensor> {
+    use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+    use candle_core::gcu_backend::WrapErr;
+
+    let query = maybe_contiguous(query)?;
+    let key_cache = maybe_contiguous(key_cache)?;
+    let value_cache = maybe_contiguous(value_cache)?;
+    let cu_seqlens_q = maybe_contiguous(cu_seqlens_q)?;
+    let seqused_k = maybe_contiguous(seqused_k)?;
+    let block_table = maybe_contiguous(block_table)?;
+    let k_scale = maybe_contiguous(k_scale)?;
+    let v_scale = maybe_contiguous(v_scale)?;
+
+    let total_q = query.dim(0)?;
+    let num_heads = query.dim(1)?;
+    let head_size = query.dim(2)?;
+    let batch = cu_seqlens_q.dim(0)?.saturating_sub(1);
+    let num_heads_k = key_cache.dim(2)?;
+    let num_blocks = key_cache.dim(0)?;
+    let page_block_size = key_cache.dim(1)?;
+    let max_num_blocks_per_seq = block_table.dim(1)?;
+    let scale_len = k_scale.elem_count();
+    if scale_len != v_scale.elem_count() || (scale_len != 1 && scale_len != num_heads_k) {
+        candle_core::bail!(
+            "int8 KV scales must have one value or one value per KV head, got K={} V={} heads={}",
+            scale_len,
+            v_scale.elem_count(),
+            num_heads_k
+        );
+    }
+    if k_scale.dtype() != DType::F32 || v_scale.dtype() != DType::F32 {
+        candle_core::bail!("int8 KV scales must be F32");
+    }
+    if key_cache.dtype() != DType::I8 || value_cache.dtype() != DType::I8 {
+        candle_core::bail!(
+            "int8 KV attention requires I8 caches, got {:?}/{:?}",
+            key_cache.dtype(),
+            value_cache.dtype()
+        );
+    }
+
+    let dev = query.device().as_gcu_device()?;
+    let output = dev.alloc::<T>(query.elem_count()).w()?;
+    let softmax_lse = get_softmax_lse_ptr(dev, flash_lse_elems(total_q, 1, num_heads))?;
+    let stream = dev.stream_inner().expect("Unable to obtain stream");
+    let code = dtype_code(query.dtype())?;
+    let window_left = window_size_left.unwrap_or(-1);
+    let window_right = window_size_right.unwrap_or(-1);
+
+    let ret = unsafe {
+        candle::gcu_backend::ubridge::ffi::tops_flash_attn_varlen_int8kv(
+            output.device_ptr() as *mut c_void,
+            softmax_lse as *mut c_void,
+            gcu_device_ptr!(query, T) as *const c_void,
+            gcu_device_ptr!(key_cache, i8) as *const c_void,
+            gcu_device_ptr!(value_cache, i8) as *const c_void,
+            gcu_device_ptr!(cu_seqlens_q, u32) as *const c_void,
+            gcu_device_ptr!(seqused_k, u32) as *const c_void,
+            gcu_device_ptr!(block_table, u32) as *const c_void,
+            gcu_device_ptr!(k_scale, f32) as *const c_void,
+            gcu_device_ptr!(v_scale, f32) as *const c_void,
+            total_q as i32,
+            batch as i32,
+            num_heads as i32,
+            num_heads_k as i32,
+            head_size as i32,
+            max_seqlen_q as i32,
+            max_seqlen_k as i32,
+            num_blocks as i32,
+            page_block_size as i32,
+            max_num_blocks_per_seq as i32,
+            scale_len as i32,
+            code,
+            softmax_scale,
+            softcap.unwrap_or(0.0),
+            causal as i32,
+            window_left,
+            window_right,
+            0,
+            stream as *const c_void,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("tops_flash_attn_varlen_int8kv failed with code {ret}");
+    }
+
+    let output = candle::GcuStorage::wrap_gcu_slice(output, dev.clone());
+    Tensor::from_storage(candle::Storage::Gcu(output), query.shape())
+}
+
 /// varlen + paged KV cache + seqused_k + block_table.
 pub fn flash_attn_varlen_paged(
     query: &Tensor,
