@@ -399,20 +399,42 @@ pub fn hc_post(
     #[cfg(feature = "cuda")]
     {
         let seq_len = x.dim(0)?;
-        let out = Tensor::zeros((seq_len, hc, dim), residual.dtype(), x.device())?;
+        // Both kernels write BF16 HC state so prefill/decode share one output dtype.
+        let out = Tensor::zeros((seq_len, hc, dim), DType::BF16, x.device())?;
         let stream = get_cuda_stream(x.device())?;
-        unsafe {
-            kernels::ffi::ds_v4_hc_post(
-                get_cuda_ptr(x)?,
-                get_cuda_ptr(residual)?,
-                get_cuda_ptr(post)?,
-                get_cuda_ptr(comb)?,
-                get_cuda_mut_ptr(&out)?,
-                seq_len as i32,
-                hc as i32,
-                dim as i32,
-                stream,
-            );
+        match x.dtype() {
+            DType::F32 => {
+                let ret = unsafe {
+                    kernels::ffi::ds_v4_hc_post_f32_branch(
+                        get_cuda_ptr(x)?,
+                        get_cuda_ptr(residual)?,
+                        get_cuda_ptr(post)?,
+                        get_cuda_ptr(comb)?,
+                        get_cuda_mut_ptr(&out)?,
+                        seq_len as i32,
+                        hc as i32,
+                        dim as i32,
+                        stream,
+                    )
+                };
+                if ret != 0 {
+                    candle_core::bail!("ds_v4_hc_post_f32_branch CUDA error: {}", ret);
+                }
+            }
+            DType::BF16 => unsafe {
+                kernels::ffi::ds_v4_hc_post(
+                    get_cuda_ptr(x)?,
+                    get_cuda_ptr(residual)?,
+                    get_cuda_ptr(post)?,
+                    get_cuda_ptr(comb)?,
+                    get_cuda_mut_ptr(&out)?,
+                    seq_len as i32,
+                    hc as i32,
+                    dim as i32,
+                    stream,
+                );
+            },
+            dtype => candle_core::bail!("hc_post expects BF16 or F32 branch, got {dtype:?}"),
         }
         Ok(out)
     }
