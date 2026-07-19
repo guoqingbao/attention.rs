@@ -8,6 +8,7 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
 
 pub mod moe;
+pub mod moe_w2;
 pub mod paged_attention;
 pub mod scale_update;
 #[cfg(feature = "cuda")]

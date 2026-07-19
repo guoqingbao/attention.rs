@@ -639,6 +639,59 @@ extern "C" {
     );
 
     // MoE GEMV with FP8 weights and block-wise scales (for decode phase)
+
+    pub fn moe_w2_pack_from_mxfp4(
+        packed: *const u8,
+        scales_in: *const u8,
+        planes: *mut u8,
+        scales_out: *mut u8,
+        e: i32,
+        n: i32,
+        k: i32,
+        stream: i64,
+    );
+
+    pub fn moe_w2_unpack_to_fp8(
+        planes: *const u8,
+        scales: *const u8,
+        out_w: *mut u8,
+        out_s: *mut f32,
+        e: i32,
+        n: i32,
+        k: i32,
+        stream: i64,
+    );
+
+    pub fn moe_w2_unpack_by_ids_to_fp8(
+        planes: *const u8,
+        scales: *const u8,
+        expert_ids: *const i32,
+        out_w: *mut u8,
+        out_s: *mut f32,
+        u: i32,
+        n: i32,
+        k: i32,
+        stream: i64,
+    );
+
+    pub fn moe_w2_dequantize_activation_fp8(
+        input_q: *const u8,
+        input_scales: *const f32,
+        output: *mut c_void,
+        rows: i32,
+        k: i32,
+        stream: i64,
+    );
+
+    pub fn moe_w2_swiglu_clamp_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        hidden: i32,
+        limit: f32,
+        stream: i64,
+    );
+
     pub fn moe_gemv_fp8(
         input: *const c_void,      // [size_m, size_k]
         weights: *const u8,        // [num_experts, size_n, size_k] FP8
@@ -3684,6 +3737,18 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_v4_hc_mixes(
+        x: *const c_void,
+        hc_fn: *const c_void,
+        mixes: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        mix_hc: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_v4_hc_scale_mixes(
         x: *const c_void,
         mixes: *mut c_void,
@@ -3762,6 +3827,18 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_v4_hc_post_f32_branch(
+        x: *const c_void,
+        residual: *const c_void,
+        post: *const c_void,
+        comb: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
     // DeepSeek V4 per-head RMSNorm
     pub fn ds_v4_head_rms_norm(
         x: *const c_void,
@@ -3791,6 +3868,43 @@ extern "C" {
     ) -> c_int;
 
     // ======== DeepSeek V4 Compressor kernels (from ds_compressor.cu) ========
+
+    pub fn ds_apply_rope_hidden(
+        x: *mut c_void,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        start_pos: c_int,
+        inverse: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_apply_rope_hidden_strided(
+        x: *mut c_void,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        start_pos: c_int,
+        position_stride: c_int,
+        inverse: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_bf16_linear_f32(
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut f32,
+        seq_len: c_int,
+        in_dim: c_int,
+        out_dim: c_int,
+        stream: i64,
+    ) -> c_int;
 
     pub fn ds_compressor_nonoverlap_prefill_epilogue(
         scores: *const f32,
@@ -3858,6 +3972,33 @@ extern "C" {
 
     // ======== DeepSeek V4 Indexer kernels (from ds_indexer.cu) ========
 
+    pub fn ds_hadamard_fp4_quant_bf16(
+        x: *mut c_void,
+        rows: c_int,
+        groups: c_int,
+        dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_copy_device_bytes(
+        src: *const c_void,
+        dst: *mut c_void,
+        bytes: usize,
+        dst_byte_offset: usize,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_fp8_act_quant_nope_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        block_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_indexer_scores_decode(
         q: *const c_void,
         kv: *const c_void,
@@ -3908,11 +4049,25 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_window_topk_indices_decode(
+        out: *mut c_int,
+        start_pos: c_int,
+        window_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_compress_topk_indices(
         out: *mut c_int,
         seq_len: c_int,
         compressed: c_int,
         ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compress_topk_indices_decode(
+        out: *mut c_int,
+        compressed: c_int,
         offset: c_int,
         stream: i64,
     ) -> c_int;
@@ -3989,6 +4144,26 @@ extern "C" {
         batch: c_int,
         seq_len: c_int,
         topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    /// DeepSeek V4 fused hash-gate: tid2eid lookup + expert-row dots +
+    /// sqrt(softplus) + L1 normalize * route_scale.
+    /// x/gate_weight: BF16; tid2eid: I64 [vocab, topk]; token_ids: U32 [seq];
+    /// route_weights: F32 [seq, topk]; route_indices: U32 [seq, topk].
+    pub fn ds_v4_hash_gate(
+        x: *const c_void,
+        gate_weight: *const c_void,
+        tid2eid: *const c_void,
+        token_ids: *const c_void,
+        route_weights: *mut c_void,
+        route_indices: *mut c_void,
+        seq_len: c_int,
+        hidden_dim: c_int,
+        n_experts: c_int,
+        topk: c_int,
+        vocab_size: c_int,
+        route_scale: f32,
         stream: i64,
     ) -> c_int;
 

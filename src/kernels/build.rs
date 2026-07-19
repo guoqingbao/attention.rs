@@ -5,6 +5,16 @@ use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    // CUDA translation units use host-side C++ state/workspaces (including
+    // DeepSeek V4's persistent per-device scratch guards).  Consumers that
+    // do not otherwise pull in a C++ dependency, such as the library test
+    // binary, still need the C++ ABI and standard-library symbols.
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=trtllm_artifacts.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
@@ -18,6 +28,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mask.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm.cu");
     println!("cargo:rerun-if-changed=src/moe_gemv.cu");
+    println!("cargo:rerun-if-changed=src/moe_w2_unpack.cu");
+    println!("cargo:rerun-if-changed=src/moe_w2_pack.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm_gguf.cu");
     println!("cargo:rerun-if-changed=src/moe_gguf_small_m.cu");
@@ -36,6 +48,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_compressor.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_indexer.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_sparse_attn.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_quant.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_moe.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_batched_gemm_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");

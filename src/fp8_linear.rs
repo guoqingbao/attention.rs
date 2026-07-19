@@ -129,6 +129,22 @@ pub fn fp8_matmul_with_input_scale(
         input.contiguous()?
     };
 
+    // Diagnostic reference path for DeepSeek-V4 QAT weights.  It emulates the
+    // checkpoint's activation FP8 round-trip, then uses the scalar-weight
+    // dequantizing GEMM.  Keep this behind an environment switch while the
+    // optimized SM90 block-scaled GEMM is compared against the reference.
+    #[cfg(feature = "cuda")]
+    if std::env::var_os("XINFER_DSV4_FP8_REFERENCE").is_some()
+        && input.dtype() == DType::BF16
+        && block_size == [128, 128]
+    {
+        let (m, k) = input.dims2()?;
+        let quantized = Tensor::zeros((m, k), DType::BF16, input.device())?;
+        crate::deepseek_v4::copy_contiguous_into(&quantized, &input, 0)?;
+        crate::deepseek_v4::fp8_act_quant_nope_bf16_inplace(&quantized, m, k, 0, 128)?;
+        return fp8_matmul_fallback(&quantized, weight, weight_scale, block_size);
+    }
+
     #[cfg(feature = "cuda")]
     let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
         crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
@@ -767,6 +783,10 @@ fn fp8_matmul_cutlass_with_input_scale(
         _ => candle_core::bail!("fp8_matmul_cutlass only supports CUDA"),
     }
 
+    if std::env::var_os("XINFER_DSV4_SYNC_FP8").is_some() {
+        input.device().synchronize()?;
+    }
+
     if pad_len > 0 {
         output = output.narrow(0, 0, m)?.contiguous()?;
     }
@@ -1236,6 +1256,9 @@ pub fn fp8_grouped_gemm_fused(
     };
     if ret != 0 {
         candle_core::bail!("fp8_grouped_gemm_fused failed with code {}", ret);
+    }
+    if std::env::var_os("XINFER_DSV4_SYNC_FP8").is_some() {
+        input.device().synchronize()?;
     }
 
     Ok(output)

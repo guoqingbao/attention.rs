@@ -2701,7 +2701,8 @@ pub fn moe_gemm_mxfp4(
             }
 
             let has_bias = biases.is_some();
-            let use_fused = is_prefill;
+            let use_fused =
+                is_prefill && std::env::var_os("XINFER_DSV4_DISABLE_MXFP4_GROUPED").is_none();
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
@@ -3511,4 +3512,113 @@ mod tests {
         };
         assert_metadata_eq(actual, expected);
     }
+}
+
+/// Moet-style 2-bit MoE GEMM: unpack W2 planes → e4m3 + F32 scales, then `moe_gemm_fp8`.
+/// Scale blocks are `(1, 32)` matching UE8M0 block-K.
+///
+/// Decode / small batches (`size_m < E`): unpack **only** the experts listed in
+/// `experts_ids` (on-the-fly dequant, Moet-style activation path), remap ids to
+/// local `[0..U)`, then FP8 GEMM. Prefill with large M falls back to full unpack.
+#[cfg(feature = "cuda")]
+pub fn moe_gemm_w2(
+    input: &Tensor,
+    planes: &Tensor,
+    scale_planes: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    n: usize,
+    k: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let input = if input.dtype() == candle_core::DType::BF16 {
+        input.clone()
+    } else {
+        input.to_dtype(candle_core::DType::BF16)?
+    };
+    let input = crate::moe_w2::moe_w2_quantize_dequantize_activation(&input)?;
+    let e = planes.dim(0)?;
+    let size_m = experts_ids.elem_count();
+
+    // Always reject out-of-range expert ids (prefill used to skip this and
+    // silently OOB-read weight rows → NaNs that poisoned later decode steps).
+    {
+        let route_ids = experts_ids
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
+        for &expert in &route_ids {
+            if expert as usize >= e {
+                candle_core::bail!(
+                    "moe_gemm_w2: routed expert id {} is outside the {}-expert table",
+                    expert,
+                    e
+                );
+            }
+        }
+    }
+
+    // Only use the compact path for decode.  The prefill route list contains
+    // one entry per token/expert assignment and can be larger than the number
+    // of unique experts; treating that route list as the expert dimension
+    // makes the grouped WMMA path both wasteful and fragile for small prompts.
+    //
+    // The unpack-by-ids kernel consumes a compact expert table, while
+    // `moe_gemm_fp8` consumes one compact expert id per sorted route.  The old
+    // code passed the route list as both, so duplicate routes produced duplicate
+    // weight rows and an invalid grouped-expert contract on decode.  Compact
+    // unique ids here and remap the sorted route list to those rows.
+    let force_full = std::env::var("XINFER_W2_FULL_UNPACK").is_ok();
+    let (weights_u8, scales_f32, compact_route_ids) = if !force_full
+        && !is_prefill
+        && size_m > 0
+        && size_m < e
+    {
+        let route_ids_tensor = experts_ids
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
+        let route_ids = route_ids_tensor.to_vec1::<u32>()?;
+        let mut unique = Vec::with_capacity(route_ids.len());
+        let mut remapped = Vec::with_capacity(route_ids.len());
+        for expert in route_ids {
+            let compact = match unique.iter().position(|&id| id == expert) {
+                Some(index) => index,
+                None => {
+                    let index = unique.len();
+                    unique.push(expert);
+                    index
+                }
+            };
+            remapped.push(compact as u32);
+        }
+        let unique_len = unique.len();
+        let unique_ids = Tensor::from_vec(unique, (unique_len,), experts_ids.device())?;
+        let route_ids =
+            Tensor::from_vec(remapped, experts_ids.dims().to_vec(), experts_ids.device())?;
+        let (w, s) =
+            crate::moe_w2::moe_w2_unpack_by_ids_to_fp8(planes, scale_planes, &unique_ids, n, k)?;
+        (w, s, route_ids)
+    } else {
+        let (w, s) = crate::moe_w2::moe_w2_unpack_to_fp8(planes, scale_planes, n, k)?;
+        (w, s, experts_ids.clone())
+    };
+
+    // W2 uses block_size_n=1 / block_size_k=32 scales. The decode FP8 GEMV
+    // path has been observed to illegal-address with that layout on Hopper;
+    // prefill WMMA with the same scales is stable. Always take WMMA for W2.
+    moe_gemm_fp8(
+        &input,
+        &weights_u8,
+        &scales_f32,
+        topk_weights,
+        sorted_token_ids,
+        &compact_route_ids,
+        topk,
+        1,
+        32,
+        true,
+    )
 }

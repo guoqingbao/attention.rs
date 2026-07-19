@@ -1,5 +1,120 @@
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <mutex>
+
+namespace {
+
+constexpr int kDsCompressorMaxDevices = 16;
+
+struct DsCompressorGemmScratch {
+  cublasHandle_t handle = nullptr;
+  std::mutex mutex;
+};
+
+DsCompressorGemmScratch g_ds_compressor_gemm_scratch[kDsCompressorMaxDevices];
+
+cudaError_t ds_compressor_scratch_for_device(DsCompressorGemmScratch **out) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= kDsCompressorMaxDevices) return cudaErrorInvalidDevice;
+  *out = &g_ds_compressor_gemm_scratch[device];
+  return cudaSuccess;
+}
+
+cudaError_t ds_compressor_ensure_handle(DsCompressorGemmScratch &scratch) {
+  if (scratch.handle != nullptr) return cudaSuccess;
+  cublasStatus_t status = cublasCreate(&scratch.handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    scratch.handle = nullptr;
+    return cudaErrorUnknown;
+  }
+  // BF16 inputs are accumulated into F32.  Tensor-op math is safe here and
+  // matches OpenInfer; unlike the old Candle path, no BF16->F32 host-side
+  // expansion is needed and no TF32 conversion is involved.
+  status = cublasSetMathMode(scratch.handle, CUBLAS_TENSOR_OP_MATH);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cublasDestroy(scratch.handle);
+    scratch.handle = nullptr;
+    return cudaErrorUnknown;
+  }
+  return cudaSuccess;
+}
+
+}  // namespace
+
+static __device__ __forceinline__ void ds_apply_rope_pair(
+    __nv_bfloat16 *x,
+    int offset,
+    float cos_value,
+    float sin_value,
+    bool inverse) {
+  float x0 = __bfloat162float(x[offset]);
+  float x1 = __bfloat162float(x[offset + 1]);
+  float c = cos_value;
+  float s = sin_value;
+  if (inverse) s = -s;
+  float out0 = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+  float out1 = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+  x[offset] = __float2bfloat16(out0);
+  x[offset + 1] = __float2bfloat16(out1);
+}
+
+__global__ void ds_apply_rope_hidden_kernel(
+    __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ cos_cache,
+    const float *__restrict__ sin_cache,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int start_pos,
+    int inverse) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  if (pair >= total_pairs) return;
+
+  int rotary_pair = pair % (rotary_dim / 2);
+  int tmp = pair / (rotary_dim / 2);
+  int head = tmp % local_heads;
+  int token = tmp / local_heads;
+  int nope_dim = head_dim - rotary_dim;
+  int pos = start_pos + token;
+  int offset =
+      token * local_heads * head_dim + head * head_dim + nope_dim + 2 * rotary_pair;
+  ds_apply_rope_pair(
+      x, offset, cos_cache[pos * (rotary_dim / 2) + rotary_pair],
+      sin_cache[pos * (rotary_dim / 2) + rotary_pair], inverse != 0);
+}
+
+__global__ void ds_apply_rope_hidden_strided_kernel(
+    __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ cos_cache,
+    const float *__restrict__ sin_cache,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int start_pos,
+    int position_stride,
+    int inverse) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  if (pair >= total_pairs) return;
+
+  int rotary_pair = pair % (rotary_dim / 2);
+  int tmp = pair / (rotary_dim / 2);
+  int head = tmp % local_heads;
+  int token = tmp / local_heads;
+  int nope_dim = head_dim - rotary_dim;
+  int pos = start_pos + token * position_stride;
+  int offset =
+      token * local_heads * head_dim + head * head_dim + nope_dim + 2 * rotary_pair;
+  ds_apply_rope_pair(
+      x, offset, cos_cache[pos * (rotary_dim / 2) + rotary_pair],
+      sin_cache[pos * (rotary_dim / 2) + rotary_pair], inverse != 0);
+}
 
 __global__ void ds_compressor_norm_serial_kernel(
     const float *__restrict__ weighted,
@@ -377,6 +492,108 @@ __global__ void ds_compressor_overlap_shift_kernel(
 }
 
 extern "C" {
+
+cudaError_t ds_apply_rope_hidden(
+    __nv_bfloat16 *x,
+    const float *cos_cache,
+    const float *sin_cache,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int start_pos,
+    int inverse,
+    cudaStream_t stream) {
+  if (x == nullptr || cos_cache == nullptr || sin_cache == nullptr || seq_len <= 0 ||
+      local_heads <= 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim ||
+      (rotary_dim % 2) != 0 || start_pos < 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  int blocks = (total_pairs + threads - 1) / threads;
+  ds_apply_rope_hidden_kernel<<<blocks, threads, 0, stream>>>(
+      x, cos_cache, sin_cache, seq_len, local_heads, head_dim, rotary_dim, start_pos,
+      inverse);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_apply_rope_hidden_strided(
+    __nv_bfloat16 *x,
+    const float *cos_cache,
+    const float *sin_cache,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int start_pos,
+    int position_stride,
+    int inverse,
+    cudaStream_t stream) {
+  if (x == nullptr || cos_cache == nullptr || sin_cache == nullptr || seq_len <= 0 ||
+      local_heads <= 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim ||
+      (rotary_dim % 2) != 0 || start_pos < 0 || position_stride <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  int blocks = (total_pairs + threads - 1) / threads;
+  ds_apply_rope_hidden_strided_kernel<<<blocks, threads, 0, stream>>>(
+      x, cos_cache, sin_cache, seq_len, local_heads, head_dim, rotary_dim, start_pos,
+      position_stride, inverse);
+  return cudaGetLastError();
+}
+
+// Row-major BF16 X @ W^T -> F32.  cuBLAS is invoked with the standard
+// column-major swap-and-transpose layout so the output buffer can be consumed
+// directly by the compressor epilogue as [seq_len, out_dim].
+cudaError_t ds_compressor_bf16_linear_f32(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *weight,
+    float *out,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    cudaStream_t stream) {
+  if (x == nullptr || weight == nullptr || out == nullptr || seq_len <= 0 ||
+      in_dim <= 0 || out_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  DsCompressorGemmScratch *scratch_ptr = nullptr;
+  cudaError_t err = ds_compressor_scratch_for_device(&scratch_ptr);
+  if (err != cudaSuccess) return err;
+  DsCompressorGemmScratch &scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  err = ds_compressor_ensure_handle(scratch);
+  if (err != cudaSuccess) return err;
+  if (cublasSetStream(scratch.handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status = cublasGemmEx(
+      scratch.handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      out_dim,
+      seq_len,
+      in_dim,
+      &alpha,
+      weight,
+      CUDA_R_16BF,
+      in_dim,
+      x,
+      CUDA_R_16BF,
+      in_dim,
+      &beta,
+      out,
+      CUDA_R_32F,
+      out_dim,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  return status == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cudaErrorUnknown;
+}
 
 // Non-overlap prefill compressor epilogue: consumes pre-computed FP32 score/value
 // projections (X @ Wgate^T, X @ Wkv^T) and runs the fused epilogue that gathers

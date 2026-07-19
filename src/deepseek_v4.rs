@@ -13,10 +13,11 @@ use candle_core::{Device, Result, Tensor};
 fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
     let (s, l) = t.storage_and_layout();
     match (&*s, t.dtype()) {
-        (Storage::Cuda(c), DType::U8) => Ok(*c
+        (Storage::Cuda(c), DType::U8 | DType::F8E8M0 | DType::F8E4M3) => Ok(*c
             .as_cuda_slice::<u8>()?
             .slice(l.start_offset()..)
-            .device_ptr() as *const core::ffi::c_void),
+            .device_ptr()
+            as *const core::ffi::c_void),
         (Storage::Cuda(c), DType::BF16) => Ok(*c
             .as_cuda_slice::<half::bf16>()?
             .slice(l.start_offset()..)
@@ -59,6 +60,66 @@ fn get_cuda_stream(device: &Device) -> Result<i64> {
     }
 }
 
+/// Bounds-checked asynchronous device-to-device copy for contiguous tensors.
+///
+/// Candle's current `Tensor::copy_` passes the destination layout to the
+/// source storage copy.  That is only safe when both tensors have identical
+/// layouts, so V4 uses this primitive for cache rows and streamed expert
+/// weights where the destination is intentionally larger than the source.
+pub fn copy_contiguous_into(dst: &Tensor, src: &Tensor, dst_element_offset: usize) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if dst.dtype() != src.dtype() {
+            candle_core::bail!(
+                "copy_contiguous_into dtype mismatch: {:?} vs {:?}",
+                dst.dtype(),
+                src.dtype()
+            );
+        }
+        if !dst.is_contiguous() || !src.is_contiguous() {
+            candle_core::bail!("copy_contiguous_into requires contiguous tensors");
+        }
+        if !dst.device().same_device(src.device()) {
+            candle_core::bail!(
+                "copy_contiguous_into requires tensors on the same device: {:?} vs {:?}",
+                dst.device(),
+                src.device()
+            );
+        }
+        let end = dst_element_offset
+            .checked_add(src.elem_count())
+            .ok_or_else(|| candle_core::Error::Msg("copy offset overflow".into()))?;
+        if end > dst.elem_count() {
+            candle_core::bail!(
+                "copy_contiguous_into range {}..{} exceeds destination elements {}",
+                dst_element_offset,
+                end,
+                dst.elem_count()
+            );
+        }
+        let element_bytes = dst.dtype().size_in_bytes();
+        let stream = get_cuda_stream(dst.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_copy_device_bytes(
+                get_cuda_ptr(src)?,
+                get_cuda_mut_ptr(dst)?,
+                src.elem_count() * element_bytes,
+                dst_element_offset * element_bytes,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("copy_contiguous_into CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (dst, src, dst_element_offset);
+        candle_core::bail!("copy_contiguous_into requires cuda feature")
+    }
+}
+
 /// Broadcast hidden states along HC dimension: [seq, dim] -> [seq, hc, dim]
 pub fn hc_expand(x: &Tensor, hc: usize) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
@@ -85,7 +146,9 @@ pub fn hc_expand(x: &Tensor, hc: usize) -> Result<Tensor> {
     }
 }
 
-/// Compute mixing coefficients: matmul in candle + RMS scaling via CUDA kernel.
+/// Compute mixing coefficients with the reference's pedantic F32 GEMM and
+/// GPU-side RMS scaling.  The BF16 hidden state is promoted on-device; this
+/// keeps the reduction precise without introducing a host synchronization.
 ///
 /// x: [seq, hc*dim] BF16 (HC-expanded, flattened), hc_fn: [mix_hc, hc*dim] F32
 /// Returns mixes: [seq, mix_hc] F32
@@ -100,15 +163,19 @@ pub fn hc_mixes(
     #[cfg(feature = "cuda")]
     {
         let seq_len = x.dim(0)?;
-        let hc_dim = hc * dim;
-        // BF16→F32 cast + matmul via candle (uses cudarc memory pool, graph-compatible)
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let mixes = x_f32.matmul(&hc_fn.t()?)?;
-        // RMS scale via CUDA kernel (no allocation)
+        if x.dtype() != DType::BF16 || hc_fn.dtype() != DType::F32 {
+            candle_core::bail!(
+                "hc_mixes expects BF16 hidden/F32 weights, got {:?}/{:?}",
+                x.dtype(),
+                hc_fn.dtype()
+            );
+        }
+        let mixes = Tensor::zeros((seq_len, mix_hc), DType::F32, x.device())?;
         let stream = get_cuda_stream(x.device())?;
         let ret = unsafe {
-            kernels::ffi::ds_v4_hc_scale_mixes(
+            kernels::ffi::ds_v4_hc_mixes(
                 get_cuda_ptr(x)?,
+                get_cuda_ptr(hc_fn)?,
                 get_cuda_mut_ptr(&mixes)?,
                 seq_len as i32,
                 hc as i32,
@@ -119,9 +186,11 @@ pub fn hc_mixes(
             )
         };
         if ret != 0 {
-            candle_core::bail!("ds_v4_hc_scale_mixes CUDA error: {}", ret);
+            candle_core::bail!("ds_v4_hc_mixes CUDA error: {}", ret);
         }
-        let _ = hc_dim;
+        if std::env::var_os("XINFER_DSV4_SYNC_HC_MIXES").is_some() {
+            x.device().synchronize()?;
+        }
         Ok(mixes)
     }
     #[cfg(not(feature = "cuda"))]
@@ -354,6 +423,50 @@ pub fn hc_post(
     }
 }
 
+/// HC post-mix after an FP32 collective, matching the reference V4 path: the
+/// row-parallel branch is reduced in FP32, rounded once to BF16 at the branch
+/// boundary, and the final HC state is stored as BF16.
+pub fn hc_post_f32_branch(
+    x: &Tensor,
+    residual: &Tensor,
+    post: &Tensor,
+    comb: &Tensor,
+    hc: usize,
+    dim: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::F32 {
+            candle_core::bail!("hc_post_f32_branch expects F32 branch, got {:?}", x.dtype());
+        }
+        let seq_len = x.dim(0)?;
+        let out = Tensor::zeros((seq_len, hc, dim), DType::BF16, x.device())?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_v4_hc_post_f32_branch(
+                get_cuda_ptr(x)?,
+                get_cuda_ptr(residual)?,
+                get_cuda_ptr(post)?,
+                get_cuda_ptr(comb)?,
+                get_cuda_mut_ptr(&out)?,
+                seq_len as i32,
+                hc as i32,
+                dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_v4_hc_post_f32_branch CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, residual, post, comb, hc, dim);
+        candle_core::bail!("hc_post_f32_branch requires cuda feature")
+    }
+}
+
 /// Per-head RMSNorm: normalize each head independently.
 ///
 /// x: [seq, num_heads, head_dim]
@@ -388,7 +501,161 @@ pub fn head_rms_norm(x: &Tensor, num_heads: usize, head_dim: usize, eps: f32) ->
 // Compressor kernels
 // ============================================================================
 
-/// Non-overlap compressor prefill: matmul in candle + fused epilogue via CUDA.
+fn rope_hidden_shape(x: &Tensor) -> Result<(usize, usize, usize)> {
+    let dims = x.dims();
+    if !(2..=3).contains(&dims.len()) {
+        candle_core::bail!(
+            "apply_rope_hidden expects [seq, head_dim] or [seq, heads, head_dim], got {:?}",
+            dims
+        );
+    }
+    let seq_len = dims[0];
+    let head_dim = dims[dims.len() - 1];
+    if seq_len == 0 || head_dim == 0 {
+        candle_core::bail!(
+            "apply_rope_hidden dimensions must be non-zero, got {:?}",
+            dims
+        );
+    }
+    let local_heads = x.elem_count() / (seq_len * head_dim);
+    Ok((seq_len, local_heads, head_dim))
+}
+
+/// Apply RoPE in place to the final `rope_dim` values of every head.
+///
+/// `x` is contiguous BF16 `[seq, head_dim]` or `[seq, heads, head_dim]`.
+/// `cos` and `sin` are contiguous F32 `[max_seq, rope_dim / 2]` tables.
+pub fn apply_rope_hidden_inplace(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    start_pos: usize,
+    rope_dim: usize,
+    inverse: bool,
+) -> Result<()> {
+    apply_rope_hidden_strided_inplace(x, cos, sin, start_pos, 1, rope_dim, inverse)
+}
+
+/// Apply hidden-state RoPE using table rows `start_pos + token * position_stride`.
+pub fn apply_rope_hidden_strided_inplace(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    start_pos: usize,
+    position_stride: usize,
+    rope_dim: usize,
+    inverse: bool,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let (seq_len, local_heads, head_dim) = rope_hidden_shape(x)?;
+        if x.dtype() != DType::BF16 || cos.dtype() != DType::F32 || sin.dtype() != DType::F32 {
+            candle_core::bail!(
+                "apply_rope_hidden expects x BF16 and cos/sin F32, got {:?}, {:?}, {:?}",
+                x.dtype(),
+                cos.dtype(),
+                sin.dtype()
+            );
+        }
+        if !x.is_contiguous() || !cos.is_contiguous() || !sin.is_contiguous() {
+            candle_core::bail!("apply_rope_hidden expects contiguous tensors");
+        }
+        if rope_dim == 0 || rope_dim > head_dim || rope_dim % 2 != 0 {
+            candle_core::bail!(
+                "invalid rope_dim {rope_dim} for head_dim {head_dim}; it must be positive and even"
+            );
+        }
+        if position_stride == 0 {
+            candle_core::bail!("position_stride must be positive");
+        }
+        let last_pos = start_pos
+            .checked_add((seq_len - 1).saturating_mul(position_stride))
+            .ok_or_else(|| candle_core::Error::Msg("RoPE position overflow".to_string()))?;
+        let required_freqs = (last_pos + 1)
+            .checked_mul(rope_dim / 2)
+            .ok_or_else(|| candle_core::Error::Msg("RoPE table size overflow".to_string()))?;
+        if cos.elem_count() < required_freqs || sin.elem_count() < required_freqs {
+            candle_core::bail!(
+                "RoPE tables are too small: need {required_freqs} values, got cos={} sin={}",
+                cos.elem_count(),
+                sin.elem_count()
+            );
+        }
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_apply_rope_hidden_strided(
+                get_cuda_mut_ptr(x)?,
+                get_cuda_ptr(cos)? as *const f32,
+                get_cuda_ptr(sin)? as *const f32,
+                seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope_dim as i32,
+                start_pos as i32,
+                position_stride as i32,
+                if inverse { 1 } else { 0 },
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("apply_rope_hidden CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, cos, sin, start_pos, position_stride, rope_dim, inverse);
+        candle_core::bail!("apply_rope_hidden requires cuda feature")
+    }
+}
+
+/// BF16 -> F32 compressor projection using the reference cuBLAS GEMM path.
+/// The output is row-major `[seq_len, out_dim]` and remains device-resident.
+pub fn compressor_bf16_linear_f32(
+    x: &Tensor,
+    weight: &Tensor,
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "compressor BF16 GEMM expects BF16 inputs, got {:?}/{:?}",
+                x.dtype(),
+                weight.dtype()
+            );
+        }
+        if !x.is_contiguous() || !weight.is_contiguous() {
+            candle_core::bail!("compressor BF16 GEMM expects contiguous inputs");
+        }
+        let out = Tensor::zeros((seq_len, out_dim), DType::F32, x.device())?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compressor_bf16_linear_f32(
+                get_cuda_ptr(x)?,
+                get_cuda_ptr(weight)?,
+                get_cuda_mut_ptr(&out)? as *mut f32,
+                seq_len as i32,
+                in_dim as i32,
+                out_dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_compressor_bf16_linear_f32 CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, weight, seq_len, in_dim, out_dim);
+        candle_core::bail!("compressor_bf16_linear_f32 requires cuda feature")
+    }
+}
+
+/// Non-overlap compressor prefill: cuBLAS projection + fused epilogue via CUDA.
 ///
 /// x: [seq_len, hidden_dim] BF16
 /// wkv: [head_dim, hidden_dim] BF16, wgate: [head_dim, hidden_dim] BF16
@@ -409,9 +676,11 @@ pub fn compressor_nonoverlap_prefill(
     #[cfg(feature = "cuda")]
     {
         let compressed_len = seq_len / ratio;
-        // BF16→F32 GEMMs: scores = x @ wgate^T, values = x @ wkv^T
-        let scores = x.matmul(&wgate.t()?)?.to_dtype(DType::F32)?;
-        let values = x.matmul(&wkv.t()?)?.to_dtype(DType::F32)?;
+        // Keep BF16 operands and accumulate into F32.  Converting both
+        // operands to F32 before Candle's matmul selected the SM90 default
+        // math mode (and potentially TF32); it is not the OpenInfer path.
+        let scores = compressor_bf16_linear_f32(x, wgate, seq_len, _hidden_dim, head_dim)?;
+        let values = compressor_bf16_linear_f32(x, wkv, seq_len, _hidden_dim, head_dim)?;
 
         let weighted = Tensor::zeros((compressed_len, head_dim), DType::F32, x.device())?;
         let out = Tensor::zeros((compressed_len, head_dim), DType::BF16, x.device())?;
@@ -454,7 +723,7 @@ pub fn compressor_nonoverlap_prefill(
     }
 }
 
-/// Overlap compressor prefill (ratio=4): matmul in candle + fused epilogue via CUDA.
+/// Overlap compressor prefill (ratio=4): cuBLAS projection + fused epilogue via CUDA.
 ///
 /// Returns: (weighted: [compressed_len, head_dim] F32, out: [compressed_len, head_dim] BF16)
 pub fn compressor_overlap_prefill(
@@ -472,9 +741,10 @@ pub fn compressor_overlap_prefill(
     {
         let ratio = 4usize;
         let compressed_len = seq_len / ratio;
-        // Overlap projections go to 2*head_dim
-        let scores = x.matmul(&wgate.t()?)?.to_dtype(DType::F32)?;
-        let values = x.matmul(&wkv.t()?)?.to_dtype(DType::F32)?;
+        // Overlap projections go to 2*head_dim and use BF16 operands with F32
+        // accumulation, matching the reference layout and math mode.
+        let scores = compressor_bf16_linear_f32(x, wgate, seq_len, _hidden_dim, 2 * head_dim)?;
+        let values = compressor_bf16_linear_f32(x, wkv, seq_len, _hidden_dim, 2 * head_dim)?;
 
         let weighted = Tensor::zeros((compressed_len, head_dim), DType::F32, x.device())?;
         let out = Tensor::zeros((compressed_len, head_dim), DType::BF16, x.device())?;
@@ -533,11 +803,16 @@ pub fn compressor_nonoverlap_decode_at(
     ratio: usize,
     state_offset: usize,
     eps: f32,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Option<(Tensor, Tensor)>> {
     #[cfg(feature = "cuda")]
     {
-        let weighted = Tensor::zeros((1, head_dim), DType::F32, x.device())?;
-        let out = Tensor::zeros((1, head_dim), DType::BF16, x.device())?;
+        let should_compress = (start_pos + 1) % ratio == 0;
+        let weighted = should_compress
+            .then(|| Tensor::zeros((1, head_dim), DType::F32, x.device()))
+            .transpose()?;
+        let out = should_compress
+            .then(|| Tensor::zeros((1, head_dim), DType::BF16, x.device()))
+            .transpose()?;
         let stream = get_cuda_stream(x.device())?;
         let ret = unsafe {
             kernels::ffi::ds_compressor_nonoverlap_decode_at(
@@ -548,8 +823,15 @@ pub fn compressor_nonoverlap_decode_at(
                 get_cuda_ptr(norm)?,
                 get_cuda_mut_ptr(kv_state)? as *mut f32,
                 get_cuda_mut_ptr(score_state)? as *mut f32,
-                get_cuda_mut_ptr(&weighted)? as *mut f32,
-                get_cuda_mut_ptr(&out)?,
+                weighted
+                    .as_ref()
+                    .map(get_cuda_mut_ptr)
+                    .transpose()?
+                    .unwrap_or(std::ptr::null_mut()) as *mut f32,
+                out.as_ref()
+                    .map(get_cuda_mut_ptr)
+                    .transpose()?
+                    .unwrap_or(std::ptr::null_mut()),
                 start_pos as i32,
                 hidden_dim as i32,
                 head_dim as i32,
@@ -562,7 +844,7 @@ pub fn compressor_nonoverlap_decode_at(
         if ret != 0 {
             candle_core::bail!("compressor_nonoverlap_decode_at CUDA error: {}", ret);
         }
-        Ok((weighted, out))
+        Ok(weighted.zip(out))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -599,11 +881,16 @@ pub fn compressor_overlap_decode_at(
     head_dim: usize,
     state_offset: usize,
     eps: f32,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Option<(Tensor, Tensor)>> {
     #[cfg(feature = "cuda")]
     {
-        let weighted = Tensor::zeros((1, head_dim), DType::F32, x.device())?;
-        let out = Tensor::zeros((1, head_dim), DType::BF16, x.device())?;
+        let should_compress = (start_pos + 1) % 4 == 0;
+        let weighted = should_compress
+            .then(|| Tensor::zeros((1, head_dim), DType::F32, x.device()))
+            .transpose()?;
+        let out = should_compress
+            .then(|| Tensor::zeros((1, head_dim), DType::BF16, x.device()))
+            .transpose()?;
         let stream = get_cuda_stream(x.device())?;
         let ret = unsafe {
             kernels::ffi::ds_compressor_overlap_decode_at(
@@ -614,8 +901,15 @@ pub fn compressor_overlap_decode_at(
                 get_cuda_ptr(norm)?,
                 get_cuda_mut_ptr(kv_state)? as *mut f32,
                 get_cuda_mut_ptr(score_state)? as *mut f32,
-                get_cuda_mut_ptr(&weighted)? as *mut f32,
-                get_cuda_mut_ptr(&out)?,
+                weighted
+                    .as_ref()
+                    .map(get_cuda_mut_ptr)
+                    .transpose()?
+                    .unwrap_or(std::ptr::null_mut()) as *mut f32,
+                out.as_ref()
+                    .map(get_cuda_mut_ptr)
+                    .transpose()?
+                    .unwrap_or(std::ptr::null_mut()),
                 start_pos as i32,
                 hidden_dim as i32,
                 head_dim as i32,
@@ -627,7 +921,7 @@ pub fn compressor_overlap_decode_at(
         if ret != 0 {
             candle_core::bail!("compressor_overlap_decode_at CUDA error: {}", ret);
         }
-        Ok((weighted, out))
+        Ok(weighted.zip(out))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -652,6 +946,195 @@ pub fn compressor_overlap_decode_at(
 // ============================================================================
 // Indexer kernels
 // ============================================================================
+
+/// Apply normalized Hadamard rotation and FP4 quantize-dequantize in place.
+///
+/// `x` is contiguous BF16 with `x.elem_count() == rows * groups * dim`.
+/// OpenInfer's current indexer contract only supports `dim == 128`.
+pub fn hadamard_fp4_quant_bf16_inplace(x: &Tensor, groups: usize, dim: usize) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "hadamard_fp4_quant_bf16_inplace expects BF16, got {:?}",
+                x.dtype()
+            );
+        }
+        if !x.is_contiguous() {
+            candle_core::bail!("hadamard_fp4_quant_bf16_inplace expects a contiguous tensor");
+        }
+        if groups == 0 || dim != 128 || x.elem_count() % (groups * dim) != 0 {
+            candle_core::bail!(
+                "invalid Hadamard layout: elements={}, groups={}, dim={} (dim must be 128)",
+                x.elem_count(),
+                groups,
+                dim
+            );
+        }
+        let rows = x.elem_count() / (groups * dim);
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_hadamard_fp4_quant_bf16(
+                get_cuda_mut_ptr(x)?,
+                rows as i32,
+                groups as i32,
+                dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("hadamard_fp4_quant_bf16 CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, groups, dim);
+        candle_core::bail!("hadamard_fp4_quant_bf16_inplace requires cuda feature")
+    }
+}
+
+/// Official QAT: FP8 E4M3 + UE8M0 block scales on non-RoPE (nope) dims, in place.
+///
+/// Layout: BF16 `[seq_len, local_heads, head_dim]` or contiguous
+/// `seq_len * local_heads * head_dim`. RoPE dims at the end stay untouched.
+pub fn fp8_act_quant_nope_bf16_inplace(
+    x: &Tensor,
+    local_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    block_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("fp8_act_quant_nope expects BF16, got {:?}", x.dtype());
+        }
+        if !x.is_contiguous() {
+            candle_core::bail!("fp8_act_quant_nope expects a contiguous tensor");
+        }
+        if local_heads == 0 || head_dim == 0 || rotary_dim >= head_dim {
+            candle_core::bail!(
+                "invalid fp8_act_quant_nope layout: heads={}, head_dim={}, rotary={}",
+                local_heads,
+                head_dim,
+                rotary_dim
+            );
+        }
+        let nope = head_dim - rotary_dim;
+        if nope % block_size != 0 {
+            candle_core::bail!(
+                "fp8_act_quant_nope: nope_dim {nope} not divisible by block_size {block_size}"
+            );
+        }
+        let elems = x.elem_count();
+        if elems % (local_heads * head_dim) != 0 {
+            candle_core::bail!(
+                "fp8_act_quant_nope: elements {elems} not divisible by heads*dim={}",
+                local_heads * head_dim
+            );
+        }
+        let seq_len = elems / (local_heads * head_dim);
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_fp8_act_quant_nope_bf16(
+                get_cuda_ptr(x)?,
+                get_cuda_mut_ptr(x)?,
+                seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rotary_dim as i32,
+                block_size as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("fp8_act_quant_nope CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, local_heads, head_dim, rotary_dim, block_size);
+        candle_core::bail!("fp8_act_quant_nope_bf16_inplace requires cuda feature")
+    }
+}
+
+/// Apply the DeepSeek-V4 FP8 activation Q/DQ into distinct storage.
+///
+/// The routed and shared experts consume the same normalized activation.  An
+/// in-place quantizer would therefore race the already-enqueued shared-expert
+/// GEMM and permanently modify its caller's tensor.  This out-of-place form
+/// fuses the copy with quantization for the common all-non-RoPE projection.
+pub fn fp8_act_quant_nope_bf16(
+    x: &Tensor,
+    local_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    block_size: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("fp8_act_quant_nope expects BF16, got {:?}", x.dtype());
+        }
+        let x = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous()?
+        };
+        if local_heads == 0 || head_dim == 0 || rotary_dim >= head_dim {
+            candle_core::bail!(
+                "invalid fp8_act_quant_nope layout: heads={}, head_dim={}, rotary={}",
+                local_heads,
+                head_dim,
+                rotary_dim
+            );
+        }
+        let nope = head_dim - rotary_dim;
+        if nope % block_size != 0 {
+            candle_core::bail!(
+                "fp8_act_quant_nope: nope_dim {nope} not divisible by block_size {block_size}"
+            );
+        }
+        let elems = x.elem_count();
+        if elems % (local_heads * head_dim) != 0 {
+            candle_core::bail!(
+                "fp8_act_quant_nope: elements {elems} not divisible by heads*dim={}",
+                local_heads * head_dim
+            );
+        }
+        let seq_len = elems / (local_heads * head_dim);
+        let output = Tensor::zeros(x.shape(), DType::BF16, x.device())?;
+        // Preserve the rotary tail when this helper is used on attention
+        // tensors.  MoE passes rotary_dim=0, so that hot path has no copy.
+        if rotary_dim != 0 {
+            copy_contiguous_into(&output, &x, 0)?;
+        }
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_fp8_act_quant_nope_bf16(
+                get_cuda_ptr(&x)?,
+                get_cuda_mut_ptr(&output)?,
+                seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rotary_dim as i32,
+                block_size as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("fp8_act_quant_nope CUDA error: {}", ret);
+        }
+        Ok(output)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, local_heads, head_dim, rotary_dim, block_size);
+        candle_core::bail!("fp8_act_quant_nope_bf16 requires cuda feature")
+    }
+}
 
 /// Compute indexer scores for prefill: dot product between Q and compressed KV.
 ///
@@ -870,6 +1353,37 @@ pub fn window_topk_indices(
     }
 }
 
+/// Generate the fixed-width ring-buffer indices for one decode token entirely
+/// on the device, including `-1` padding before the window fills.
+pub fn window_topk_indices_decode(
+    start_pos: usize,
+    window_size: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let out = Tensor::zeros((1, window_size), DType::U32, device)?;
+        let stream = get_cuda_stream(device)?;
+        let ret = unsafe {
+            kernels::ffi::ds_window_topk_indices_decode(
+                get_cuda_mut_ptr(&out)? as *mut i32,
+                start_pos as i32,
+                window_size as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("window_topk_indices_decode CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (start_pos, window_size, device);
+        candle_core::bail!("window_topk_indices_decode requires cuda feature")
+    }
+}
+
 /// Generate compressed block top-k indices for prefill.
 ///
 /// Returns: [seq_len, compressed] I32
@@ -903,6 +1417,36 @@ pub fn compress_topk_indices(
     {
         let _ = (seq_len, compressed, ratio, offset, device);
         candle_core::bail!("compress_topk_indices requires cuda feature")
+    }
+}
+
+/// Generate contiguous compressed-cache indices for one decode token on GPU.
+pub fn compress_topk_indices_decode(
+    compressed: usize,
+    offset: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let out = Tensor::zeros((1, compressed), DType::U32, device)?;
+        let stream = get_cuda_stream(device)?;
+        let ret = unsafe {
+            kernels::ffi::ds_compress_topk_indices_decode(
+                get_cuda_mut_ptr(&out)? as *mut i32,
+                compressed as i32,
+                offset as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compress_topk_indices_decode CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (compressed, offset, device);
+        candle_core::bail!("compress_topk_indices_decode requires cuda feature")
     }
 }
 
@@ -1030,4 +1574,200 @@ pub fn e8m0_scales_to_f32(scales: &Tensor) -> Result<Tensor> {
         .map(|&byte| f32::from_bits((byte as u32) << 23))
         .collect();
     Tensor::from_vec(f32_vals, shape, &device)
+}
+
+// ============================================================================
+// MoE hash-gate routing
+// ============================================================================
+
+/// Fused DeepSeek-V4 hash-gate routing (openinfer `deepseek_hash_gate_cuda`).
+///
+/// For each `(token, route)`:
+/// 1. `expert = tid2eid[token_id, route]` (I64 table)
+/// 2. `score = sqrt(softplus(dot(x[token], gate_weight[expert])))`
+/// 3. L1-normalize scores across routes and multiply by `route_scale`
+///
+/// Inputs:
+/// - `x`: BF16 `[seq, hidden]`
+/// - `gate_weight`: BF16 `[n_experts, hidden]`
+/// - `tid2eid`: I64 `[vocab, topk]`
+/// - `token_ids`: U32 `[seq]`
+///
+/// Returns `(route_weights F32 [seq, topk], route_indices U32 [seq, topk])`.
+pub fn hash_gate_route(
+    x: &Tensor,
+    gate_weight: &Tensor,
+    tid2eid: &Tensor,
+    token_ids: &Tensor,
+    n_experts: usize,
+    topk: usize,
+    route_scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!("hash_gate_route: x must be BF16, got {:?}", x.dtype());
+        }
+        if gate_weight.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "hash_gate_route: gate_weight must be BF16, got {:?}",
+                gate_weight.dtype()
+            );
+        }
+        if tid2eid.dtype() != DType::I64 {
+            candle_core::bail!(
+                "hash_gate_route: tid2eid must be I64, got {:?}",
+                tid2eid.dtype()
+            );
+        }
+        let token_ids = if token_ids.dtype() != DType::U32 {
+            token_ids.to_dtype(DType::U32)?
+        } else {
+            token_ids.clone()
+        };
+        let token_ids = token_ids.flatten_all()?.contiguous()?;
+        let x = x.contiguous()?;
+        let gate_weight = gate_weight.contiguous()?;
+        let tid2eid = tid2eid.contiguous()?;
+
+        let (seq_len, hidden_dim) = x.dims2()?;
+        if token_ids.dim(0)? != seq_len {
+            candle_core::bail!(
+                "hash_gate_route: token_ids len {} != seq_len {}",
+                token_ids.dim(0)?,
+                seq_len
+            );
+        }
+        let (gw_e, gw_h) = gate_weight.dims2()?;
+        if gw_e != n_experts || gw_h != hidden_dim {
+            candle_core::bail!(
+                "hash_gate_route: gate_weight {:?} expected [{n_experts}, {hidden_dim}]",
+                gate_weight.dims()
+            );
+        }
+        if tid2eid.dim(1)? != topk {
+            candle_core::bail!(
+                "hash_gate_route: tid2eid topk {} != {topk}",
+                tid2eid.dim(1)?
+            );
+        }
+        let vocab_size = tid2eid.dim(0)?;
+
+        let route_weights = Tensor::zeros((seq_len, topk), DType::F32, x.device())?;
+        let route_indices = Tensor::zeros((seq_len, topk), DType::U32, x.device())?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_v4_hash_gate(
+                get_cuda_ptr(&x)?,
+                get_cuda_ptr(&gate_weight)?,
+                get_cuda_ptr(&tid2eid)?,
+                get_cuda_ptr(&token_ids)?,
+                get_cuda_mut_ptr(&route_weights)?,
+                get_cuda_mut_ptr(&route_indices)?,
+                seq_len as i32,
+                hidden_dim as i32,
+                n_experts as i32,
+                topk as i32,
+                vocab_size as i32,
+                route_scale,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_v4_hash_gate CUDA error: {}", ret);
+        }
+        Ok((route_weights, route_indices))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x,
+            gate_weight,
+            tid2eid,
+            token_ids,
+            n_experts,
+            topk,
+            route_scale,
+        );
+        candle_core::bail!("hash_gate_route requires cuda feature")
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_indices_and_offset_copy_stay_on_device() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+
+        let dst = Tensor::zeros(10, DType::U32, &device)?;
+        let src = Tensor::from_vec(vec![11u32, 12, 13], 3, &device)?;
+        copy_contiguous_into(&dst, &src, 4)?;
+        assert_eq!(dst.to_vec1::<u32>()?, vec![0, 0, 0, 0, 11, 12, 13, 0, 0, 0]);
+
+        let early = window_topk_indices_decode(2, 5, &device)?.flatten_all()?;
+        assert_eq!(early.to_vec1::<u32>()?, vec![0, 1, 2, u32::MAX, u32::MAX]);
+
+        let wrapped = window_topk_indices_decode(6, 5, &device)?.flatten_all()?;
+        assert_eq!(wrapped.to_vec1::<u32>()?, vec![2, 3, 4, 0, 1]);
+
+        let compressed = compress_topk_indices_decode(4, 5, &device)?.flatten_all()?;
+        assert_eq!(compressed.to_vec1::<u32>()?, vec![5, 6, 7, 8]);
+
+        let scores = Tensor::from_vec(vec![1.0f32, -2.0, 4.0, 4.0, 0.0, 3.0, 4.0], 7, &device)?;
+        let selected = indexer_topk_decode(&scores, 7, 5, 128)?;
+        // Descending score with the serial reference's first-index tie break.
+        assert_eq!(selected.to_vec1::<u32>()?, vec![130, 131, 134, 133, 128]);
+
+        let long_scores: Vec<f32> = (0..129).map(|v| v as f32).collect();
+        let long_scores = Tensor::from_vec(long_scores, 129, &device)?;
+        let selected = indexer_topk_decode(&long_scores, 129, 100, 7)?;
+        let expected: Vec<u32> = (29..129).rev().map(|v| (v + 7) as u32).collect();
+        assert_eq!(selected.to_vec1::<u32>()?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_attention_skips_padding_and_keeps_sink_in_denominator() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let head_dim = 512;
+        let q = Tensor::zeros((1, 1, head_dim), DType::BF16, &device)?;
+        let mut kv_values = vec![3.0f32; head_dim];
+        kv_values.extend(std::iter::repeat_n(6.0f32, head_dim));
+        let kv = Tensor::from_vec(kv_values, (2, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let sink = Tensor::zeros(1, DType::F32, &device)?;
+        let indices = Tensor::from_vec(vec![0u32, u32::MAX, 1], (1, 3), &device)?;
+
+        // q.k = 0 for both valid rows and sink = 0, so the output is
+        // (3 + 6) / (2 valid rows + 1 sink) = 3. Padding contributes nothing.
+        let out = sparse_attention(&q, &kv, &sink, &indices, 1, 1, head_dim, 2, 3, 1.0)?;
+        for value in out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()? {
+            assert_eq!(value, 3.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hc_post_f32_branch_restores_reference_bf16_boundary() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let hc = 4;
+        let dim = 4;
+        let x = Tensor::from_vec(vec![1.003f32, -2.007, 0.499, 7.031], (1, dim), &device)?;
+        let residual = Tensor::zeros((1, hc, dim), DType::BF16, &device)?;
+        let post = Tensor::ones((1, hc), DType::F32, &device)?;
+        let comb = Tensor::zeros((1, hc, hc), DType::F32, &device)?;
+
+        let out = hc_post_f32_branch(&x, &residual, &post, &comb, hc, dim)?;
+        let expected = x
+            .to_dtype(DType::BF16)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?[0]
+            .clone();
+        let actual = out.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        for branch in actual.chunks_exact(dim) {
+            assert_eq!(branch, expected.as_slice());
+        }
+        Ok(())
+    }
 }

@@ -3,7 +3,67 @@
 //           hc_pre_output, hc_post, hc_head_pre, hc_scale_mixes
 
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <mutex>
+
+namespace {
+
+constexpr int kDsHcMaxDevices = 16;
+
+struct DsHcGemmScratch {
+  cublasHandle_t handle = nullptr;
+  float *x_f32 = nullptr;
+  size_t x_capacity = 0;
+  std::mutex mutex;
+};
+
+DsHcGemmScratch g_ds_hc_gemm_scratch[kDsHcMaxDevices];
+
+cudaError_t ds_hc_scratch_for_device(DsHcGemmScratch **out) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= kDsHcMaxDevices) return cudaErrorInvalidDevice;
+  *out = &g_ds_hc_gemm_scratch[device];
+  return cudaSuccess;
+}
+
+cudaError_t ds_hc_ensure_scratch(DsHcGemmScratch &scratch, size_t elements) {
+  if (elements <= scratch.x_capacity) return cudaSuccess;
+  if (scratch.x_f32 != nullptr) {
+    cudaError_t err = cudaFree(scratch.x_f32);
+    if (err != cudaSuccess) return err;
+    scratch.x_f32 = nullptr;
+    scratch.x_capacity = 0;
+  }
+  cudaError_t err = cudaMalloc(
+      reinterpret_cast<void **>(&scratch.x_f32), elements * sizeof(float));
+  if (err != cudaSuccess) return err;
+  scratch.x_capacity = elements;
+  return cudaSuccess;
+}
+
+cudaError_t ds_hc_ensure_handle(DsHcGemmScratch &scratch) {
+  if (scratch.handle != nullptr) return cudaSuccess;
+  cublasStatus_t status = cublasCreate(&scratch.handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    scratch.handle = nullptr;
+    return cudaErrorUnknown;
+  }
+  // HC mixes are especially sensitive: the reference uses a pedantic F32
+  // GEMM after converting the BF16 hidden state to F32.  This also prevents
+  // the SM90 default from silently selecting TF32 for this reduction.
+  status = cublasSetMathMode(scratch.handle, CUBLAS_PEDANTIC_MATH);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cublasDestroy(scratch.handle);
+    scratch.handle = nullptr;
+    return cudaErrorUnknown;
+  }
+  return cudaSuccess;
+}
+
+}  // namespace
 
 static __device__ __forceinline__ float round_to_bf16_float(float value) {
   return __bfloat162float(__float2bfloat16(value));
@@ -14,6 +74,14 @@ static __device__ __forceinline__ float ds_sigmoid(float x) {
 }
 
 // ============ Kernels ============
+
+__global__ void ds_hc_bf16_to_f32_kernel(
+    const __nv_bfloat16 *__restrict__ input,
+    float *__restrict__ output,
+    int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) output[idx] = __bfloat162float(input[idx]);
+}
 
 __global__ void ds_hc_expand_kernel(
     const __nv_bfloat16 *__restrict__ x,
@@ -392,6 +460,45 @@ __global__ void ds_hc_post_kernel(
   out[idx] = __float2bfloat16(__fadd_rn(post_term, residual_sum));
 }
 
+__global__ void ds_hc_post_f32_branch_kernel(
+    const float *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ residual,
+    const float *__restrict__ post,
+    const float *__restrict__ comb,
+    __nv_bfloat16 *__restrict__ out,
+    int seq_len, int hc, int dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * hc * dim;
+  if (idx >= total) return;
+  int dim_idx = idx % dim;
+  int h_out = (idx / dim) % hc;
+  int token = idx / (hc * dim);
+  float residual_sum = 0.0f;
+  if (hc == 4) {
+    float term0 = __fmul_rn(comb[(token * hc + 0) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 0) * dim + dim_idx]));
+    float term1 = __fmul_rn(comb[(token * hc + 1) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 1) * dim + dim_idx]));
+    float term2 = __fmul_rn(comb[(token * hc + 2) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 2) * dim + dim_idx]));
+    float term3 = __fmul_rn(comb[(token * hc + 3) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 3) * dim + dim_idx]));
+    residual_sum = __fadd_rn(__fadd_rn(__fadd_rn(term0, term1), term2), term3);
+  } else {
+    for (int h_in = 0; h_in < hc; ++h_in) {
+      float term = __fmul_rn(comb[(token * hc + h_in) * hc + h_out],
+          __bfloat162float(residual[(token * hc + h_in) * dim + dim_idx]));
+      residual_sum = __fadd_rn(residual_sum, term);
+    }
+  }
+  // The attention/FFN branch is BF16 at the Python model boundary.  Decode
+  // keeps the row-parallel all-reduce in F32, so reproduce that BF16 boundary
+  // here before feeding the branch back through the hyperconnection.
+  float branch = __bfloat162float(__float2bfloat16(x[token * dim + dim_idx]));
+  float post_term = __fmul_rn(post[token * hc + h_out], branch);
+  out[idx] = __float2bfloat16(__fadd_rn(post_term, residual_sum));
+}
+
 // Per-head RMSNorm for V4 Q projection
 __global__ void ds_head_rms_norm_kernel(
     const __nv_bfloat16 *__restrict__ x,
@@ -436,6 +543,67 @@ cudaError_t ds_v4_hc_expand(
   int blocks = (total + threads - 1) / threads;
   ds_hc_expand_kernel<<<blocks, threads, 0, stream>>>(
       (const __nv_bfloat16*)x, (__nv_bfloat16*)out, seq_len, hc, dim);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_v4_hc_mixes(
+    const void *x, const void *hc_fn, void *mixes,
+    int seq_len, int hc, int dim, int mix_hc, float eps, int64_t stream_) {
+  if (x == nullptr || hc_fn == nullptr || mixes == nullptr || seq_len <= 0 ||
+      hc <= 0 || dim <= 0 || mix_hc <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  const int hc_dim = hc * dim;
+  const int total = seq_len * hc_dim;
+  constexpr int threads = 256;
+
+  DsHcGemmScratch *scratch_ptr = nullptr;
+  cudaError_t err = ds_hc_scratch_for_device(&scratch_ptr);
+  if (err != cudaSuccess) return err;
+  DsHcGemmScratch &scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+
+  err = ds_hc_ensure_scratch(scratch, static_cast<size_t>(total));
+  if (err != cudaSuccess) return err;
+  const int blocks = (total + threads - 1) / threads;
+  ds_hc_bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(
+      (const __nv_bfloat16 *)x, scratch.x_f32, total);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  err = ds_hc_ensure_handle(scratch);
+  if (err != cudaSuccess) return err;
+  if (cublasSetStream(scratch.handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status;
+  if (seq_len == 1) {
+    status = cublasSgemv(
+        scratch.handle, CUBLAS_OP_T, hc_dim, mix_hc, &alpha,
+        (const float *)hc_fn, hc_dim, scratch.x_f32, 1, &beta,
+        (float *)mixes, 1);
+  } else {
+    status = cublasGemmEx(
+        scratch.handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        mix_hc, seq_len, hc_dim, &alpha,
+        hc_fn, CUDA_R_32F, hc_dim,
+        scratch.x_f32, CUDA_R_32F, hc_dim,
+        &beta, mixes, CUDA_R_32F, mix_hc,
+        CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
+  }
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
+
+  // Keep the exact reference ordering: normalize the source hidden state
+  // after the GEMM, on the same stream, without a host-visible fence.
+  constexpr int scale_threads = 512;
+  ds_hc_scale_mixes_block_kernel<<<
+      seq_len, scale_threads, scale_threads * sizeof(float), stream>>>(
+          (const __nv_bfloat16 *)x, (float *)mixes, nullptr,
+          seq_len, hc_dim, mix_hc, eps);
   return cudaGetLastError();
 }
 
@@ -529,11 +697,27 @@ cudaError_t ds_v4_hc_post(
   return cudaGetLastError();
 }
 
+cudaError_t ds_v4_hc_post_f32_branch(
+    const void *x, const void *residual,
+    const void *post, const void *comb, void *out,
+    int seq_len, int hc, int dim, int64_t stream_) {
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  constexpr int threads = 256;
+  int total = seq_len * hc * dim;
+  int blocks = (total + threads - 1) / threads;
+  ds_hc_post_f32_branch_kernel<<<blocks, threads, 0, stream>>>(
+      (const float*)x, (const __nv_bfloat16*)residual,
+      (const float*)post, (const float*)comb, (__nv_bfloat16*)out,
+      seq_len, hc, dim);
+  return cudaGetLastError();
+}
+
 cudaError_t ds_v4_head_rms_norm(
     const void *x, void *out,
     int seq_len, int num_heads, int head_dim, float eps, int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
-  constexpr int threads = 256;
+  // Match openinfer: 512 threads for head_dim=512 (covers one dim per thread).
+  constexpr int threads = 512;
   dim3 grid(seq_len, num_heads);
   size_t shared_bytes = threads * sizeof(float);
   ds_head_rms_norm_kernel<<<grid, threads, shared_bytes, stream>>>(

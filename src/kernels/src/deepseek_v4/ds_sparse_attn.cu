@@ -1,5 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
 // Grid: (seq_len, num_heads), Block: 256 threads.
 // Each block handles one (token, head) pair.
@@ -11,6 +12,10 @@
 // out: [seq_len, num_heads, head_dim] BF16
 
 static constexpr int kSparseThreads = 256;
+
+static __device__ __forceinline__ float ds_sparse_round_bf16(float value) {
+  return __bfloat162float(__float2bfloat16(value));
+}
 
 __global__ void ds_sparse_attn_kernel(
     const __nv_bfloat16 *__restrict__ q,
@@ -34,7 +39,10 @@ __global__ void ds_sparse_attn_kernel(
   for (int i = 0; i < dims_per_thread; ++i)
     q_reg[i] = __bfloat162float(q[q_base + tid * dims_per_thread + i]);
 
-  float running_max = -1e30f;
+  // Invalid/padded indices must not participate in the online softmax.  In
+  // particular, using a finite sentinel here makes an invalid score equal to
+  // the initial running maximum and contributes exp(0) to the denominator.
+  float running_max = -INFINITY;
   float running_sum = 0.0f;
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -45,13 +53,16 @@ __global__ void ds_sparse_attn_kernel(
   for (int ki = 0; ki < topk; ++ki) {
     int kv_idx = tok_idxs[ki];
 
+    // The top-k builders intentionally pad causal/future slots with -1.  All
+    // threads take the same branch, so skipping here is synchronization-safe
+    // and keeps both the numerator and denominator unchanged.
+    if (kv_idx < 0 || kv_idx >= kv_len) continue;
+
     float partial = 0.0f;
-    if (kv_idx >= 0 && kv_idx < kv_len) {
-      const __nv_bfloat16 *krow = kv + kv_idx * head_dim;
-      #pragma unroll
-      for (int i = 0; i < dims_per_thread; ++i)
-        partial += q_reg[i] * __bfloat162float(krow[tid * dims_per_thread + i]);
-    }
+    const __nv_bfloat16 *krow = kv + kv_idx * head_dim;
+    #pragma unroll
+    for (int i = 0; i < dims_per_thread; ++i)
+      partial += q_reg[i] * __bfloat162float(krow[tid * dims_per_thread + i]);
 
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -66,11 +77,14 @@ __global__ void ds_sparse_attn_kernel(
       float s = 0.0f;
       for (int w = 0; w < kSparseThreads / 32; ++w)
         s += s_score[w];
-      score = (kv_idx >= 0 && kv_idx < kv_len) ? s * softmax_scale : -1e30f;
+      score = s * softmax_scale;
       s_score[0] = score;
     }
     __syncthreads();
     score = s_score[0];
+    // All threads must consume s_score[0] before warp leaders overwrite the
+    // shared buffer in the next iteration.
+    __syncthreads();
 
     float new_max = fmaxf(running_max, score);
     float old_scale = expf(running_max - new_max);
@@ -82,12 +96,14 @@ __global__ void ds_sparse_attn_kernel(
     running_sum = running_sum * old_scale + exp_score;
     running_max = new_max;
 
-    if (kv_idx >= 0 && kv_idx < kv_len) {
-      const __nv_bfloat16 *krow = kv + kv_idx * head_dim;
-      #pragma unroll
-      for (int i = 0; i < dims_per_thread; ++i)
-        acc[i] += exp_score * __bfloat162float(krow[tid * dims_per_thread + i]);
-    }
+    // The official TileLang kernel keeps the softmax denominator in FP32 but
+    // casts the unnormalized probabilities to BF16 before the P@V GEMM.
+    // Retaining FP32 here looks more accurate in isolation, yet crosses a QAT
+    // precision boundary and measurably changes every sparse layer.
+    float value_weight = ds_sparse_round_bf16(exp_score);
+    #pragma unroll
+    for (int i = 0; i < dims_per_thread; ++i)
+      acc[i] += value_weight * __bfloat162float(krow[tid * dims_per_thread + i]);
   }
 
   float sink_val = attn_sink[head];
@@ -112,6 +128,12 @@ extern "C" int ds_sparse_attn_dispatch(
     int seq_len, int num_heads, int head_dim, int kv_len, int topk,
     float softmax_scale, cudaStream_t stream) {
   if (seq_len <= 0 || kv_len <= 0 || topk <= 0 || num_heads <= 0) return (int)cudaSuccess;
+  // Kernel packs head_dim / 256 dims per thread into a fixed float[4] register
+  // file. DeepSeek V4 Flash uses head_dim=512 (exactly 2 dims/thread).
+  if (head_dim <= 0 || head_dim % kSparseThreads != 0 ||
+      (head_dim / kSparseThreads) > 4) {
+    return (int)cudaErrorInvalidValue;
+  }
   dim3 grid(seq_len, num_heads);
   ds_sparse_attn_kernel<<<grid, kSparseThreads, 0, stream>>>(
       (const __nv_bfloat16*)q, (const __nv_bfloat16*)kv, (const float*)attn_sink,
