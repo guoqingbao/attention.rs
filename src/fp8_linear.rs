@@ -18,11 +18,11 @@ fn get_cuda_slice<
 >(
     tensor: &Tensor,
 ) -> Result<u64> {
-    let (storage, _) = tensor.storage_and_layout();
+    let (storage, layout) = tensor.storage_and_layout();
     match &*storage {
         candle_core::Storage::Cuda(c) => {
             let slice = c.as_cuda_slice::<T>()?;
-            Ok(*slice.device_ptr() as u64)
+            Ok(*slice.slice(layout.start_offset()..).device_ptr() as u64)
         }
         _ => candle_core::bail!("expecting cuda tensor"),
     }
@@ -383,17 +383,15 @@ pub fn fp8_matmul_flashinfer(
     let m_padded = (m + 4 - 1) / 4 * 4;
     let out = unsafe { Tensor::empty_((m, n), DType::BF16, dev)? };
     let k_over_128 = k / 128;
-    let input_q = unsafe { Tensor::empty_((m, k), DType::U8, dev)? };
     // FlashInfer/DeepGEMM expects scales_a to use an M-aligned leading stride.
-    // Their own tests allocate [K/128, M_padded] and treat only the first M columns as live.
-    let input_scale = if m_padded == m {
-        unsafe { Tensor::empty_((k_over_128, m_padded), DType::F32, dev)? }
-    } else {
-        Tensor::zeros((k_over_128, m_padded), DType::F32, dev)?
-    };
-    let scale_stride = input_scale.stride()[0] as i32;
-    let q_ptr = get_cuda_slice::<u8>(&input_q)? as *mut std::ffi::c_void;
-    let s_ptr = get_cuda_slice::<f32>(&input_scale)? as *mut f32;
+    // Keep both asynchronous inputs in the per-device pool: call-local tensors
+    // can be reclaimed as soon as this function returns, before the GEMM has
+    // finished reading them.
+    let input_q_bytes = m * k;
+    let input_scales_bytes = k_over_128 * m_padded * std::mem::size_of::<f32>();
+    let (q_ptr, s_ptr) = get_grouped_gemm_scratch(cu_dev, input_q_bytes, input_scales_bytes)?;
+    let s_ptr = s_ptr as *mut f32;
+    let scale_stride = m_padded as i32;
     let inp_ptr = get_cuda_slice::<half::bf16>(input)? as *const std::ffi::c_void;
 
     unsafe {
@@ -553,21 +551,11 @@ pub fn fp8_matmul_cutlass(
     let stream = *cu_dev.cu_stream() as i64;
     let k_over_128 = (k + 127) / 128;
 
-    let input_q = if pad_len == 0 {
-        unsafe { Tensor::empty_((m_padded, k), DType::U8, &dev)? }
-    } else {
-        Tensor::zeros((m_padded, k), DType::U8, &dev)?
-    };
-    let input_scale_base = if pad_len == 0 {
-        unsafe { Tensor::empty_((k_over_128, m_padded), DType::F32, &dev)? }
-    } else {
-        Tensor::zeros((k_over_128, m_padded), DType::F32, &dev)?
-    };
-    let input_scale = input_scale_base.t()?;
-    let scale_stride = input_scale.stride()[1] as i32;
-
-    let q_ptr = get_cuda_slice::<u8>(&input_q)? as *mut std::ffi::c_void;
-    let s_ptr = get_cuda_slice::<f32>(&input_scale)? as *mut f32;
+    let input_q_bytes = m_padded * k;
+    let input_scales_bytes = k_over_128 * m_padded * std::mem::size_of::<f32>();
+    let (q_ptr, s_ptr) = get_grouped_gemm_scratch(cu_dev, input_q_bytes, input_scales_bytes)?;
+    let s_ptr = s_ptr as *mut f32;
+    let scale_stride = m_padded as i32;
 
     let inp_ptr = if dtype == DType::F16 {
         get_cuda_slice::<half::f16>(input)?
@@ -873,7 +861,9 @@ fn fp8_grouped_matmul_cutlass(
 /// 1. Quantize BF16 activations to FP8 with 1x128 column-wise scales
 /// 2. Run strided batched FP8 GEMM with block-wise weight scales
 ///
-/// No intermediate tensor allocations/drops, making it safe for CUDA graph capture.
+/// Quantization scratch is kept in a per-device grow-only pool. The FlashInfer
+/// GEMM is asynchronous, so call-local Tensor scratch would be freed as this
+/// function returns while the kernel can still be reading it.
 ///
 /// input: [n_groups, seq_len, k] BF16 (contiguous)
 /// group_weights: pre-stacked [n_groups, n, k] U8 (FP8_E4M3, contiguous)  
@@ -897,13 +887,13 @@ pub fn fp8_grouped_matmul_strided(
         // Allocate output: [n_groups, seq_len, n] BF16
         let output = Tensor::zeros((n_groups, seq_len, n), DType::BF16, input.device())?;
 
-        // Allocate FP8 quantized input buffer: [n_groups, seq_len, k] U8
-        let input_q = unsafe { Tensor::empty_((n_groups, seq_len, k), DType::U8, input.device())? };
-
-        // Allocate activation scales: [n_groups * seq_len, ceil(k/128)] F32
         let scale_k = (k + 127) / 128;
-        let input_scales =
-            unsafe { Tensor::empty_((n_groups * seq_len, scale_k), DType::F32, input.device())? };
+        let total_rows = n_groups * seq_len;
+        let input_q_bytes = total_rows * k;
+        let input_scales_bytes = total_rows * scale_k * std::mem::size_of::<f32>();
+        let (input_q_ptr, input_scales_ptr) =
+            get_grouped_gemm_scratch(dev, input_q_bytes, input_scales_bytes)?;
+        let input_scales_ptr = input_scales_ptr as *mut f32;
 
         // Get raw pointers via storage access (scoped to drop guards before Ok(output))
         let input_ptr = {
@@ -913,26 +903,6 @@ pub fn fp8_grouped_matmul_strided(
                     *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *const std::ffi::c_void
                 }
                 _ => candle_core::bail!("input must be a CUDA tensor"),
-            }
-        };
-
-        let input_q_ptr = {
-            let (s, _) = input_q.storage_and_layout();
-            match &*s {
-                candle_core::Storage::Cuda(c) => {
-                    *c.as_cuda_slice::<u8>()?.device_ptr() as *mut std::ffi::c_void
-                }
-                _ => candle_core::bail!("input_q must be a CUDA tensor"),
-            }
-        };
-
-        let input_scales_ptr = {
-            let (s, _) = input_scales.storage_and_layout();
-            match &*s {
-                candle_core::Storage::Cuda(c) => {
-                    *c.as_cuda_slice::<f32>()?.device_ptr() as *mut f32
-                }
-                _ => candle_core::bail!("input_scales must be a CUDA tensor"),
             }
         };
 
@@ -967,13 +937,12 @@ pub fn fp8_grouped_matmul_strided(
         };
 
         // Step 1: Quantize BF16 input to FP8 with 1x128 column-wise scales
-        let total_rows = (n_groups * seq_len) as i32;
         let ret = unsafe {
             kernels::ffi::flashinfer_fp8_quantize_1x128(
                 input_q_ptr,
                 input_scales_ptr,
                 input_ptr,
-                total_rows,
+                total_rows as i32,
                 k as i32,
                 stream,
             )
@@ -1139,7 +1108,7 @@ pub fn fp8_grouped_gemm_fused(
 }
 
 /// Thread-local scratch buffer pool for grouped GEMM (avoids per-call allocations).
-#[cfg(all(feature = "cuda", feature = "cutlass"))]
+#[cfg(all(feature = "cuda", any(feature = "flashinfer", feature = "cutlass")))]
 mod grouped_gemm_pool {
     use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
     use candle_core::cuda_backend::WrapErr;
@@ -1206,5 +1175,5 @@ mod grouped_gemm_pool {
     }
 }
 
-#[cfg(all(feature = "cuda", feature = "cutlass"))]
+#[cfg(all(feature = "cuda", any(feature = "flashinfer", feature = "cutlass")))]
 use grouped_gemm_pool::get_grouped_gemm_scratch;
