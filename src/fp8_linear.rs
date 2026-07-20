@@ -12,6 +12,41 @@ use crate::workspace::get_or_init_flashinfer_fp8_workspace;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Device, Result, Tensor};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fp8ExecutionDomain {
+    Eager,
+    DecodeGraph,
+    MtpGraph,
+}
+
+thread_local! {
+    static FP8_EXECUTION_DOMAIN: std::cell::Cell<Fp8ExecutionDomain> =
+        const { std::cell::Cell::new(Fp8ExecutionDomain::Eager) };
+}
+
+pub struct Fp8ExecutionGuard {
+    previous: Fp8ExecutionDomain,
+}
+
+impl Drop for Fp8ExecutionGuard {
+    fn drop(&mut self) {
+        FP8_EXECUTION_DOMAIN.with(|domain| domain.set(self.previous));
+    }
+}
+
+pub fn set_fp8_execution_domain(domain: Fp8ExecutionDomain) -> Fp8ExecutionGuard {
+    let previous = FP8_EXECUTION_DOMAIN.with(|current| {
+        let previous = current.get();
+        current.set(domain);
+        previous
+    });
+    Fp8ExecutionGuard { previous }
+}
+
+pub(crate) fn fp8_execution_domain() -> Fp8ExecutionDomain {
+    FP8_EXECUTION_DOMAIN.with(|domain| domain.get())
+}
+
 #[cfg(feature = "cuda")]
 fn get_cuda_slice<
     T: candle_core::cuda_backend::cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType,
@@ -1123,7 +1158,56 @@ mod grouped_gemm_pool {
     }
 
     thread_local! {
-        static POOL: std::cell::RefCell<Option<ScratchPool>> = const { std::cell::RefCell::new(None) };
+        static POOL_EAGER: std::cell::RefCell<Option<ScratchPool>> = const { std::cell::RefCell::new(None) };
+        static POOL_DECODE_GRAPH: std::cell::RefCell<Option<ScratchPool>> = const { std::cell::RefCell::new(None) };
+        static POOL_MTP_GRAPH: std::cell::RefCell<Option<ScratchPool>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn get_from_pool(
+        cell: &std::cell::RefCell<Option<ScratchPool>>,
+        dev: &candle_core::cuda_backend::CudaDevice,
+        input_q_bytes: usize,
+        input_scales_bytes: usize,
+    ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+        let mut slot = cell.borrow_mut();
+        let ordinal = dev.ordinal();
+
+        let needs_realloc = match slot.as_ref() {
+            None => true,
+            Some(p) => {
+                p.device_ordinal != ordinal
+                    || p.input_q_bytes < input_q_bytes
+                    || p.input_scales_bytes < input_scales_bytes
+            }
+        };
+
+        if needs_realloc {
+            let old = slot.take();
+            let (q_sz, s_sz) = if let Some(ref prev) = old {
+                (
+                    input_q_bytes.max(prev.input_q_bytes),
+                    input_scales_bytes.max(prev.input_scales_bytes),
+                )
+            } else {
+                (input_q_bytes, input_scales_bytes)
+            };
+            drop(old);
+            let input_q = unsafe { dev.alloc::<u8>(q_sz.max(1)) }.w()?;
+            let input_scales = unsafe { dev.alloc::<u8>(s_sz.max(1)) }.w()?;
+            *slot = Some(ScratchPool {
+                input_q,
+                input_q_bytes: q_sz,
+                input_scales,
+                input_scales_bytes: s_sz,
+                device_ordinal: ordinal,
+            });
+        }
+
+        let pool = slot.as_ref().unwrap();
+        Ok((
+            *pool.input_q.device_ptr() as *mut std::ffi::c_void,
+            *pool.input_scales.device_ptr() as *mut std::ffi::c_void,
+        ))
     }
 
     pub fn get_grouped_gemm_scratch(
@@ -1131,47 +1215,15 @@ mod grouped_gemm_pool {
         input_q_bytes: usize,
         input_scales_bytes: usize,
     ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-        POOL.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let ordinal = dev.ordinal();
-
-            let needs_realloc = match slot.as_ref() {
-                None => true,
-                Some(p) => {
-                    p.device_ordinal != ordinal
-                        || p.input_q_bytes < input_q_bytes
-                        || p.input_scales_bytes < input_scales_bytes
-                }
-            };
-
-            if needs_realloc {
-                let old = slot.take();
-                let (q_sz, s_sz) = if let Some(ref prev) = old {
-                    (
-                        input_q_bytes.max(prev.input_q_bytes),
-                        input_scales_bytes.max(prev.input_scales_bytes),
-                    )
-                } else {
-                    (input_q_bytes, input_scales_bytes)
-                };
-                drop(old);
-                let input_q = unsafe { dev.alloc::<u8>(q_sz.max(1)) }.w()?;
-                let input_scales = unsafe { dev.alloc::<u8>(s_sz.max(1)) }.w()?;
-                *slot = Some(ScratchPool {
-                    input_q,
-                    input_q_bytes: q_sz,
-                    input_scales,
-                    input_scales_bytes: s_sz,
-                    device_ordinal: ordinal,
-                });
+        match crate::fp8_linear::fp8_execution_domain() {
+            crate::fp8_linear::Fp8ExecutionDomain::Eager => {
+                POOL_EAGER.with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes))
             }
-
-            let pool = slot.as_ref().unwrap();
-            Ok((
-                *pool.input_q.device_ptr() as *mut std::ffi::c_void,
-                *pool.input_scales.device_ptr() as *mut std::ffi::c_void,
-            ))
-        })
+            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => POOL_DECODE_GRAPH
+                .with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes)),
+            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => POOL_MTP_GRAPH
+                .with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes)),
+        }
     }
 }
 

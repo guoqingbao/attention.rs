@@ -216,7 +216,11 @@ mod cuda {
 
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
-        pub static FLASHINFER_FP8_WORKSPACE: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        pub static FLASHINFER_FP8_WORKSPACE_EAGER: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        #[cfg(feature = "flashinfer")]
+        pub static FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        #[cfg(feature = "flashinfer")]
+        pub static FLASHINFER_FP8_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Initializes or retrieves the FlashInfer workspace for the given device.
@@ -483,7 +487,7 @@ mod cuda {
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
-        FLASHINFER_FP8_WORKSPACE.with(|cell| {
+        let init = |cell: &std::cell::RefCell<Option<FlashInferFp8Workspace>>| {
             let mut slot = cell.borrow_mut();
             let ordinal = dev.ordinal();
 
@@ -506,7 +510,19 @@ mod cuda {
 
             let ws = slot.as_ref().unwrap();
             Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
-        })
+        };
+
+        match crate::fp8_linear::fp8_execution_domain() {
+            crate::fp8_linear::Fp8ExecutionDomain::Eager => {
+                FLASHINFER_FP8_WORKSPACE_EAGER.with(init)
+            }
+            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => {
+                FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH.with(init)
+            }
+            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
+                FLASHINFER_FP8_WORKSPACE_MTP_GRAPH.with(init)
+            }
+        }
     }
 }
 
