@@ -14,10 +14,10 @@ __global__ void concat_and_cache_mla_kernel(
     const int64_t* __restrict__ slot_mapping,
     const int ckv_stride, const int kpe_stride,
     const int kv_lora_rank, const int kpe_head_dim,
-    const int block_size) {
+    const int block_size, const int num_blocks) {
     const int64_t token_idx = blockIdx.x;
     const int64_t slot_idx = slot_mapping[token_idx];
-    if (slot_idx < 0) {
+    if (slot_idx < 0 || slot_idx >= static_cast<int64_t>(num_blocks) * block_size) {
         return;
     }
 
@@ -39,17 +39,24 @@ __global__ void concat_and_cache_mla_kernel(
     }
 }
 
-extern "C" void concat_and_cache_mla(
+extern "C" cudaError_t concat_and_cache_mla(
     void* ckv,
     void* k_pe,
     void* ckv_cache,
     void* kpe_cache,
     int64_t* slot_mapping,
     int32_t num_tokens, int32_t kv_lora_rank,
-    int32_t kpe_head_dim, int32_t block_size,
+    int32_t kpe_head_dim, int32_t block_size, int32_t num_blocks,
     int32_t ckv_stride, int32_t kpe_stride,
     cudaStream_t stream, uint32_t dtype) {
-    if (num_tokens == 0) return;
+    if (num_tokens == 0) return cudaSuccess;
+    if (kv_lora_rank <= 0 || kpe_head_dim <= 0 || block_size <= 0 || num_blocks <= 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    // Clear a stale asynchronous error so the status returned below belongs
+    // to this launch rather than to an earlier layer's kernel.
+    (void)cudaGetLastError();
 
     dim3 grid(num_tokens);
     int max_dim = kv_lora_rank > kpe_head_dim ? kv_lora_rank : kpe_head_dim;
@@ -60,25 +67,25 @@ extern "C" void concat_and_cache_mla(
             reinterpret_cast<__half*>(ckv), reinterpret_cast<__half*>(k_pe),
             reinterpret_cast<__half*>(ckv_cache),
             reinterpret_cast<__half*>(kpe_cache), slot_mapping, ckv_stride,
-            kpe_stride, kv_lora_rank, kpe_head_dim, block_size);
+            kpe_stride, kv_lora_rank, kpe_head_dim, block_size, num_blocks);
     } else if (dtype == 1) {
         concat_and_cache_mla_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(ckv),
             reinterpret_cast<__nv_bfloat16*>(k_pe),
             reinterpret_cast<__nv_bfloat16*>(ckv_cache),
             reinterpret_cast<__nv_bfloat16*>(kpe_cache), slot_mapping,
-            ckv_stride, kpe_stride, kv_lora_rank, kpe_head_dim, block_size);
+            ckv_stride, kpe_stride, kv_lora_rank, kpe_head_dim, block_size,
+            num_blocks);
     } else if (dtype == 2) {
         concat_and_cache_mla_kernel<float><<<grid, block, 0, stream>>>(
             reinterpret_cast<float*>(ckv), reinterpret_cast<float*>(k_pe),
             reinterpret_cast<float*>(ckv_cache),
             reinterpret_cast<float*>(kpe_cache), slot_mapping, ckv_stride,
-            kpe_stride, kv_lora_rank, kpe_head_dim, block_size);
+            kpe_stride, kv_lora_rank, kpe_head_dim, block_size, num_blocks);
+    } else {
+        return cudaErrorInvalidValue;
     }
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[concat_and_cache_mla] CUDA error: %s\n",
-                cudaGetErrorString(err));
-    }
+    // Check launch configuration without synchronizing the stream.
+    return cudaPeekAtLastError();
 }

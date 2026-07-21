@@ -2829,11 +2829,12 @@ extern "C" {
         kv_lora_rank: c_int,
         kpe_head_dim: c_int,
         block_size: c_int,
+        num_blocks: c_int,
         ckv_stride: c_int,
         kpe_stride: c_int,
         stream: i64,
         dtype: u32,
-    );
+    ) -> c_int;
 
     // =========================================================================
     // Fused MLA paged attention (non-FlashInfer)

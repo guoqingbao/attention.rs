@@ -81,10 +81,102 @@ pub fn concat_and_cache_mla(
 ) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let num_tokens = ckv.dim(0)? as i32;
-        let kv_lora_rank = ckv.dim(1)? as i32;
-        let kpe_head_dim = k_pe.dim(1)? as i32;
-        let block_size = ckv_cache.dim(1)? as i32;
+        let (num_tokens, kv_lora_rank) = ckv.dims2()?;
+        let (kpe_tokens, kpe_head_dim) = k_pe.dims2()?;
+        if kpe_tokens != num_tokens {
+            candle_core::bail!(
+                "concat_and_cache_mla: ckv and k_pe token counts differ ({} vs {})",
+                num_tokens,
+                kpe_tokens
+            );
+        }
+        if ckv.dtype() != k_pe.dtype() {
+            candle_core::bail!(
+                "concat_and_cache_mla: ckv and k_pe dtypes differ ({:?} vs {:?})",
+                ckv.dtype(),
+                k_pe.dtype()
+            );
+        }
+        if !ckv.device().same_device(k_pe.device())
+            || !ckv.device().same_device(ckv_cache.device())
+            || !ckv.device().same_device(kpe_cache.device())
+            || !ckv.device().same_device(slot_mapping.device())
+        {
+            candle_core::bail!("concat_and_cache_mla: all tensors must be on the same device");
+        }
+        if slot_mapping.dtype() != DType::I64 || slot_mapping.dims1()? != num_tokens {
+            candle_core::bail!(
+                "concat_and_cache_mla: slot_mapping must be I64 with {} entries, got {:?} {:?}",
+                num_tokens,
+                slot_mapping.dtype(),
+                slot_mapping.dims()
+            );
+        }
+
+        // The allocator exposes [block, slot, 1, dim], while the fused MLA
+        // kernels consume the equivalent squeezed [block, slot, dim] view.
+        // Accept both forms, but never silently reinterpret another layout.
+        let cache_shape = |name: &str, cache: &Tensor, dim: usize| -> Result<(usize, usize)> {
+            let dims = cache.dims();
+            let (num_blocks, block_size, cache_dim) = match dims {
+                [num_blocks, block_size, cache_dim] => (*num_blocks, *block_size, *cache_dim),
+                [num_blocks, block_size, singleton, cache_dim] if *singleton == 1 => {
+                    (*num_blocks, *block_size, *cache_dim)
+                }
+                _ => candle_core::bail!(
+                    "concat_and_cache_mla: {name} must be [blocks, block, dim] or [blocks, block, 1, dim], got {:?}",
+                    dims
+                ),
+            };
+            if cache.dtype() != ckv.dtype() {
+                candle_core::bail!(
+                    "concat_and_cache_mla: {name} dtype {:?} does not match input {:?}",
+                    cache.dtype(),
+                    ckv.dtype()
+                );
+            }
+            if !cache.is_contiguous() {
+                candle_core::bail!(
+                    "concat_and_cache_mla: {name} must be contiguous, got strides {:?}",
+                    cache.stride()
+                );
+            }
+            if cache_dim != dim {
+                candle_core::bail!(
+                    "concat_and_cache_mla: {name} last dimension is {}, expected {}",
+                    cache_dim,
+                    dim
+                );
+            }
+            Ok((num_blocks, block_size))
+        };
+
+        let (ckv_blocks, block_size) = cache_shape("ckv_cache", ckv_cache, kv_lora_rank)?;
+        let (kpe_blocks, kpe_block_size) = cache_shape("kpe_cache", kpe_cache, kpe_head_dim)?;
+        if ckv_blocks != kpe_blocks || block_size != kpe_block_size {
+            candle_core::bail!(
+                "concat_and_cache_mla: cache page shapes differ: ckv [{}, {}, {}], kpe [{}, {}, {}]",
+                ckv_blocks,
+                block_size,
+                kv_lora_rank,
+                kpe_blocks,
+                kpe_block_size,
+                kpe_head_dim
+            );
+        }
+
+        let num_tokens = i32::try_from(num_tokens)
+            .map_err(|_| candle_core::Error::msg("concat_and_cache_mla: too many tokens"))?;
+        let kv_lora_rank = i32::try_from(kv_lora_rank)
+            .map_err(|_| candle_core::Error::msg("concat_and_cache_mla: ckv rank is too large"))?;
+        let kpe_head_dim = i32::try_from(kpe_head_dim)
+            .map_err(|_| candle_core::Error::msg("concat_and_cache_mla: k_pe rank is too large"))?;
+        let block_size = i32::try_from(block_size).map_err(|_| {
+            candle_core::Error::msg("concat_and_cache_mla: block size is too large")
+        })?;
+        let num_blocks = i32::try_from(ckv_blocks).map_err(|_| {
+            candle_core::Error::msg("concat_and_cache_mla: block count is too large")
+        })?;
         let ckv_stride = ckv.stride()[0] as i32;
         let kpe_stride = k_pe.stride()[0] as i32;
         let dtype = dtype_to_u32(ckv.dtype());
@@ -110,7 +202,7 @@ pub fn concat_and_cache_mla(
         let stream = *dev.cu_stream() as i64;
 
         unsafe {
-            kernels::ffi::concat_and_cache_mla(
+            let status = kernels::ffi::concat_and_cache_mla(
                 ckv_ptr,
                 kpe_ptr,
                 ckv_cache_ptr,
@@ -120,11 +212,18 @@ pub fn concat_and_cache_mla(
                 kv_lora_rank,
                 kpe_head_dim,
                 block_size,
+                num_blocks,
                 ckv_stride,
                 kpe_stride,
                 stream,
                 dtype,
             );
+            if status != 0 {
+                candle_core::bail!(
+                    "concat_and_cache_mla kernel launch failed with CUDA error code {}",
+                    status
+                );
+            }
         }
         Ok(())
     }
