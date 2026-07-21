@@ -317,12 +317,6 @@ extern "C" __global__ void flash_tq_decode_k8v4(
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
-    // `k_scale_ptr` is intentionally null when the caller has no FP8 K-scale
-    // to apply (e.g. GGUF-quantized backbones using TurboQuant V-only
-    // quantization) — `scale_gpu_ptr(None)` in flash.rs produces exactly
-    // this null sentinel. Guard the read: no scale configured means no
-    // rescaling (1.0f), not an unconditional dereference of a pointer that
-    // was deliberately passed as null.
     const float k_scale = k_scale_ptr ? k_scale_ptr[kv_head] : 1.0f;
 
     // Load query into registers (vectorized)
@@ -617,12 +611,6 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
-    // `k_scale_ptr` is intentionally null when the caller has no FP8 K-scale
-    // to apply (e.g. GGUF-quantized backbones using TurboQuant V-only
-    // quantization) — `scale_gpu_ptr(None)` in flash.rs produces exactly
-    // this null sentinel. Guard the read: no scale configured means no
-    // rescaling (1.0f), not an unconditional dereference of a pointer that
-    // was deliberately passed as null.
     const float k_scale = k_scale_ptr ? k_scale_ptr[kv_head] : 1.0f;
 
     const unsigned int bf16_vec_off = lane_id * (HDIM / WARP_SIZE);
