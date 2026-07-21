@@ -317,7 +317,7 @@ extern "C" __global__ void flash_tq_decode_k8v4(
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
-    const float k_scale = k_scale_ptr[kv_head];
+    const float k_scale = k_scale_ptr ? k_scale_ptr[kv_head] : 1.0f;
 
     // Load query into registers (vectorized)
     const unsigned int bf16_vec_off = lane_id * (HDIM / WARP_SIZE);
@@ -611,7 +611,7 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
-    const float k_scale = k_scale_ptr[kv_head];
+    const float k_scale = k_scale_ptr ? k_scale_ptr[kv_head] : 1.0f;
 
     const unsigned int bf16_vec_off = lane_id * (HDIM / WARP_SIZE);
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
