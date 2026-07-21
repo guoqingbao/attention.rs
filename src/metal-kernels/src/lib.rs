@@ -2199,10 +2199,12 @@ pub fn flash_attention_decode(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Shared memory: s_m[NUM_SIMD_GROUPS] + s_l[NUM_SIMD_GROUPS] + s_o[NUM_SIMD_GROUPS * HEAD_DIM]
+    // Shared memory: q_shared(HEAD_DIM), followed by the larger of the
+    // s_m/s_l reduction arrays and s_reduce. The decode kernel still loads Q
+    // into threadgroup memory before using the reduction workspace.
     let num_simd_groups = (NUM_THREADS / 32) as u64;
-    let smem_size = (num_simd_groups * 2 + num_simd_groups * head_size as u64)
-        * std::mem::size_of::<f32>() as u64;
+    let reduction_size = (NUM_THREADS * 2).max(num_simd_groups * head_size as u64);
+    let smem_size = (head_size as u64 + reduction_size) * std::mem::size_of::<f32>() as u64;
     encoder.set_threadgroup_memory_length(0, smem_size);
 
     encoder.set_buffer(0, Some(output), 0);
