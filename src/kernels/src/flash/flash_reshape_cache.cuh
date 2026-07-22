@@ -1,7 +1,7 @@
 /**
  * @brief Reshape-and-cache kernels for writing K/V into paged NHD-layout cache.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_reshape_cache.cuh
  *
  * @details

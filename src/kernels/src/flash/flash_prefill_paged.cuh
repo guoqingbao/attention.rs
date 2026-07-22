@@ -1,7 +1,7 @@
 /**
  * @brief Native Flash Attention v2 — paged prefill with BF16 KV cache, SM80+.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_prefill_paged.cuh
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

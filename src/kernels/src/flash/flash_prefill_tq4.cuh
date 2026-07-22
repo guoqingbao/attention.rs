@@ -1,7 +1,7 @@
 /**
  * @brief TurboQuant-4bit aware Flash Attention v2 paged prefill, SM80+.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_prefill_tq4.cuh
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

@@ -1,7 +1,7 @@
 /**
  * @brief TurboQuant KV cache — k8v4 preset (FP8 keys + 4-bit values), SM80+.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_turboquant.cuh
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

@@ -3,7 +3,7 @@
  * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
  * This kernel computes k_scale and v_scale and update existing ones during fp8 kvcache computation
  *
- * This CUDA kernel is part of the vllm.rs project:
+ * This CUDA kernel is part of the xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/update_kvscales.cu
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

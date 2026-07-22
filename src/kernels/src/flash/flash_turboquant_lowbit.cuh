@@ -1,7 +1,7 @@
 /**
  * @brief TurboQuant KV cache — low-bit variants (turbo4/turbo3), SM80+.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_turboquant_lowbit.cuh
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

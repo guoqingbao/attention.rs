@@ -10,9 +10,9 @@ Sampling is the final step of LLM inference, where a token ID is selected from t
 ## Fused Sampler
 The `Sampler` struct provides a `sample_cuda` method that performs softmax, filtering, and random selection entirely on the GPU.
 
-## Integration in `vllm-rs`
+## Integration in `xInfer (vLLM.rs)`
 
-In `vllm-rs`, the `LogitsProcessor` uses the fast GPU sampler for compatible strategies.
+In `xInfer (vLLM.rs)`, the `LogitsProcessor` uses the fast GPU sampler for compatible strategies.
 
 ```rust
 use attention_rs::sampler::Sampler;

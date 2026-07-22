@@ -21,9 +21,9 @@ The core linear attention operation:
 - `gated_delta_rule_recurrence_varlen`: Batched prefill recurrence using a single CUDA launch for multiple variable-length sequences.
 - `gated_delta_rule_decode_slots`: Decoding recurrence with slot-based state updates.
 
-## Integration in `vllm-rs`
+## Integration in `xInfer (vLLM.rs)`
 
-In `vllm-rs`, the `GatedDeltaNet` layer manages the hybrid forward pass using `MambaCache`.
+In `xInfer (vLLM.rs)`, the `GatedDeltaNet` layer manages the hybrid forward pass using `MambaCache`.
 
 ### Prefill Pass (Batched)
 ```rust

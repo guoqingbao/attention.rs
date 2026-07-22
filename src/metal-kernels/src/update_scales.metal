@@ -3,7 +3,7 @@
  * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
  * This kernel computes k_scale and v_scale and update existing ones during fp8 kvcache computation
  *
- * This Metal kernel is part of the vllm.rs project:
+ * This Metal kernel is part of the xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/metal-kernels/src/update_kvscales.metal
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

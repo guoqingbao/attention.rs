@@ -11,9 +11,9 @@ FP8 (8-bit floating point) offers 2x the throughput of FP16 while maintaining hi
 1.  **Conventional (`fp8_matmul`)**: Optimized CUDA/Metal kernels for general-purpose FP8 matrix-vector or matrix-matrix multiplication.
 2.  **CUTLASS (`fp8_matmul_cutlass`)**: Specialized for NVIDIA **Hopper (H100/H200)** and **Blackwell**. Uses CUTLASS Grouped GEMM for maximum Tensor Core utilization.
 
-## Integration in `vllm-rs`
+## Integration in `xInfer (vLLM.rs)`
 
-In `vllm-rs`, the `LnFp8` (Linear FP8) layer selects the best kernel based on the GPU's Compute Capability.
+In `xInfer (vLLM.rs)`, the `LnFp8` (Linear FP8) layer selects the best kernel based on the GPU's Compute Capability.
 
 ```rust
 use attention_rs::fp8_linear::{fp8_matmul, fp8_matmul_cutlass};

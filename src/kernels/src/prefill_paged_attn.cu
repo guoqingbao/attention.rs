@@ -4,7 +4,7 @@
  * This kernel computes attention during the prefill stage (processing prompt tokens)
  * using a **paged key-value cache**. Each thread computes the output for a token/head pair.
  *
- * This CUDA kernel is part of the vllm.rs project:
+ * This CUDA kernel is part of the xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/prefill_paged_attn.cu
  * Features:
  *  - Support Chunked Prefill (prefilled attention with kvcache)
@@ -80,7 +80,7 @@ __device__ inline T make_zero() {
  * using a **paged key-value cache**. Each thread computes the output for a token/head pair.
  *
  * @author Guoqing Bao
- * This CUDA kernel is part of the vllm.rs project:
+ * This CUDA kernel is part of the xInfer (vLLM.rs) project:
  * Original implmentation: https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/prefill_paged_attn.cu
  * @tparam scalar_t   Data type (e.g., half, float, bfloat16).
  * @tparam HEAD_SIZE  Dimension of each attention head.

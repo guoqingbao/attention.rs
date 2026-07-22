@@ -8,7 +8,7 @@
  * Uses Philox RNG for deterministic, reproducible sampling across runs.
  * Supports float32, float16, and bfloat16 input logits.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/gpu_sampling.cu
  *
  * @details

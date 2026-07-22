@@ -6,7 +6,7 @@
 
 ## 🔍 Overview
 
-`attention.rs` is a collection of high-performance CUDA and Metal kernels designed for Large Language Model (LLM) inference. It provides the foundational operations required for Rust LLM inference engines like [vllm.rs](https://github.com/guoqingbao/vllm.rs) and [candle-vllm](https://github.com/EricLBuehler/candle-vllm).
+`attention.rs` is a collection of high-performance CUDA and Metal kernels designed for Large Language Model (LLM) inference. It provides the foundational operations required for Rust LLM inference engines like [xInfer (vLLM.rs)](https://github.com/guoqingbao/xinfer) and [candle-vllm](https://github.com/EricLBuehler/candle-vllm).
 
 ### 🌟 Key Features
 
@@ -113,4 +113,4 @@ This project is licensed under the **MIT License**.
 
 ---
 
-> 💡 **Used in [vllm.rs](https://github.com/guoqingbao/vllm.rs) and [candle-vllm](https://github.com/EricLBuehler/candle-vllm)**
+> 💡 **Used in [xInfer (vLLM.rs)](https://github.com/guoqingbao/vllm.rs) and [candle-vllm](https://github.com/EricLBuehler/candle-vllm)**

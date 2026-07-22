@@ -6,7 +6,7 @@
  * gating weights (`topk_weights`) and leverages shared memory, vectorized loads,
  * and fused multiply-add operations for maximum performance.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemm.cu
  *
  * @details

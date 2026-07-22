@@ -9,9 +9,9 @@ In a standard implementation, applying RoPE involves:
 
 This requires two kernel launches and intermediate memory. The **Fused RoPE** kernel in `attention-rs` does both in a single pass, reading positions and the global table directly within the RoPE computation.
 
-## Integration in `vllm-rs`
+## Integration in `xInfer (vLLM.rs)`
 
-In `vllm-rs`, the `ApplyRotaryEmbedding` trait is implemented using `FusedRope` for the CUDA backend.
+In `xInfer (vLLM.rs)`, the `ApplyRotaryEmbedding` trait is implemented using `FusedRope` for the CUDA backend.
 
 ```rust
 use attention_rs::fused_rope::FusedRope;

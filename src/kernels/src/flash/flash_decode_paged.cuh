@@ -1,7 +1,7 @@
 /**
  * @brief Native flash decode attention — paged half KV cache, SM75+ (FP16) / SM80+ (BF16).
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode_paged.cuh
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

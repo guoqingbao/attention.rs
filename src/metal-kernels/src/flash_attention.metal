@@ -1,5 +1,5 @@
 /**
- * Metal Flash Attention Kernels for vllm.rs
+ * Metal Flash Attention Kernels for xInfer (vLLM.rs)
  * Copyright (c) 2025, Guoqing Bao. All rights reserved.
  *
  * High-performance flash attention implementation for Apple Metal GPUs.

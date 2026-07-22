@@ -6,7 +6,7 @@
  * large KV-cache scenarios (num_blocks > 64). It uses shared memory tiling for
  * cooperative K/V block loading and binary search for O(log N) sequence lookup.
  *
- * This CUDA kernel is part of the vllm.rs project:
+ * This CUDA kernel is part of the xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/prefill_paged_attn_opt.cu
  * 
  * Optimizations:

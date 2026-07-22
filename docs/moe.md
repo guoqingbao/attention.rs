@@ -13,9 +13,9 @@ To achieve high performance, `attention-rs` follows an optimized pipeline for Mo
    - Uses `moe_gemm` (F16/BF16) or `moe_gemm_fp8` (FP8).
    - Optimized for both Prefill (throughput) and Decode (latency).
 
-## Integration in `vllm-rs`
+## Integration in `xInfer (vLLM.rs)`
 
-In `vllm-rs`, the `FusedMoe` layer uses `attention-rs` for routing and execution:
+In `xInfer (vLLM.rs)`, the `FusedMoe` layer uses `attention-rs` for routing and execution:
 
 ```rust
 use attention_rs::moe;

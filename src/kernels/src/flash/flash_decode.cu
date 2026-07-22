@@ -2,7 +2,7 @@
 /**
  * @brief BF16 paged decode kernel instantiation for native flash attention.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode.cu
  *
  * @details

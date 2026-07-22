@@ -1,7 +1,7 @@
 /**
  * @brief Master instantiation file for native flash attention kernels.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_instantiate.cu
  * 
  * Copyright (c) 2026, Guoqing Bao.  All rights reserved.

@@ -45,7 +45,7 @@ namespace fp8 {
 
   // --- softmax FP8 (E4M3) software fast conversions on GPU Arch < 900 ---
 // Author: Guoqing Bao,
-// Part of the vllm.rs project
+// Part of the xInfer (vLLM.rs) project
 static inline __device__ uint8_t softmax_float_to_fp8_e4m3(float f) {
   // bit-level access
   uint32_t bits = __float_as_uint(f);
@@ -153,7 +153,7 @@ static inline __device__ uint8_t softmax_float_to_fp8_e4m3(float f) {
 }
 
 // Author: Guoqing Bao,
-// Part of the vllm.rs project
+// Part of the xInfer (vLLM.rs) project
 static inline __device__ float softmax_fp8_to_float_e4m3(uint8_t x) {
   int sign = (x >> 7) & 1;
   int exp = (x >> 3) & 0xF;

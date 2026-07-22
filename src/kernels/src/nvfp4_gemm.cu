@@ -21,7 +21,7 @@
  *
  * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/nvfp4_gemm.cu
  *
  * Notes:

@@ -20,7 +20,7 @@ The behavior of the attention kernels is governed by `InputMetadata`:
 
 ## Integration Example
 
-In a real-world engine like `vllm-rs`, `PagedAttention` is integrated into a higher-level `Attention` layer.
+In a real-world engine like `xInfer (vLLM.rs)`, `PagedAttention` is integrated into a higher-level `Attention` layer.
 
 ```rust
 use candle_core::{Tensor, Result, DType};

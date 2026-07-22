@@ -4,7 +4,7 @@
  * This kernel computes attention during the prefill stage (processing prompt tokens)
  * using a **paged key-value cache**. Each thread computes the output for a token/head pair.
  *
- * This Metal kernel is part of the vllm.rs project:
+ * This Metal kernel is part of the xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/metal-kernels/src/prefill_paged_attn.metal
  * Features:
  *  - Support Chunked Prefill (prefilled attention with kvcache)
@@ -1009,7 +1009,7 @@ struct Qk_dot {
  * @tparam TOKEN_CHUNK_SIZE The number of threads in a threadgroup.
  *
  * @author Guoqing Bao
- * This kernel is part of the vllm.rs project
+ * This kernel is part of the xInfer (vLLM.rs) project
  *
  * Optimizations over the baseline:
  *  - Threadgroup Memory Tiling: Cooperative loading of K/V blocks reduces global memory bandwidth.
