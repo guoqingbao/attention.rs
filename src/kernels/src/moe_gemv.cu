@@ -747,7 +747,7 @@ __global__ void moe_gemv_kernel_wna16(
     const float *__restrict__ topk_weights,
     T *__restrict__ output,
     const int num_experts, const int topk, const int M, const int N,
-    const int K, const int group_size) {
+    const int K, const int group_size, const int zero_point) {
   const int token_idx = blockIdx.y;
   if (token_idx >= M) return;
 
@@ -787,7 +787,6 @@ __global__ void moe_gemv_kernel_wna16(
   const int packed_k = K / PACK_FACTOR;
   const int scale_k = K / group_size;
   const uint32_t mask = (1u << BITS) - 1u;
-  const int signed_offset = 1 << (BITS - 1);
   const uint32_t *expert_w =
       weights + (size_t)expert * N * packed_k + (size_t)row * packed_k;
   const T *expert_s =
@@ -809,7 +808,7 @@ __global__ void moe_gemv_kernel_wna16(
       const int k = k_base + q_idx;
       if (k >= K) continue;
       const int q = static_cast<int>((word >> (q_idx * BITS)) & mask) -
-                    signed_offset;
+                    zero_point;
       const float scale = one_scale_per_word
                               ? word_scale
                               : static_cast<float>(expert_s[k / group_size]);
@@ -847,6 +846,7 @@ extern "C" void moe_gemv_wna16(
     int size_k,
     int bits,
     int group_size,
+    int zero_point,
     int dtype,
     cudaStream_t stream) {
   if (bits != 4 && bits != 8) {
@@ -866,7 +866,7 @@ extern "C" void moe_gemv_wna16(
         reinterpret_cast<const T *>(input), weights,
         reinterpret_cast<const T *>(weight_scales), sorted_token_ids,
         expert_ids, topk_weights, reinterpret_cast<T *>(output), num_experts,
-        topk, size_m, size_n, size_k, group_size);
+        topk, size_m, size_n, size_k, group_size, zero_point);
   };
 
   // Match the FP8 GEMV occupancy choices.  Each warp owns one N row, while

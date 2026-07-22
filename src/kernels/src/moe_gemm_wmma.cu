@@ -589,7 +589,7 @@ __global__ void moe_gemm_grouped_kernel_wna16(
     T* __restrict__ output,
     const int num_experts, const int topk,
     const int32_t size_m, const int32_t size_n, const int32_t size_k,
-    const int bits, const int group_size
+    const int bits, const int group_size, const int zero_point
 ) {
     const int expert_id = blockIdx.x;
     const int n_tile_idx = blockIdx.y;
@@ -605,7 +605,6 @@ __global__ void moe_gemm_grouped_kernel_wna16(
 
     const int pack_factor = 32 / bits;
     const uint32_t mask = (1u << bits) - 1u;
-    const int signed_offset = 1 << (bits - 1);
     const int packed_k = (size_k + pack_factor - 1) / pack_factor;
     const int scale_k = (size_k + group_size - 1) / group_size;
     const uint32_t* expert_w = weights + (size_t)expert_id * size_n * packed_k;
@@ -639,7 +638,7 @@ __global__ void moe_gemm_grouped_kernel_wna16(
                 if (n_global < size_n && k_global < size_k) {
                     const uint32_t word = expert_w[(size_t)n_global * packed_k + k_global / pack_factor];
                     const int shift = (k_global % pack_factor) * bits;
-                    const int q = static_cast<int>((word >> shift) & mask) - signed_offset;
+                    const int q = static_cast<int>((word >> shift) & mask) - zero_point;
                     const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k_global / group_size]);
                     B_sh[n_local * K_BLK + k_local] = static_cast<T>(q * scale);
                 } else {
@@ -739,7 +738,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
     T* __restrict__ output,
     const int num_experts, const int topk,
     const int32_t size_m, const int32_t size_n, const int32_t size_k,
-    const int group_size) {
+    const int group_size, const int zero_point) {
     const int expert_id = blockIdx.x;
     const int n_tile_idx = blockIdx.y;
     if (expert_id >= num_experts) return;
@@ -756,7 +755,6 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
     const int packed_k = (size_k + PACK_FACTOR - 1) / PACK_FACTOR;
     const int scale_k = (size_k + group_size - 1) / group_size;
     const uint32_t mask = (1u << BITS) - 1u;
-    const int signed_offset = 1 << (BITS - 1);
 
     const uint32_t* expert_w =
         weights + (size_t)expert_id * size_n * packed_k;
@@ -802,8 +800,14 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                     if (input_aligned) {
                         wna16_cp_async_16(&A_sh[m_local * WNA16_PREFILL_K + k_local], src);
                     } else {
-                        *reinterpret_cast<VecT *>(&A_sh[m_local * WNA16_PREFILL_K + k_local]) =
-                            *reinterpret_cast<const VecT *>(src);
+                        // A routed activation can be a valid, contiguous view
+                        // whose base address is not 16-byte aligned.  Do not
+                        // issue a float4 load in that case: CUDA alignment
+                        // faults here are data-dependent and tend to appear
+                        // only after long-context/sliced scheduling.
+                        for (int j = 0; j < A_VEC; ++j) {
+                            A_sh[m_local * WNA16_PREFILL_K + k_local + j] = src[j];
+                        }
                     }
                 } else {
                     for (int j = 0; j < A_VEC; ++j) {
@@ -844,7 +848,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                             const uint32_t word = word_idx == 0 ? packed.x : packed.y;
 #pragma unroll
                             for (int q_idx = 0; q_idx < 8; ++q_idx) {
-                                const int q = static_cast<int>((word >> (q_idx * 4)) & mask) - signed_offset;
+                                const int q = static_cast<int>((word >> (q_idx * 4)) & mask) - zero_point;
                                 const int k = k_global + word_idx * 8 + q_idx;
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
@@ -862,7 +866,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                             const uint32_t word = word_idx == 0 ? packed.x : (word_idx == 1 ? packed.y : (word_idx == 2 ? packed.z : packed.w));
 #pragma unroll
                             for (int q_idx = 0; q_idx < 4; ++q_idx) {
-                                const int q = static_cast<int>((word >> (q_idx * 8)) & mask) - signed_offset;
+                                const int q = static_cast<int>((word >> (q_idx * 8)) & mask) - zero_point;
                                 const int k = k_global + word_idx * 4 + q_idx;
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
@@ -876,7 +880,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                         const int k = k_global + q_idx;
                         if (k < size_k) {
                             const uint32_t word = row_w[k / PACK_FACTOR];
-                            const int q = static_cast<int>((word >> ((k % PACK_FACTOR) * BITS)) & mask) - signed_offset;
+                            const int q = static_cast<int>((word >> ((k % PACK_FACTOR) * BITS)) & mask) - zero_point;
                             const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
                             dst[q_idx] = static_cast<T>(q * scale);
                         } else {
@@ -928,20 +932,20 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
     moe_gemm_grouped_kernel_wna16_prefill<DTYPE, BITS, 16, 16, 2><<<grid, block, prefill_smem_bytes, stream>>>( \
         reinterpret_cast<const DTYPE*>(input), weights, reinterpret_cast<const DTYPE*>(weight_scales), \
         sorted_token_ids, expert_offsets, topk_weights, reinterpret_cast<DTYPE*>(output), \
-        num_experts, topk, size_m, size_n, size_k, group_size);
+        num_experts, topk, size_m, size_n, size_k, group_size, zero_point);
 
 #define LAUNCH_MOE_WMMA_WNA16(DTYPE, WMMA_M, WMMA_N, WARPS_N) \
     moe_gemm_grouped_kernel_wna16<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>( \
         reinterpret_cast<const DTYPE*>(input), weights, \
         reinterpret_cast<const DTYPE*>(weight_scales), sorted_token_ids, expert_offsets, \
-        topk_weights, reinterpret_cast<DTYPE*>(output), num_experts, topk, size_m, size_n, size_k, bits, group_size);
+        topk_weights, reinterpret_cast<DTYPE*>(output), num_experts, topk, size_m, size_n, size_k, bits, group_size, zero_point);
 
 extern "C" void moe_gemm_wmma_wna16(
     const void* input, const uint32_t* weights, const void* weight_scales,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights, void* output, int32_t* expert_counts,
     int32_t* expert_offsets, int num_experts, int topk, int size_m,
-    int size_n, int size_k, int bits, int group_size, int data_type,
+    int size_n, int size_k, int bits, int group_size, int zero_point, int data_type,
     bool is_prefill, cudaStream_t stream) {
     g_calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
     dim3 grid(num_experts, CEILDIV(size_n, N_BLK), 1);

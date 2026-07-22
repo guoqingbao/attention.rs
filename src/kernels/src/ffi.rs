@@ -678,6 +678,7 @@ extern "C" {
         size_k: i32,
         bits: i32,
         group_size: i32,
+        zero_point: i32,
         data_type: i32,
         is_prefill: bool,
         stream: i64,
@@ -700,6 +701,7 @@ extern "C" {
         size_k: i32,
         bits: i32,
         group_size: i32,
+        zero_point: i32,
         data_type: i32,
         stream: i64,
     );
