@@ -2,7 +2,7 @@
  * @brief Optimized CUDA kernels for MoE GEMV (General Matrix-Vector Multiplication)
  * for the decode phase.
  *
- * This CUDA kernel is developed for vLLM.rs project:
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemv.cu
  *
  * @details
@@ -725,4 +725,180 @@ extern "C" void moe_gemv_fp8(
   } else {
     launch.template operator()<2>();
   }
+}
+
+// ============================================================================
+// Compressed-tensors WNA16 GEMV
+// ============================================================================
+//
+// One warp computes one output row for one routed row.  This is intentionally
+// separate from the grouped WMMA kernel: decode commonly has one token and
+// top-k routed rows, so a WMMA M tile would spend most of its work on zeros.
+// The packed layout is [expert, N, K / (32 / bits)] and scales are
+// [expert, N, K / group_size].
+
+template <typename T, int BITS, int ROWS_PER_BLOCK>
+__global__ void moe_gemv_kernel_wna16(
+    const T *__restrict__ input,
+    const uint32_t *__restrict__ weights,
+    const T *__restrict__ weight_scales,
+    const int32_t *__restrict__ sorted_token_ids,
+    const int32_t *__restrict__ expert_ids,
+    const float *__restrict__ topk_weights,
+    T *__restrict__ output,
+    const int num_experts, const int topk, const int M, const int N,
+    const int K, const int group_size) {
+  const int token_idx = blockIdx.y;
+  if (token_idx >= M) return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+  const int lane_id = tid % 32;
+  const int row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+  const int token_id = sorted_token_ids[token_idx];
+  const int expert = expert_ids[token_idx];
+  if (expert < 0 || expert >= num_experts || row >= N) return;
+
+  const int input_idx = token_id / (topk_weights ? 1 : topk);
+  const T *input_row = input + (size_t)input_idx * K;
+
+  // The scheduler can produce a sliced view with a non-16-byte base offset.
+  // Keep that case correct, but use 128-bit loads for the normal contiguous
+  // case.  The input is shared by all output-row warps in this block.
+  extern __shared__ unsigned char wna16_smem_raw[];
+  T *smem_input = reinterpret_cast<T *>(wna16_smem_raw);
+  const bool input_aligned =
+      ((reinterpret_cast<uintptr_t>(input_row) & 15) == 0) && ((K & 7) == 0);
+  if (input_aligned) {
+    constexpr int INPUT_VEC = 8;
+    const int vec_count = K / INPUT_VEC;
+    for (int i = tid; i < vec_count; i += blockDim.x) {
+      *reinterpret_cast<float4 *>(&smem_input[i * INPUT_VEC]) =
+          *reinterpret_cast<const float4 *>(&input_row[i * INPUT_VEC]);
+    }
+  } else {
+    for (int k = tid; k < K; k += blockDim.x) {
+      smem_input[k] = input_row[k];
+    }
+  }
+  __syncthreads();
+
+  constexpr int PACK_FACTOR = 32 / BITS;
+  const int packed_k = K / PACK_FACTOR;
+  const int scale_k = K / group_size;
+  const uint32_t mask = (1u << BITS) - 1u;
+  const int signed_offset = 1 << (BITS - 1);
+  const uint32_t *expert_w =
+      weights + (size_t)expert * N * packed_k + (size_t)row * packed_k;
+  const T *expert_s =
+      weight_scales + (size_t)expert * N * scale_k + (size_t)row * scale_k;
+
+  float sum0 = 0.0f;
+  float sum1 = 0.0f;
+  for (int packed_idx = lane_id; packed_idx < packed_k; packed_idx += 32) {
+    const uint32_t word = __ldg(expert_w + packed_idx);
+    const int k_base = packed_idx * PACK_FACTOR;
+    const bool one_scale_per_word =
+        group_size >= PACK_FACTOR && (group_size % PACK_FACTOR) == 0;
+    const float word_scale = one_scale_per_word
+                                 ? static_cast<float>(expert_s[k_base / group_size])
+                                 : 0.0f;
+
+#pragma unroll
+    for (int q_idx = 0; q_idx < PACK_FACTOR; ++q_idx) {
+      const int k = k_base + q_idx;
+      if (k >= K) continue;
+      const int q = static_cast<int>((word >> (q_idx * BITS)) & mask) -
+                    signed_offset;
+      const float scale = one_scale_per_word
+                              ? word_scale
+                              : static_cast<float>(expert_s[k / group_size]);
+      const float product =
+          vllm::to_float(smem_input[k]) * (static_cast<float>(q) * scale);
+      if (q_idx & 1) {
+        sum1 += product;
+      } else {
+        sum0 += product;
+      }
+    }
+  }
+
+  float sum = vllm_rs::warp_reduce_sum(sum0 + sum1);
+  if (lane_id == 0) {
+    if (topk_weights) sum *= topk_weights[token_id];
+    T out_value;
+    vllm::from_float(out_value, sum);
+    output[(size_t)token_id * N + row] = out_value;
+  }
+}
+
+extern "C" void moe_gemv_wna16(
+    const void *input,
+    const uint32_t *weights,
+    const void *weight_scales,
+    const int32_t *sorted_token_ids,
+    const int32_t *expert_ids,
+    const float *topk_weights,
+    void *output,
+    int num_experts,
+    int topk,
+    int size_m,
+    int size_n,
+    int size_k,
+    int bits,
+    int group_size,
+    int dtype,
+    cudaStream_t stream) {
+  if (bits != 4 && bits != 8) {
+    fprintf(stderr, "moe_gemv_wna16: bits must be 4 or 8.\n");
+    return;
+  }
+  if (group_size <= 0 || size_k % group_size != 0) {
+    fprintf(stderr, "moe_gemv_wna16: invalid group size.\n");
+    return;
+  }
+
+  auto launch = [&]<typename T, int RPB, int BITS>() {
+    dim3 grid(CEILDIV(size_n, RPB), size_m);
+    dim3 block(RPB * 32);
+    const size_t smem_bytes = (size_t)size_k * sizeof(T);
+    moe_gemv_kernel_wna16<T, BITS, RPB><<<grid, block, smem_bytes, stream>>>(
+        reinterpret_cast<const T *>(input), weights,
+        reinterpret_cast<const T *>(weight_scales), sorted_token_ids,
+        expert_ids, topk_weights, reinterpret_cast<T *>(output), num_experts,
+        topk, size_m, size_n, size_k, group_size);
+  };
+
+  // Match the FP8 GEMV occupancy choices.  Each warp owns one N row, while
+  // all warps in a block reuse the same routed input vector.
+  const bool small_n = size_n <= 512;
+  const int rpb = small_n ? 16 : (size_n <= 2048 ? 8 : (size_n <= 4096 ? 4 : 2));
+  if (dtype == 0) {
+    if (bits == 4) {
+      if (rpb == 16) launch.template operator()<half, 16, 4>();
+      else if (rpb == 8) launch.template operator()<half, 8, 4>();
+      else if (rpb == 4) launch.template operator()<half, 4, 4>();
+      else launch.template operator()<half, 2, 4>();
+    } else {
+      if (rpb == 16) launch.template operator()<half, 16, 8>();
+      else if (rpb == 8) launch.template operator()<half, 8, 8>();
+      else if (rpb == 4) launch.template operator()<half, 4, 8>();
+      else launch.template operator()<half, 2, 8>();
+    }
+  }
+#ifndef NO_BF16_KERNEL
+  else if (dtype == 1) {
+    if (bits == 4) {
+      if (rpb == 16) launch.template operator()<nv_bfloat16, 16, 4>();
+      else if (rpb == 8) launch.template operator()<nv_bfloat16, 8, 4>();
+      else if (rpb == 4) launch.template operator()<nv_bfloat16, 4, 4>();
+      else launch.template operator()<nv_bfloat16, 2, 4>();
+    } else {
+      if (rpb == 16) launch.template operator()<nv_bfloat16, 16, 8>();
+      else if (rpb == 8) launch.template operator()<nv_bfloat16, 8, 8>();
+      else if (rpb == 4) launch.template operator()<nv_bfloat16, 4, 8>();
+      else launch.template operator()<nv_bfloat16, 2, 8>();
+    }
+  }
+#endif
 }
