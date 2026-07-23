@@ -1,5 +1,7 @@
 #[cfg(feature = "cuda")]
 use crate::kernels;
+#[cfg(feature = "cuda")]
+use crate::workspace::get_or_init_mla_decode_workspace;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use crate::workspace::{get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
 #[cfg(feature = "cuda")]
@@ -256,6 +258,7 @@ const MLA_PARTITION_SIZE: usize = 128;
 /// kpe_cache:  [num_blocks, block_size, qk_rope_head_dim]
 /// block_tables: [num_seqs, max_num_blocks_per_seq] (i32)
 /// context_lens: [num_seqs] (i32)
+/// max_context_len: max over context_lens (launch/workspace sized by this, not table capacity)
 /// Returns: [num_seqs, num_heads, kv_lora_rank]
 #[cfg(feature = "cuda")]
 pub fn mla_paged_decode(
@@ -266,6 +269,7 @@ pub fn mla_paged_decode(
     block_tables: &Tensor,
     context_lens: &Tensor,
     scale: f32,
+    max_context_len: usize,
 ) -> Result<Tensor> {
     let num_seqs = q_absorbed.dim(0)?;
     let num_heads = q_absorbed.dim(1)?;
@@ -281,9 +285,13 @@ pub fn mla_paged_decode(
         q_absorbed.device(),
     )?;
 
-    let max_ctx = (max_num_blocks_per_seq as usize) * (block_size as usize);
-    let max_partitions = (max_ctx + MLA_PARTITION_SIZE - 1) / MLA_PARTITION_SIZE;
-    let use_partitioned = max_partitions > 1;
+    let capacity_ctx = (max_num_blocks_per_seq as usize).saturating_mul(block_size as usize);
+    let effective_ctx = if max_context_len == 0 {
+        capacity_ctx
+    } else {
+        max_context_len.min(capacity_ctx).max(1)
+    };
+    let max_partitions = (effective_ctx + MLA_PARTITION_SIZE - 1) / MLA_PARTITION_SIZE;
 
     let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_void;
     let q_abs_ptr = get_cuda_ptr(q_absorbed)?;
@@ -297,76 +305,39 @@ pub fn mla_paged_decode(
     let dev = q_absorbed.device().as_cuda_device()?;
     let stream = *dev.cu_stream() as i64;
 
-    if use_partitioned {
-        let tmp_out = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions, kv_lora_rank],
-            DType::F32,
-            q_absorbed.device(),
-        )?;
-        let tmp_max = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions],
-            DType::F32,
-            q_absorbed.device(),
-        )?;
-        let tmp_sum = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions],
-            DType::F32,
-            q_absorbed.device(),
-        )?;
+    // Always use cached split-K workspace (even for short ctx / 1 partition).
+    let ws = get_or_init_mla_decode_workspace(
+        dev,
+        num_seqs,
+        num_heads,
+        max_partitions.max(1),
+        kv_lora_rank,
+    )?;
 
-        let tmp_out_ptr = get_cuda_ptr(&tmp_out)? as *mut core::ffi::c_void;
-        let tmp_max_ptr = get_cuda_ptr(&tmp_max)? as *mut core::ffi::c_void;
-        let tmp_sum_ptr = get_cuda_ptr(&tmp_sum)? as *mut core::ffi::c_void;
-
-        unsafe {
-            kernels::ffi::mla_paged_attention_decode(
-                out_ptr,
-                q_abs_ptr,
-                q_pe_ptr,
-                ckv_cache_ptr,
-                kpe_cache_ptr,
-                bt_ptr,
-                cl_ptr,
-                scale,
-                num_seqs as i32,
-                num_heads as i32,
-                kv_lora_rank as i32,
-                qk_rope_head_dim as i32,
-                block_size,
-                max_num_blocks_per_seq,
-                dtype,
-                stream,
-                tmp_out_ptr,
-                tmp_max_ptr,
-                tmp_sum_ptr,
-                1,
-            );
-        }
-    } else {
-        unsafe {
-            kernels::ffi::mla_paged_attention_decode(
-                out_ptr,
-                q_abs_ptr,
-                q_pe_ptr,
-                ckv_cache_ptr,
-                kpe_cache_ptr,
-                bt_ptr,
-                cl_ptr,
-                scale,
-                num_seqs as i32,
-                num_heads as i32,
-                kv_lora_rank as i32,
-                qk_rope_head_dim as i32,
-                block_size,
-                max_num_blocks_per_seq,
-                dtype,
-                stream,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                0,
-            );
-        }
+    unsafe {
+        kernels::ffi::mla_paged_attention_decode(
+            out_ptr,
+            q_abs_ptr,
+            q_pe_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            bt_ptr,
+            cl_ptr,
+            scale,
+            num_seqs as i32,
+            num_heads as i32,
+            kv_lora_rank as i32,
+            qk_rope_head_dim as i32,
+            block_size,
+            max_num_blocks_per_seq,
+            effective_ctx as i32,
+            dtype,
+            stream,
+            ws.tmp_out,
+            ws.tmp_max,
+            ws.tmp_sum,
+            1,
+        );
     }
     Ok(output)
 }

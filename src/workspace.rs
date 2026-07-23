@@ -2,7 +2,7 @@
 //!
 //! This module provides a centralized workspace allocation strategy that eliminates
 //! redundant buffer allocations across different modules (moe.rs, fp8_linear.rs,
-//! nvfp4_linear.rs, mxfp4_linear.rs, flashinfer.rs).
+//! nvfp4_linear.rs, mxfp4_linear.rs, flashinfer.rs, mla.rs).
 //!
 //! # Workspace Layout (when `flashinfer` feature is enabled)
 //!
@@ -29,6 +29,12 @@
 //! CUTLASS keeps a separate per-thread device workspace. When `flashinfer` is
 //! enabled, CUTLASS does not alias the FlashInfer float buffer because that
 //! shared path is not stable for the FP8 CUTLASS GEMM kernels.
+//!
+//! # Native MLA decode workspace (FlashInfer disabled / skipped)
+//!
+//! Grow-only f32 buffer for split-K temps (`tmp_out`, `tmp_max`, `tmp_sum`),
+//! lazily allocated on first `mla_paged_decode` use (graph warmup). Separate
+//! eager / CUDA-graph slots keep captured addresses stable.
 //!
 //! # Thread Safety
 //!
@@ -521,6 +527,118 @@ mod cuda {
             }
             crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
                 FLASHINFER_FP8_WORKSPACE_MTP_GRAPH.with(init)
+            }
+        }
+    }
+
+    /// Grow-only workspace for native (non-FlashInfer) MLA split-K decode temps.
+    ///
+    /// Layout (all f32):
+    /// ```text
+    /// [tmp_out | tmp_max | tmp_sum]
+    /// tmp_out: [num_seqs, num_heads, max_partitions, kv_lora_rank]
+    /// tmp_max / tmp_sum: [num_seqs, num_heads, max_partitions]
+    /// ```
+    ///
+    /// Lazily allocated on first `mla_paged_decode` use (typically graph warmup)
+    /// and grown when a larger request arrives. Separate eager / graph slots keep
+    /// CUDA-graph-captured addresses stable.
+    pub struct MlaDecodeWorkspace {
+        pub buffer: CudaSlice<u8>,
+        pub size: usize,
+        pub device_ordinal: usize,
+    }
+
+    thread_local! {
+        static MLA_DECODE_WORKSPACE_EAGER: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+        static MLA_DECODE_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+        static MLA_DECODE_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Pointers into the cached MLA decode workspace.
+    pub struct MlaDecodeWorkspacePtrs {
+        pub tmp_out: *mut std::ffi::c_void,
+        pub tmp_max: *mut std::ffi::c_void,
+        pub tmp_sum: *mut std::ffi::c_void,
+    }
+
+    /// Bytes required for native MLA split-K decode temps.
+    pub fn mla_decode_workspace_bytes(
+        num_seqs: usize,
+        num_heads: usize,
+        max_partitions: usize,
+        kv_lora_rank: usize,
+    ) -> usize {
+        let out_elems = num_seqs
+            .saturating_mul(num_heads)
+            .saturating_mul(max_partitions)
+            .saturating_mul(kv_lora_rank);
+        let meta_elems = num_seqs
+            .saturating_mul(num_heads)
+            .saturating_mul(max_partitions);
+        // tmp_out + tmp_max + tmp_sum, all f32
+        (out_elems.saturating_add(meta_elems.saturating_mul(2))).saturating_mul(4)
+    }
+
+    /// Get or grow the native MLA decode workspace; returns (tmp_out, tmp_max, tmp_sum).
+    pub fn get_or_init_mla_decode_workspace(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        num_seqs: usize,
+        num_heads: usize,
+        max_partitions: usize,
+        kv_lora_rank: usize,
+    ) -> Result<MlaDecodeWorkspacePtrs> {
+        let out_elems = num_seqs
+            .saturating_mul(num_heads)
+            .saturating_mul(max_partitions)
+            .saturating_mul(kv_lora_rank);
+        let meta_elems = num_seqs
+            .saturating_mul(num_heads)
+            .saturating_mul(max_partitions);
+        let out_bytes = out_elems.saturating_mul(4);
+        let meta_bytes = meta_elems.saturating_mul(4);
+        let required = out_bytes
+            .saturating_add(meta_bytes)
+            .saturating_add(meta_bytes)
+            .max(1);
+
+        let init = |cell: &std::cell::RefCell<Option<MlaDecodeWorkspace>>| {
+            let mut slot = cell.borrow_mut();
+            let ordinal = dev.ordinal();
+            let needs_init = match slot.as_ref() {
+                None => true,
+                Some(existing) => existing.device_ordinal != ordinal || existing.size < required,
+            };
+
+            if needs_init {
+                let buffer = unsafe { dev.alloc::<u8>(required) }.w()?;
+                *slot = Some(MlaDecodeWorkspace {
+                    buffer,
+                    size: required,
+                    device_ordinal: ordinal,
+                });
+            }
+
+            let ws = slot.as_ref().unwrap();
+            let base = *ws.buffer.device_ptr() as *mut u8;
+            Ok(MlaDecodeWorkspacePtrs {
+                tmp_out: base as *mut std::ffi::c_void,
+                tmp_max: unsafe { base.add(out_bytes) } as *mut std::ffi::c_void,
+                tmp_sum: unsafe { base.add(out_bytes.saturating_add(meta_bytes)) }
+                    as *mut std::ffi::c_void,
+            })
+        };
+
+        match crate::fp8_linear::fp8_execution_domain() {
+            crate::fp8_linear::Fp8ExecutionDomain::Eager => MLA_DECODE_WORKSPACE_EAGER.with(init),
+            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => {
+                MLA_DECODE_WORKSPACE_DECODE_GRAPH.with(init)
+            }
+            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
+                MLA_DECODE_WORKSPACE_MTP_GRAPH.with(init)
             }
         }
     }

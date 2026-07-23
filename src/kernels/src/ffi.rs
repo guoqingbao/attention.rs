@@ -2903,6 +2903,7 @@ extern "C" {
         qk_rope_head_dim: c_int,
         block_size: c_int,
         max_num_blocks_per_seq: c_int,
+        max_context_len: c_int,
         dtype: u32,
         stream: i64,
         tmp_out_buf: *mut c_void,
