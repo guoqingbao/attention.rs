@@ -601,7 +601,7 @@ template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
 __global__ void moe_gemm_grouped_kernel_wna16(
     const T* __restrict__ input,
     const uint32_t* __restrict__ weights,
-    const T* __restrict__ weight_scales,
+    const float* __restrict__ weight_scales,
     const int32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
@@ -627,7 +627,7 @@ __global__ void moe_gemm_grouped_kernel_wna16(
     const int packed_k = (size_k + pack_factor - 1) / pack_factor;
     const int scale_k = (size_k + group_size - 1) / group_size;
     const uint32_t* expert_w = weights + (size_t)expert_id * size_n * packed_k;
-    const T* expert_s = weight_scales + (size_t)expert_id * size_n * scale_k;
+    const float* expert_s = weight_scales + (size_t)expert_id * size_n * scale_k;
 
     extern __shared__ uint8_t smem_bytes[];
     T* A_sh = reinterpret_cast<T*>(smem_bytes);
@@ -658,7 +658,7 @@ __global__ void moe_gemm_grouped_kernel_wna16(
                     const uint32_t word = expert_w[(size_t)n_global * packed_k + k_global / pack_factor];
                     const int shift = (k_global % pack_factor) * bits;
                     const int q = static_cast<int>((word >> shift) & mask) - zero_point;
-                    const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k_global / group_size]);
+                    const float scale = expert_s[(size_t)n_global * scale_k + k_global / group_size];
                     B_sh[n_local * K_BLK + k_local] = vllm::wna16_dequant<T>(q, scale);
                 } else {
                     B_sh[n_local * K_BLK + k_local] = vllm::wna16_zero<T>();
@@ -750,7 +750,7 @@ template<typename T, int BITS, int WMMA_M, int WMMA_N, int WARPS_N>
 __global__ void moe_gemm_grouped_kernel_wna16_prefill(
     const T* __restrict__ input,
     const uint32_t* __restrict__ weights,
-    const T* __restrict__ weight_scales,
+    const float* __restrict__ weight_scales,
     const int32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
@@ -777,7 +777,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
 
     const uint32_t* expert_w =
         weights + (size_t)expert_id * size_n * packed_k;
-    const T* expert_s =
+    const float* expert_s =
         weight_scales + (size_t)expert_id * size_n * scale_k;
 
     extern __shared__ uint8_t smem_bytes[];
@@ -860,7 +860,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                     if constexpr (BITS == 4) {
                         const uint2 packed = *reinterpret_cast<const uint2 *>(row_w + packed_start);
                         const float segment_scale = uniform_scale_segment
-                            ? static_cast<float>(expert_s[(size_t)n_global * scale_k + k_global / group_size])
+                            ? expert_s[(size_t)n_global * scale_k + k_global / group_size]
                             : 0.0f;
 #pragma unroll
                         for (int word_idx = 0; word_idx < 2; ++word_idx) {
@@ -871,14 +871,14 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                                 const int k = k_global + word_idx * 8 + q_idx;
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
-                                    : static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
+                                    : expert_s[(size_t)n_global * scale_k + k / group_size];
                                 dst[word_idx * 8 + q_idx] = vllm::wna16_dequant<T>(q, scale);
                             }
                         }
                     } else {
                         const uint4 packed = *reinterpret_cast<const uint4 *>(row_w + packed_start);
                         const float segment_scale = uniform_scale_segment
-                            ? static_cast<float>(expert_s[(size_t)n_global * scale_k + k_global / group_size])
+                            ? expert_s[(size_t)n_global * scale_k + k_global / group_size]
                             : 0.0f;
 #pragma unroll
                         for (int word_idx = 0; word_idx < 4; ++word_idx) {
@@ -889,7 +889,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                                 const int k = k_global + word_idx * 4 + q_idx;
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
-                                    : static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
+                                    : expert_s[(size_t)n_global * scale_k + k / group_size];
                                 dst[word_idx * 4 + q_idx] = vllm::wna16_dequant<T>(q, scale);
                             }
                         }
@@ -900,7 +900,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                         if (k < size_k) {
                             const uint32_t word = row_w[k / PACK_FACTOR];
                             const int q = static_cast<int>((word >> ((k % PACK_FACTOR) * BITS)) & mask) - zero_point;
-                            const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
+                            const float scale = expert_s[(size_t)n_global * scale_k + k / group_size];
                             dst[q_idx] = vllm::wna16_dequant<T>(q, scale);
                         } else {
                             dst[q_idx] = vllm::wna16_zero<T>();
@@ -953,14 +953,14 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
 
 #define LAUNCH_MOE_WMMA_WNA16_PREFILL(DTYPE, BITS) \
     moe_gemm_grouped_kernel_wna16_prefill<DTYPE, BITS, 16, 16, 2><<<grid, block, prefill_smem_bytes, stream>>>( \
-        reinterpret_cast<const DTYPE*>(input), weights, reinterpret_cast<const DTYPE*>(weight_scales), \
+        reinterpret_cast<const DTYPE*>(input), weights, reinterpret_cast<const float*>(weight_scales), \
         sorted_token_ids, expert_offsets, topk_weights, reinterpret_cast<DTYPE*>(output), \
         num_experts, topk, size_m, size_n, size_k, group_size, zero_point);
 
 #define LAUNCH_MOE_WMMA_WNA16(DTYPE, WMMA_M, WMMA_N, WARPS_N) \
     moe_gemm_grouped_kernel_wna16<DTYPE, WMMA_M, WMMA_N, WARPS_N><<<grid, block, smem_bytes, stream>>>( \
         reinterpret_cast<const DTYPE*>(input), weights, \
-        reinterpret_cast<const DTYPE*>(weight_scales), sorted_token_ids, expert_offsets, \
+        reinterpret_cast<const float*>(weight_scales), sorted_token_ids, expert_offsets, \
         topk_weights, reinterpret_cast<DTYPE*>(output), num_experts, topk, size_m, size_n, size_k, bits, group_size, zero_point);
 
 extern "C" void moe_gemm_wmma_wna16(

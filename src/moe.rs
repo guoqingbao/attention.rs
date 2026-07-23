@@ -674,8 +674,14 @@ pub fn moe_gemm_wna16(
                 weight_scales.dims()
             );
         }
-        if input.dtype() != weight_scales.dtype() {
-            candle_core::bail!("WNA16 input and scale dtypes must match");
+        // Keep scales in F32 regardless of activation dtype. Loading them as
+        // F16/BF16 throws away mantissa when the checkpoint (or an F32 source)
+        // had more precision; dequant already multiplies in float.
+        if weight_scales.dtype() != candle::DType::F32 {
+            candle_core::bail!(
+                "WNA16 weight_scales must be F32 (got {:?}); load with DType::F32",
+                weight_scales.dtype()
+            );
         }
 
         let dtype = match input.dtype() {
@@ -711,7 +717,7 @@ pub fn moe_gemm_wna16(
             .as_cuda_slice::<u32>()?
             .slice(weights_l.start_offset()..);
         let scales = scales_s
-            .as_cuda_slice::<T>()?
+            .as_cuda_slice::<f32>()?
             .slice(scales_l.start_offset()..);
 
         let (sorted_s, sorted_l) = sorted_token_ids.storage_and_layout();
@@ -753,7 +759,7 @@ pub fn moe_gemm_wna16(
                 crate::kernels::ffi::moe_gemv_wna16(
                     *input.device_ptr() as *const c_void,
                     *weights.device_ptr() as *const u32,
-                    *scales.device_ptr() as *const c_void,
+                    *scales.device_ptr() as *const f32 as *const c_void,
                     *sorted.device_ptr() as *const i32,
                     *experts.device_ptr() as *const i32,
                     topk_ptr,
@@ -782,7 +788,7 @@ pub fn moe_gemm_wna16(
             crate::kernels::ffi::moe_gemm_wmma_wna16(
                 *input.device_ptr() as *const c_void,
                 *weights.device_ptr() as *const u32,
-                *scales.device_ptr() as *const c_void,
+                *scales.device_ptr() as *const f32 as *const c_void,
                 *sorted.device_ptr() as *const i32,
                 *experts.device_ptr() as *const i32,
                 topk_ptr,

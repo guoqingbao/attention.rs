@@ -9,7 +9,7 @@
  * @details
  * Per-Q-head paged decode with online softmax. 8 warps split the KV
  * sequence; each thread covers head_dim/32 BF16 elements. Batched (BC=4)
- * score/V accumulation reduces __expf calls. GQA_RATIO compile-time
+ * score/V accumulation reduces expf calls. GQA_RATIO compile-time
  * parameter controls Q heads per CTA (always 1 in current dispatch).
  * Includes main decode, split-K, and reduce kernels.
  *
@@ -202,14 +202,14 @@ extern "C" __global__ void flash_decode_paged(
                 float m_new = m_val[g];
                 #pragma unroll
                 for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[g][b]);
-                float exp_old = __expf(m_val[g] - m_new);
+                float exp_old = expf(m_val[g] - m_new);
                 #pragma unroll
                 for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] *= exp_old;
                 l_val[g] *= exp_old;
 
                 #pragma unroll
                 for (int b = 0; b < BC; b++) {
-                    float w = __expf(scores[g][b] - m_new);
+                    float w = expf(scores[g][b] - m_new);
                     l_val[g] += w;
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] += w * vf_batch[b][i];
@@ -249,8 +249,8 @@ extern "C" __global__ void flash_decode_paged(
                 if (softcap > 0.f) score = softcap * tanhf(score / softcap);
 
                 float m_new = fmaxf(m_val[g], score);
-                float exp_old = __expf(m_val[g] - m_new);
-                float exp_new = __expf(score - m_new);
+                float exp_old = expf(m_val[g] - m_new);
+                float exp_new = expf(score - m_new);
                 l_val[g] = l_val[g] * exp_old + exp_new;
                 #pragma unroll
                 for (int i = 0; i < VEC_BF16; i++)
@@ -285,7 +285,7 @@ extern "C" __global__ void flash_decode_paged(
                 if (lw > 0.f) {
                     float mw = smem_m[g][other], my_m = smem_m[g][warp_id], my_l = smem_l[g][warp_id];
                     float m_new = fmaxf(my_m, mw);
-                    float scale_me = __expf(my_m - m_new), scale_w = __expf(mw - m_new);
+                    float scale_me = expf(my_m - m_new), scale_w = expf(mw - m_new);
                     smem_l[g][warp_id] = my_l * scale_me + lw * scale_w;
                     smem_m[g][warp_id] = m_new;
                     #pragma unroll
@@ -466,13 +466,13 @@ extern "C" __global__ void flash_decode_paged_splitk(
                     float m_new = m_val[g];
                     #pragma unroll
                     for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[g][b]);
-                    float exp_old = __expf(m_val[g] - m_new);
+                    float exp_old = expf(m_val[g] - m_new);
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] *= exp_old;
                     l_val[g] *= exp_old;
                     #pragma unroll
                     for (int b = 0; b < BC; b++) {
-                        float w = __expf(scores[g][b] - m_new);
+                        float w = expf(scores[g][b] - m_new);
                         l_val[g] += w;
                         #pragma unroll
                         for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] += w * vf_batch[b][i];
@@ -510,7 +510,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                     if (softcap > 0.f) score = softcap * tanhf(score / softcap);
 
                     float m_new = fmaxf(m_val[g], score);
-                    float exp_old = __expf(m_val[g] - m_new), exp_new = __expf(score - m_new);
+                    float exp_old = expf(m_val[g] - m_new), exp_new = expf(score - m_new);
                     l_val[g] = l_val[g] * exp_old + exp_new;
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++)
@@ -545,7 +545,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                 if (lw > 0.f) {
                     float mw = smem_m[g][other], my_m = smem_m[g][warp_id], my_l = smem_l[g][warp_id];
                     float m_new = fmaxf(my_m, mw);
-                    float scale_me = __expf(my_m - m_new), scale_w = __expf(mw - m_new);
+                    float scale_me = expf(my_m - m_new), scale_w = expf(mw - m_new);
                     smem_l[g][warp_id] = my_l * scale_me + lw * scale_w;
                     smem_m[g][warp_id] = m_new;
                     #pragma unroll
@@ -607,7 +607,7 @@ extern "C" __global__ void flash_decode_paged_reduce(
         float ms = ws[head_dim], ls = ws[head_dim + 1];
         if (ls <= 0.f) continue;
         float m_new = fmaxf(m, ms);
-        float scale_me = __expf(m - m_new), scale_s = __expf(ms - m_new);
+        float scale_me = expf(m - m_new), scale_s = expf(ms - m_new);
         #pragma unroll
         for (int i = 0; i < VEC_BF16; i++)
             o_reg[i] = o_reg[i] * scale_me + ws[vec_off + i] * scale_s;

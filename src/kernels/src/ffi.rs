@@ -660,7 +660,7 @@ extern "C" {
 
     // Grouped MoE WNA16 (compressed-tensors pack-quantized) kernel.
     // Weights are dense INT{4,8} values packed along K into uint32 words;
-    // scales are symmetric per-group and kept in the input dtype.
+    // scales are symmetric per-group and kept in F32 for dequant precision.
     pub fn moe_gemm_wmma_wna16(
         input: *const c_void,
         weights: *const u32,
@@ -3128,6 +3128,30 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM80+ F16 Tensor Core native flash prefill (aliases to BF16-era API on SM70/75).
+    #[cfg(feature = "flash")]
+    pub fn call_flash_prefill_paged_f16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_tables: *const c_int,
+        block_table_stride: u32,
+        cu_seqlens_q: *const u32,
+        context_lens: *const u32,
+        num_seqs: u32,
+        max_q_len: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        sliding_window: u32,
+        causal: u32,
+        inv_sqrt_d: f32,
+        softcap: f32,
+        stream: i64,
+    );
+
     #[cfg(feature = "flash")]
     pub fn call_flash_prefill_paged_fp8(
         q: *const c_void,
@@ -3177,6 +3201,28 @@ extern "C" {
     );
 
     #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_f16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        o: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        q_stride: u32,
+        sliding_window: u32,
+        softcap: f32,
+        gqa_ratio: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
     pub fn call_flash_decode_paged_splitk(
         q: *const c_void,
         k_cache: *const c_void,
@@ -3200,7 +3246,41 @@ extern "C" {
     );
 
     #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_splitk_f16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        workspace: *mut c_void,
+        block_tables: *const c_int,
+        seq_lens: *const c_int,
+        max_blocks_per_seq: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        inv_sqrt_d: f32,
+        num_seqs: u32,
+        num_splits: u32,
+        q_stride: u32,
+        softcap: f32,
+        sliding_window: u32,
+        gqa_ratio: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
     pub fn call_flash_decode_paged_reduce(
+        workspace: *const c_void,
+        o: *mut c_void,
+        num_q_heads: u32,
+        head_dim: u32,
+        num_splits: u32,
+        num_seqs: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_decode_paged_reduce_f16(
         workspace: *const c_void,
         o: *mut c_void,
         num_q_heads: u32,
@@ -3263,6 +3343,20 @@ extern "C" {
 
     #[cfg(feature = "flash")]
     pub fn call_flash_reshape_and_cache_bf16(
+        key: *const c_void,
+        value: *const c_void,
+        key_cache: *mut c_void,
+        value_cache: *mut c_void,
+        slot_mapping: *const i64,
+        num_tokens: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        cache_block_size: u32,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flash")]
+    pub fn call_flash_reshape_and_cache_f16(
         key: *const c_void,
         value: *const c_void,
         key_cache: *mut c_void,

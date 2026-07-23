@@ -26,7 +26,7 @@
  */
 // Key differences from atlas GB10 (SM121):
 //   - Uses ldmatrix.x4 / ldmatrix.trans for efficient smem→register loads (SM80+)
-//   - Uses hardware __expf (high-BW GPUs have plenty of SFU throughput)
+//   - Uses IEEE expf for long-context softmax stability (was __expf)
 //   - cp.async.cg for vectorized 16-byte global→shared loads
 //
 // Algorithm: Tiled online softmax over KV sequence (Flash Attention v2).
@@ -346,14 +346,14 @@ flash_prefill_paged(
         // Online softmax rescale
         float mn0 = fmaxf(m_r0, rmax0);
         if (mn0 != m_r0) {
-            float eo0 = __expf(m_r0 - mn0); l_r0 *= eo0;
+            float eo0 = expf(m_r0 - mn0); l_r0 *= eo0;
             #pragma unroll
             for (int i = 0; i < N_TILES_PER_WARP; i++) { acc_o[i][0] *= eo0; acc_o[i][1] *= eo0; }
             m_r0 = mn0;
         }
         float mn1 = fmaxf(m_r1, rmax1);
         if (mn1 != m_r1) {
-            float eo1 = __expf(m_r1 - mn1); l_r1 *= eo1;
+            float eo1 = expf(m_r1 - mn1); l_r1 *= eo1;
             #pragma unroll
             for (int i = 0; i < N_TILES_PER_WARP; i++) { acc_o[i][2] *= eo1; acc_o[i][3] *= eo1; }
             m_r1 = mn1;
@@ -363,8 +363,8 @@ flash_prefill_paged(
         float sum0 = 0.f, sum1 = 0.f;
         #pragma unroll
         for (int nt = 0; nt < 2; nt++) {
-            float p00 = __expf(acc_s[nt][0] - m_r0), p01 = __expf(acc_s[nt][1] - m_r0);
-            float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
+            float p00 = expf(acc_s[nt][0] - m_r0), p01 = expf(acc_s[nt][1] - m_r0);
+            float p10 = expf(acc_s[nt][2] - m_r1), p11 = expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
             smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
@@ -679,14 +679,14 @@ extern "C" __global__ void flash_prefill_paged(
 
             float mn0 = fmaxf(m_r0, rmax0);
             if (mn0 != m_r0) {
-                float eo0 = __expf(m_r0 - mn0); l_r0 *= eo0;
+                float eo0 = expf(m_r0 - mn0); l_r0 *= eo0;
                 #pragma unroll
                 for (int i = 0; i < N_TILES_PER_WARP_512; i++) { acc_o[i][0] *= eo0; acc_o[i][1] *= eo0; }
                 m_r0 = mn0;
             }
             float mn1 = fmaxf(m_r1, rmax1);
             if (mn1 != m_r1) {
-                float eo1 = __expf(m_r1 - mn1); l_r1 *= eo1;
+                float eo1 = expf(m_r1 - mn1); l_r1 *= eo1;
                 #pragma unroll
                 for (int i = 0; i < N_TILES_PER_WARP_512; i++) { acc_o[i][2] *= eo1; acc_o[i][3] *= eo1; }
                 m_r1 = mn1;
@@ -695,8 +695,8 @@ extern "C" __global__ void flash_prefill_paged(
             float sum0 = 0.f, sum1 = 0.f;
             #pragma unroll
             for (int nt = 0; nt < 4; nt++) {
-                float p00 = __expf(acc_s[nt][0] - m_r0), p01 = __expf(acc_s[nt][1] - m_r0);
-                float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
+                float p00 = expf(acc_s[nt][0] - m_r0), p01 = expf(acc_s[nt][1] - m_r0);
+                float p10 = expf(acc_s[nt][2] - m_r1), p11 = expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
                 smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
@@ -728,13 +728,13 @@ extern "C" __global__ void flash_prefill_paged(
             unsigned int r0 = pv_warp_m + group_id, r1 = r0 + 8;
             float cm0 = smem_ml[r0 * 2], cm1 = smem_ml[r1 * 2];
             if (cm0 != m_r0) {
-                float er0 = __expf(m_r0 - cm0);
+                float er0 = expf(m_r0 - cm0);
                 #pragma unroll
                 for (int i = 0; i < N_TILES_PER_WARP_512; i++) { acc_o[i][0] *= er0; acc_o[i][1] *= er0; }
                 m_r0 = cm0;
             }
             if (cm1 != m_r1) {
-                float er1 = __expf(m_r1 - cm1);
+                float er1 = expf(m_r1 - cm1);
                 #pragma unroll
                 for (int i = 0; i < N_TILES_PER_WARP_512; i++) { acc_o[i][2] *= er1; acc_o[i][3] *= er1; }
                 m_r1 = cm1;

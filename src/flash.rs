@@ -134,7 +134,25 @@ pub fn flash_reshape_and_cache(
                 stream,
             );
         }
-    } else {
+    } else if key.dtype() == DType::F16 {
+        // SM70/75: *_f16 aliases to F16 kernels named *_bf16.
+        // SM80+: real F16 reshape (flash_f16.cu / FLASH_FORCE_F16).
+        unsafe {
+            kernels::ffi::call_flash_reshape_and_cache_f16(
+                key_ptr,
+                value_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                slot_ptr,
+                num_tokens as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                stream,
+            );
+        }
+    } else if key.dtype() == DType::BF16 {
+        // SM80+: real BF16. SM70/75 never reach here (xinfer forces F16).
         unsafe {
             kernels::ffi::call_flash_reshape_and_cache_bf16(
                 key_ptr,
@@ -149,6 +167,11 @@ pub fn flash_reshape_and_cache(
                 stream,
             );
         }
+    } else {
+        candle::bail!(
+            "flash_reshape_and_cache: unsupported key dtype {:?} (need F16 or BF16)",
+            key.dtype()
+        );
     }
     Ok(())
 }
@@ -248,7 +271,31 @@ pub fn flash_prefill(
                 stream,
             );
         }
-    } else {
+    } else if query.dtype() == DType::F16 {
+        unsafe {
+            kernels::ffi::call_flash_prefill_paged_f16(
+                q_ptr,
+                kc_ptr,
+                vc_ptr,
+                o_ptr,
+                bt_ptr,
+                block_table_stride,
+                cu_ptr,
+                cl_ptr,
+                num_seqs as u32,
+                actual_max_q_len as u32,
+                num_q_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                sw,
+                1,
+                scale,
+                softcap,
+                stream,
+            );
+        }
+    } else if query.dtype() == DType::BF16 {
         unsafe {
             kernels::ffi::call_flash_prefill_paged(
                 q_ptr,
@@ -272,14 +319,36 @@ pub fn flash_prefill(
                 stream,
             );
         }
+    } else {
+        candle::bail!(
+            "flash_prefill: unsupported query dtype {:?} (need F16 or BF16)",
+            query.dtype()
+        );
     }
 
     Ok(o)
 }
 
-pub const SPLIT_K_THRESHOLD: usize = 1024;
+/// Prefer a single-pass decode below this length. Split-K changes reduction
+/// order and was a source of slight long-context drift vs FlashInfer (Metal
+/// uses 8192 for the same reason).
+pub const SPLIT_K_THRESHOLD: usize = 8192;
+/// Workspace capacity / hard cap for split-K partials.
 pub const NUM_SPLITS: u32 = 16;
 pub const TQ_NUM_SPLITS: u32 = 16;
+/// Target KV tokens per split. Fixed 16-way splits at ~50k (~3k tokens/split)
+/// over-fragmented the online softmax and amplified slight decode drift.
+const TARGET_TOKENS_PER_SPLIT: usize = 8192;
+
+/// Adaptive split count for native flash decode. Always ≤ [`NUM_SPLITS`] so the
+/// preallocated workspace remains valid.
+pub fn flash_num_splits(max_context_len: usize) -> u32 {
+    if max_context_len < SPLIT_K_THRESHOLD {
+        return 1;
+    }
+    let needed = (max_context_len + TARGET_TOKENS_PER_SPLIT - 1) / TARGET_TOKENS_PER_SPLIT;
+    (needed as u32).clamp(2, NUM_SPLITS)
+}
 
 #[cfg(feature = "cuda")]
 pub fn flash_decode(
@@ -335,7 +404,8 @@ pub fn flash_decode(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let sw = sliding_window.unwrap_or(0) as u32;
     let is_fp8 = key_cache.dtype() == DType::U8;
-    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let num_splits = flash_num_splits(max_context_len);
+    let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
     // GQA disabled for native flash path: shared memory overflow at higher ratios
     // (e.g. GQA=8 with HDIM=256 needs 64KB smem, exceeding 48KB limit).
@@ -365,7 +435,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     q_stride,
                     softcap,
                     ks_ptr,
@@ -380,7 +450,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     num_seqs as u32,
                     stream,
                 );
@@ -412,7 +482,67 @@ pub fn flash_decode(
                 );
             }
         }
-    } else {
+    } else if query.dtype() == DType::F16 {
+        if use_splitk {
+            let ws = workspace.unwrap();
+            let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+            unsafe {
+                kernels::ffi::call_flash_decode_paged_splitk_f16(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    ws_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    num_splits,
+                    q_stride,
+                    softcap,
+                    sw,
+                    effective_gqa as u32,
+                    stream,
+                );
+                kernels::ffi::call_flash_decode_paged_reduce_f16(
+                    ws_ptr as *const std::ffi::c_void,
+                    o_ptr,
+                    num_q_heads as u32,
+                    head_dim as u32,
+                    num_splits,
+                    num_seqs as u32,
+                    stream,
+                );
+            }
+        } else {
+            unsafe {
+                kernels::ffi::call_flash_decode_paged_f16(
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    o_ptr,
+                    bt_ptr,
+                    cl_ptr,
+                    max_blocks_per_seq,
+                    num_q_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    scale,
+                    num_seqs as u32,
+                    q_stride,
+                    sw,
+                    softcap,
+                    effective_gqa as u32,
+                    stream,
+                );
+            }
+        }
+    } else if query.dtype() == DType::BF16 {
         if use_splitk {
             let ws = workspace.unwrap();
             let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
@@ -431,7 +561,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     q_stride,
                     softcap,
                     sw,
@@ -443,7 +573,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     num_seqs as u32,
                     stream,
                 );
@@ -472,6 +602,11 @@ pub fn flash_decode(
                 );
             }
         }
+    } else {
+        candle::bail!(
+            "flash_decode: unsupported query dtype {:?} (need F16 or BF16)",
+            query.dtype()
+        );
     }
 
     Ok(output.clone())
@@ -637,7 +772,8 @@ pub fn flash_tq_decode_k8v4_splitk(
     workspace: Option<&Tensor>,
     sliding_window: Option<usize>,
 ) -> Result<Tensor> {
-    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let num_splits = flash_num_splits(max_context_len);
+    let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
     if !use_splitk {
         return flash_tq_decode_k8v4(
@@ -713,7 +849,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             head_dim as u32,
             block_size as u32,
             scale,
-            TQ_NUM_SPLITS,
+            num_splits,
             num_seqs as u32,
             q_stride,
             softcap,
@@ -726,7 +862,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             o_ptr,
             num_q_heads as u32,
             head_dim as u32,
-            TQ_NUM_SPLITS,
+            num_splits,
             num_seqs as u32,
             stream,
         );
@@ -855,7 +991,8 @@ pub fn flash_tq4_decode(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let sw = sliding_window.unwrap_or(0) as u32;
 
-    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let num_splits = flash_num_splits(max_context_len);
+    let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
     if use_splitk {
         let ws = workspace.unwrap();
@@ -876,7 +1013,7 @@ pub fn flash_tq4_decode(
                 head_dim as u32,
                 block_size_from_absmax as u32,
                 scale,
-                TQ_NUM_SPLITS,
+                num_splits,
                 num_seqs as u32,
                 q_stride,
                 softcap,
@@ -888,7 +1025,7 @@ pub fn flash_tq4_decode(
                 o_ptr,
                 num_q_heads as u32,
                 head_dim as u32,
-                TQ_NUM_SPLITS,
+                num_splits,
                 num_seqs as u32,
                 stream,
             );
@@ -1042,7 +1179,8 @@ pub fn flash_tq3_decode(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let sw = sliding_window.unwrap_or(0) as u32;
 
-    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let num_splits = flash_num_splits(max_context_len);
+    let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
 
     if use_splitk {
         let ws = workspace.unwrap();
@@ -1063,7 +1201,7 @@ pub fn flash_tq3_decode(
                 head_dim as u32,
                 block_size_from_absmax as u32,
                 scale,
-                TQ_NUM_SPLITS,
+                num_splits,
                 num_seqs as u32,
                 q_stride,
                 softcap,
@@ -1075,7 +1213,7 @@ pub fn flash_tq3_decode(
                 o_ptr,
                 num_q_heads as u32,
                 head_dim as u32,
-                TQ_NUM_SPLITS,
+                num_splits,
                 num_seqs as u32,
                 stream,
             );

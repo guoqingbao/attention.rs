@@ -37,7 +37,7 @@
 #define WARP_SIZE 32
 #endif
 
-// BF16 → BF16 cache write
+// BF16 → BF16 (or F16 → F16 when FLASH_FORCE_F16) cache write
 extern "C" __global__ void flash_reshape_and_cache(
     const flash_half_t* __restrict__ key,
     const flash_half_t* __restrict__ value,
@@ -80,6 +80,8 @@ extern "C" __global__ void flash_reshape_and_cache(
         }
     }
 }
+
+#ifndef FLASH_F16_RESHAPE_ONLY
 
 // BF16 → FP8 E4M3 cache write (with per-head GPU scale pointers)
 extern "C" __global__ void flash_reshape_and_cache_fp8(
@@ -161,3 +163,5 @@ extern "C" __global__ void flash_bf16_absmax(
         atomicMax((int*)scale_out, __float_as_int(fmaxf(block_max, 1e-12f) / 448.f));
     }
 }
+
+#endif // FLASH_F16_RESHAPE_ONLY

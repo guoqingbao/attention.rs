@@ -5,11 +5,16 @@
  * and run across SM70 (Volta), SM75 (Turing), and SM80+ (Ampere/Hopper/Blackwell)
  * using the best available Tensor Core MMA instructions for each architecture.
  *
- * SM80+ path (NO_BF16_KERNEL not defined):
+ * SM80+ path (NO_BF16_KERNEL not defined, FLASH_FORCE_F16 not defined):
  *   - __nv_bfloat16 (BF16) as the half-precision type
  *   - mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
  *   - cp.async.cg.shared.global for async global→shared copy
  *   - cp.async.commit_group / cp.async.wait_group for pipeline control
+ *
+ * SM80+ F16 path (FLASH_FORCE_F16 defined):
+ *   - __half (FP16) as the half-precision type
+ *   - mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+ *   - same cp.async pipeline as the BF16 SM80+ path
  *
  * SM75 path (NO_BF16_KERNEL defined, __CUDA_ARCH__ >= 750):
  *   - __half (FP16) as the half-precision type
@@ -242,6 +247,35 @@ __device__ __forceinline__ void flash_mma_k16_sm70(
 #endif // __CUDA_ARCH__ >= 750
 
 #else
+#ifdef FLASH_FORCE_F16
+// ============================================================================
+// SM80+ FP16 path (Ampere+ Tensor Core F16 MMA + cp.async)
+// Used when a second TU instantiates native flash for --dtype f16.
+// ============================================================================
+
+using flash_half_t = __half;
+
+#define FLASH_FLOAT2HALF(x)     __float2half(x)
+#define FLASH_HALF_AS_USHORT(x) __half_as_ushort(x)
+#define FLASH_HALF2FLOAT(x)     __half2float(x)
+
+#define FLASH_CP_ASYNC(sa, gm_ptr) \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" \
+                 :: "r"(sa), "l"(gm_ptr))
+
+#define FLASH_ASYNC_COMMIT() asm volatile("cp.async.commit_group;")
+#define FLASH_ASYNC_WAIT()   asm volatile("cp.async.wait_group 0;")
+
+#define FLASH_MMA_K16(d0,d1,d2,d3, a0,a1,a2,a3, b0,b1, c0,c1,c2,c3) \
+    asm volatile( \
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3) \
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), \
+          "r"(b0), "r"(b1), \
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3))
+
+#else
 // ============================================================================
 // SM80+: BF16 path (Ampere, Ada, Hopper, Blackwell)
 // ============================================================================
@@ -269,4 +303,5 @@ using flash_half_t = __nv_bfloat16;
           "r"(b0), "r"(b1), \
           "f"(c0), "f"(c1), "f"(c2), "f"(c3))
 
+#endif // FLASH_FORCE_F16
 #endif // NO_BF16_KERNEL

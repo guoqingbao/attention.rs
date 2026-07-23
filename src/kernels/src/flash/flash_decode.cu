@@ -9,7 +9,7 @@
  * Instantiates BF16 paged decode kernels (main + split-K + reduce) for HDIM
  * 128/256/512. Each CTA handles one Q head; GQA kv_head mapping is computed
  * inside the kernel. 8 warps split the KV sequence with online softmax and
- * batched (BC=4) score/V accumulation for reduced __expf overhead.
+ * batched (BC=4) score/V accumulation for reduced expf overhead.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
