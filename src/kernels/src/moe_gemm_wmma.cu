@@ -50,11 +50,11 @@ using namespace nvcuda::wmma;
 namespace vllm {
 
 inline __device__ void from_float(half& dst, float src) {
-  dst = static_cast<half>(float_to_half(src));
+  dst = __float2half(src);
 }
 
 inline __device__ float to_float(half u) {
-  return half_to_float(static_cast<uint16_t>(u));
+  return __half2float(u);
 }
 
 }
