@@ -1,5 +1,7 @@
 #[cfg(feature = "cuda")]
 use crate::kernels;
+#[cfg(feature = "cuda")]
+use crate::workspace::get_or_init_mla_decode_workspace;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use crate::workspace::{get_or_init_workspace, WORKSPACE_FLOAT_SIZE};
 #[cfg(feature = "cuda")]
@@ -298,25 +300,15 @@ pub fn mla_paged_decode(
     let stream = *dev.cu_stream() as i64;
 
     if use_partitioned {
-        let tmp_out = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions, kv_lora_rank],
-            DType::F32,
-            q_absorbed.device(),
+        // Cached grow-only workspace (FlashInfer-style): allocated on first use
+        // (graph warmup / first eager decode), reused across layers and steps.
+        let ws = get_or_init_mla_decode_workspace(
+            dev,
+            num_seqs,
+            num_heads,
+            max_partitions,
+            kv_lora_rank,
         )?;
-        let tmp_max = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions],
-            DType::F32,
-            q_absorbed.device(),
-        )?;
-        let tmp_sum = Tensor::zeros(
-            &[num_seqs, num_heads, max_partitions],
-            DType::F32,
-            q_absorbed.device(),
-        )?;
-
-        let tmp_out_ptr = get_cuda_ptr(&tmp_out)? as *mut core::ffi::c_void;
-        let tmp_max_ptr = get_cuda_ptr(&tmp_max)? as *mut core::ffi::c_void;
-        let tmp_sum_ptr = get_cuda_ptr(&tmp_sum)? as *mut core::ffi::c_void;
 
         unsafe {
             kernels::ffi::mla_paged_attention_decode(
@@ -336,9 +328,9 @@ pub fn mla_paged_decode(
                 max_num_blocks_per_seq,
                 dtype,
                 stream,
-                tmp_out_ptr,
-                tmp_max_ptr,
-                tmp_sum_ptr,
+                ws.tmp_out,
+                ws.tmp_max,
+                ws.tmp_sum,
                 1,
             );
         }
