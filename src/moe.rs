@@ -609,6 +609,236 @@ pub fn moe_gemm(
     }
 }
 
+/// Grouped MoE GEMM for compressed-tensors WNA16 weights.
+///
+/// `weights` has shape `[experts, N, K / (32 / bits)]` and contains the
+/// dense little-endian INT4/INT8 packing emitted by compressed-tensors.
+/// `weight_scales` has shape `[experts, N, K / group_size]` and is symmetric.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_wna16(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    bits: usize,
+    group_size: usize,
+    is_prefill: bool,
+    legacy_gptq: bool,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::WrapErr;
+    use candle_core as candle;
+    use half::{bf16, f16};
+    use std::ffi::c_void;
+
+    fn cuda_fwd<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        input: &Tensor,
+        weights: &Tensor,
+        weight_scales: &Tensor,
+        topk_weights: &Option<Tensor>,
+        sorted_token_ids: &Tensor,
+        experts_ids: &Tensor,
+        topk: usize,
+        bits: usize,
+        group_size: usize,
+        is_prefill: bool,
+        legacy_gptq: bool,
+    ) -> Result<Tensor> {
+        let (input_rows, size_k) = input.dims2()?;
+        let (num_experts, size_n, packed_k) = weights.dims3()?;
+        // Gate/up receives one row per token and expands to one row per
+        // routed assignment. Down receives those expanded rows already.
+        let size_m = if topk_weights.is_none() {
+            input_rows * topk
+        } else {
+            input_rows
+        };
+        let expected_packed_k = (size_k + (32 / bits) - 1) / (32 / bits);
+        if bits == 0 || bits > 8 || 32 % bits != 0 || packed_k != expected_packed_k {
+            candle_core::bail!("invalid compressed-tensors WNA16 packed shape or bit width");
+        }
+        if group_size == 0 || size_k % group_size != 0 {
+            candle_core::bail!("compressed-tensors WNA16 requires K divisible by group_size");
+        }
+        let (scale_experts, scale_n, scale_k) = weight_scales.dims3()?;
+        if (scale_experts, scale_n, scale_k) != (num_experts, size_n, size_k / group_size) {
+            candle_core::bail!(
+                "invalid WNA16 scale shape: expected [{num_experts}, {size_n}, {}], got {:?}",
+                size_k / group_size,
+                weight_scales.dims()
+            );
+        }
+        if input.dtype() != weight_scales.dtype() {
+            candle_core::bail!("WNA16 input and scale dtypes must match");
+        }
+
+        let dtype = match input.dtype() {
+            candle::DType::F16 => 0,
+            candle::DType::BF16 => 1,
+            dtype => candle::bail!("WNA16 MoE only supports F16/BF16 input, got {dtype:?}"),
+        };
+        let zero_point = if legacy_gptq {
+            (1usize << (bits - 1)) - 1
+        } else {
+            1usize << (bits - 1)
+        };
+        let dev = input.device().as_cuda_device()?;
+        let (input_s, input_l) = input.storage_and_layout();
+        let input_s = match &*input_s {
+            candle::Storage::Cuda(s) => s,
+            _ => candle::bail!("WNA16 input must be a CUDA tensor"),
+        };
+        let (weights_s, weights_l) = weights.storage_and_layout();
+        let weights_s = match &*weights_s {
+            candle::Storage::Cuda(s) => s,
+            _ => candle::bail!("WNA16 weights must be a CUDA tensor"),
+        };
+        let (scales_s, scales_l) = weight_scales.storage_and_layout();
+        let scales_s = match &*scales_s {
+            candle::Storage::Cuda(s) => s,
+            _ => candle::bail!("WNA16 scales must be a CUDA tensor"),
+        };
+        let input = input_s
+            .as_cuda_slice::<T>()?
+            .slice(input_l.start_offset()..);
+        let weights = weights_s
+            .as_cuda_slice::<u32>()?
+            .slice(weights_l.start_offset()..);
+        let scales = scales_s
+            .as_cuda_slice::<T>()?
+            .slice(scales_l.start_offset()..);
+
+        let (sorted_s, sorted_l) = sorted_token_ids.storage_and_layout();
+        let sorted_s = match &*sorted_s {
+            candle::Storage::Cuda(s) => s,
+            _ => candle::bail!("sorted token ids must be a CUDA tensor"),
+        };
+        let sorted = sorted_s
+            .as_cuda_slice::<u32>()?
+            .slice(sorted_l.start_offset()..);
+        let (experts_s, experts_l) = experts_ids.storage_and_layout();
+        let experts_s = match &*experts_s {
+            candle::Storage::Cuda(s) => s,
+            _ => candle::bail!("expert ids must be a CUDA tensor"),
+        };
+        let experts = experts_s
+            .as_cuda_slice::<u32>()?
+            .slice(experts_l.start_offset()..);
+        let topk_ptr = if let Some(weights) = topk_weights {
+            let (s, l) = weights.storage_and_layout();
+            let s = match &*s {
+                candle::Storage::Cuda(s) => s,
+                _ => candle::bail!("topk weights must be a CUDA tensor"),
+            };
+            let slice = s.as_cuda_slice::<f32>()?.slice(l.start_offset()..);
+            *slice.device_ptr() as *const f32
+        } else {
+            std::ptr::null()
+        };
+
+        let output = unsafe { dev.alloc::<T>(size_m * size_n) }.w()?;
+        let stream = *dev.cu_stream() as i64;
+
+        // Decode is a matrix-vector workload.  Avoid the grouped WMMA
+        // launcher (and its expert-count/offset scan) when only a small
+        // number of routed rows are present.
+        if !is_prefill {
+            unsafe {
+                crate::kernels::ffi::moe_gemv_wna16(
+                    *input.device_ptr() as *const c_void,
+                    *weights.device_ptr() as *const u32,
+                    *scales.device_ptr() as *const c_void,
+                    *sorted.device_ptr() as *const i32,
+                    *experts.device_ptr() as *const i32,
+                    topk_ptr,
+                    *output.device_ptr() as *mut c_void,
+                    num_experts as i32,
+                    topk as i32,
+                    size_m as i32,
+                    size_n as i32,
+                    size_k as i32,
+                    bits as i32,
+                    group_size as i32,
+                    zero_point as i32,
+                    dtype,
+                    stream,
+                );
+            }
+            return Ok(Tensor::from_storage(
+                candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(output, dev.clone())),
+                (size_m, size_n),
+            )?);
+        }
+
+        let counts = unsafe { dev.alloc::<i32>(num_experts) }.w()?;
+        let offsets = unsafe { dev.alloc::<i32>(num_experts + 1) }.w()?;
+        unsafe {
+            crate::kernels::ffi::moe_gemm_wmma_wna16(
+                *input.device_ptr() as *const c_void,
+                *weights.device_ptr() as *const u32,
+                *scales.device_ptr() as *const c_void,
+                *sorted.device_ptr() as *const i32,
+                *experts.device_ptr() as *const i32,
+                topk_ptr,
+                *output.device_ptr() as *mut c_void,
+                *counts.device_ptr() as *mut i32,
+                *offsets.device_ptr() as *mut i32,
+                num_experts as i32,
+                topk as i32,
+                size_m as i32,
+                size_n as i32,
+                size_k as i32,
+                bits as i32,
+                group_size as i32,
+                zero_point as i32,
+                dtype,
+                is_prefill,
+                stream,
+            );
+        }
+        Ok(Tensor::from_storage(
+            candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(output, dev.clone())),
+            (size_m, size_n),
+        )?)
+    }
+
+    match input.dtype() {
+        candle::DType::F16 => cuda_fwd::<f16>(
+            input,
+            weights,
+            weight_scales,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            bits,
+            group_size,
+            is_prefill,
+            legacy_gptq,
+        ),
+        candle::DType::BF16 => cuda_fwd::<bf16>(
+            input,
+            weights,
+            weight_scales,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            bits,
+            group_size,
+            is_prefill,
+            legacy_gptq,
+        ),
+        dtype => candle_core::bail!("WNA16 MoE only supports F16/BF16 input, got {dtype:?}"),
+    }
+}
+
 /// MoE GEMM with FP8 weights and block-wise scales.
 ///
 /// # Arguments

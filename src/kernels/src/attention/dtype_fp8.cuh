@@ -215,12 +215,14 @@ __inline__ __device__ Tout scaled_vec_conversion(
   return x;
 }
 
-// fp8 -> half
+// fp8 -> half (stored as raw fp16 bits in uint16_t, matching dtype_float16.cuh).
+// Must bit-cast via __half_as_ushort: assigning __float2half(...) to uint16_t
+// numerically truncates the float value (e.g. 1.5 -> 1) instead of storing bits.
 template <>
 __inline__ __device__ uint16_t scaled_vec_conversion<uint16_t, uint8_t>(
     const uint8_t& a, const float scale) {
   float f = dispatch_fp8_to_float(a);
-  return __float2half(f * scale);
+  return __half_as_ushort(__float2half(f * scale));
 }
 
 // fp8x2 -> half2
@@ -233,8 +235,10 @@ __inline__ __device__ uint32_t scaled_vec_conversion<uint32_t, uint16_t>(
   } tmp;
   uint8_t b0 = (uint8_t)(a & 0xFFu);
   uint8_t b1 = (uint8_t)((a >> 8u) & 0xFFu);
-  tmp.u16[0] = __float2half(dispatch_fp8_to_float(b0) * scale);
-  tmp.u16[1] = __float2half(dispatch_fp8_to_float(b1) * scale);
+  tmp.u16[0] = __half_as_ushort(
+      __float2half(dispatch_fp8_to_float(b0) * scale));
+  tmp.u16[1] = __half_as_ushort(
+      __float2half(dispatch_fp8_to_float(b1) * scale));
   return tmp.u32;
 }
 
@@ -355,12 +359,13 @@ __inline__ __device__ Float8_ scaled_vec_conversion<Float8_, uint2>(
   return res;
 }
 
-// half -> fp8
+// half (raw fp16 bits in uint16_t) -> fp8.
+// __half2float(uint16_t) implicitly does numeric uint16->half conversion;
+// bit-cast first with __ushort_as_half.
 template <>
 __inline__ __device__ uint8_t scaled_vec_conversion<uint8_t, uint16_t>(
     const uint16_t& a, const float scale) {
-  // float f = fminf(fmaxf(__half2float(a) / scale, MIN_FP8_VALUE), MAX_FP8_VALUE);
-  float f = __half2float(a) / scale;
+  float f = __half2float(__ushort_as_half(a)) / scale;
   return dispatch_float_to_fp8(f);
 }
 

@@ -658,6 +658,54 @@ extern "C" {
         stream: i64,
     );
 
+    // Grouped MoE WNA16 (compressed-tensors pack-quantized) kernel.
+    // Weights are dense INT{4,8} values packed along K into uint32 words;
+    // scales are symmetric per-group and kept in the input dtype.
+    pub fn moe_gemm_wmma_wna16(
+        input: *const c_void,
+        weights: *const u32,
+        weight_scales: *const c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        expert_counts: *mut i32,
+        expert_offsets: *mut i32,
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        bits: i32,
+        group_size: i32,
+        zero_point: i32,
+        data_type: i32,
+        is_prefill: bool,
+        stream: i64,
+    );
+
+    // Decode GEMV for compressed-tensors WNA16. One warp computes one
+    // output row and reuses the routed input vector from shared memory.
+    pub fn moe_gemv_wna16(
+        input: *const c_void,
+        weights: *const u32,
+        weight_scales: *const c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32,
+        output: *mut c_void,
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        bits: i32,
+        group_size: i32,
+        zero_point: i32,
+        data_type: i32,
+        stream: i64,
+    );
+
     pub fn topk_softmax(
         gating_output: *const f32,      // in： [num_tokens, num_experts]
         token_expert_indices: *mut i32, // out: [num_tokens, topk]
