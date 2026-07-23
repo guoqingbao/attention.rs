@@ -57,6 +57,22 @@ inline __device__ float to_float(half u) {
   return __half2float(u);
 }
 
+// Dequant to activation dtype via explicit float→T conversion. Prefer this over
+// static_cast<T>(q * scale) so F16/BF16 paths stay consistent across arches.
+template <typename T>
+__device__ inline T wna16_dequant(int q, float scale) {
+  T out;
+  from_float(out, static_cast<float>(q) * scale);
+  return out;
+}
+
+template <typename T>
+__device__ inline T wna16_zero() {
+  T out;
+  from_float(out, 0.0f);
+  return out;
+}
+
 }
 
 #define CEILDIV(x,y) (((x) + (y) - 1) / (y))
@@ -368,10 +384,13 @@ __global__ void moe_gemm_grouped_kernel_fp8(
                             int scale_k_idx = kg / block_size_k;
                             float scale = expert_scales[scale_n_idx * scale_k_dim + scale_k_idx];
                             uint8_t fp8_val = expert_w[(size_t)n_global * size_k + kg];
-                            B_sh[n_local * K_BLK + k_local + kk] =
-                                static_cast<T>(vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
+                            T dq;
+                            vllm::from_float(
+                                dq,
+                                vllm::fp8::dispatch_fp8_to_float(fp8_val) * scale);
+                            B_sh[n_local * K_BLK + k_local + kk] = dq;
                         } else {
-                            B_sh[n_local * K_BLK + k_local + kk] = static_cast<T>(0);
+                            B_sh[n_local * K_BLK + k_local + kk] = vllm::wna16_zero<T>();
                         }
                     }
                 }
@@ -640,9 +659,9 @@ __global__ void moe_gemm_grouped_kernel_wna16(
                     const int shift = (k_global % pack_factor) * bits;
                     const int q = static_cast<int>((word >> shift) & mask) - zero_point;
                     const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k_global / group_size]);
-                    B_sh[n_local * K_BLK + k_local] = static_cast<T>(q * scale);
+                    B_sh[n_local * K_BLK + k_local] = vllm::wna16_dequant<T>(q, scale);
                 } else {
-                    B_sh[n_local * K_BLK + k_local] = static_cast<T>(0);
+                    B_sh[n_local * K_BLK + k_local] = vllm::wna16_zero<T>();
                 }
             }
 
@@ -662,7 +681,7 @@ __global__ void moe_gemm_grouped_kernel_wna16(
                     A_sh[m_local * K_BLK + k_local] =
                         input[(size_t)input_index * size_k + k_global];
                 } else {
-                    A_sh[m_local * K_BLK + k_local] = static_cast<T>(0);
+                    A_sh[m_local * K_BLK + k_local] = vllm::wna16_zero<T>();
                 }
             }
 
@@ -811,7 +830,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                     }
                 } else {
                     for (int j = 0; j < A_VEC; ++j) {
-                        A_sh[m_local * WNA16_PREFILL_K + k_local + j] = static_cast<T>(0);
+                        A_sh[m_local * WNA16_PREFILL_K + k_local + j] = vllm::wna16_zero<T>();
                     }
                 }
             }
@@ -828,7 +847,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                 const int k_global = k_base + k_local;
                 T* dst = &B_sh[n_local * WNA16_PREFILL_K + k_local];
                 if (n_global >= size_n || k_global >= size_k) {
-                    for (int q_idx = 0; q_idx < 16; ++q_idx) dst[q_idx] = static_cast<T>(0);
+                    for (int q_idx = 0; q_idx < 16; ++q_idx) dst[q_idx] = vllm::wna16_zero<T>();
                     continue;
                 }
 
@@ -853,7 +872,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
                                     : static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
-                                dst[word_idx * 8 + q_idx] = static_cast<T>(q * scale);
+                                dst[word_idx * 8 + q_idx] = vllm::wna16_dequant<T>(q, scale);
                             }
                         }
                     } else {
@@ -871,7 +890,7 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                                 const float scale = uniform_scale_segment
                                     ? segment_scale
                                     : static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
-                                dst[word_idx * 4 + q_idx] = static_cast<T>(q * scale);
+                                dst[word_idx * 4 + q_idx] = vllm::wna16_dequant<T>(q, scale);
                             }
                         }
                     }
@@ -882,9 +901,9 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                             const uint32_t word = row_w[k / PACK_FACTOR];
                             const int q = static_cast<int>((word >> ((k % PACK_FACTOR) * BITS)) & mask) - zero_point;
                             const float scale = static_cast<float>(expert_s[(size_t)n_global * scale_k + k / group_size]);
-                            dst[q_idx] = static_cast<T>(q * scale);
+                            dst[q_idx] = vllm::wna16_dequant<T>(q, scale);
                         } else {
-                            dst[q_idx] = static_cast<T>(0);
+                            dst[q_idx] = vllm::wna16_zero<T>();
                         }
                     }
                 }
@@ -902,6 +921,10 @@ __global__ void moe_gemm_grouped_kernel_wna16_prefill(
                 load_matrix_sync(a_frag, A_ptr + kk, WNA16_PREFILL_K);
                 load_matrix_sync(b_frag, B_ptr + kk, WNA16_PREFILL_K);
                 mma_sync(c_frag, a_frag, b_frag, c_frag);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                // Volta/Turing: barrier after each MMA (same pattern as d983056).
+                __syncthreads();
+#endif
             }
             __syncthreads();
         }
@@ -970,6 +993,10 @@ extern "C" void moe_gemm_wmma_wna16(
 #ifndef NO_BF16_KERNEL
             if (bits == 4) LAUNCH_MOE_WMMA_WNA16_PREFILL(nv_bfloat16, 4)
             else if (bits == 8) LAUNCH_MOE_WMMA_WNA16_PREFILL(nv_bfloat16, 8)
+#else
+            fprintf(stderr,
+                    "moe_gemm_wmma_wna16: BF16 requested but NO_BF16_KERNEL "
+                    "(SM70/SM75 build). Pass F16 dtype instead.\n");
 #endif
         }
         return;
@@ -980,6 +1007,10 @@ extern "C" void moe_gemm_wmma_wna16(
     } else if (data_type == 1) {
 #ifndef NO_BF16_KERNEL
         LAUNCH_MOE_WMMA_WNA16(nv_bfloat16, 8, 32, 1)
+#else
+        fprintf(stderr,
+                "moe_gemm_wmma_wna16: BF16 requested but NO_BF16_KERNEL "
+                "(SM70/SM75 build). Pass F16 dtype instead.\n");
 #endif
     }
 }

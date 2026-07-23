@@ -203,6 +203,23 @@ extern "C" void call_reshape_and_cache(
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ float scalar_to_float(scalar_t v) {
+  return static_cast<float>(v);
+}
+
+// F16 is carried as raw bits (uint16_t) in several attention kernels.
+// static_cast<float>(bits) numerically converts the integer, not the fp16 value.
+template <>
+__device__ __forceinline__ float scalar_to_float<uint16_t>(uint16_t v) {
+  return vllm::to_float(v);
+}
+
+template <>
+__device__ __forceinline__ float scalar_to_float<__nv_bfloat16>(__nv_bfloat16 v) {
+  return __bfloat162float(v);
+}
+
+template <typename scalar_t>
 __global__ void convert_to_fp8_per_head_kernel(
     const scalar_t* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -228,7 +245,7 @@ __global__ void convert_to_fp8_per_head_kernel(
       int token = i / head_dim;
       int d = i % head_dim;
       int src_idx = token * num_heads * head_dim + head_idx * head_dim + d;
-      float val = fabsf(static_cast<float>(input[src_idx]));
+      float val = fabsf(scalar_to_float(input[src_idx]));
       local_max = fmaxf(local_max, val);
     }
     smem[tid] = local_max;
@@ -252,7 +269,7 @@ __global__ void convert_to_fp8_per_head_kernel(
     int token = i / head_dim;
     int d = i % head_dim;
     int idx = token * num_heads * head_dim + head_idx * head_dim + d;
-    float val = static_cast<float>(input[idx]) * inv_scale;
+    float val = scalar_to_float(input[idx]) * inv_scale;
 #ifndef NO_HARDWARE_FP8
 // Do not use raw cast, use cuda api to convert it!
     output[idx] = vllm::fp8::dispatch_float_to_fp8(val);

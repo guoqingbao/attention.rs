@@ -900,5 +900,11 @@ extern "C" void moe_gemv_wna16(
       else launch.template operator()<nv_bfloat16, 2, 8>();
     }
   }
+#else
+  else if (dtype == 1) {
+    fprintf(stderr,
+            "moe_gemv_wna16: BF16 requested but NO_BF16_KERNEL "
+            "(SM70/SM75 build). Pass F16 dtype instead.\n");
+  }
 #endif
 }

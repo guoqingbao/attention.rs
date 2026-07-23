@@ -65,16 +65,6 @@ void flashinfer_prefill_ragged_wrapper_fp8(
 }
 #endif
 
-template <typename T>
-__global__ void scale_output_inplace_kernel(T* out, int64_t numel, float scale) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; idx < numel; idx += stride) {
-        float x = static_cast<float>(out[idx]);
-        out[idx] = static_cast<T>(x * scale);
-    }
-}
-
 extern "C" {
 
 void flashinfer_prefill_ragged_wrapper(
