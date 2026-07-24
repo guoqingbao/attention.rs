@@ -1,8 +1,30 @@
 /**
  * @brief Native flash decode instantiation — dual F16/BF16 templates.
  *
+ * This CUDA kernel is developed for xInfer (vLLM.rs) project:
+ * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode.cu
+ *
+ * Copyright (c) 2026, Guoqing Bao.  All rights reserved.
+ *
+ * @details
  * Instantiates templated paged decode kernels for HDIM 128/256/512.
  * F16 always; BF16 only when !NO_BF16_KERNEL (SM80+).
+ * Instantiates BF16 paged decode kernels (main + split-K + reduce) for HDIM
+ * 128/256/512. Each CTA handles one Q head; GQA kv_head mapping is computed
+ * inside the kernel. 8 warps split the KV sequence with online softmax and
+ * batched (BC=4) score/V accumulation for reduced __expf overhead.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <cuda_runtime.h>
