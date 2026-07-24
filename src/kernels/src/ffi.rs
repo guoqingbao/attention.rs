@@ -3103,6 +3103,7 @@ extern "C" {
 
     // =========================================================================
     // Native flash attention (flash feature)
+    // dtype: 0 = f16, 1 = bf16 (BF16 kernels only on SM80+)
     // =========================================================================
 
     #[cfg(feature = "flash")]
@@ -3125,30 +3126,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
-        stream: i64,
-    );
-
-    /// SM80+ F16 Tensor Core native flash prefill (aliases to BF16-era API on SM70/75).
-    #[cfg(feature = "flash")]
-    pub fn call_flash_prefill_paged_f16(
-        q: *const c_void,
-        k_cache: *const c_void,
-        v_cache: *const c_void,
-        o: *mut c_void,
-        block_tables: *const c_int,
-        block_table_stride: u32,
-        cu_seqlens_q: *const u32,
-        context_lens: *const u32,
-        num_seqs: u32,
-        max_q_len: u32,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        cache_block_size: u32,
-        sliding_window: u32,
-        causal: u32,
-        inv_sqrt_d: f32,
-        softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3175,6 +3153,7 @@ extern "C" {
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3197,28 +3176,7 @@ extern "C" {
         sliding_window: u32,
         softcap: f32,
         gqa_ratio: u32,
-        stream: i64,
-    );
-
-    #[cfg(feature = "flash")]
-    pub fn call_flash_decode_paged_f16(
-        q: *const c_void,
-        k_cache: *const c_void,
-        v_cache: *const c_void,
-        o: *mut c_void,
-        block_tables: *const c_int,
-        seq_lens: *const c_int,
-        max_blocks_per_seq: u32,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        block_size: u32,
-        inv_sqrt_d: f32,
-        num_seqs: u32,
-        q_stride: u32,
-        sliding_window: u32,
-        softcap: f32,
-        gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3242,29 +3200,7 @@ extern "C" {
         softcap: f32,
         sliding_window: u32,
         gqa_ratio: u32,
-        stream: i64,
-    );
-
-    #[cfg(feature = "flash")]
-    pub fn call_flash_decode_paged_splitk_f16(
-        q: *const c_void,
-        k_cache: *const c_void,
-        v_cache: *const c_void,
-        workspace: *mut c_void,
-        block_tables: *const c_int,
-        seq_lens: *const c_int,
-        max_blocks_per_seq: u32,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        block_size: u32,
-        inv_sqrt_d: f32,
-        num_seqs: u32,
-        num_splits: u32,
-        q_stride: u32,
-        softcap: f32,
-        sliding_window: u32,
-        gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3276,17 +3212,7 @@ extern "C" {
         head_dim: u32,
         num_splits: u32,
         num_seqs: u32,
-        stream: i64,
-    );
-
-    #[cfg(feature = "flash")]
-    pub fn call_flash_decode_paged_reduce_f16(
-        workspace: *const c_void,
-        o: *mut c_void,
-        num_q_heads: u32,
-        head_dim: u32,
-        num_splits: u32,
-        num_seqs: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3312,6 +3238,7 @@ extern "C" {
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3338,11 +3265,12 @@ extern "C" {
         fp8_cache_stride: u64,
         sliding_window: u32,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
     #[cfg(feature = "flash")]
-    pub fn call_flash_reshape_and_cache_bf16(
+    pub fn call_flash_reshape_and_cache(
         key: *const c_void,
         value: *const c_void,
         key_cache: *mut c_void,
@@ -3352,20 +3280,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         cache_block_size: u32,
-        stream: i64,
-    );
-
-    #[cfg(feature = "flash")]
-    pub fn call_flash_reshape_and_cache_f16(
-        key: *const c_void,
-        value: *const c_void,
-        key_cache: *mut c_void,
-        value_cache: *mut c_void,
-        slot_mapping: *const i64,
-        num_tokens: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        cache_block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3382,6 +3297,7 @@ extern "C" {
         cache_block_size: u32,
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3398,6 +3314,7 @@ extern "C" {
         head_dim: u32,
         block_size: u32,
         k_scale_ptr: *const f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3421,6 +3338,7 @@ extern "C" {
         softcap: f32,
         k_scale_ptr: *const f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3445,6 +3363,7 @@ extern "C" {
         softcap: f32,
         k_scale_ptr: *const f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3461,6 +3380,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3484,6 +3404,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3508,6 +3429,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3524,6 +3446,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3547,6 +3470,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3571,6 +3495,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3596,6 +3521,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3621,6 +3547,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 

@@ -79,11 +79,11 @@
                 unsigned int _bits = (unsigned int)_qp[_byte_base] \
                     | ((unsigned int)_qp[_byte_base + 1] << 8) \
                     | ((unsigned int)_qp[_byte_base + 2] << 16); \
-                flash_half_t _tmp[8]; \
+                HalfT _tmp[8]; \
                 _Pragma("unroll") \
                 for (int _c = 0; _c < 8; _c++) { \
                     unsigned int _q3 = (_bits >> (_c * 3)) & 0x7; \
-                    _tmp[_c] = FLASH_FLOAT2HALF(((float)_q3 - 3.f) * _scale); \
+                    _tmp[_c] = FLASH_FROM_FLOAT(((float)_q3 - 3.f) * _scale); \
                 } \
                 *((uint4*)&(smem)[_row * TQ3P_HDIM_PAD + _col]) = *((uint4*)_tmp); \
             } else { \
@@ -115,14 +115,14 @@
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
-                flash_half_t _tmp[8]; \
+                HalfT _tmp[8]; \
                 const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
                 unsigned int _pk4 = *_qp32; \
                 _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
                     unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
-                    _tmp[_b * 2]     = FLASH_FLOAT2HALF(((float)(_packed & 0xF) - 7.5f) * _scale); \
-                    _tmp[_b * 2 + 1] = FLASH_FLOAT2HALF(((float)(_packed >> 4) - 7.5f) * _scale); \
+                    _tmp[_b * 2]     = FLASH_FROM_FLOAT(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = FLASH_FROM_FLOAT(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(smem)[_row * TQ3P_HDIM_PAD + _col]) = *((uint4*)_tmp); \
             } else { \
@@ -140,17 +140,18 @@
 #define TQ3P_USE_DYNAMIC_SMEM 0
 #endif
 
-extern "C" __global__ void
+template<typename HalfT>
+__global__ void
 #if TQ3P_USE_DYNAMIC_SMEM
 __launch_bounds__(TQ3P_NUM_THREADS)
 #endif
 flash_tq3_prefill(
-    const flash_half_t* __restrict__ Q,
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -191,17 +192,17 @@ flash_tq3_prefill(
 
 #if TQ3P_USE_DYNAMIC_SMEM
     extern __shared__ __align__(16) unsigned char tq3p_smem_dyn[];
-    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(tq3p_smem_dyn);
-    flash_half_t* smem_K_flat = smem_Q + TQ3P_BR * TQ3P_HDIM_PAD;
-    flash_half_t* smem_V = smem_K_flat + 2 * TQ3P_BC * TQ3P_HDIM_PAD;
-    flash_half_t* smem_P = smem_V + TQ3P_BC * TQ3P_HDIM_PAD;
+    HalfT* smem_Q = reinterpret_cast<HalfT*>(tq3p_smem_dyn);
+    HalfT* smem_K_flat = smem_Q + TQ3P_BR * TQ3P_HDIM_PAD;
+    HalfT* smem_V = smem_K_flat + 2 * TQ3P_BC * TQ3P_HDIM_PAD;
+    HalfT* smem_P = smem_V + TQ3P_BC * TQ3P_HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ3P_BR * (TQ3P_BC + TQ3P_PAD_P));
     #define SMEM_K_TQ3P(buf, idx) smem_K_flat[(buf) * TQ3P_BC * TQ3P_HDIM_PAD + (idx)]
 #else
-    __shared__ flash_half_t smem_Q[TQ3P_BR * TQ3P_HDIM_PAD];
-    __shared__ flash_half_t smem_K_arr[2][TQ3P_BC * TQ3P_HDIM_PAD];
-    __shared__ flash_half_t smem_V[TQ3P_BC * TQ3P_HDIM_PAD];
-    __shared__ flash_half_t smem_P[TQ3P_BR * (TQ3P_BC + TQ3P_PAD_P)];
+    __shared__ HalfT smem_Q[TQ3P_BR * TQ3P_HDIM_PAD];
+    __shared__ HalfT smem_K_arr[2][TQ3P_BC * TQ3P_HDIM_PAD];
+    __shared__ HalfT smem_V[TQ3P_BC * TQ3P_HDIM_PAD];
+    __shared__ HalfT smem_P[TQ3P_BR * (TQ3P_BC + TQ3P_PAD_P)];
     __shared__ float smem_ml[TQ3P_BR * 2];
     #define SMEM_K_TQ3P(buf, idx) smem_K_arr[buf][idx]
 #endif
@@ -262,14 +263,14 @@ flash_tq3_prefill(
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                qr[i] = FLASH_HALF2FLOAT(smem_Q[row * TQ3P_HDIM_PAD + ch]);
+                qr[i] = FLASH_TO_FLOAT(smem_Q[row * TQ3P_HDIM_PAD + ch]);
                 qr[i] *= get_sign_flip(kv_head, ch);
             }
             wht_transform(qr, lane_id);
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                smem_Q[row * TQ3P_HDIM_PAD + ch] = FLASH_FLOAT2HALF(qr[i]);
+                smem_Q[row * TQ3P_HDIM_PAD + ch] = FLASH_FROM_FLOAT(qr[i]);
             }
         }
     }
@@ -403,10 +404,10 @@ flash_tq3_prefill(
             float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
-            smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
-            smem_P[row0 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p01);
-            smem_P[row1 * p_stride + c0]     = FLASH_FLOAT2HALF(p10);
-            smem_P[row1 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p11);
+            smem_P[row0 * p_stride + c0]     = FLASH_FROM_FLOAT(p00);
+            smem_P[row0 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p01);
+            smem_P[row1 * p_stride + c0]     = FLASH_FROM_FLOAT(p10);
+            smem_P[row1 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p11);
         }
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -464,19 +465,19 @@ flash_tq3_prefill(
         float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
         float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
-        flash_half_t* ob = O + q_head * head_dim;
+        HalfT* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < TQ3P_N_TILES_PER_WARP; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }
@@ -522,11 +523,11 @@ flash_tq3_prefill(
                 unsigned int _bits = (unsigned int)_qp[_byte_base] \
                     | ((unsigned int)_qp[_byte_base + 1] << 8) \
                     | ((unsigned int)_qp[_byte_base + 2] << 16); \
-                flash_half_t _tmp[8]; \
+                HalfT _tmp[8]; \
                 _Pragma("unroll") \
                 for (int _c = 0; _c < 8; _c++) { \
                     unsigned int _q3 = (_bits >> (_c * 3)) & 0x7; \
-                    _tmp[_c] = FLASH_FLOAT2HALF(((float)_q3 - 3.f) * _scale); \
+                    _tmp[_c] = FLASH_FROM_FLOAT(((float)_q3 - 3.f) * _scale); \
                 } \
                 *((uint4*)&(dst)[_row * 512 + _col]) = *((uint4*)_tmp); \
             } else { *((uint4*)&(dst)[_row * 512 + _col]) = make_uint4(0,0,0,0); } \
@@ -555,27 +556,28 @@ flash_tq3_prefill(
                     + (unsigned long long)(kvh) * _hd_half; \
                 const unsigned char* _qp = (quant_buf) + _q_base; \
                 unsigned int _byte_off = _col / 2; \
-                flash_half_t _tmp[8]; \
+                HalfT _tmp[8]; \
                 const unsigned int* _qp32 = (const unsigned int*)(_qp + _byte_off); \
                 unsigned int _pk4 = *_qp32; \
                 _Pragma("unroll") \
                 for (int _b = 0; _b < 4; _b++) { \
                     unsigned int _packed = (_pk4 >> (_b * 8)) & 0xFF; \
-                    _tmp[_b * 2]     = FLASH_FLOAT2HALF(((float)(_packed & 0xF) - 7.5f) * _scale); \
-                    _tmp[_b * 2 + 1] = FLASH_FLOAT2HALF(((float)(_packed >> 4) - 7.5f) * _scale); \
+                    _tmp[_b * 2]     = FLASH_FROM_FLOAT(((float)(_packed & 0xF) - 7.5f) * _scale); \
+                    _tmp[_b * 2 + 1] = FLASH_FROM_FLOAT(((float)(_packed >> 4) - 7.5f) * _scale); \
                 } \
                 *((uint4*)&(dst)[_row * 512 + _col]) = *((uint4*)_tmp); \
             } else { *((uint4*)&(dst)[_row * 512 + _col]) = make_uint4(0,0,0,0); } \
         } \
     } while(0)
 
-extern "C" __global__ void flash_tq3_prefill(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq3_prefill(
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -615,10 +617,10 @@ extern "C" __global__ void flash_tq3_prefill(
     const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
 
     extern __shared__ __align__(16) unsigned char smem_dyn[];
-    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(smem_dyn);
-    flash_half_t* smem_K = smem_Q + TQ3P_BR_512 * 512;
-    flash_half_t* smem_V = smem_K + TQ3P_BC_512 * 512;
-    flash_half_t* smem_P = smem_V + TQ3P_BC_512 * 512;
+    HalfT* smem_Q = reinterpret_cast<HalfT*>(smem_dyn);
+    HalfT* smem_K = smem_Q + TQ3P_BR_512 * 512;
+    HalfT* smem_V = smem_K + TQ3P_BC_512 * 512;
+    HalfT* smem_P = smem_V + TQ3P_BC_512 * 512;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ3P_BR_512 * (TQ3P_BC_512 + TQ3P_PAD_P_512));
 
     const unsigned int group_id = lane_id >> 2;
@@ -676,14 +678,14 @@ extern "C" __global__ void flash_tq3_prefill(
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                qr[i] = FLASH_HALF2FLOAT(smem_Q[row * 512 + ch]);
+                qr[i] = FLASH_TO_FLOAT(smem_Q[row * 512 + ch]);
                 qr[i] *= get_sign_flip(kv_head, ch);
             }
             wht_transform(qr, lane_id);
             #pragma unroll
             for (unsigned int i = 0; i < tq_vec; i++) {
                 unsigned int ch = lane_id * tq_vec + i;
-                smem_Q[row * 512 + ch] = FLASH_FLOAT2HALF(qr[i]);
+                smem_Q[row * 512 + ch] = FLASH_FROM_FLOAT(qr[i]);
             }
         }
     }
@@ -791,10 +793,10 @@ extern "C" __global__ void flash_tq3_prefill(
                 float p10 = __expf(acc_s[nt][2] - m_r1), p11 = __expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
-                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p01);
-                smem_P[row1 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p10);
-                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p11);
+                smem_P[row0 * p_stride_512 + c0]     = FLASH_FROM_FLOAT(p00);
+                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FROM_FLOAT(p01);
+                smem_P[row1 * p_stride_512 + c0]     = FLASH_FROM_FLOAT(p10);
+                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FROM_FLOAT(p11);
             }
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -882,19 +884,19 @@ extern "C" __global__ void flash_tq3_prefill(
             il1 = (lv1 > 0.f) ? (1.f / lv1) : 0.f;
         }
 
-        flash_half_t* ob = O + q_head * head_dim;
+        HalfT* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < TQ3P_N_TILES_PER_WARP_512; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }

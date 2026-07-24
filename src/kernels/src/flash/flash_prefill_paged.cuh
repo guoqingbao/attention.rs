@@ -117,15 +117,16 @@
 #define PREFILL_USE_DYNAMIC_SMEM 0
 #endif
 
-extern "C" __global__ void
+template<typename HalfT>
+__global__ void
 #if PREFILL_USE_DYNAMIC_SMEM
 __launch_bounds__(NUM_THREADS)
 #endif
 flash_prefill_paged(
-    const flash_half_t* __restrict__ Q,
-    const flash_half_t* __restrict__ K_cache,
-    const flash_half_t* __restrict__ V_cache,
-    flash_half_t* __restrict__ O,
+    const HalfT* __restrict__ Q,
+    const HalfT* __restrict__ K_cache,
+    const HalfT* __restrict__ V_cache,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -166,17 +167,17 @@ flash_prefill_paged(
 
 #if PREFILL_USE_DYNAMIC_SMEM
     extern __shared__ __align__(16) unsigned char prefill_smem_dyn[];
-    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(prefill_smem_dyn);
-    flash_half_t* smem_K_flat = smem_Q + BR * HDIM_PAD;
-    flash_half_t* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
-    flash_half_t* smem_P = smem_V + BC * HDIM_PAD;
+    HalfT* smem_Q = reinterpret_cast<HalfT*>(prefill_smem_dyn);
+    HalfT* smem_K_flat = smem_Q + BR * HDIM_PAD;
+    HalfT* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
+    HalfT* smem_P = smem_V + BC * HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
     #define SMEM_K_PAGED(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
 #else
-    __shared__ flash_half_t smem_Q[BR * HDIM_PAD];
-    __shared__ flash_half_t smem_K_arr[2][BC * HDIM_PAD];
-    __shared__ flash_half_t smem_V[BC * HDIM_PAD];
-    __shared__ flash_half_t smem_P[BR * (BC + PAD_P)];
+    __shared__ HalfT smem_Q[BR * HDIM_PAD];
+    __shared__ HalfT smem_K_arr[2][BC * HDIM_PAD];
+    __shared__ HalfT smem_V[BC * HDIM_PAD];
+    __shared__ HalfT smem_P[BR * (BC + PAD_P)];
     __shared__ float smem_ml[BR * 2];
     #define SMEM_K_PAGED(buf, idx) smem_K_arr[buf][idx]
 #endif
@@ -367,10 +368,10 @@ flash_prefill_paged(
             float p10 = expf(acc_s[nt][2] - m_r1), p11 = expf(acc_s[nt][3] - m_r1);
             sum0 += p00 + p01; sum1 += p10 + p11;
             unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
-            smem_P[row0 * p_stride + c0]     = FLASH_FLOAT2HALF(p00);
-            smem_P[row0 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p01);
-            smem_P[row1 * p_stride + c0]     = FLASH_FLOAT2HALF(p10);
-            smem_P[row1 * p_stride + c0 + 1] = FLASH_FLOAT2HALF(p11);
+            smem_P[row0 * p_stride + c0]     = FLASH_FROM_FLOAT(p00);
+            smem_P[row0 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p01);
+            smem_P[row1 * p_stride + c0]     = FLASH_FROM_FLOAT(p10);
+            smem_P[row1 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p11);
         }
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
         sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -440,19 +441,19 @@ flash_prefill_paged(
         float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
         float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
-        flash_half_t* ob = O + q_head * head_dim;
+        HalfT* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }
@@ -478,11 +479,12 @@ flash_prefill_paged(
 #define TILE_CHUNKS_512 (BR_512 * (512 / 8))
 #define NUM_THREADS_512 256
 
-extern "C" __global__ void flash_prefill_paged(
-    const flash_half_t* __restrict__ Q,
-    const flash_half_t* __restrict__ K_cache,
-    const flash_half_t* __restrict__ V_cache,
-    flash_half_t* __restrict__ O,
+template<typename HalfT>
+__global__ void flash_prefill_paged(
+    const HalfT* __restrict__ Q,
+    const HalfT* __restrict__ K_cache,
+    const HalfT* __restrict__ V_cache,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
     const unsigned int* __restrict__ cu_seqlens_q,
@@ -522,10 +524,10 @@ extern "C" __global__ void flash_prefill_paged(
     O += q_seq_start * q_seq_stride;
 
     extern __shared__ __align__(16) unsigned char smem_dyn[];
-    flash_half_t* smem_Q = reinterpret_cast<flash_half_t*>(smem_dyn);
-    flash_half_t* smem_K = smem_Q + BR_512 * 512;
-    flash_half_t* smem_V = smem_K + BC_512 * 512;
-    flash_half_t* smem_P = smem_V + BC_512 * 512;
+    HalfT* smem_Q = reinterpret_cast<HalfT*>(smem_dyn);
+    HalfT* smem_K = smem_Q + BR_512 * 512;
+    HalfT* smem_V = smem_K + BC_512 * 512;
+    HalfT* smem_P = smem_V + BC_512 * 512;
     float* smem_ml = reinterpret_cast<float*>(smem_P + BR_512 * (BC_512 + PAD_P_512));
 
     const unsigned int group_id = lane_id >> 2;
@@ -699,10 +701,10 @@ extern "C" __global__ void flash_prefill_paged(
                 float p10 = expf(acc_s[nt][2] - m_r1), p11 = expf(acc_s[nt][3] - m_r1);
                 sum0 += p00 + p01; sum1 += p10 + p11;
                 unsigned int c0 = nt * 8 + tid_in_group * 2;
-                smem_P[row0 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p00);
-                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p01);
-                smem_P[row1 * p_stride_512 + c0]     = FLASH_FLOAT2HALF(p10);
-                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FLOAT2HALF(p11);
+                smem_P[row0 * p_stride_512 + c0]     = FLASH_FROM_FLOAT(p00);
+                smem_P[row0 * p_stride_512 + c0 + 1] = FLASH_FROM_FLOAT(p01);
+                smem_P[row1 * p_stride_512 + c0]     = FLASH_FROM_FLOAT(p10);
+                smem_P[row1 * p_stride_512 + c0 + 1] = FLASH_FROM_FLOAT(p11);
             }
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
             sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
@@ -793,19 +795,19 @@ extern "C" __global__ void flash_prefill_paged(
             il1 = (lv1 > 0.f) ? (1.f / lv1) : 0.f;
         }
 
-        flash_half_t* ob = O + q_head * head_dim;
+        HalfT* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP_512; nt++) {
             unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][0] * il0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][1] * il0));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
             if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][2] * il1));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(acc_o[nt][3] * il1));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][2] * il1));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
             }
         }

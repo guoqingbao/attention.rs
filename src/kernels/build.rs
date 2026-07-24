@@ -66,7 +66,6 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fast_topk.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_instantiate.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_decode.cu");
-    println!("cargo:rerun-if-changed=src/flash/flash_f16.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged_fp8.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_decode_paged.cuh");

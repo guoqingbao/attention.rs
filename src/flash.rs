@@ -41,6 +41,16 @@ fn get_cuda_stream(dev: &candle::CudaDevice) -> i64 {
 }
 
 #[cfg(feature = "cuda")]
+/// Maps activation dtype to native-flash FFI dtype: 0=f16, 1=bf16.
+fn flash_half_dtype(dt: DType) -> Result<i32> {
+    match dt {
+        DType::F16 => Ok(0),
+        DType::BF16 => Ok(1),
+        _ => candle::bail!("native flash requires F16 or BF16, got {dt:?}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn ptr_from_tensor(t: &Tensor) -> Result<*const std::ffi::c_void> {
     let (storage, layout) = t.storage_and_layout();
     let cuda_storage = match &*storage {
@@ -118,6 +128,7 @@ pub fn flash_reshape_and_cache(
     if is_fp8 {
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
+        let flash_dtype = flash_half_dtype(key.dtype())?;
         unsafe {
             kernels::ffi::call_flash_reshape_and_cache_fp8_kv(
                 key_ptr,
@@ -131,47 +142,28 @@ pub fn flash_reshape_and_cache(
                 block_size as u32,
                 ks_ptr,
                 vs_ptr,
-                stream,
-            );
-        }
-    } else if key.dtype() == DType::F16 {
-        // SM70/75: *_f16 aliases to F16 kernels named *_bf16.
-        // SM80+: real F16 reshape (flash_f16.cu / FLASH_FORCE_F16).
-        unsafe {
-            kernels::ffi::call_flash_reshape_and_cache_f16(
-                key_ptr,
-                value_ptr,
-                key_cache_ptr,
-                value_cache_ptr,
-                slot_ptr,
-                num_tokens as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
-                stream,
-            );
-        }
-    } else if key.dtype() == DType::BF16 {
-        // SM80+: real BF16. SM70/75 never reach here (xinfer forces F16).
-        unsafe {
-            kernels::ffi::call_flash_reshape_and_cache_bf16(
-                key_ptr,
-                value_ptr,
-                key_cache_ptr,
-                value_cache_ptr,
-                slot_ptr,
-                num_tokens as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
+                flash_dtype,
                 stream,
             );
         }
     } else {
-        candle::bail!(
-            "flash_reshape_and_cache: unsupported key dtype {:?} (need F16 or BF16)",
-            key.dtype()
-        );
+        let flash_dtype = flash_half_dtype(key.dtype())?;
+
+        unsafe {
+            kernels::ffi::call_flash_reshape_and_cache(
+                key_ptr,
+                value_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                slot_ptr,
+                num_tokens as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                block_size as u32,
+                flash_dtype,
+                stream,
+            );
+        }
     }
     Ok(())
 }
@@ -245,6 +237,7 @@ pub fn flash_prefill(
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
         let fp8_cache_stride = (key_cache.dim(1)? * key_cache.dim(2)? * key_cache.dim(3)?) as u64;
+        let flash_dtype = flash_half_dtype(query.dtype())?;
         unsafe {
             kernels::ffi::call_flash_prefill_paged_fp8(
                 q_ptr,
@@ -268,34 +261,13 @@ pub fn flash_prefill(
                 ks_ptr,
                 vs_ptr,
                 fp8_cache_stride,
+                flash_dtype,
                 stream,
             );
         }
-    } else if query.dtype() == DType::F16 {
-        unsafe {
-            kernels::ffi::call_flash_prefill_paged_f16(
-                q_ptr,
-                kc_ptr,
-                vc_ptr,
-                o_ptr,
-                bt_ptr,
-                block_table_stride,
-                cu_ptr,
-                cl_ptr,
-                num_seqs as u32,
-                actual_max_q_len as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
-                sw,
-                1,
-                scale,
-                softcap,
-                stream,
-            );
-        }
-    } else if query.dtype() == DType::BF16 {
+    } else {
+        let flash_dtype = flash_half_dtype(query.dtype())?;
+
         unsafe {
             kernels::ffi::call_flash_prefill_paged(
                 q_ptr,
@@ -316,14 +288,10 @@ pub fn flash_prefill(
                 1,
                 scale,
                 softcap,
+                flash_dtype,
                 stream,
             );
         }
-    } else {
-        candle::bail!(
-            "flash_prefill: unsupported query dtype {:?} (need F16 or BF16)",
-            query.dtype()
-        );
     }
 
     Ok(o)
@@ -416,6 +384,7 @@ pub fn flash_decode(
         let fp8_cache_stride = (block_size * num_kv_heads * head_dim) as u64;
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
+        let flash_dtype = flash_half_dtype(query.dtype())?;
 
         if use_splitk {
             let ws = workspace.unwrap();
@@ -443,6 +412,7 @@ pub fn flash_decode(
                     fp8_cache_stride,
                     sw,
                     effective_gqa as u32,
+                    flash_dtype,
                     stream,
                 );
                 kernels::ffi::call_flash_decode_paged_reduce(
@@ -452,6 +422,7 @@ pub fn flash_decode(
                     head_dim as u32,
                     num_splits,
                     num_seqs as u32,
+                    flash_dtype,
                     stream,
                 );
             }
@@ -478,71 +449,13 @@ pub fn flash_decode(
                     vs_ptr,
                     fp8_cache_stride,
                     effective_gqa as u32,
+                    flash_dtype,
                     stream,
                 );
             }
         }
-    } else if query.dtype() == DType::F16 {
-        if use_splitk {
-            let ws = workspace.unwrap();
-            let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
-            unsafe {
-                kernels::ffi::call_flash_decode_paged_splitk_f16(
-                    q_ptr,
-                    kc_ptr,
-                    vc_ptr,
-                    ws_ptr,
-                    bt_ptr,
-                    cl_ptr,
-                    max_blocks_per_seq,
-                    num_q_heads as u32,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    block_size as u32,
-                    scale,
-                    num_seqs as u32,
-                    num_splits,
-                    q_stride,
-                    softcap,
-                    sw,
-                    effective_gqa as u32,
-                    stream,
-                );
-                kernels::ffi::call_flash_decode_paged_reduce_f16(
-                    ws_ptr as *const std::ffi::c_void,
-                    o_ptr,
-                    num_q_heads as u32,
-                    head_dim as u32,
-                    num_splits,
-                    num_seqs as u32,
-                    stream,
-                );
-            }
-        } else {
-            unsafe {
-                kernels::ffi::call_flash_decode_paged_f16(
-                    q_ptr,
-                    kc_ptr,
-                    vc_ptr,
-                    o_ptr,
-                    bt_ptr,
-                    cl_ptr,
-                    max_blocks_per_seq,
-                    num_q_heads as u32,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    block_size as u32,
-                    scale,
-                    num_seqs as u32,
-                    q_stride,
-                    sw,
-                    softcap,
-                    effective_gqa as u32,
-                    stream,
-                );
-            }
-        }
-    } else if query.dtype() == DType::BF16 {
+    } else {
+        let flash_dtype = flash_half_dtype(query.dtype())?;
         if use_splitk {
             let ws = workspace.unwrap();
             let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
@@ -566,6 +479,7 @@ pub fn flash_decode(
                     softcap,
                     sw,
                     effective_gqa as u32,
+                    flash_dtype,
                     stream,
                 );
                 kernels::ffi::call_flash_decode_paged_reduce(
@@ -575,6 +489,7 @@ pub fn flash_decode(
                     head_dim as u32,
                     num_splits,
                     num_seqs as u32,
+                    flash_dtype,
                     stream,
                 );
             }
@@ -598,15 +513,11 @@ pub fn flash_decode(
                     sw,
                     softcap,
                     effective_gqa as u32,
+                    flash_dtype,
                     stream,
                 );
             }
         }
-    } else {
-        candle::bail!(
-            "flash_decode: unsupported query dtype {:?} (need F16 or BF16)",
-            query.dtype()
-        );
     }
 
     Ok(output.clone())
@@ -652,6 +563,7 @@ pub fn flash_tq_store_k8v4(
     };
 
     let ks_ptr = scale_gpu_ptr(k_scale)?;
+    let flash_dtype = flash_half_dtype(key.dtype())?;
 
     unsafe {
         kernels::ffi::call_flash_tq_store_k8v4(
@@ -666,6 +578,7 @@ pub fn flash_tq_store_k8v4(
             head_dim as u32,
             block_size as u32,
             ks_ptr,
+            flash_dtype,
             stream,
         );
     }
@@ -725,6 +638,7 @@ pub fn flash_tq_decode_k8v4(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let ks_ptr = scale_gpu_ptr(k_scale)?;
     let sw = sliding_window.unwrap_or(0) as u32;
+    let flash_dtype = flash_half_dtype(query.dtype())?;
 
     unsafe {
         kernels::ffi::call_flash_tq_decode_k8v4(
@@ -746,6 +660,7 @@ pub fn flash_tq_decode_k8v4(
             softcap,
             ks_ptr,
             sw,
+            flash_dtype,
             stream,
         );
     }
@@ -833,6 +748,7 @@ pub fn flash_tq_decode_k8v4_splitk(
 
     let ws = workspace.unwrap();
     let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+    let flash_dtype = flash_half_dtype(query.dtype())?;
 
     unsafe {
         kernels::ffi::call_flash_tq_decode_k8v4_splitk(
@@ -855,6 +771,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             softcap,
             ks_ptr,
             sw,
+            flash_dtype,
             stream,
         );
         kernels::ffi::call_flash_decode_paged_reduce(
@@ -864,6 +781,7 @@ pub fn flash_tq_decode_k8v4_splitk(
             head_dim as u32,
             num_splits,
             num_seqs as u32,
+            flash_dtype,
             stream,
         );
     }
@@ -910,6 +828,8 @@ pub fn flash_tq4_store(
         *s.slice(l.start_offset()..).device_ptr() as *const i64
     };
 
+    let flash_dtype = flash_half_dtype(key.dtype())?;
+
     unsafe {
         kernels::ffi::call_flash_tq4_store(
             k_ptr,
@@ -923,6 +843,7 @@ pub fn flash_tq4_store(
             num_kv_heads as u32,
             head_dim as u32,
             block_size as u32,
+            flash_dtype,
             stream,
         );
     }
@@ -993,10 +914,12 @@ pub fn flash_tq4_decode(
 
     let num_splits = flash_num_splits(max_context_len);
     let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let flash_dtype = flash_half_dtype(query.dtype())?;
 
     if use_splitk {
         let ws = workspace.unwrap();
         let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+
         unsafe {
             kernels::ffi::call_flash_tq4_decode_splitk(
                 q_ptr,
@@ -1018,6 +941,7 @@ pub fn flash_tq4_decode(
                 q_stride,
                 softcap,
                 sw,
+                flash_dtype,
                 stream,
             );
             kernels::ffi::call_flash_decode_paged_reduce(
@@ -1027,6 +951,7 @@ pub fn flash_tq4_decode(
                 head_dim as u32,
                 num_splits,
                 num_seqs as u32,
+                flash_dtype,
                 stream,
             );
         }
@@ -1051,6 +976,7 @@ pub fn flash_tq4_decode(
                 q_stride,
                 softcap,
                 sw,
+                flash_dtype,
                 stream,
             );
         }
@@ -1098,6 +1024,8 @@ pub fn flash_tq3_store(
         *s.slice(l.start_offset()..).device_ptr() as *const i64
     };
 
+    let flash_dtype = flash_half_dtype(key.dtype())?;
+
     unsafe {
         kernels::ffi::call_flash_tq3_store(
             k_ptr,
@@ -1111,6 +1039,7 @@ pub fn flash_tq3_store(
             num_kv_heads as u32,
             head_dim as u32,
             block_size as u32,
+            flash_dtype,
             stream,
         );
     }
@@ -1181,10 +1110,12 @@ pub fn flash_tq3_decode(
 
     let num_splits = flash_num_splits(max_context_len);
     let use_splitk = num_splits > 1 && max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let flash_dtype = flash_half_dtype(query.dtype())?;
 
     if use_splitk {
         let ws = workspace.unwrap();
         let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
+
         unsafe {
             kernels::ffi::call_flash_tq3_decode_splitk(
                 q_ptr,
@@ -1206,6 +1137,7 @@ pub fn flash_tq3_decode(
                 q_stride,
                 softcap,
                 sw,
+                flash_dtype,
                 stream,
             );
             kernels::ffi::call_flash_decode_paged_reduce(
@@ -1215,6 +1147,7 @@ pub fn flash_tq3_decode(
                 head_dim as u32,
                 num_splits,
                 num_seqs as u32,
+                flash_dtype,
                 stream,
             );
         }
@@ -1239,6 +1172,7 @@ pub fn flash_tq3_decode(
                 q_stride,
                 softcap,
                 sw,
+                flash_dtype,
                 stream,
             );
         }
@@ -1316,6 +1250,8 @@ pub fn flash_tq4_prefill(
         )
     };
 
+    let flash_dtype = flash_half_dtype(query.dtype())?;
+
     unsafe {
         kernels::ffi::call_flash_tq4_prefill(
             q_ptr,
@@ -1338,6 +1274,7 @@ pub fn flash_tq4_prefill(
             1,
             scale,
             softcap,
+            flash_dtype,
             stream,
         );
     }
@@ -1410,6 +1347,8 @@ pub fn flash_tq3_prefill(
         )
     };
 
+    let flash_dtype = flash_half_dtype(query.dtype())?;
+
     unsafe {
         kernels::ffi::call_flash_tq3_prefill(
             q_ptr,
@@ -1432,6 +1371,7 @@ pub fn flash_tq3_prefill(
             1,
             scale,
             softcap,
+            flash_dtype,
             stream,
         );
     }
