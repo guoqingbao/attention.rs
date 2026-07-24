@@ -34,6 +34,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include "flash_sm_compat.cuh"
 #include <cuda_fp8.h>
 
@@ -404,7 +405,8 @@
 #define DISPATCH_DECODE_FP8(HDIM_VAL, ...) flash_decode_paged_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
 #define DISPATCH_DECODE_SPLITK_FP8(HDIM_VAL, ...) flash_decode_paged_splitk_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
 
-// Prefill BF16 launcher
+// Launchers: dtype 0=f16, 1=bf16 (BF16 only when !NO_BF16_KERNEL)
+
 extern "C" void call_flash_prefill_paged(
     const void* Q, const void* K_cache, const void* V_cache, void* O,
     const int* block_tables, unsigned int block_table_stride,
@@ -414,39 +416,72 @@ extern "C" void call_flash_prefill_paged(
     unsigned int head_dim, unsigned int cache_block_size,
     unsigned int sliding_window, unsigned int causal,
     float inv_sqrt_d, float softcap,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    unsigned int br = 32;
-    dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
-
-    #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-        flash_prefill_paged_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
-            (const flash_half_t*)V_cache, (flash_half_t*)O, \
-            block_tables, block_table_stride, cu_seqlens_q, context_lens, \
-            num_q_heads, num_kv_heads, \
-            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
-
-    if (head_dim <= 128) {
-        LAUNCH_PREFILL(128, 128, 0);
-    } else if (head_dim <= 256) {
-        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_prefill_paged_256,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_PREFILL(256, 128, smem);
-    } else {
-        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_prefill_paged_512,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_PREFILL(512, 256, smem);
+    if (dtype == 0) {
+#define HALF __half
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_prefill_paged_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
     }
-    #undef LAUNCH_PREFILL
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_prefill_paged_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// Prefill FP8 launcher
 extern "C" void call_flash_prefill_paged_fp8(
     const void* Q, const void* K_cache, const void* V_cache, void* O,
     const int* block_tables, unsigned int block_table_stride,
@@ -457,74 +492,128 @@ extern "C" void call_flash_prefill_paged_fp8(
     unsigned int sliding_window, unsigned int causal,
     float inv_sqrt_d, float softcap,
     const float* k_scale_ptr, const float* v_scale_ptr, unsigned long long fp8_cache_stride,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    unsigned int br = 32;
-    dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
-
-    #define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
-        flash_prefill_paged_fp8_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const flash_half_t*)Q, K_cache, V_cache, (flash_half_t*)O, \
-            block_tables, block_table_stride, cu_seqlens_q, context_lens, \
-            num_q_heads, num_kv_heads, \
-            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap, \
-            k_scale_ptr, v_scale_ptr, fp8_cache_stride)
-
-    if (head_dim <= 128) {
-        LAUNCH_PREFILL_FP8(128, 128, 0);
-    } else if (head_dim <= 256) {
-        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_prefill_paged_fp8_256,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_PREFILL_FP8(256, 128, smem);
-    } else {
-        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_prefill_paged_fp8_512,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_PREFILL_FP8(512, 256, smem);
+    if (dtype == 0) {
+#define HALF __half
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
+            flash_prefill_paged_fp8_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL_FP8(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL_FP8(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL_FP8(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL_FP8
+#undef HALF
     }
-    #undef LAUNCH_PREFILL_FP8
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
+            flash_prefill_paged_fp8_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL_FP8(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL_FP8(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL_FP8(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL_FP8
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// Decode BF16 launcher
-// BF16 decode launchers moved to flash_decode.cu
-
-// Decode FP8 launcher — per-Q-head dispatch (GQA computed inside kernel)
 extern "C" void call_flash_decode_paged_fp8(
     const void* Q, const void* K_cache, const void* V_cache, void* O,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs,
-    unsigned int q_stride,
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int q_stride,
     unsigned int sliding_window, float softcap,
     const float* k_scale_ptr, const float* v_scale_ptr, unsigned long long fp8_cache_stride,
     unsigned int gqa_ratio,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_seqs);
-
-    #define LAUNCH_DECODE_FP8(HD) \
-        flash_decode_paged_fp8_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, K_cache, V_cache, (flash_half_t*)O, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, q_stride, sliding_window, softcap, \
-            k_scale_ptr, v_scale_ptr, fp8_cache_stride)
-
-    if (head_dim <= 128) { LAUNCH_DECODE_FP8(128); }
-    else if (head_dim <= 256) { LAUNCH_DECODE_FP8(256); }
-    else { LAUNCH_DECODE_FP8(512); }
-    #undef LAUNCH_DECODE_FP8
+    if (dtype == 0) {
+#define HALF __half
+        (void)gqa_ratio;
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE_FP8(HD) \
+            flash_decode_paged_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, q_stride, sliding_window, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+        if (head_dim <= 128) { LAUNCH_DECODE_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_FP8(256); }
+        else { LAUNCH_DECODE_FP8(512); }
+#undef LAUNCH_DECODE_FP8
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        (void)gqa_ratio;
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE_FP8(HD) \
+            flash_decode_paged_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, q_stride, sliding_window, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+        if (head_dim <= 128) { LAUNCH_DECODE_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_FP8(256); }
+        else { LAUNCH_DECODE_FP8(512); }
+#undef LAUNCH_DECODE_FP8
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// Decode FP8 split-K launcher — per-Q-head dispatch
 extern "C" void call_flash_decode_paged_splitk_fp8(
     const void* Q, const void* K_cache, const void* V_cache,
     void* workspace,
@@ -532,90 +621,155 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs, unsigned int num_splits,
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int num_splits,
     unsigned int q_stride, float softcap,
     const float* k_scale_ptr, const float* v_scale_ptr, unsigned long long fp8_cache_stride,
-    unsigned int sliding_window,
-    unsigned int gqa_ratio,
-    int64_t stream
+    unsigned int sliding_window, unsigned int gqa_ratio,
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_splits, num_seqs);
-
-    #define LAUNCH_DECODE_SK_FP8(HD) \
-        flash_decode_paged_splitk_fp8_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, K_cache, V_cache, (float*)workspace, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_splits, q_stride, softcap, \
-            k_scale_ptr, v_scale_ptr, fp8_cache_stride, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_DECODE_SK_FP8(128); }
-    else if (head_dim <= 256) { LAUNCH_DECODE_SK_FP8(256); }
-    else { LAUNCH_DECODE_SK_FP8(512); }
-    #undef LAUNCH_DECODE_SK_FP8
+    if (dtype == 0) {
+#define HALF __half
+        (void)gqa_ratio;
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK_FP8(HD) \
+            flash_decode_paged_splitk_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, q_stride, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK_FP8(256); }
+        else { LAUNCH_DECODE_SK_FP8(512); }
+#undef LAUNCH_DECODE_SK_FP8
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        (void)gqa_ratio;
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK_FP8(HD) \
+            flash_decode_paged_splitk_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, K_cache, V_cache, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, q_stride, softcap, \
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK_FP8(256); }
+        else { LAUNCH_DECODE_SK_FP8(512); }
+#undef LAUNCH_DECODE_SK_FP8
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// Reshape & cache BF16 launcher
-extern "C" void call_flash_reshape_and_cache_bf16(
+extern "C" void call_flash_reshape_and_cache(
     const void* key, const void* value, void* key_cache, void* value_cache,
     const long long* slot_mapping,
     unsigned int num_tokens, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int cache_block_size,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_tokens, num_kv_heads);
-    unsigned int threads = (head_dim + 7) / 8;
-    if (threads < 32) threads = 32;
-    if (threads > 256) threads = 256;
-
-    #define LAUNCH_CACHE(HD) \
-        flash_reshape_and_cache_##HD<<<grid, threads, 0, s>>>( \
-            (const flash_half_t*)key, (const flash_half_t*)value, \
-            (flash_half_t*)key_cache, (flash_half_t*)value_cache, \
-            slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
-
-    if (head_dim <= 128) { LAUNCH_CACHE(128); }
-    else if (head_dim <= 256) { LAUNCH_CACHE(256); }
-    else { LAUNCH_CACHE(512); }
-    #undef LAUNCH_CACHE
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 7) / 8;
+        if (threads < 32) threads = 32;
+        if (threads > 256) threads = 256;
+#define LAUNCH_CACHE(HD) \
+            flash_reshape_and_cache_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)key, (const HALF*)value, \
+                (HALF*)key_cache, (HALF*)value_cache, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
+        if (head_dim <= 128) { LAUNCH_CACHE(128); }
+        else if (head_dim <= 256) { LAUNCH_CACHE(256); }
+        else { LAUNCH_CACHE(512); }
+#undef LAUNCH_CACHE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 7) / 8;
+        if (threads < 32) threads = 32;
+        if (threads > 256) threads = 256;
+#define LAUNCH_CACHE(HD) \
+            flash_reshape_and_cache_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)key, (const HALF*)value, \
+                (HALF*)key_cache, (HALF*)value_cache, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
+        if (head_dim <= 128) { LAUNCH_CACHE(128); }
+        else if (head_dim <= 256) { LAUNCH_CACHE(256); }
+        else { LAUNCH_CACHE(512); }
+#undef LAUNCH_CACHE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// Reshape & cache FP8 launcher
 extern "C" void call_flash_reshape_and_cache_fp8_kv(
     const void* key, const void* value, void* key_cache, void* value_cache,
     const long long* slot_mapping,
     unsigned int num_tokens, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int cache_block_size,
     const float* k_scale_ptr, const float* v_scale_ptr,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_tokens, num_kv_heads);
-    unsigned int threads = (head_dim + 31) / 32 * 32;
-    if (threads > 256) threads = 256;
-    if (threads < 32) threads = 32;
-
-    #define LAUNCH_CACHE_FP8(HD) \
-        flash_reshape_and_cache_fp8_##HD<<<grid, threads, 0, s>>>( \
-            (const flash_half_t*)key, (const flash_half_t*)value, \
-            key_cache, value_cache, slot_mapping, \
-            num_tokens, num_kv_heads, head_dim, cache_block_size, \
-            k_scale_ptr, v_scale_ptr)
-
-    if (head_dim <= 128) { LAUNCH_CACHE_FP8(128); }
-    else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
-    else { LAUNCH_CACHE_FP8(512); }
-    #undef LAUNCH_CACHE_FP8
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 31) / 32 * 32;
+        if (threads > 256) threads = 256;
+        if (threads < 32) threads = 32;
+#define LAUNCH_CACHE_FP8(HD) \
+            flash_reshape_and_cache_fp8_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)key, (const HALF*)value, \
+                key_cache, value_cache, slot_mapping, \
+                num_tokens, num_kv_heads, head_dim, cache_block_size, \
+                k_scale_ptr, v_scale_ptr)
+        if (head_dim <= 128) { LAUNCH_CACHE_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
+        else { LAUNCH_CACHE_FP8(512); }
+#undef LAUNCH_CACHE_FP8
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 31) / 32 * 32;
+        if (threads > 256) threads = 256;
+        if (threads < 32) threads = 32;
+#define LAUNCH_CACHE_FP8(HD) \
+            flash_reshape_and_cache_fp8_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)key, (const HALF*)value, \
+                key_cache, value_cache, slot_mapping, \
+                num_tokens, num_kv_heads, head_dim, cache_block_size, \
+                k_scale_ptr, v_scale_ptr)
+        if (head_dim <= 128) { LAUNCH_CACHE_FP8(128); }
+        else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
+        else { LAUNCH_CACHE_FP8(512); }
+#undef LAUNCH_CACHE_FP8
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// ============================================================================
-// TurboQuant k8v4 launchers
-// ============================================================================
-
-// TurboQuant store: K → WHT rotate → FP8, V → 4-bit uniform
 extern "C" void call_flash_tq_store_k8v4(
     const void* K, const void* V,
     void* K_cache, void* V_absmax, void* V_quant,
@@ -623,302 +777,311 @@ extern "C" void call_flash_tq_store_k8v4(
     unsigned int num_tokens, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
     const float* k_scale_ptr,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_tokens, num_kv_heads);
-    unsigned int threads = 32; // single warp per head
-
-    #define LAUNCH_TQ_STORE(HD) \
-        flash_tq_store_k8v4_##HD<<<grid, threads, 0, s>>>( \
-            (const flash_half_t*)K, (const flash_half_t*)V, \
-            K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
-            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, \
-            k_scale_ptr)
-
-    if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
-    else { LAUNCH_TQ_STORE(512); }
-    #undef LAUNCH_TQ_STORE
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = 32;
+#define LAUNCH_TQ_STORE(HD) \
+            flash_tq_store_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, k_scale_ptr)
+        if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
+        else { LAUNCH_TQ_STORE(512); }
+#undef LAUNCH_TQ_STORE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = 32;
+#define LAUNCH_TQ_STORE(HD) \
+            flash_tq_store_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, k_scale_ptr)
+        if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
+        else { LAUNCH_TQ_STORE(512); }
+#undef LAUNCH_TQ_STORE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant decode: FP8 keys + 4-bit values → attention output
 extern "C" void call_flash_tq_decode_k8v4(
     const void* Q, const void* K_cache,
-    const void* V_absmax, const void* V_quant,
-    void* O,
+    const void* V_absmax, const void* V_quant, void* O,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    const float* k_scale_ptr,
-    unsigned int sliding_window,
-    int64_t stream
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int q_stride,
+    float softcap, const float* k_scale_ptr, unsigned int sliding_window,
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_seqs);
-    unsigned int threads = 8 * 32; // TQ_NUM_WARPS * WARP_SIZE
-
-    #define LAUNCH_TQ_DECODE(HD) \
-        flash_tq_decode_k8v4_##HD<<<grid, threads, 0, s>>>( \
-            (const flash_half_t*)Q, K_cache, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (flash_half_t*)O, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
-    else { LAUNCH_TQ_DECODE(512); }
-    #undef LAUNCH_TQ_DECODE
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_q_heads, num_seqs);
+        unsigned int threads = 8 * 32;
+#define LAUNCH_TQ_DECODE(HD) \
+            flash_tq_decode_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)Q, K_cache, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
+        if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
+        else { LAUNCH_TQ_DECODE(512); }
+#undef LAUNCH_TQ_DECODE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_q_heads, num_seqs);
+        unsigned int threads = 8 * 32;
+#define LAUNCH_TQ_DECODE(HD) \
+            flash_tq_decode_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)Q, K_cache, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
+        if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
+        else { LAUNCH_TQ_DECODE(512); }
+#undef LAUNCH_TQ_DECODE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant k8v4 decode split-K: long sequences
 extern "C" void call_flash_tq_decode_k8v4_splitk(
     const void* Q, const void* K_cache,
-    const void* V_absmax, const void* V_quant,
-    void* workspace,
+    const void* V_absmax, const void* V_quant, void* workspace,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_splits,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    const float* k_scale_ptr,
+    float inv_sqrt_d, unsigned int num_splits, unsigned int num_seqs,
+    unsigned int q_stride, float softcap, const float* k_scale_ptr,
     unsigned int sliding_window,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    unsigned int threads = 8 * 32; // TQ_NUM_WARPS * WARP_SIZE
-    dim3 grid(num_q_heads, num_splits, num_seqs);
-
-    #define LAUNCH_TQ_DECODE_SK(HD) \
-        flash_tq_decode_k8v4_splitk_##HD<<<grid, threads, 0, s>>>( \
-            (const flash_half_t*)Q, K_cache, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (float*)workspace, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
-    else { LAUNCH_TQ_DECODE_SK(512); }
-    #undef LAUNCH_TQ_DECODE_SK
+    if (dtype == 0) {
+#define HALF __half
+        unsigned int threads = 8 * 32;
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_TQ_DECODE_SK(HD) \
+            flash_tq_decode_k8v4_splitk_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)Q, K_cache, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
+        if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
+        else { LAUNCH_TQ_DECODE_SK(512); }
+#undef LAUNCH_TQ_DECODE_SK
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        unsigned int threads = 8 * 32;
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_TQ_DECODE_SK(HD) \
+            flash_tq_decode_k8v4_splitk_##HD<HALF><<<grid, threads, 0, s>>>( \
+                (const HALF*)Q, K_cache, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
+        if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
+        else { LAUNCH_TQ_DECODE_SK(512); }
+#undef LAUNCH_TQ_DECODE_SK
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant turbo4 store: K → WHT → 4-bit, V → 4-bit
 extern "C" void call_flash_tq4_store(
     const void* K, const void* V,
-    void* K_absmax, void* K_quant,
-    void* V_absmax, void* V_quant,
+    void* K_absmax, void* K_quant, void* V_absmax, void* V_quant,
     const long long* slot_mapping,
     unsigned int num_tokens, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_tokens, num_kv_heads);
-
-    #define LAUNCH_TQ4_STORE(HD) \
-        flash_tq4_store_##HD<<<grid, 32, 0, s>>>( \
-            (const flash_half_t*)K, (const flash_half_t*)V, \
-            (float*)K_absmax, (unsigned char*)K_quant, \
-            (float*)V_absmax, (unsigned char*)V_quant, \
-            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
-
-    if (head_dim <= 128) { LAUNCH_TQ4_STORE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ4_STORE(256); }
-    else { LAUNCH_TQ4_STORE(512); }
-    #undef LAUNCH_TQ4_STORE
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+#define LAUNCH_STORE(HD) \
+            flash_tq4_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                (float*)K_absmax, (unsigned char*)K_quant, \
+                (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+        if (head_dim <= 128) { LAUNCH_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_STORE(256); }
+        else { LAUNCH_STORE(512); }
+#undef LAUNCH_STORE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+#define LAUNCH_STORE(HD) \
+            flash_tq4_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                (float*)K_absmax, (unsigned char*)K_quant, \
+                (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+        if (head_dim <= 128) { LAUNCH_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_STORE(256); }
+        else { LAUNCH_STORE(512); }
+#undef LAUNCH_STORE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant turbo4 decode: 4-bit K + 4-bit V → attention
 extern "C" void call_flash_tq4_decode(
     const void* Q,
     const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* O,
+    const void* V_absmax, const void* V_quant, void* O,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    unsigned int sliding_window,
-    int64_t stream
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int q_stride,
+    float softcap, unsigned int sliding_window,
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_seqs);
-
-    #define LAUNCH_TQ4_DECODE(HD) \
-        flash_tq4_decode_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (flash_half_t*)O, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ4_DECODE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ4_DECODE(256); }
-    else { LAUNCH_TQ4_DECODE(512); }
-    #undef LAUNCH_TQ4_DECODE
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE(HD) \
+            flash_tq4_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE(256); }
+        else { LAUNCH_DECODE(512); }
+#undef LAUNCH_DECODE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE(HD) \
+            flash_tq4_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE(256); }
+        else { LAUNCH_DECODE(512); }
+#undef LAUNCH_DECODE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant turbo4 decode split-K: long sequences
 extern "C" void call_flash_tq4_decode_splitk(
     const void* Q,
     const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* workspace,
+    const void* V_absmax, const void* V_quant, void* workspace,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_splits,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    unsigned int sliding_window,
-    int64_t stream
+    float inv_sqrt_d, unsigned int num_splits, unsigned int num_seqs,
+    unsigned int q_stride, float softcap, unsigned int sliding_window,
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_splits, num_seqs);
-
-    #define LAUNCH_TQ4_DECODE_SK(HD) \
-        flash_tq4_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (float*)workspace, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ4_DECODE_SK(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ4_DECODE_SK(256); }
-    else { LAUNCH_TQ4_DECODE_SK(512); }
-    #undef LAUNCH_TQ4_DECODE_SK
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK(HD) \
+            flash_tq4_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
+        else { LAUNCH_DECODE_SK(512); }
+#undef LAUNCH_DECODE_SK
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK(HD) \
+            flash_tq4_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
+        else { LAUNCH_DECODE_SK(512); }
+#undef LAUNCH_DECODE_SK
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant turbo3 store: K → WHT → 3-bit, V → 4-bit
-extern "C" void call_flash_tq3_store(
-    const void* K, const void* V,
-    void* K_absmax, void* K_quant,
-    void* V_absmax, void* V_quant,
-    const long long* slot_mapping,
-    unsigned int num_tokens, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int block_size,
-    int64_t stream
-) {
-    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_tokens, num_kv_heads);
-
-    #define LAUNCH_TQ3_STORE(HD) \
-        flash_tq3_store_##HD<<<grid, 32, 0, s>>>( \
-            (const flash_half_t*)K, (const flash_half_t*)V, \
-            (float*)K_absmax, (unsigned char*)K_quant, \
-            (float*)V_absmax, (unsigned char*)V_quant, \
-            slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
-
-    if (head_dim <= 128) { LAUNCH_TQ3_STORE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ3_STORE(256); }
-    else { LAUNCH_TQ3_STORE(512); }
-    #undef LAUNCH_TQ3_STORE
-}
-
-// TurboQuant turbo3 decode: 3-bit K + 4-bit V → attention
-extern "C" void call_flash_tq3_decode(
-    const void* Q,
-    const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* O,
-    const int* block_tables, const int* seq_lens,
-    unsigned int max_blocks_per_seq,
-    unsigned int num_q_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    unsigned int sliding_window,
-    int64_t stream
-) {
-    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_seqs);
-
-    #define LAUNCH_TQ3_DECODE(HD) \
-        flash_tq3_decode_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (flash_half_t*)O, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ3_DECODE(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ3_DECODE(256); }
-    else { LAUNCH_TQ3_DECODE(512); }
-    #undef LAUNCH_TQ3_DECODE
-}
-
-// TurboQuant turbo3 decode split-K: long sequences
-extern "C" void call_flash_tq3_decode_splitk(
-    const void* Q,
-    const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* workspace,
-    const int* block_tables, const int* seq_lens,
-    unsigned int max_blocks_per_seq,
-    unsigned int num_q_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_splits,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    float softcap,
-    unsigned int sliding_window,
-    int64_t stream
-) {
-    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    dim3 grid(num_q_heads, num_splits, num_seqs);
-
-    #define LAUNCH_TQ3_DECODE_SK(HD) \
-        flash_tq3_decode_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (float*)workspace, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
-
-    if (head_dim <= 128) { LAUNCH_TQ3_DECODE_SK(128); }
-    else if (head_dim <= 256) { LAUNCH_TQ3_DECODE_SK(256); }
-    else { LAUNCH_TQ3_DECODE_SK(512); }
-    #undef LAUNCH_TQ3_DECODE_SK
-}
-
-// TurboQuant 4-bit prefill: reads K/V from 4-bit TQ buffers, dequant to BF16 in smem
 extern "C" void call_flash_tq4_prefill(
     const void* Q,
     const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* O,
+    const void* V_absmax, const void* V_quant, void* O,
     const int* block_tables, unsigned int block_table_stride,
     const unsigned int* cu_seqlens_q, const unsigned int* context_lens,
     unsigned int num_seqs, unsigned int max_q_len,
@@ -926,46 +1089,234 @@ extern "C" void call_flash_tq4_prefill(
     unsigned int head_dim, unsigned int cache_block_size,
     unsigned int sliding_window, unsigned int causal,
     float inv_sqrt_d, float softcap,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    unsigned int br = 32;
-    dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
-
-    #define LAUNCH_TQ4_PREFILL(HD, THREADS, SMEM) \
-        flash_tq4_prefill_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (flash_half_t*)O, \
-            block_tables, block_table_stride, cu_seqlens_q, context_lens, \
-            num_q_heads, num_kv_heads, \
-            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
-
-    if (head_dim <= 128) {
-        LAUNCH_TQ4_PREFILL(128, 128, 0);
-    } else if (head_dim <= 256) {
-        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_tq4_prefill_256,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_TQ4_PREFILL(256, 128, smem);
-    } else {
-        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_tq4_prefill_512,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_TQ4_PREFILL(512, 256, smem);
+    if (dtype == 0) {
+#define HALF __half
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_tq4_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
     }
-    #undef LAUNCH_TQ4_PREFILL
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_tq4_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
-// TurboQuant 3-bit-K prefill: reads K from 3-bit TQ buffers, V from 4-bit
+extern "C" void call_flash_tq3_store(
+    const void* K, const void* V,
+    void* K_absmax, void* K_quant, void* V_absmax, void* V_quant,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+#define LAUNCH_STORE(HD) \
+            flash_tq3_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                (float*)K_absmax, (unsigned char*)K_quant, \
+                (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+        if (head_dim <= 128) { LAUNCH_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_STORE(256); }
+        else { LAUNCH_STORE(512); }
+#undef LAUNCH_STORE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+#define LAUNCH_STORE(HD) \
+            flash_tq3_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+                (const HALF*)K, (const HALF*)V, \
+                (float*)K_absmax, (unsigned char*)K_quant, \
+                (float*)V_absmax, (unsigned char*)V_quant, \
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+        if (head_dim <= 128) { LAUNCH_STORE(128); }
+        else if (head_dim <= 256) { LAUNCH_STORE(256); }
+        else { LAUNCH_STORE(512); }
+#undef LAUNCH_STORE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_tq3_decode(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant, void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int q_stride,
+    float softcap, unsigned int sliding_window,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE(HD) \
+            flash_tq3_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE(256); }
+        else { LAUNCH_DECODE(512); }
+#undef LAUNCH_DECODE
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_q_heads, num_seqs);
+#define LAUNCH_DECODE(HD) \
+            flash_tq3_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE(256); }
+        else { LAUNCH_DECODE(512); }
+#undef LAUNCH_DECODE
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_tq3_decode_splitk(
+    const void* Q,
+    const void* K_absmax, const void* K_quant,
+    const void* V_absmax, const void* V_quant, void* workspace,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d, unsigned int num_splits, unsigned int num_seqs,
+    unsigned int q_stride, float softcap, unsigned int sliding_window,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK(HD) \
+            flash_tq3_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
+        else { LAUNCH_DECODE_SK(512); }
+#undef LAUNCH_DECODE_SK
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_q_heads, num_splits, num_seqs);
+#define LAUNCH_DECODE_SK(HD) \
+            flash_tq3_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
+                block_tables, seq_lens, max_blocks_per_seq, \
+                num_q_heads, num_kv_heads, head_dim, block_size, \
+                inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
+        if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
+        else { LAUNCH_DECODE_SK(512); }
+#undef LAUNCH_DECODE_SK
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
+}
+
 extern "C" void call_flash_tq3_prefill(
     const void* Q,
     const void* K_absmax, const void* K_quant,
-    const void* V_absmax, const void* V_quant,
-    void* O,
+    const void* V_absmax, const void* V_quant, void* O,
     const int* block_tables, unsigned int block_table_stride,
     const unsigned int* cu_seqlens_q, const unsigned int* context_lens,
     unsigned int num_seqs, unsigned int max_q_len,
@@ -973,36 +1324,73 @@ extern "C" void call_flash_tq3_prefill(
     unsigned int head_dim, unsigned int cache_block_size,
     unsigned int sliding_window, unsigned int causal,
     float inv_sqrt_d, float softcap,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    unsigned int br = 32;
-    dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
-
-    #define LAUNCH_TQ3_PREFILL(HD, THREADS, SMEM) \
-        flash_tq3_prefill_##HD<<<grid, THREADS, SMEM, s>>>( \
-            (const flash_half_t*)Q, \
-            (const float*)K_absmax, (const unsigned char*)K_quant, \
-            (const float*)V_absmax, (const unsigned char*)V_quant, \
-            (flash_half_t*)O, \
-            block_tables, block_table_stride, cu_seqlens_q, context_lens, \
-            num_q_heads, num_kv_heads, \
-            head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
-
-    if (head_dim <= 128) {
-        LAUNCH_TQ3_PREFILL(128, 128, 0);
-    } else if (head_dim <= 256) {
-        unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_tq3_prefill_256,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_TQ3_PREFILL(256, 128, smem);
-    } else {
-        unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
-        smem = (smem + 255) & ~255u;
-        cudaFuncSetAttribute(flash_tq3_prefill_512,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        LAUNCH_TQ3_PREFILL(512, 256, smem);
+    if (dtype == 0) {
+#define HALF __half
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_tq3_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
     }
-    #undef LAUNCH_TQ3_PREFILL
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        unsigned int br = 32;
+        dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
+#define LAUNCH_PREFILL(HD, THREADS, SMEM) \
+            flash_tq3_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+                (const HALF*)Q, \
+                (const float*)K_absmax, (const unsigned char*)K_quant, \
+                (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
+                block_tables, block_table_stride, cu_seqlens_q, context_lens, \
+                num_q_heads, num_kv_heads, head_dim, cache_block_size, \
+                sliding_window, causal, inv_sqrt_d, softcap)
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(256, 128, smem);
+        } else {
+            unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            LAUNCH_PREFILL(512, 256, smem);
+        }
+#undef LAUNCH_PREFILL
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_*: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
+

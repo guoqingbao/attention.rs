@@ -1,11 +1,14 @@
-/* ldg_vec fix: support VEC_U32 > 2 for HDIM > 128 */
 /**
- * @brief BF16 paged decode kernel instantiation for native flash attention.
+ * @brief Native flash decode instantiation — dual F16/BF16 templates.
  *
  * This CUDA kernel is developed for xInfer (vLLM.rs) project:
  * https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/flash/flash_decode.cu
  *
+ * Copyright (c) 2026, Guoqing Bao.  All rights reserved.
+ *
  * @details
+ * Instantiates templated paged decode kernels for HDIM 128/256/512.
+ * F16 always; BF16 only when !NO_BF16_KERNEL (SM80+).
  * Instantiates BF16 paged decode kernels (main + split-K + reduce) for HDIM
  * 128/256/512. Each CTA handles one Q head; GQA kv_head mapping is computed
  * inside the kernel. 8 warps split the KV sequence with online softmax and
@@ -25,6 +28,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include "flash_sm_compat.cuh"
 #include <cuda_fp8.h>
 
@@ -58,10 +62,8 @@
 #undef BC
 #undef LDG_VEC_DEFINED
 #undef LDG_VEC_LOAD
+// Keep FLASH_DECODE_UNPACK_DEFINED: unpack2_bf16_d is HDIM-independent.
 
-// ============================================================================
-// HDIM=256, GQA_RATIO=1
-// ============================================================================
 #define FLASH_HDIM 256
 #define GQA_RATIO 1
 #define flash_decode_paged      flash_decode_paged_256
@@ -82,9 +84,6 @@
 #undef LDG_VEC_DEFINED
 #undef LDG_VEC_LOAD
 
-// ============================================================================
-// HDIM=512, GQA_RATIO=1
-// ============================================================================
 #define FLASH_HDIM 512
 #define GQA_RATIO 1
 #define flash_decode_paged      flash_decode_paged_512
@@ -104,10 +103,25 @@
 #undef BC
 #undef LDG_VEC_DEFINED
 #undef LDG_VEC_LOAD
+#undef FLASH_DECODE_UNPACK_DEFINED
 
 // ============================================================================
-// BF16 Decode Dispatcher — per-Q-head, no GQA grouping
+// Launch helpers — unified dtype: 0=f16, 1=bf16
 // ============================================================================
+
+#define LAUNCH_DECODE_T(HALF, HD) \
+    flash_decode_paged_##HD<HALF><<<grid, 256, 0, s>>>( \
+        (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
+        block_tables, seq_lens, max_blocks_per_seq, \
+        num_q_heads, num_kv_heads, head_dim, block_size, \
+        inv_sqrt_d, q_stride, sliding_window, softcap)
+
+#define LAUNCH_DECODE_SK_T(HALF, HD) \
+    flash_decode_paged_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+        (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (float*)workspace, \
+        block_tables, seq_lens, max_blocks_per_seq, \
+        num_q_heads, num_kv_heads, head_dim, block_size, \
+        inv_sqrt_d, num_splits, q_stride, softcap, sliding_window)
 
 extern "C" void call_flash_decode_paged(
     const void* Q, const void* K_cache, const void* V_cache, void* O,
@@ -115,71 +129,89 @@ extern "C" void call_flash_decode_paged(
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs,
-    unsigned int q_stride,
-    unsigned int sliding_window, float softcap,
-    unsigned int gqa_ratio,
-    int64_t stream
+    float inv_sqrt_d, unsigned int num_seqs, unsigned int q_stride,
+    unsigned int sliding_window, float softcap, unsigned int gqa_ratio,
+    int dtype, int64_t stream
 ) {
+    (void)gqa_ratio;
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     dim3 grid(num_q_heads, num_seqs);
-
-    #define DO_LAUNCH(HD) \
-        flash_decode_paged_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
-            (const flash_half_t*)V_cache, (flash_half_t*)O, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, q_stride, sliding_window, softcap)
-
-    if (head_dim <= 128)      { DO_LAUNCH(128); }
-    else if (head_dim <= 256) { DO_LAUNCH(256); }
-    else                      { DO_LAUNCH(512); }
-    #undef DO_LAUNCH
+    if (dtype == 0) {
+        if (head_dim <= 128)      { LAUNCH_DECODE_T(__half, 128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_T(__half, 256); }
+        else                      { LAUNCH_DECODE_T(__half, 512); }
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+        if (head_dim <= 128)      { LAUNCH_DECODE_T(__nv_bfloat16, 128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_T(__nv_bfloat16, 256); }
+        else                      { LAUNCH_DECODE_T(__nv_bfloat16, 512); }
+    }
+#endif
+    else {
+        printf("call_flash_decode_paged: unsupported dtype %d (0=f16, 1=bf16)\n", (int)dtype);
+    }
 }
 
 extern "C" void call_flash_decode_paged_splitk(
-    const void* Q, const void* K_cache, const void* V_cache,
-    void* workspace,
+    const void* Q, const void* K_cache, const void* V_cache, void* workspace,
     const int* block_tables, const int* seq_lens,
     unsigned int max_blocks_per_seq,
     unsigned int num_q_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int block_size,
-    float inv_sqrt_d,
-    unsigned int num_seqs, unsigned int num_splits,
-    unsigned int q_stride, float softcap,
-    unsigned int sliding_window,
-    unsigned int gqa_ratio,
-    int64_t stream
+    unsigned int head_dim, unsigned int block_size, float inv_sqrt_d,
+    unsigned int num_seqs, unsigned int num_splits, unsigned int q_stride,
+    float softcap, unsigned int sliding_window, unsigned int gqa_ratio,
+    int dtype, int64_t stream
 ) {
+    (void)gqa_ratio;
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     dim3 grid(num_q_heads, num_splits, num_seqs);
-
-    #define DO_LAUNCH_SK(HD) \
-        flash_decode_paged_splitk_##HD<<<grid, 256, 0, s>>>( \
-            (const flash_half_t*)Q, (const flash_half_t*)K_cache, \
-            (const flash_half_t*)V_cache, (float*)workspace, \
-            block_tables, seq_lens, max_blocks_per_seq, \
-            num_q_heads, num_kv_heads, head_dim, block_size, \
-            inv_sqrt_d, num_splits, q_stride, softcap, sliding_window)
-
-    if (head_dim <= 128)      { DO_LAUNCH_SK(128); }
-    else if (head_dim <= 256) { DO_LAUNCH_SK(256); }
-    else                      { DO_LAUNCH_SK(512); }
-    #undef DO_LAUNCH_SK
+    if (dtype == 0) {
+        if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__half, 128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__half, 256); }
+        else                      { LAUNCH_DECODE_SK_T(__half, 512); }
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+        if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 128); }
+        else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__nv_bfloat16, 256); }
+        else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 512); }
+    }
+#endif
+    else {
+        printf("call_flash_decode_paged_splitk: unsupported dtype %d\n", (int)dtype);
+    }
 }
 
 extern "C" void call_flash_decode_paged_reduce(
     const void* workspace, void* O,
     unsigned int num_q_heads, unsigned int head_dim,
     unsigned int num_splits, unsigned int num_seqs,
-    int64_t stream
+    int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     dim3 grid(num_q_heads, num_seqs);
-
-    if (head_dim <= 128)      flash_decode_paged_reduce_128<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
-    else if (head_dim <= 256) flash_decode_paged_reduce_256<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
-    else                      flash_decode_paged_reduce_512<<<grid, 32, 0, s>>>((const float*)workspace, (flash_half_t*)O, num_q_heads, head_dim, num_splits);
+#define LAUNCH_REDUCE(HALF) \
+    do { \
+        if (head_dim <= 128) \
+            flash_decode_paged_reduce_128<HALF><<<grid, 32, 0, s>>>( \
+                (const float*)workspace, (HALF*)O, num_q_heads, head_dim, num_splits); \
+        else if (head_dim <= 256) \
+            flash_decode_paged_reduce_256<HALF><<<grid, 32, 0, s>>>( \
+                (const float*)workspace, (HALF*)O, num_q_heads, head_dim, num_splits); \
+        else \
+            flash_decode_paged_reduce_512<HALF><<<grid, 32, 0, s>>>( \
+                (const float*)workspace, (HALF*)O, num_q_heads, head_dim, num_splits); \
+    } while (0)
+    if (dtype == 0) { LAUNCH_REDUCE(__half); }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) { LAUNCH_REDUCE(__nv_bfloat16); }
+#endif
+    else {
+        printf("call_flash_decode_paged_reduce: unsupported dtype %d\n", (int)dtype);
+    }
+#undef LAUNCH_REDUCE
 }
+
+#undef LAUNCH_DECODE_T
+#undef LAUNCH_DECODE_SK_T

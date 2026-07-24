@@ -56,11 +56,12 @@
 
 #ifndef FLASH_DECODE_UNPACK_DEFINED
 #define FLASH_DECODE_UNPACK_DEFINED
+template<typename HalfT>
 __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, float& v1) {
     const unsigned short lo = (unsigned short)(packed & 0xFFFF);
     const unsigned short hi = (unsigned short)(packed >> 16);
-    v0 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
-    v1 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
+    v0 = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&lo));
+    v1 = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&hi));
 }
 #endif
 
@@ -100,11 +101,12 @@ __device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
 
 #endif
 
-extern "C" __global__ void flash_decode_paged_fp8(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_decode_paged_fp8(
+    const HalfT* __restrict__ Q,
     const void* __restrict__ K_cache,
     const void* __restrict__ V_cache,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -149,7 +151,7 @@ extern "C" __global__ void flash_decode_paged_fp8(
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) qp[i] = __ldg(q32 + i);
         #pragma unroll
-        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(qp[i], q_reg[2*i], q_reg[2*i+1]);
+        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(qp[i], q_reg[2*i], q_reg[2*i+1]);
     }
 
     const unsigned int attended = seq_len - window_start;
@@ -317,16 +319,17 @@ extern "C" __global__ void flash_decode_paged_fp8(
         for (int i = 0; i < VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+            unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+            unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
             o32[i] = lo | (hi << 16);
         }
     }
 }
 
 // Split-K variant
-extern "C" __global__ void flash_decode_paged_splitk_fp8(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_decode_paged_splitk_fp8(
+    const HalfT* __restrict__ Q,
     const void* __restrict__ K_cache,
     const void* __restrict__ V_cache,
     float* __restrict__ workspace,
@@ -382,7 +385,7 @@ extern "C" __global__ void flash_decode_paged_splitk_fp8(
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) qp[i] = __ldg(q32 + i);
         #pragma unroll
-        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(qp[i], q_reg[2*i], q_reg[2*i+1]);
+        for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(qp[i], q_reg[2*i], q_reg[2*i+1]);
     }
 
     unsigned int local_len = kv_end - kv_start;

@@ -155,9 +155,10 @@ __device__ __forceinline__ float dequantize_4bit(unsigned char q, float absmax) 
 // Values are quantized to 4-bit uniform with per-head absmax scaling.
 // The absmax is stored alongside the packed 4-bit data.
 
-extern "C" __global__ void flash_tq_store_k8v4(
-    const flash_half_t* __restrict__ K,       // [num_tokens, num_kv_heads, head_dim]
-    const flash_half_t* __restrict__ V,       // [num_tokens, num_kv_heads, head_dim]
+template<typename HalfT>
+__global__ void flash_tq_store_k8v4(
+    const HalfT* __restrict__ K,       // [num_tokens, num_kv_heads, head_dim]
+    const HalfT* __restrict__ V,       // [num_tokens, num_kv_heads, head_dim]
     void* __restrict__ K_cache,                // [num_blocks, block_size, num_kv_heads, head_dim] FP8
     float* __restrict__ V_absmax,              // [num_blocks, block_size, num_kv_heads] float
     unsigned char* __restrict__ V_quant,       // [num_blocks, block_size, num_kv_heads, head_dim/2] uint8
@@ -190,7 +191,7 @@ extern "C" __global__ void flash_tq_store_k8v4(
     #pragma unroll
     for (int i = 0; i < TQ_VEC; i++) {
         unsigned int ch = lane_id * TQ_VEC + i;
-        v_reg[i] = FLASH_HALF2FLOAT(V[v_offset + ch]);
+        v_reg[i] = FLASH_TO_FLOAT(V[v_offset + ch]);
     }
 
     // Compute per-head absmax for V (warp reduction)
@@ -275,19 +276,21 @@ __device__ __forceinline__ void fp8x4_to_f32x4(unsigned int packed, float scale,
 }
 #endif
 
+template<typename HalfT>
 __device__ __forceinline__ void unpack2_bf16_tq(unsigned int packed, float &a, float &b) {
     const unsigned short lo = (unsigned short)(packed & 0xFFFF);
     const unsigned short hi = (unsigned short)(packed >> 16);
-    a = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
-    b = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
+    a = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&lo));
+    b = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&hi));
 }
 
-extern "C" __global__ void flash_tq_decode_k8v4(
-    const flash_half_t* __restrict__ Q,       // [num_seqs, num_q_heads, head_dim]
+template<typename HalfT>
+__global__ void flash_tq_decode_k8v4(
+    const HalfT* __restrict__ Q,       // [num_seqs, num_q_heads, head_dim]
     const void* __restrict__ K_cache,          // [num_blocks, block_size, num_kv_heads, head_dim] FP8
     const float* __restrict__ V_absmax,        // [num_blocks, block_size, num_kv_heads]
     const unsigned char* __restrict__ V_quant, // [num_blocks, block_size, num_kv_heads, head_dim/2]
-    flash_half_t* __restrict__ O,             // [num_seqs, num_q_heads, head_dim]
+    HalfT* __restrict__ O,             // [num_seqs, num_q_heads, head_dim]
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -327,24 +330,24 @@ extern "C" __global__ void flash_tq_decode_k8v4(
     {
 #if TQ_VEC >= 4
         uint2 qv = __ldg((const uint2*)q32);
-        unpack2_bf16_tq(qv.x, q_reg[0], q_reg[1]);
-        unpack2_bf16_tq(qv.y, q_reg[2], q_reg[3]);
+        unpack2_bf16_tq<HalfT>(qv.x, q_reg[0], q_reg[1]);
+        unpack2_bf16_tq<HalfT>(qv.y, q_reg[2], q_reg[3]);
 #if TQ_VEC >= 8
         uint2 qv2 = __ldg(((const uint2*)q32) + 1);
-        unpack2_bf16_tq(qv2.x, q_reg[4], q_reg[5]);
-        unpack2_bf16_tq(qv2.y, q_reg[6], q_reg[7]);
+        unpack2_bf16_tq<HalfT>(qv2.x, q_reg[4], q_reg[5]);
+        unpack2_bf16_tq<HalfT>(qv2.y, q_reg[6], q_reg[7]);
 #if TQ_VEC >= 16
         uint4 qv3 = __ldg(((const uint4*)q32) + 1);
-        unpack2_bf16_tq(qv3.x, q_reg[8], q_reg[9]);
-        unpack2_bf16_tq(qv3.y, q_reg[10], q_reg[11]);
-        unpack2_bf16_tq(qv3.z, q_reg[12], q_reg[13]);
-        unpack2_bf16_tq(qv3.w, q_reg[14], q_reg[15]);
+        unpack2_bf16_tq<HalfT>(qv3.x, q_reg[8], q_reg[9]);
+        unpack2_bf16_tq<HalfT>(qv3.y, q_reg[10], q_reg[11]);
+        unpack2_bf16_tq<HalfT>(qv3.z, q_reg[12], q_reg[13]);
+        unpack2_bf16_tq<HalfT>(qv3.w, q_reg[14], q_reg[15]);
 #endif
 #endif
 #else
         #pragma unroll
         for (int i = 0; i < TQ_VEC / 2; i++) {
-            unpack2_bf16_tq(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
+            unpack2_bf16_tq<HalfT>(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
         }
 #endif
     }
@@ -555,8 +558,8 @@ extern "C" __global__ void flash_tq_decode_k8v4(
         for (int i = 0; i < TQ_VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+            unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+            unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -568,8 +571,9 @@ extern "C" __global__ void flash_tq_decode_k8v4(
 // Writes partial results to float workspace; reduced by flash_decode_paged_reduce.
 // ============================================================================
 
-extern "C" __global__ void flash_tq_decode_k8v4_splitk(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq_decode_k8v4_splitk(
+    const HalfT* __restrict__ Q,
     const void* __restrict__ K_cache,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
@@ -620,24 +624,24 @@ extern "C" __global__ void flash_tq_decode_k8v4_splitk(
     {
 #if TQ_VEC >= 4
         uint2 qv = __ldg((const uint2*)q32);
-        unpack2_bf16_tq(qv.x, q_reg[0], q_reg[1]);
-        unpack2_bf16_tq(qv.y, q_reg[2], q_reg[3]);
+        unpack2_bf16_tq<HalfT>(qv.x, q_reg[0], q_reg[1]);
+        unpack2_bf16_tq<HalfT>(qv.y, q_reg[2], q_reg[3]);
 #if TQ_VEC >= 8
         uint2 qv2 = __ldg(((const uint2*)q32) + 1);
-        unpack2_bf16_tq(qv2.x, q_reg[4], q_reg[5]);
-        unpack2_bf16_tq(qv2.y, q_reg[6], q_reg[7]);
+        unpack2_bf16_tq<HalfT>(qv2.x, q_reg[4], q_reg[5]);
+        unpack2_bf16_tq<HalfT>(qv2.y, q_reg[6], q_reg[7]);
 #if TQ_VEC >= 16
         uint4 qv3 = __ldg(((const uint4*)q32) + 1);
-        unpack2_bf16_tq(qv3.x, q_reg[8], q_reg[9]);
-        unpack2_bf16_tq(qv3.y, q_reg[10], q_reg[11]);
-        unpack2_bf16_tq(qv3.z, q_reg[12], q_reg[13]);
-        unpack2_bf16_tq(qv3.w, q_reg[14], q_reg[15]);
+        unpack2_bf16_tq<HalfT>(qv3.x, q_reg[8], q_reg[9]);
+        unpack2_bf16_tq<HalfT>(qv3.y, q_reg[10], q_reg[11]);
+        unpack2_bf16_tq<HalfT>(qv3.z, q_reg[12], q_reg[13]);
+        unpack2_bf16_tq<HalfT>(qv3.w, q_reg[14], q_reg[15]);
 #endif
 #endif
 #else
         #pragma unroll
         for (int i = 0; i < TQ_VEC / 2; i++) {
-            unpack2_bf16_tq(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
+            unpack2_bf16_tq<HalfT>(__ldg(q32 + i), q_reg[2*i], q_reg[2*i+1]);
         }
 #endif
     }

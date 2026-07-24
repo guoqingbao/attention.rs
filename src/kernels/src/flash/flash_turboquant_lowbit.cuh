@@ -65,9 +65,10 @@
 // turbo4: 4-bit keys + 4-bit values store kernel
 // ============================================================================
 
-extern "C" __global__ void flash_tq4_store(
-    const flash_half_t* __restrict__ K,
-    const flash_half_t* __restrict__ V,
+template<typename HalfT>
+__global__ void flash_tq4_store(
+    const HalfT* __restrict__ K,
+    const HalfT* __restrict__ V,
     float* __restrict__ K_absmax,
     unsigned char* __restrict__ K_quant,
     float* __restrict__ V_absmax,
@@ -96,7 +97,7 @@ extern "C" __global__ void flash_tq4_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        k_reg[i] = FLASH_HALF2FLOAT(K[base + ch]);
+        k_reg[i] = FLASH_TO_FLOAT(K[base + ch]);
         k_reg[i] *= get_sign_flip(head_idx, ch);
     }
     wht_transform(k_reg, lane_id);
@@ -132,7 +133,7 @@ extern "C" __global__ void flash_tq4_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        v_reg[i] = FLASH_HALF2FLOAT(V[base + ch]);
+        v_reg[i] = FLASH_TO_FLOAT(V[base + ch]);
     }
 
     // V absmax
@@ -171,11 +172,12 @@ extern "C" __global__ void flash_tq4_store(
 
 #ifndef UNPACK2_BF16_TQ4_DEFINED
 #define UNPACK2_BF16_TQ4_DEFINED
+template<typename HalfT>
 __device__ __forceinline__ void unpack2_bf16_tq4(unsigned int packed, float &a, float &b) {
     const unsigned short lo = (unsigned short)(packed & 0xFFFF);
     const unsigned short hi = (unsigned short)(packed >> 16);
-    a = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
-    b = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
+    a = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&lo));
+    b = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&hi));
 }
 #endif
 
@@ -263,13 +265,14 @@ __device__ __forceinline__ void unpack2_bf16_tq4(unsigned int packed, float &a, 
         } \
     } while(0)
 
-extern "C" __global__ void flash_tq4_decode(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq4_decode(
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -305,7 +308,7 @@ extern "C" __global__ void flash_tq4_decode(
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ4_VEC];
     #pragma unroll
-    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4<HalfT>(q32[i], q_reg[2*i], q_reg[2*i+1]);
 
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
@@ -458,8 +461,8 @@ extern "C" __global__ void flash_tq4_decode(
         for (int i = 0; i < TQ4_VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+            unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+            unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -470,8 +473,9 @@ extern "C" __global__ void flash_tq4_decode(
 // Grid: (num_q_heads, num_splits, num_seqs)  Block: (256,1,1)
 // ============================================================================
 
-extern "C" __global__ void flash_tq4_decode_splitk(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq4_decode_splitk(
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
@@ -519,7 +523,7 @@ extern "C" __global__ void flash_tq4_decode_splitk(
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ4_VEC];
     #pragma unroll
-    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4<HalfT>(q32[i], q_reg[2*i], q_reg[2*i+1]);
 
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
@@ -727,9 +731,10 @@ __device__ __forceinline__ void unpack_3bit_x8(
 #endif // TQ3_QUANT_HELPERS_DEFINED
 
 // turbo3 store: K → WHT → 3-bit, V → 4-bit
-extern "C" __global__ void flash_tq3_store(
-    const flash_half_t* __restrict__ K,
-    const flash_half_t* __restrict__ V,
+template<typename HalfT>
+__global__ void flash_tq3_store(
+    const HalfT* __restrict__ K,
+    const HalfT* __restrict__ V,
     float* __restrict__ K_absmax,
     unsigned char* __restrict__ K_quant,
     float* __restrict__ V_absmax,
@@ -758,7 +763,7 @@ extern "C" __global__ void flash_tq3_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        k_reg[i] = FLASH_HALF2FLOAT(K[base + ch]);
+        k_reg[i] = FLASH_TO_FLOAT(K[base + ch]);
         k_reg[i] *= get_sign_flip(head_idx, ch);
     }
     wht_transform(k_reg, lane_id);
@@ -837,7 +842,7 @@ extern "C" __global__ void flash_tq3_store(
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
         unsigned int ch = lane_id * TQ4_VEC + i;
-        v_reg[i] = FLASH_HALF2FLOAT(V[base + ch]);
+        v_reg[i] = FLASH_TO_FLOAT(V[base + ch]);
     }
 
     float v_absmax = 0.f;
@@ -899,13 +904,14 @@ extern "C" __global__ void flash_tq3_store(
         (dot_out) = _dot; \
     } while(0)
 
-extern "C" __global__ void flash_tq3_decode(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq3_decode(
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
     const unsigned char* __restrict__ V_quant,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -940,7 +946,7 @@ extern "C" __global__ void flash_tq3_decode(
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ4_VEC];
     #pragma unroll
-    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4<HalfT>(q32[i], q_reg[2*i], q_reg[2*i+1]);
 
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {
@@ -1095,8 +1101,8 @@ extern "C" __global__ void flash_tq3_decode(
         for (int i = 0; i < TQ4_VEC_U32; i++) {
             float v0 = smem_o[0][bf16_vec_off + 2*i]     * inv_l;
             float v1 = smem_o[0][bf16_vec_off + 2*i + 1] * inv_l;
-            unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-            unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+            unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+            unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
             o32[i] = lo | (hi << 16);
         }
     }
@@ -1107,8 +1113,9 @@ extern "C" __global__ void flash_tq3_decode(
 // Grid: (num_q_heads, num_splits, num_seqs)  Block: (256,1,1)
 // ============================================================================
 
-extern "C" __global__ void flash_tq3_decode_splitk(
-    const flash_half_t* __restrict__ Q,
+template<typename HalfT>
+__global__ void flash_tq3_decode_splitk(
+    const HalfT* __restrict__ Q,
     const float* __restrict__ K_absmax,
     const unsigned char* __restrict__ K_quant,
     const float* __restrict__ V_absmax,
@@ -1156,7 +1163,7 @@ extern "C" __global__ void flash_tq3_decode_splitk(
                                                        + (unsigned long long)q_head * head_dim + bf16_vec_off);
     float q_reg[TQ4_VEC];
     #pragma unroll
-    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4(q32[i], q_reg[2*i], q_reg[2*i+1]);
+    for (int i = 0; i < TQ4_VEC / 2; i++) unpack2_bf16_tq4<HalfT>(q32[i], q_reg[2*i], q_reg[2*i+1]);
 
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i++) {

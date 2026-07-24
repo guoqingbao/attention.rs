@@ -741,7 +741,7 @@ template <typename T, int BITS, int ROWS_PER_BLOCK>
 __global__ void moe_gemv_kernel_wna16(
     const T *__restrict__ input,
     const uint32_t *__restrict__ weights,
-    const T *__restrict__ weight_scales,
+    const float *__restrict__ weight_scales,
     const int32_t *__restrict__ sorted_token_ids,
     const int32_t *__restrict__ expert_ids,
     const float *__restrict__ topk_weights,
@@ -789,7 +789,7 @@ __global__ void moe_gemv_kernel_wna16(
   const uint32_t mask = (1u << BITS) - 1u;
   const uint32_t *expert_w =
       weights + (size_t)expert * N * packed_k + (size_t)row * packed_k;
-  const T *expert_s =
+  const float *expert_s =
       weight_scales + (size_t)expert * N * scale_k + (size_t)row * scale_k;
 
   float sum0 = 0.0f;
@@ -864,7 +864,7 @@ extern "C" void moe_gemv_wna16(
     const size_t smem_bytes = (size_t)size_k * sizeof(T);
     moe_gemv_kernel_wna16<T, BITS, RPB><<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<const T *>(input), weights,
-        reinterpret_cast<const T *>(weight_scales), sorted_token_ids,
+        reinterpret_cast<const float *>(weight_scales), sorted_token_ids,
         expert_ids, topk_weights, reinterpret_cast<T *>(output), num_experts,
         topk, size_m, size_n, size_k, group_size, zero_point);
   };

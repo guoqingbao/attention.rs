@@ -660,7 +660,7 @@ extern "C" {
 
     // Grouped MoE WNA16 (compressed-tensors pack-quantized) kernel.
     // Weights are dense INT{4,8} values packed along K into uint32 words;
-    // scales are symmetric per-group and kept in the input dtype.
+    // scales are symmetric per-group and kept in F32 for dequant precision.
     pub fn moe_gemm_wmma_wna16(
         input: *const c_void,
         weights: *const u32,
@@ -3103,6 +3103,7 @@ extern "C" {
 
     // =========================================================================
     // Native flash attention (flash feature)
+    // dtype: 0 = f16, 1 = bf16 (BF16 kernels only on SM80+)
     // =========================================================================
 
     #[cfg(feature = "flash")]
@@ -3125,6 +3126,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3151,6 +3153,7 @@ extern "C" {
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3173,6 +3176,7 @@ extern "C" {
         sliding_window: u32,
         softcap: f32,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3196,6 +3200,7 @@ extern "C" {
         softcap: f32,
         sliding_window: u32,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3207,6 +3212,7 @@ extern "C" {
         head_dim: u32,
         num_splits: u32,
         num_seqs: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3232,6 +3238,7 @@ extern "C" {
         v_scale_ptr: *const f32,
         fp8_cache_stride: u64,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3258,11 +3265,12 @@ extern "C" {
         fp8_cache_stride: u64,
         sliding_window: u32,
         gqa_ratio: u32,
+        dtype: i32,
         stream: i64,
     );
 
     #[cfg(feature = "flash")]
-    pub fn call_flash_reshape_and_cache_bf16(
+    pub fn call_flash_reshape_and_cache(
         key: *const c_void,
         value: *const c_void,
         key_cache: *mut c_void,
@@ -3272,6 +3280,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         cache_block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3288,6 +3297,7 @@ extern "C" {
         cache_block_size: u32,
         k_scale_ptr: *const f32,
         v_scale_ptr: *const f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3304,6 +3314,7 @@ extern "C" {
         head_dim: u32,
         block_size: u32,
         k_scale_ptr: *const f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3327,6 +3338,7 @@ extern "C" {
         softcap: f32,
         k_scale_ptr: *const f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3351,6 +3363,7 @@ extern "C" {
         softcap: f32,
         k_scale_ptr: *const f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3367,6 +3380,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3390,6 +3404,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3414,6 +3429,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3430,6 +3446,7 @@ extern "C" {
         num_kv_heads: u32,
         head_dim: u32,
         block_size: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3453,6 +3470,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3477,6 +3495,7 @@ extern "C" {
         q_stride: u32,
         softcap: f32,
         sliding_window: u32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3502,6 +3521,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 
@@ -3527,6 +3547,7 @@ extern "C" {
         causal: u32,
         inv_sqrt_d: f32,
         softcap: f32,
+        dtype: i32,
         stream: i64,
     );
 

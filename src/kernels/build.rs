@@ -109,7 +109,12 @@ fn main() -> Result<()> {
         } else if compute_cap <= 75 {
             println!(
                 "cargo:warning=Native flash kernels using FP16 m16n8k8 Tensor Core MMA for SM{}. \
-                 SM80+ uses BF16 m16n8k16 for best performance.",
+                 SM80+ builds both BF16 and F16 m16n8k16 native flash paths.",
+                compute_cap
+            );
+        } else {
+            println!(
+                "cargo:warning=Native flash kernels: BF16 + F16 m16n8k16 Tensor Core MMA for SM{}.",
                 compute_cap
             );
         }

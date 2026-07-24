@@ -9,7 +9,7 @@
  * @details
  * Per-Q-head paged decode with online softmax. 8 warps split the KV
  * sequence; each thread covers head_dim/32 BF16 elements. Batched (BC=4)
- * score/V accumulation reduces __expf calls. GQA_RATIO compile-time
+ * score/V accumulation reduces expf calls. GQA_RATIO compile-time
  * parameter controls Q heads per CTA (always 1 in current dispatch).
  * Includes main decode, split-K, and reduce kernels.
  *
@@ -44,11 +44,12 @@
 
 #ifndef FLASH_DECODE_UNPACK_DEFINED
 #define FLASH_DECODE_UNPACK_DEFINED
+template<typename HalfT>
 __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, float& v1) {
     const unsigned short lo = (unsigned short)(packed & 0xFFFF);
     const unsigned short hi = (unsigned short)(packed >> 16);
-    v0 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&lo));
-    v1 = FLASH_HALF2FLOAT(*reinterpret_cast<const flash_half_t*>(&hi));
+    v0 = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&lo));
+    v1 = FLASH_TO_FLOAT(*reinterpret_cast<const HalfT*>(&hi));
 }
 #endif
 
@@ -68,11 +69,12 @@ __device__ __forceinline__ void unpack2_bf16_d(unsigned int packed, float& v0, f
 // Block: (256, 1, 1)
 // ============================================================================
 
-extern "C" __global__ void flash_decode_paged(
-    const flash_half_t* __restrict__ Q,
-    const flash_half_t* __restrict__ K_cache,
-    const flash_half_t* __restrict__ V_cache,
-    flash_half_t* __restrict__ O,
+template<typename HalfT>
+__global__ void flash_decode_paged(
+    const HalfT* __restrict__ Q,
+    const HalfT* __restrict__ K_cache,
+    const HalfT* __restrict__ V_cache,
+    HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -120,7 +122,7 @@ extern "C" __global__ void flash_decode_paged(
         LDG_VEC_LOAD(q32, qp, VEC_U32);
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++)
-            unpack2_bf16_d(qp[i], q_reg[g][2*i], q_reg[g][2*i+1]);
+            unpack2_bf16_d<HalfT>(qp[i], q_reg[g][2*i], q_reg[g][2*i+1]);
     }
 
     const unsigned int attended = seq_len - window_start;
@@ -151,10 +153,10 @@ extern "C" __global__ void flash_decode_paged(
         unsigned int batch_count = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
-        const flash_half_t* k_block_base = K_cache + (unsigned long long)physical_block * page_stride
+        const HalfT* k_block_base = K_cache + (unsigned long long)physical_block * page_stride
                                                      + (unsigned long long)block_offset * head_stride_kv
                                                      + (unsigned long long)kv_head * head_dim;
-        const flash_half_t* v_block_base = V_cache + (unsigned long long)physical_block * page_stride
+        const HalfT* v_block_base = V_cache + (unsigned long long)physical_block * page_stride
                                                      + (unsigned long long)block_offset * head_stride_kv
                                                      + (unsigned long long)kv_head * head_dim;
 
@@ -174,7 +176,7 @@ extern "C" __global__ void flash_decode_paged(
                 float kf[VEC_BF16];
                 #pragma unroll
                 for (int i = 0; i < VEC_U32; i++)
-                    unpack2_bf16_d(kp[i], kf[2*i], kf[2*i+1]);
+                    unpack2_bf16_d<HalfT>(kp[i], kf[2*i], kf[2*i+1]);
 
                 const unsigned int* v32 = (const unsigned int*)(v_block_base
                     + (unsigned long long)(t + b) * head_stride_kv + vec_offset);
@@ -182,7 +184,7 @@ extern "C" __global__ void flash_decode_paged(
                 LDG_VEC_LOAD(v32, vp2, VEC_U32);
                 #pragma unroll
                 for (int i = 0; i < VEC_U32; i++)
-                    unpack2_bf16_d(vp2[i], vf_batch[b][2*i], vf_batch[b][2*i+1]);
+                    unpack2_bf16_d<HalfT>(vp2[i], vf_batch[b][2*i], vf_batch[b][2*i+1]);
 
                 #pragma unroll
                 for (int g = 0; g < GQA_RATIO; g++) {
@@ -202,14 +204,14 @@ extern "C" __global__ void flash_decode_paged(
                 float m_new = m_val[g];
                 #pragma unroll
                 for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[g][b]);
-                float exp_old = __expf(m_val[g] - m_new);
+                float exp_old = expf(m_val[g] - m_new);
                 #pragma unroll
                 for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] *= exp_old;
                 l_val[g] *= exp_old;
 
                 #pragma unroll
                 for (int b = 0; b < BC; b++) {
-                    float w = __expf(scores[g][b] - m_new);
+                    float w = expf(scores[g][b] - m_new);
                     l_val[g] += w;
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] += w * vf_batch[b][i];
@@ -226,7 +228,7 @@ extern "C" __global__ void flash_decode_paged(
             float kf[VEC_BF16];
             #pragma unroll
             for (int i = 0; i < VEC_U32; i++)
-                unpack2_bf16_d(kp[i], kf[2*i], kf[2*i+1]);
+                unpack2_bf16_d<HalfT>(kp[i], kf[2*i], kf[2*i+1]);
 
             const unsigned int* v32 = (const unsigned int*)(v_block_base
                 + (unsigned long long)t * head_stride_kv + vec_offset);
@@ -235,7 +237,7 @@ extern "C" __global__ void flash_decode_paged(
             float vf[VEC_BF16];
             #pragma unroll
             for (int i = 0; i < VEC_U32; i++)
-                unpack2_bf16_d(vp[i], vf[2*i], vf[2*i+1]);
+                unpack2_bf16_d<HalfT>(vp[i], vf[2*i], vf[2*i+1]);
 
             #pragma unroll
             for (int g = 0; g < GQA_RATIO; g++) {
@@ -249,8 +251,8 @@ extern "C" __global__ void flash_decode_paged(
                 if (softcap > 0.f) score = softcap * tanhf(score / softcap);
 
                 float m_new = fmaxf(m_val[g], score);
-                float exp_old = __expf(m_val[g] - m_new);
-                float exp_new = __expf(score - m_new);
+                float exp_old = expf(m_val[g] - m_new);
+                float exp_new = expf(score - m_new);
                 l_val[g] = l_val[g] * exp_old + exp_new;
                 #pragma unroll
                 for (int i = 0; i < VEC_BF16; i++)
@@ -285,7 +287,7 @@ extern "C" __global__ void flash_decode_paged(
                 if (lw > 0.f) {
                     float mw = smem_m[g][other], my_m = smem_m[g][warp_id], my_l = smem_l[g][warp_id];
                     float m_new = fmaxf(my_m, mw);
-                    float scale_me = __expf(my_m - m_new), scale_w = __expf(mw - m_new);
+                    float scale_me = expf(my_m - m_new), scale_w = expf(mw - m_new);
                     smem_l[g][warp_id] = my_l * scale_me + lw * scale_w;
                     smem_m[g][warp_id] = m_new;
                     #pragma unroll
@@ -310,8 +312,8 @@ extern "C" __global__ void flash_decode_paged(
             for (int i = 0; i < VEC_U32; i++) {
                 float v0 = smem_o[g][0][vec_offset + 2*i]     * inv_l;
                 float v1 = smem_o[g][0][vec_offset + 2*i + 1] * inv_l;
-                unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-                unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+                unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+                unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
                 o32[i] = lo | (hi << 16);
             }
         }
@@ -325,10 +327,11 @@ extern "C" __global__ void flash_decode_paged(
 // Block: (256,1,1)
 // ============================================================================
 
-extern "C" __global__ void flash_decode_paged_splitk(
-    const flash_half_t* __restrict__ Q,
-    const flash_half_t* __restrict__ K_cache,
-    const flash_half_t* __restrict__ V_cache,
+template<typename HalfT>
+__global__ void flash_decode_paged_splitk(
+    const HalfT* __restrict__ Q,
+    const HalfT* __restrict__ K_cache,
+    const HalfT* __restrict__ V_cache,
     float* __restrict__ workspace,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
@@ -385,7 +388,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
         LDG_VEC_LOAD(q32, qp, VEC_U32);
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++)
-            unpack2_bf16_d(qp[i], q_reg[g][2*i], q_reg[g][2*i+1]);
+            unpack2_bf16_d<HalfT>(qp[i], q_reg[g][2*i], q_reg[g][2*i+1]);
     }
 
     unsigned int local_len = kv_end - kv_start;
@@ -417,10 +420,10 @@ extern "C" __global__ void flash_decode_paged_splitk(
             unsigned int remaining_total = my_end_pos - pos;
             unsigned int bc = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
 
-            const flash_half_t* k_base = K_cache + (unsigned long long)physical_block * page_stride
+            const HalfT* k_base = K_cache + (unsigned long long)physical_block * page_stride
                 + (unsigned long long)block_offset_s * head_stride_kv
                 + (unsigned long long)kv_head * head_dim;
-            const flash_half_t* v_base = V_cache + (unsigned long long)physical_block * page_stride
+            const HalfT* v_base = V_cache + (unsigned long long)physical_block * page_stride
                 + (unsigned long long)block_offset_s * head_stride_kv
                 + (unsigned long long)kv_head * head_dim;
 
@@ -439,14 +442,14 @@ extern "C" __global__ void flash_decode_paged_splitk(
                     LDG_VEC_LOAD(k32, kp2, VEC_U32);
                     float kf[VEC_BF16];
                     #pragma unroll
-                    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(kp2[i], kf[2*i], kf[2*i+1]);
+                    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(kp2[i], kf[2*i], kf[2*i+1]);
 
                     const unsigned int* v32 = (const unsigned int*)(v_base
                         + (unsigned long long)(t + b) * head_stride_kv + vec_offset);
                     unsigned int vp2[VEC_U32];
                     LDG_VEC_LOAD(v32, vp2, VEC_U32);
                     #pragma unroll
-                    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(vp2[i], vf_batch[b][2*i], vf_batch[b][2*i+1]);
+                    for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(vp2[i], vf_batch[b][2*i], vf_batch[b][2*i+1]);
 
                     #pragma unroll
                     for (int g = 0; g < GQA_RATIO; g++) {
@@ -466,13 +469,13 @@ extern "C" __global__ void flash_decode_paged_splitk(
                     float m_new = m_val[g];
                     #pragma unroll
                     for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[g][b]);
-                    float exp_old = __expf(m_val[g] - m_new);
+                    float exp_old = expf(m_val[g] - m_new);
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] *= exp_old;
                     l_val[g] *= exp_old;
                     #pragma unroll
                     for (int b = 0; b < BC; b++) {
-                        float w = __expf(scores[g][b] - m_new);
+                        float w = expf(scores[g][b] - m_new);
                         l_val[g] += w;
                         #pragma unroll
                         for (int i = 0; i < VEC_BF16; i++) o_reg[g][i] += w * vf_batch[b][i];
@@ -488,7 +491,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                 LDG_VEC_LOAD(k32, kp, VEC_U32);
                 float kf[VEC_BF16];
                 #pragma unroll
-                for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(kp[i], kf[2*i], kf[2*i+1]);
+                for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(kp[i], kf[2*i], kf[2*i+1]);
 
                 const unsigned int* v32 = (const unsigned int*)(v_base
                     + (unsigned long long)t * head_stride_kv + vec_offset);
@@ -496,7 +499,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                 LDG_VEC_LOAD(v32, vp, VEC_U32);
                 float vf[VEC_BF16];
                 #pragma unroll
-                for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d(vp[i], vf[2*i], vf[2*i+1]);
+                for (int i = 0; i < VEC_U32; i++) unpack2_bf16_d<HalfT>(vp[i], vf[2*i], vf[2*i+1]);
 
                 #pragma unroll
                 for (int g = 0; g < GQA_RATIO; g++) {
@@ -510,7 +513,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                     if (softcap > 0.f) score = softcap * tanhf(score / softcap);
 
                     float m_new = fmaxf(m_val[g], score);
-                    float exp_old = __expf(m_val[g] - m_new), exp_new = __expf(score - m_new);
+                    float exp_old = expf(m_val[g] - m_new), exp_new = expf(score - m_new);
                     l_val[g] = l_val[g] * exp_old + exp_new;
                     #pragma unroll
                     for (int i = 0; i < VEC_BF16; i++)
@@ -545,7 +548,7 @@ extern "C" __global__ void flash_decode_paged_splitk(
                 if (lw > 0.f) {
                     float mw = smem_m[g][other], my_m = smem_m[g][warp_id], my_l = smem_l[g][warp_id];
                     float m_new = fmaxf(my_m, mw);
-                    float scale_me = __expf(my_m - m_new), scale_w = __expf(mw - m_new);
+                    float scale_me = expf(my_m - m_new), scale_w = expf(mw - m_new);
                     smem_l[g][warp_id] = my_l * scale_me + lw * scale_w;
                     smem_m[g][warp_id] = m_new;
                     #pragma unroll
@@ -578,9 +581,10 @@ extern "C" __global__ void flash_decode_paged_splitk(
 // Grid: (num_q_heads, num_seqs, 1)  Block: (32,1,1)
 // ============================================================================
 
-extern "C" __global__ void flash_decode_paged_reduce(
+template<typename HalfT>
+__global__ void flash_decode_paged_reduce(
     const float* __restrict__ workspace,
-    flash_half_t* __restrict__ O,
+    HalfT* __restrict__ O,
     const unsigned int num_q_heads,
     const unsigned int head_dim,
     const unsigned int num_splits
@@ -607,7 +611,7 @@ extern "C" __global__ void flash_decode_paged_reduce(
         float ms = ws[head_dim], ls = ws[head_dim + 1];
         if (ls <= 0.f) continue;
         float m_new = fmaxf(m, ms);
-        float scale_me = __expf(m - m_new), scale_s = __expf(ms - m_new);
+        float scale_me = expf(m - m_new), scale_s = expf(ms - m_new);
         #pragma unroll
         for (int i = 0; i < VEC_BF16; i++)
             o_reg[i] = o_reg[i] * scale_me + ws[vec_off + i] * scale_s;
@@ -621,8 +625,8 @@ extern "C" __global__ void flash_decode_paged_reduce(
     #pragma unroll
     for (int i = 0; i < VEC_U32; i++) {
         float v0 = o_reg[2*i] * inv_l, v1 = o_reg[2*i + 1] * inv_l;
-        unsigned int lo = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v0));
-        unsigned int hi = (unsigned int)FLASH_HALF_AS_USHORT(FLASH_FLOAT2HALF(v1));
+        unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v0));
+        unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(v1));
         o32[i] = lo | (hi << 16);
     }
 }
