@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, str};
-const METAL_SOURCES: [&str; 17] = [
+const METAL_SOURCES: [&str; 18] = [
     "copy_blocks",
     "pagedattention",
     "reshape_and_cache",
@@ -11,6 +11,7 @@ const METAL_SOURCES: [&str; 17] = [
     "fused_rope",
     "fp8_matmul",
     "fp8_moe_gemm",
+    "wna16_moe_gemm",
     "gdn",
     "moe_gemm",
     "moe_gguf",

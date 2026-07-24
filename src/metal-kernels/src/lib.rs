@@ -1772,6 +1772,119 @@ pub fn call_fp8_moe_gemm(
 }
 
 // ---------------------------------------------------------------------------
+// WNA16 MoE GEMM (INT4/INT8 weight-only)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_wna16_moe_gemm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    input_offset: usize,
+    weights: &Buffer,
+    weights_offset: usize,
+    weight_scales: &Buffer,
+    weight_scales_offset: usize,
+    sorted_token_ids: &Buffer,
+    sorted_token_ids_offset: usize,
+    expert_ids: &Buffer,
+    expert_ids_offset: usize,
+    topk_weights: Option<(&Buffer, usize)>,
+    output: &Buffer,
+    output_offset: usize,
+    num_experts: i32,
+    topk: i32,
+    size_m: i32,
+    size_n: i32,
+    size_k: i32,
+    bits: i32,
+    group_size: i32,
+    zero_point: i32,
+    is_prefill: bool,
+) -> Result<(), MetalKernelError> {
+    if bits != 4 && bits != 8 {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "wna16_moe_gemm: bits must be 4 or 8, got {bits}"
+        )));
+    }
+
+    let use_gemv = !is_prefill && size_m <= 128;
+    let has_topk_weights: i32 = if topk_weights.is_some() { 1 } else { 0 };
+    let dummy_offset: usize = 0;
+
+    let name = match (use_gemv, ty, bits) {
+        (true, DType::F16, 4) => "wna16_moe_gemv_half_4",
+        (true, DType::F16, 8) => "wna16_moe_gemv_half_8",
+        (true, DType::BF16, 4) => "wna16_moe_gemv_bfloat16_4",
+        (true, DType::BF16, 8) => "wna16_moe_gemv_bfloat16_8",
+        (false, DType::F16, 4) => "wna16_moe_gemm_half_4_32_32",
+        (false, DType::F16, 8) => "wna16_moe_gemm_half_8_32_32",
+        (false, DType::BF16, 4) => "wna16_moe_gemm_bfloat16_4_32_32",
+        (false, DType::BF16, 8) => "wna16_moe_gemm_bfloat16_8_32_32",
+        (_, other, _) => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(input), input_offset as NSUInteger);
+    encoder.set_buffer(1, Some(weights), weights_offset as NSUInteger);
+    encoder.set_buffer(2, Some(weight_scales), weight_scales_offset as NSUInteger);
+    encoder.set_buffer(
+        3,
+        Some(sorted_token_ids),
+        sorted_token_ids_offset as NSUInteger,
+    );
+    encoder.set_buffer(4, Some(expert_ids), expert_ids_offset as NSUInteger);
+    if let Some((tw_buf, tw_off)) = topk_weights {
+        encoder.set_buffer(5, Some(tw_buf), tw_off as NSUInteger);
+    } else {
+        encoder.set_buffer(5, Some(output), dummy_offset as NSUInteger);
+    }
+    encoder.set_buffer(6, Some(output), output_offset as NSUInteger);
+    utils::set_param(encoder, 7, num_experts);
+    utils::set_param(encoder, 8, topk);
+    utils::set_param(encoder, 9, size_m);
+    utils::set_param(encoder, 10, size_n);
+    utils::set_param(encoder, 11, size_k);
+    utils::set_param(encoder, 12, group_size);
+    utils::set_param(encoder, 13, zero_point);
+    utils::set_param(encoder, 14, has_topk_weights);
+
+    let thread_group_size = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = if use_gemv {
+        MTLSize {
+            width: size_n as u64,
+            height: size_m as u64,
+            depth: 1,
+        }
+    } else {
+        const BLOCK_M: u64 = 32;
+        const BLOCK_N: u64 = 32;
+        MTLSize {
+            width: (size_n as u64 + BLOCK_N - 1) / BLOCK_N,
+            height: (size_m as u64 + BLOCK_M - 1) / BLOCK_M,
+            depth: 1,
+        }
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // MXFP4 matmul
 // ---------------------------------------------------------------------------
 

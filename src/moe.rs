@@ -845,6 +845,185 @@ pub fn moe_gemm_wna16(
     }
 }
 
+/// Grouped MoE GEMM for compressed-tensors WNA16 weights (Metal / non-CUDA).
+///
+/// Same signature and semantics as the CUDA `moe_gemm_wna16` so callers do not
+/// need feature-gated call sites.
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_wna16(
+    input: &Tensor,
+    weights: &Tensor,
+    weight_scales: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    bits: usize,
+    group_size: usize,
+    is_prefill: bool,
+    legacy_gptq: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    {
+        use candle_core::{DType, Storage};
+
+        let (input_rows, size_k) = input.dims2()?;
+        let (num_experts, size_n, packed_k) = weights.dims3()?;
+        let size_m = if topk_weights.is_none() {
+            input_rows * topk
+        } else {
+            input_rows
+        };
+        let expected_packed_k = (size_k + (32 / bits) - 1) / (32 / bits);
+        if bits == 0 || bits > 8 || 32 % bits != 0 || packed_k != expected_packed_k {
+            candle_core::bail!("invalid compressed-tensors WNA16 packed shape or bit width");
+        }
+        if group_size == 0 || size_k % group_size != 0 {
+            candle_core::bail!("compressed-tensors WNA16 requires K divisible by group_size");
+        }
+        let (scale_experts, scale_n, scale_k) = weight_scales.dims3()?;
+        if (scale_experts, scale_n, scale_k) != (num_experts, size_n, size_k / group_size) {
+            candle_core::bail!(
+                "invalid WNA16 scale shape: expected [{num_experts}, {size_n}, {}], got {:?}",
+                size_k / group_size,
+                weight_scales.dims()
+            );
+        }
+        if weight_scales.dtype() != DType::F32 {
+            candle_core::bail!(
+                "WNA16 weight_scales must be F32 (got {:?}); load with DType::F32",
+                weight_scales.dtype()
+            );
+        }
+        let dtype = input.dtype();
+        if !matches!(dtype, DType::F16 | DType::BF16) {
+            candle_core::bail!("WNA16 MoE only supports F16/BF16 input, got {dtype:?}");
+        }
+        if !matches!(bits, 4 | 8) {
+            candle_core::bail!("WNA16 MoE Metal only supports 4/8-bit weights, got {bits}");
+        }
+
+        let zero_point = if legacy_gptq {
+            (1usize << (bits - 1)) - 1
+        } else {
+            1usize << (bits - 1)
+        };
+
+        let dev = input.device();
+        let metal_dev = match dev {
+            candle_core::Device::Metal(d) => d,
+            _ => candle_core::bail!("moe_gemm_wna16: expected Metal device"),
+        };
+
+        let output = Tensor::zeros((size_m, size_n), dtype, dev)?;
+        let command_buffer = metal_dev.command_buffer()?;
+        let command_buffer_ref = command_buffer.as_ref();
+
+        {
+            let (input_s, input_l) = input.storage_and_layout();
+            let input_ms = match &*input_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("input must be metal"),
+            };
+            let (w_s, w_l) = weights.storage_and_layout();
+            let w_ms = match &*w_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weights must be metal"),
+            };
+            let (ws_s, ws_l) = weight_scales.storage_and_layout();
+            let ws_ms = match &*ws_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("weight_scales must be metal"),
+            };
+            let (st_s, st_l) = sorted_token_ids.storage_and_layout();
+            let st_ms = match &*st_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("sorted_token_ids must be metal"),
+            };
+            let (ei_s, ei_l) = experts_ids.storage_and_layout();
+            let ei_ms = match &*ei_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("expert_ids must be metal"),
+            };
+
+            let tw_buf_pair = if let Some(tw) = topk_weights {
+                let (tw_s, tw_l) = tw.storage_and_layout();
+                let tw_ms = match &*tw_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("topk_weights must be metal"),
+                };
+                Some((
+                    tw_ms.buffer().clone(),
+                    tw_l.start_offset() * tw.dtype().size_in_bytes(),
+                ))
+            } else {
+                None
+            };
+
+            let (output_s, output_l) = output.storage_and_layout();
+            let output_ms = match &*output_s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("output must be metal"),
+            };
+
+            let tw_ref = tw_buf_pair
+                .as_ref()
+                .map(|(buf, off)| (buf as &metal::Buffer, *off));
+
+            crate::metal_kernels::call_wna16_moe_gemm(
+                metal_dev.device(),
+                command_buffer_ref,
+                crate::metal_kernels::Kernels::default(),
+                dtype,
+                input_ms.buffer(),
+                input_l.start_offset() * dtype.size_in_bytes(),
+                w_ms.buffer(),
+                w_l.start_offset() * weights.dtype().size_in_bytes(),
+                ws_ms.buffer(),
+                ws_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+                st_ms.buffer(),
+                st_l.start_offset() * sorted_token_ids.dtype().size_in_bytes(),
+                ei_ms.buffer(),
+                ei_l.start_offset() * experts_ids.dtype().size_in_bytes(),
+                tw_ref,
+                output_ms.buffer(),
+                output_l.start_offset() * dtype.size_in_bytes(),
+                num_experts as i32,
+                topk as i32,
+                size_m as i32,
+                size_n as i32,
+                size_k as i32,
+                bits as i32,
+                group_size as i32,
+                zero_point as i32,
+                is_prefill,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        }
+
+        return Ok(output);
+    }
+
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (
+            input,
+            weights,
+            weight_scales,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+            bits,
+            group_size,
+            is_prefill,
+            legacy_gptq,
+        );
+        candle_core::bail!("moe_gemm_wna16 is not implemented on this platform!")
+    }
+}
+
 /// MoE GEMM with FP8 weights and block-wise scales.
 ///
 /// # Arguments
