@@ -1236,6 +1236,20 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn fp8_quantize_per_token_group_static_launch(
+        input: *const c_void,
+        output_q: *mut c_void,
+        output_s: *mut f32,
+        num_groups: c_int,
+        group_size: c_int,
+        num_groups_per_row: c_int,
+        scale_stride: c_int,
+        is_input_f16: bool,
+        is_column_major_stats: bool,
+        input_scale: f32,
+        stream: i64,
+    );
+
     pub fn flashinfer_fp8_quantize_q_per_head(
         input: *const c_void,
         output_q: *mut c_void,
