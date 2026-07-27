@@ -165,6 +165,53 @@ __global__ void per_token_group_quant_fp8_v2_kernel(
     st_global(reinterpret_cast<int4*>(output_q + group_id * GROUP_SIZE + lane_id * VEC_SIZE), output_buf);
 }
 
+// Quantize FP8 activations with a checkpoint-provided, per-tensor scale.
+//
+// ModelOpt stores the FP8 activation scale as the dequantization scale
+// (typically amax / 448).  The dynamic kernel above computes that value from
+// each input group.  For static W8A8 checkpoints we must instead use the same
+// scalar for every [1, 128] activation group and pass it to the GEMM as the
+// activation scale.  Keep this as a separate kernel so existing dynamic FP8
+// callers retain their current behavior.
+template <typename T, bool IS_COLUMN_MAJOR>
+__global__ void per_token_group_quant_fp8_static_kernel(
+    const T* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int num_groups,
+    const int group_size,
+    const int num_groups_per_row,
+    const int scale_stride,
+    const float input_scale) {
+    const int group_id = blockIdx.x;
+    if (group_id >= num_groups) return;
+
+    if (threadIdx.x == 0) {
+        float* scale_output;
+        if constexpr (IS_COLUMN_MAJOR) {
+            const int row_idx = group_id / num_groups_per_row;
+            const int col_idx = group_id % num_groups_per_row;
+            scale_output = output_s + (col_idx * scale_stride + row_idx);
+        } else {
+            scale_output = output_s + group_id;
+        }
+        *scale_output = input_scale;
+    }
+
+    const float inv_scale = 1.0f / input_scale;
+    const int64_t group_offset = static_cast<int64_t>(group_id) * group_size;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        float val;
+        if constexpr (std::is_same_v<T, __half>) {
+            val = __half2float(input[group_offset + i]);
+        } else {
+            val = __bfloat162float(input[group_offset + i]);
+        }
+        const float q_val = fminf(fmaxf(val * inv_scale, kFp8Min), kFp8Max);
+        output_q[group_offset + i] = static_cast<__nv_fp8_e4m3>(q_val);
+    }
+}
+
 // Fallback kernel for non-128 group sizes or older architectures
 template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR, bool SCALE_UE8M0, int THREADS_PER_GROUP = 32>
 __global__ void per_token_group_quant_8bit_kernel(
@@ -555,6 +602,60 @@ extern "C" void fp8_quantize_per_token_group_launch(
                     eps, min_8bit, max_8bit
                 );
         }
+    }
+}
+
+extern "C" void fp8_quantize_per_token_group_static_launch(
+    const void* input,
+    void* output_q,
+    float* output_s,
+    int num_groups,
+    int group_size,
+    int num_groups_per_row,
+    int scale_stride,
+    bool is_input_f16,
+    bool is_column_major_stats,
+    float input_scale,
+    cudaStream_t stream
+) {
+    if (num_groups <= 0 || group_size <= 0 || !(input_scale > 0.0f)) return;
+
+    // One block handles one group.  The common FP8 block size is 128, so this
+    // gives one thread per element while also supporting a smaller tail group.
+    constexpr int THREADS_PER_GROUP = 128;
+    const dim3 grid(static_cast<unsigned int>(num_groups));
+    const dim3 block(THREADS_PER_GROUP);
+
+    if (is_input_f16) {
+        if (is_column_major_stats) {
+            per_token_group_quant_fp8_static_kernel<__half, true>
+                <<<grid, block, 0, stream>>>(
+                    static_cast<const __half*>(input),
+                    static_cast<__nv_fp8_e4m3*>(output_q), output_s,
+                    num_groups, group_size, num_groups_per_row, scale_stride,
+                    input_scale);
+        } else {
+            per_token_group_quant_fp8_static_kernel<__half, false>
+                <<<grid, block, 0, stream>>>(
+                    static_cast<const __half*>(input),
+                    static_cast<__nv_fp8_e4m3*>(output_q), output_s,
+                    num_groups, group_size, num_groups_per_row, scale_stride,
+                    input_scale);
+        }
+    } else if (is_column_major_stats) {
+        per_token_group_quant_fp8_static_kernel<__nv_bfloat16, true>
+            <<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<__nv_fp8_e4m3*>(output_q), output_s,
+                num_groups, group_size, num_groups_per_row, scale_stride,
+                input_scale);
+    } else {
+        per_token_group_quant_fp8_static_kernel<__nv_bfloat16, false>
+            <<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<__nv_fp8_e4m3*>(output_q), output_s,
+                num_groups, group_size, num_groups_per_row, scale_stride,
+                input_scale);
     }
 }
 

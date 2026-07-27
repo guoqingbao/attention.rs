@@ -88,6 +88,41 @@ pub fn fp8_matmul(
     block_size: &[usize],
     is_prefill: bool,
 ) -> Result<Tensor> {
+    fp8_matmul_with_input_scale(
+        input,
+        weight,
+        weight_scale,
+        weight_scale_cutlass,
+        block_size,
+        None,
+        is_prefill,
+    )
+}
+
+/// FP8 matrix multiplication with an optional static activation scale.
+///
+/// `input_scale` is the dequantization scale used by ModelOpt static FP8
+/// activation exports (normally `amax / 448`). When present, FlashInfer and
+/// CUTLASS quantize every 128-element activation group with this same scale;
+/// when absent, they retain the existing per-token dynamic quantization.
+/// The conventional/fallback path remains W8A16 and does not quantize the
+/// activation.
+#[allow(unused)]
+pub fn fp8_matmul_with_input_scale(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    weight_scale_cutlass: Option<&Tensor>,
+    block_size: &[usize],
+    input_scale: Option<f32>,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    if let Some(scale) = input_scale {
+        if !scale.is_finite() || scale <= 0.0 {
+            candle_core::bail!("FP8 input_scale must be finite and positive, got {scale}");
+        }
+    }
+
     let input = if input.is_contiguous() {
         input.clone()
     } else {
@@ -111,7 +146,12 @@ pub fn fp8_matmul(
             && DType::BF16 == input.dtype()
             && block_size == [128, 128];
         if use_flashinfer {
-            return fp8_matmul_flashinfer(&input, weight, weight_scale);
+            return fp8_matmul_flashinfer_with_input_scale(
+                &input,
+                weight,
+                weight_scale,
+                input_scale,
+            );
         }
     }
 
@@ -129,7 +169,13 @@ pub fn fp8_matmul(
                     }
                 }
             };
-            return fp8_matmul_cutlass(&input, &weight.t()?, &cutlass_scale, block_size);
+            return fp8_matmul_cutlass_with_input_scale(
+                &input,
+                &weight.t()?,
+                &cutlass_scale,
+                block_size,
+                input_scale,
+            );
         }
     }
 
@@ -362,6 +408,16 @@ pub fn fp8_matmul_flashinfer(
     weight: &Tensor,
     weight_scale: &Tensor,
 ) -> Result<Tensor> {
+    fp8_matmul_flashinfer_with_input_scale(input, weight, weight_scale, None)
+}
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+fn fp8_matmul_flashinfer_with_input_scale(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    input_scale: Option<f32>,
+) -> Result<Tensor> {
     let (m, k) = input.dims2()?;
     let (n, k_w) = weight.dims2()?;
 
@@ -431,18 +487,34 @@ pub fn fp8_matmul_flashinfer(
 
     unsafe {
         let num_groups = m * k_over_128;
-        ffi::fp8_quantize_per_token_group_launch(
-            inp_ptr,
-            q_ptr,
-            s_ptr,
-            num_groups as i32,
-            128,
-            k_over_128 as i32,
-            scale_stride,
-            false,
-            true,
-            stream,
-        );
+        if let Some(input_scale) = input_scale {
+            ffi::fp8_quantize_per_token_group_static_launch(
+                inp_ptr,
+                q_ptr,
+                s_ptr,
+                num_groups as i32,
+                128,
+                k_over_128 as i32,
+                scale_stride,
+                false,
+                true,
+                input_scale,
+                stream,
+            );
+        } else {
+            ffi::fp8_quantize_per_token_group_launch(
+                inp_ptr,
+                q_ptr,
+                s_ptr,
+                num_groups as i32,
+                128,
+                k_over_128 as i32,
+                scale_stride,
+                false,
+                true,
+                stream,
+            );
+        }
     }
 
     let required_ws =
@@ -490,6 +562,17 @@ pub fn fp8_matmul_cutlass(
     weight: &Tensor,
     weight_scale: &Tensor,
     block_size: &[usize],
+) -> Result<Tensor> {
+    fp8_matmul_cutlass_with_input_scale(input, weight, weight_scale, block_size, None)
+}
+
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+fn fp8_matmul_cutlass_with_input_scale(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    block_size: &[usize],
+    input_scale: Option<f32>,
 ) -> Result<Tensor> {
     if block_size.len() != 2 || block_size[0] != 128 || block_size[1] != 128 {
         candle_core::bail!("fp8_matmul_cutlass requires block_size [128, 128]");
@@ -602,18 +685,34 @@ pub fn fp8_matmul_cutlass(
         let num_groups = m * k_over_128;
         let group_size = 128;
         let num_groups_per_row = k_over_128;
-        ffi::fp8_quantize_per_token_group_launch(
-            inp_ptr as *const std::ffi::c_void,
-            q_ptr,
-            s_ptr,
-            num_groups as i32,
-            group_size as i32,
-            num_groups_per_row as i32,
-            scale_stride,
-            dtype == DType::F16,
-            true,
-            stream as i64,
-        );
+        if let Some(input_scale) = input_scale {
+            ffi::fp8_quantize_per_token_group_static_launch(
+                inp_ptr as *const std::ffi::c_void,
+                q_ptr,
+                s_ptr,
+                num_groups as i32,
+                group_size as i32,
+                num_groups_per_row as i32,
+                scale_stride,
+                dtype == DType::F16,
+                true,
+                input_scale,
+                stream as i64,
+            );
+        } else {
+            ffi::fp8_quantize_per_token_group_launch(
+                inp_ptr as *const std::ffi::c_void,
+                q_ptr,
+                s_ptr,
+                num_groups as i32,
+                group_size as i32,
+                num_groups_per_row as i32,
+                scale_stride,
+                dtype == DType::F16,
+                true,
+                stream as i64,
+            );
+        }
     }
 
     let (gemm_ws_ptr, gemm_ws_bytes) = get_cutlass_workspace(cu_dev, 0)?;
