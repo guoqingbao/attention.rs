@@ -3910,4 +3910,75 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    // =========================================================================
+    // ZipCCL: lossless BF16/F16 exponent compression for NCCL collectives
+    // =========================================================================
+
+    pub fn zipccl_header_bytes() -> c_int;
+    pub fn zipccl_block_size() -> c_int;
+    pub fn zipccl_num_blocks(n: c_int) -> c_int;
+    pub fn zipccl_static_bytes_dtype(n: c_int, dtype: c_int) -> c_int;
+    pub fn zipccl_zp_cap(n: c_int) -> c_int;
+    /// Fixed transfer size from (n, dtype) only — no device access.
+    pub fn zipccl_xfer_bytes_dtype(n: c_int, dtype: c_int) -> c_int;
+    pub fn zipccl_max_compressed_bytes_dtype(n: c_int, dtype: c_int) -> c_int;
+    pub fn zipccl_compress(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        top7: *const c_void,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_compress_dynamic(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        hist: *mut c_void,
+        top7: *mut c_void,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_extract_counts(
+        packed: *const c_void,
+        stride: c_int,
+        counts: *mut c_void,
+        count: c_int,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_decompress(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_decompress_add_f32(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_half_to_f32(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_half_add_f32(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+    pub fn zipccl_f32_to_half(
+        input: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
 }

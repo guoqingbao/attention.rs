@@ -29,6 +29,7 @@ sha2 = { version = "0.10", optional = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:kernels"]
+nccl = ["cuda", "candle-core/nccl"]
 graph = ["cuda", "candle-core/graph"]
 flashattn = ["dep:flashattn-rs", "flashattn-rs/flash-context"]
 flash-decoding = ["dep:flashattn-rs", "flashattn-rs/flash-decoding"]
@@ -40,3 +41,8 @@ cutlass = ["dep:kernels", "kernels/cutlass"]
 flash = ["cuda", "dep:kernels", "kernels/flash"]
 flashinfer = ["cuda", "dep:kernels", "kernels/flashinfer"]
 trtllm = ["flashinfer", "kernels/trtllm", "dep:ureq", "dep:sha2"]
+
+# Keep standalone attention-rs ZipCCL tests on the same local cudarc wrapper
+# used by xInfer.
+[patch."https://github.com/guoqingbao/cudarc.git"]
+cudarc = { path = "../cudarc" }

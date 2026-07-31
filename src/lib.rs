@@ -42,6 +42,9 @@ pub mod nvfp4_linear;
 pub mod ops;
 pub mod silu_and_mul;
 pub mod swiglu;
+pub mod zipccl;
+#[cfg(feature = "nccl")]
+pub mod zipccl_comm;
 
 #[cfg(feature = "flash")]
 pub mod flash;
