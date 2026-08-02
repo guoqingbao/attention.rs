@@ -478,7 +478,12 @@ static int run_fp4_moe_grouped_gemm_sm100(
     return -1;
   }
 
-  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/true);
+  // Do not enable programmatic dependent launch for the grouped NVFP4 MoE
+  // kernel.  The reference SM120 grouped implementation keeps PDL disabled
+  // until the CUTLASS version provides a validated grouped-GEMM path; with
+  // PDL enabled, small/irregular expert groups can produce corrupted output
+  // even though the launch itself reports success.
+  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/false);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
