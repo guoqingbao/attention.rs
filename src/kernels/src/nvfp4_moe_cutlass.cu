@@ -478,7 +478,12 @@ static int run_fp4_moe_grouped_gemm_sm100(
     return -1;
   }
 
-  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/true);
+  // Do not enable programmatic dependent launch for the grouped NVFP4 MoE
+  // kernel.  The reference SM120 grouped implementation keeps PDL disabled
+  // until the CUTLASS version provides a validated grouped-GEMM path; with
+  // PDL enabled, small/irregular expert groups can produce corrupted output
+  // even though the launch itself reports success.
+  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/false);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
@@ -674,7 +679,11 @@ static int run_fp4_moe_grouped_gemm_sm120(
     return -1;
   }
 
-  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/true);
+  // Keep programmatic dependent launch disabled for SM120 grouped NVFP4
+  // MoE as well.  The reference grouped implementation does not enable PDL
+  // for this path until the CUTLASS grouped scheduler is validated with
+  // irregular expert sizes.
+  status = gemm_op.run(args, gemm_workspace, stream, nullptr, /*launch_with_pdl=*/false);
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr, "[NVFP4 MoE CUTLASS SM120] run failed: %s\n",
             cutlass::cutlassGetStatusString(status));
@@ -758,6 +767,41 @@ int nvfp4_cutlass_moe_gemm_bf16(
 #endif
 }
 
+// FP32 output is used by the hardware MoE path to keep the alpha-scaled
+// grouped GEMM result precise until route weighting and final dtype conversion.
+int nvfp4_cutlass_moe_gemm_f32(
+    void* output,
+    const void* a,
+    const void* b,
+    const void* a_blockscale,
+    const void* b_blockscales,
+    const float* alphas,
+    const int32_t* expert_offsets,
+    const int32_t* sf_offsets,
+    const int32_t* problem_sizes,
+    int num_experts,
+    int total_tokens,
+    int N, int K,
+    void* workspace,
+    int64_t workspace_bytes,
+    int64_t stream)
+{
+  auto s = reinterpret_cast<cudaStream_t>(stream);
+#if defined(ENABLE_FP4_SM120)
+  return run_fp4_moe_grouped_gemm_sm120<float>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
+#elif defined(ENABLE_FP4_SM100)
+  return run_fp4_moe_grouped_gemm_sm100<float>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
+#else
+  return -1;
+#endif
+}
+
 }  // extern "C"
 
 #else  // !ENABLE_FP4
@@ -773,6 +817,14 @@ int nvfp4_cutlass_moe_gemm_f16(
 }
 
 int nvfp4_cutlass_moe_gemm_bf16(
+    void*, const void*, const void*, const void*, const void*,
+    const float*, const int32_t*, const int32_t*, const int32_t*,
+    int, int, int, int, void*, int64_t, int64_t)
+{
+  return -1;
+}
+
+int nvfp4_cutlass_moe_gemm_f32(
     void*, const void*, const void*, const void*, const void*,
     const float*, const int32_t*, const int32_t*, const int32_t*,
     int, int, int, int, void*, int64_t, int64_t)

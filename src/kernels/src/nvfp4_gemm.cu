@@ -536,6 +536,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
                         const float *__restrict__ weight_global_scales,
                         const T *__restrict__ biases,
                         const uint32_t *__restrict__ indices,
+                        const float *__restrict__ topk_weights,
                         T *__restrict__ output, int num_tokens, int topk,
                         int num_experts, int N, int K, bool has_bias,
                         bool input_has_topk_dim, bool force_lut) {
@@ -733,6 +734,13 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         } else {
           acc += __bfloat162float(__ldg(&bias_row[n_idx]));
         }
+      }
+
+      // Apply routing in FP32 before the final BF16/F16 conversion.  The
+      // previous host-side broadcast multiplied an already rounded GEMM
+      // result and caused avoidable indexed-decode ULP errors.
+      if (topk_weights != nullptr) {
+        acc *= __ldg(&topk_weights[token_idx * topk + expert_slot]);
       }
 
       size_t out_idx =
@@ -1020,7 +1028,8 @@ extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,
 extern "C" void nvfp4_indexed_moe_gemm_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
     const float *weight_global_scales, const __half *biases,
-    const uint32_t *indices, __half *output, int num_tokens, int topk,
+    const uint32_t *indices, const float *topk_weights, __half *output,
+    int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     bool force_lut, cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
@@ -1034,7 +1043,7 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
-      output, num_tokens, topk, num_experts, N, K, has_bias,
+      topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
 
@@ -1043,7 +1052,8 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const float *weight_global_scales,
     const __nv_bfloat16 *biases, const uint32_t *indices,
-    __nv_bfloat16 *output, int num_tokens, int topk, int num_experts, int N,
+    const float *topk_weights, __nv_bfloat16 *output, int num_tokens, int topk,
+    int num_experts, int N,
     int K, bool has_bias, bool input_has_topk_dim, bool force_lut,
     cudaStream_t stream) {
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
@@ -1057,15 +1067,16 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
       input, weights, weight_scales, weight_global_scales, biases, indices,
-      output, num_tokens, topk, num_experts, N, K, has_bias,
+      topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
 #else
 extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
                                              const uint8_t *, const float *,
                                              const void *, const uint32_t *,
-                                             void *, int, int, int, int, int,
-                                             bool, bool, bool, cudaStream_t) {}
+                                             const float *, void *, int, int,
+                                             int, int, int, bool, bool, bool,
+                                             cudaStream_t) {}
 #endif
 
 

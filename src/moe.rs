@@ -1182,7 +1182,9 @@ pub fn moe_gemm_fp8(
                 } else {
                     Tensor::zeros((size_m, k_blocks), DType::F32, &device)?
                 };
-                let rep_out = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
+                // Keep the grouped GEMM result in FP32 until top-k route
+                // weighting and final output conversion are complete.
+                let rep_out = Tensor::zeros((size_m, size_n), DType::F32, &device)?;
                 let output = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
                 let map_divisor = if topk_weights.is_none() {
                     topk as i32
@@ -1219,7 +1221,7 @@ pub fn moe_gemm_fp8(
                 };
                 let (rep_out, _) = rep_out.storage_and_layout();
                 let rep_out = match &*rep_out {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
                     _ => candle::bail!("rep_out must be a cuda tensor"),
                 };
                 let (output, _) = output.storage_and_layout();
@@ -1296,7 +1298,7 @@ pub fn moe_gemm_fp8(
                     );
 
                     if data_type == 0 {
-                        ffi::moe_fp8_grouped_gemm_f16(
+                        ffi::moe_fp8_grouped_gemm_f32(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
@@ -1309,11 +1311,11 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            *rep_out.device_ptr() as *mut f32,
                             stream as i64,
                         );
-                        ffi::moe_fp8_scatter_rows_f16(
-                            *rep_out.device_ptr() as *const c_void,
+                        ffi::moe_fp8_scatter_rows_f32_to_f16(
+                            *rep_out.device_ptr() as *const f32,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
@@ -1323,7 +1325,7 @@ pub fn moe_gemm_fp8(
                             stream as i64,
                         );
                     } else {
-                        ffi::moe_fp8_grouped_gemm_bf16(
+                        ffi::moe_fp8_grouped_gemm_f32(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
@@ -1336,11 +1338,11 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            *rep_out.device_ptr() as *mut f32,
                             stream as i64,
                         );
-                        ffi::moe_fp8_scatter_rows_bf16(
-                            *rep_out.device_ptr() as *const c_void,
+                        ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                            *rep_out.device_ptr() as *const f32,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
@@ -1865,6 +1867,13 @@ pub fn moe_gemm_nvfp4(
         let (indices_s, _) = indices.storage_and_layout();
         let (output_s, _) = output.storage_and_layout();
 
+        let topk_w_ptr = if let Some(tw) = topk_weights {
+            let (tw_s, _) = tw.storage_and_layout();
+            cuda_ptr(&tw_s, DType::F32)? as *const f32
+        } else {
+            std::ptr::null()
+        };
+
         let biases_ptr = if let Some(b) = biases {
             let (b_s, _) = b.storage_and_layout();
             cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
@@ -1881,6 +1890,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    topk_w_ptr,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     num_tokens as i32,
                     topk as i32,
@@ -1899,6 +1909,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
+                    topk_w_ptr,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     num_tokens as i32,
                     topk as i32,
@@ -1915,10 +1926,6 @@ pub fn moe_gemm_nvfp4(
         }
     }
 
-    if let Some(tw) = topk_weights {
-        let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
-        return Ok(output.broadcast_mul(&tw)?);
-    }
     Ok(output)
 }
 
@@ -2278,8 +2285,12 @@ pub fn moe_gemm_nvfp4_hardware(
     let gathered_bytes = size_m * k * dtype_bytes;
     let act_packed_bytes = size_m * (k / 2);
     let act_scales_bytes = total_sf_rows_capacity * k_scale_padded;
-    let rep_out_bytes = size_m * n * dtype_bytes;
-    let output_bytes = rep_out_bytes;
+    // Keep the grouped GEMM result in FP32.  The hardware path applies the
+    // per-expert alpha in CUTLASS and the top-k route weight during scatter;
+    // storing either intermediate in F16/BF16 introduces a second rounding
+    // step and diverges from the FP32 reference for valid NVFP4 results.
+    let rep_out_bytes = size_m * n * std::mem::size_of::<f32>();
+    let output_bytes = size_m * n * dtype_bytes;
     let metadata_bytes = 1;
 
     let pool = get_moe_activation_pool(
@@ -2452,45 +2463,24 @@ pub fn moe_gemm_nvfp4_hardware(
         let (ps_s, _) = problem_sizes_t.storage_and_layout();
         let (workspace_ptr, workspace_bytes) = get_moe_cutlass_workspace(cuda_dev, 0)?;
         unsafe {
-            let ret = match dtype {
-                DType::F16 => ffi::nvfp4_cutlass_moe_gemm_f16(
-                    rep_out_ptr as *mut std::ffi::c_void,
-                    act_packed_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
-                    act_scales_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
-                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
-                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
-                    cuda_ptr(&sfo_s, DType::U32)? as *const i32,
-                    cuda_ptr(&ps_s, DType::U32)? as *const i32,
-                    num_experts as i32,
-                    size_m as i32,
-                    n as i32,
-                    k as i32,
-                    workspace_ptr,
-                    workspace_bytes as i64,
-                    stream,
-                ),
-                DType::BF16 => ffi::nvfp4_cutlass_moe_gemm_bf16(
-                    rep_out_ptr as *mut std::ffi::c_void,
-                    act_packed_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
-                    act_scales_ptr as *const std::ffi::c_void,
-                    cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
-                    cuda_ptr(&alphas_s, DType::F32)? as *const f32,
-                    cuda_ptr(&eo_s, DType::U32)? as *const i32,
-                    cuda_ptr(&sfo_s, DType::U32)? as *const i32,
-                    cuda_ptr(&ps_s, DType::U32)? as *const i32,
-                    num_experts as i32,
-                    size_m as i32,
-                    n as i32,
-                    k as i32,
-                    workspace_ptr,
-                    workspace_bytes as i64,
-                    stream,
-                ),
-                _ => unreachable!(),
-            };
+            let ret = ffi::nvfp4_cutlass_moe_gemm_f32(
+                rep_out_ptr as *mut std::ffi::c_void,
+                act_packed_ptr as *const std::ffi::c_void,
+                cuda_ptr(&weights_s, DType::U8)? as *const std::ffi::c_void,
+                act_scales_ptr as *const std::ffi::c_void,
+                cuda_ptr(&wss_s, DType::U8)? as *const std::ffi::c_void,
+                cuda_ptr(&alphas_s, DType::F32)? as *const f32,
+                cuda_ptr(&eo_s, DType::U32)? as *const i32,
+                cuda_ptr(&sfo_s, DType::U32)? as *const i32,
+                cuda_ptr(&ps_s, DType::U32)? as *const i32,
+                num_experts as i32,
+                size_m as i32,
+                n as i32,
+                k as i32,
+                workspace_ptr,
+                workspace_bytes as i64,
+                stream,
+            );
             if ret != 0 {
                 candle_core::bail!("nvfp4_cutlass_moe_gemm failed with error code {}", ret);
             }
@@ -2509,8 +2499,8 @@ pub fn moe_gemm_nvfp4_hardware(
         };
         unsafe {
             match dtype {
-                DType::F16 => ffi::moe_fp8_scatter_rows_f16(
-                    rep_out_ptr as *const std::ffi::c_void,
+                DType::F16 => ffi::moe_fp8_scatter_rows_f32_to_f16(
+                    rep_out_ptr as *const f32,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     size_m as i64,
@@ -2519,8 +2509,8 @@ pub fn moe_gemm_nvfp4_hardware(
                     weights_ffi_ptr,
                     stream,
                 ),
-                DType::BF16 => ffi::moe_fp8_scatter_rows_bf16(
-                    rep_out_ptr as *const std::ffi::c_void,
+                DType::BF16 => ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                    rep_out_ptr as *const f32,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
                     size_m as i64,
