@@ -785,3 +785,62 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
 #endif
   printf("moe_fp8_grouped_gemm_bf16 unsupported sm_version %d\n", sm_version);
 }
+
+// Keep the FP8 grouped-MoE result in FP32 until route weighting is applied.
+// This avoids rounding the GEMM result once in F16/BF16 and then rounding the
+// weighted result a second time in the scatter kernel.
+extern "C" void moe_fp8_grouped_gemm_f32(
+    const uint8_t* a,
+    const uint8_t* b,
+    const float* a_scales,
+    const float* b_scales,
+    const int32_t* expert_offsets,
+    int num_experts,
+    int m,
+    int n,
+    int k,
+    int block_size_n,
+    int block_size_k,
+    int sm_version,
+    float* out,
+    cudaStream_t stream) {
+#if defined(USE_CUTLASS)
+  const auto* a_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(a);
+  const auto* b_ptr = reinterpret_cast<const cutlass::float_e4m3_t*>(b);
+
+  int n_blocks = (n + block_size_n - 1) / block_size_n;
+  int k_blocks = (k + block_size_k - 1) / block_size_k;
+  bool column_major_a_scales = sm_version >= 100;
+
+  if (sm_version >= 120) {
+    auto status = vllm_rs_moe::launch_grouped_gemm<float, vllm_rs_moe::Sm120GroupConfig, cutlass::layout::RowMajor>(
+        a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out, stream,
+        column_major_a_scales);
+    if (status != cutlass::Status::kSuccess) {
+      printf("moe_fp8_grouped_gemm_f32 sm120 failed: %s\n", cutlass::cutlassGetStatusString(status));
+    }
+    return;
+  }
+
+  if (sm_version >= 100) {
+    auto status = vllm_rs_moe::launch_grouped_gemm<float, vllm_rs_moe::Sm100GroupConfig, cutlass::layout::RowMajor>(
+        a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out, stream,
+        column_major_a_scales);
+    if (status != cutlass::Status::kSuccess) {
+      printf("moe_fp8_grouped_gemm_f32 sm100 failed: %s\n", cutlass::cutlassGetStatusString(status));
+    }
+    return;
+  }
+
+  if (sm_version >= 90) {
+    auto status = vllm_rs_moe::launch_grouped_gemm<float, vllm_rs_moe::Sm90GroupConfig, cutlass::layout::RowMajor>(
+        a_ptr, b_ptr, a_scales, b_scales, expert_offsets, num_experts, m, n, k, n_blocks, k_blocks, out, stream,
+        column_major_a_scales);
+    if (status != cutlass::Status::kSuccess) {
+      printf("moe_fp8_grouped_gemm_f32 sm90 failed: %s\n", cutlass::cutlassGetStatusString(status));
+    }
+    return;
+  }
+#endif
+  printf("moe_fp8_grouped_gemm_f32 unsupported sm_version %d\n", sm_version);
+}

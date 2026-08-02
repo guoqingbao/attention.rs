@@ -1245,6 +1245,23 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn moe_fp8_grouped_gemm_f32(
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        b_scales: *const f32,
+        expert_offsets: *const i32,
+        num_experts: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        block_size_n: c_int,
+        block_size_k: c_int,
+        sm_version: c_int,
+        out: *mut f32,
+        stream: i64,
+    );
+
     pub fn fp8_quantize_per_token_group_launch(
         input: *const c_void,
         output_q: *mut c_void,

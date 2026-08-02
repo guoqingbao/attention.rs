@@ -1182,7 +1182,9 @@ pub fn moe_gemm_fp8(
                 } else {
                     Tensor::zeros((size_m, k_blocks), DType::F32, &device)?
                 };
-                let rep_out = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
+                // Keep the grouped GEMM result in FP32 until top-k route
+                // weighting and final output conversion are complete.
+                let rep_out = Tensor::zeros((size_m, size_n), DType::F32, &device)?;
                 let output = Tensor::zeros((size_m, size_n), input_dtype, &device)?;
                 let map_divisor = if topk_weights.is_none() {
                     topk as i32
@@ -1219,7 +1221,7 @@ pub fn moe_gemm_fp8(
                 };
                 let (rep_out, _) = rep_out.storage_and_layout();
                 let rep_out = match &*rep_out {
-                    candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
                     _ => candle::bail!("rep_out must be a cuda tensor"),
                 };
                 let (output, _) = output.storage_and_layout();
@@ -1296,7 +1298,7 @@ pub fn moe_gemm_fp8(
                     );
 
                     if data_type == 0 {
-                        ffi::moe_fp8_grouped_gemm_f16(
+                        ffi::moe_fp8_grouped_gemm_f32(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
@@ -1309,11 +1311,11 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            *rep_out.device_ptr() as *mut f32,
                             stream as i64,
                         );
-                        ffi::moe_fp8_scatter_rows_f16(
-                            *rep_out.device_ptr() as *const c_void,
+                        ffi::moe_fp8_scatter_rows_f32_to_f16(
+                            *rep_out.device_ptr() as *const f32,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
@@ -1323,7 +1325,7 @@ pub fn moe_gemm_fp8(
                             stream as i64,
                         );
                     } else {
-                        ffi::moe_fp8_grouped_gemm_bf16(
+                        ffi::moe_fp8_grouped_gemm_f32(
                             *rep_a_q.device_ptr() as *const u8,
                             *weights.device_ptr() as *const u8,
                             *rep_a_scales.device_ptr() as *const f32,
@@ -1336,11 +1338,11 @@ pub fn moe_gemm_fp8(
                             block_size_n as i32,
                             block_size_k as i32,
                             sm_version as i32,
-                            *rep_out.device_ptr() as *mut c_void,
+                            *rep_out.device_ptr() as *mut f32,
                             stream as i64,
                         );
-                        ffi::moe_fp8_scatter_rows_bf16(
-                            *rep_out.device_ptr() as *const c_void,
+                        ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                            *rep_out.device_ptr() as *const f32,
                             *sorted_token_ids.device_ptr() as *const i32,
                             *output.device_ptr() as *mut c_void,
                             size_m as i64,
