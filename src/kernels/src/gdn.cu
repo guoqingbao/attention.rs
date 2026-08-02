@@ -84,9 +84,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     const int tid = threadIdx.x;
     const int v_idx = v_tile * BV + tid;
 
-    if (v_idx >= v_dim) {
-        return;
-    }
+    const bool v_valid = v_idx < v_dim;
 
     const T* q_bh = q + bh * seq_len * BK;
     const T* k_bh = k + bh * seq_len * BK;
@@ -104,7 +102,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     float s[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s[j] = state_base[j * v_dim + v_idx];
+        s[j] = v_valid ? state_base[j * v_dim + v_idx] : 0.0f;
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -121,7 +119,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 
         const float decay = scalars[0];
         const float beta_t = scalars[1];
-        const float v_t = to_float(v_bh[t * v_dim + v_idx]);
+        const float v_t = v_valid ? to_float(v_bh[t * v_dim + v_idx]) : 0.0f;
 
         float kv_mem = 0.0f;
 #pragma unroll
@@ -147,12 +145,16 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
             y_t = __fmaf_rn(s[j], q_buf[j], y_t);
         }
 
-        out_bh[t * v_dim + v_idx] = y_t;
+        if (v_valid) {
+            out_bh[t * v_dim + v_idx] = y_t;
+        }
     }
 
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        state_base[j * v_dim + v_idx] = s[j];
+        if (v_valid) {
+            state_base[j * v_dim + v_idx] = s[j];
+        }
     }
 }
 
@@ -173,9 +175,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const int tid = threadIdx.x;
     const int v_idx = v_tile * BV + tid;
 
-    if (v_idx >= v_dim) {
-        return;
-    }
+    const bool v_valid = v_idx < v_dim;
 
     const T* q_bh = q + bh * seq_len * k_dim;
     const T* k_bh = k + bh * seq_len * k_dim;
@@ -192,7 +192,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
     float s[MAX_K];
     for (int j = 0; j < k_dim; ++j) {
-        s[j] = state_base[j * v_dim + v_idx];
+        s[j] = v_valid ? state_base[j * v_dim + v_idx] : 0.0f;
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -207,7 +207,7 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
         const float decay = scalars_buf[0];
         const float beta_t = scalars_buf[1];
-        const float v_t = to_float(v_bh[t * v_dim + v_idx]);
+        const float v_t = v_valid ? to_float(v_bh[t * v_dim + v_idx]) : 0.0f;
 
         float kv_mem = 0.0f;
         for (int j = 0; j < k_dim; ++j) {
@@ -229,11 +229,15 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
             y_t = __fmaf_rn(s[j], q_buf[j], y_t);
         }
 
-        out_bh[t * v_dim + v_idx] = y_t;
+        if (v_valid) {
+            out_bh[t * v_dim + v_idx] = y_t;
+        }
     }
 
     for (int j = 0; j < k_dim; ++j) {
-        state_base[j * v_dim + v_idx] = s[j];
+        if (v_valid) {
+            state_base[j * v_dim + v_idx] = s[j];
+        }
     }
 }
 
@@ -360,7 +364,8 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const int bh = blockIdx.y;
     const int tid = threadIdx.x;
     const int v_idx = v_tile * BV + tid;
-    if (v_idx >= v_dim || bh >= batch * heads) return;
+    if (bh >= batch * heads) return;
+    const bool v_valid = v_idx < v_dim;
 
     const int b = bh / heads;
     const int h = bh % heads;
@@ -392,20 +397,21 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? to_float(state_head[j * v_dim + v_idx]) : 0.0f;
+        s_buf[j] = (v_valid && j < k_dim) ? to_float(state_head[j * v_dim + v_idx]) : 0.0f;
     }
 
     float kv_mem = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && j < k_dim) {
             s_buf[j] *= decay;
             kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
         }
     }
 
     const T* v_bh = v + (bh * v_dim);
-    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+    const float delta = (v_valid ? to_float(v_bh[v_idx]) : 0.0f) - kv_mem;
+    const float scaled_delta = delta * beta_t;
 
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
@@ -416,20 +422,22 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     float y = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
-            s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
+        if (v_valid && j < k_dim) {
+            s_buf[j] = __fmaf_rn(k_smem[j], scaled_delta, s_buf[j]);
             y = __fmaf_rn(s_buf[j], q_smem[j], y);
         }
     }
 
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && j < k_dim) {
             state_head[j * v_dim + v_idx] = from_float<T>(s_buf[j]);
         }
     }
 
-    out[bh * v_dim + v_idx] = from_float<T>(y);
+    if (v_valid) {
+        out[bh * v_dim + v_idx] = from_float<T>(y);
+    }
 }
 
 template <typename T, int BV, int BK>
@@ -450,7 +458,8 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     const int bh = blockIdx.y;
     const int tid = threadIdx.x;
     const int v_idx = v_tile * BV + tid;
-    if (v_idx >= v_dim || bh >= batch * heads) return;
+    if (bh >= batch * heads) return;
+    const bool v_valid = v_idx < v_dim;
 
     const int b = bh / heads;
     const int h = bh % heads;
@@ -481,20 +490,20 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     float s_buf[BK];
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        s_buf[j] = (j < k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
+        s_buf[j] = (v_valid && j < k_dim) ? state_head[j * v_dim + v_idx] : 0.0f;
     }
 
     float kv_mem = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && j < k_dim) {
             s_buf[j] *= decay;
             kv_mem = __fmaf_rn(s_buf[j], k_smem[j], kv_mem);
         }
     }
 
     const T* v_bh = v + (bh * v_dim);
-    const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
+    const float delta = ((v_valid ? to_float(v_bh[v_idx]) : 0.0f) - kv_mem) * beta_t;
 
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
@@ -505,7 +514,7 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
     float y = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && j < k_dim) {
             s_buf[j] = __fmaf_rn(k_smem[j], delta, s_buf[j]);
             y = __fmaf_rn(s_buf[j], q_smem[j], y);
         }
@@ -513,12 +522,14 @@ __global__ void gated_delta_rule_decode_slots_kernel_state_f32(
 
 #pragma unroll
     for (int j = 0; j < BK; ++j) {
-        if (j < k_dim) {
+        if (v_valid && j < k_dim) {
             state_head[j * v_dim + v_idx] = s_buf[j];
         }
     }
 
-    out[bh * v_dim + v_idx] = from_float<T>(y);
+    if (v_valid) {
+        out[bh * v_dim + v_idx] = from_float<T>(y);
+    }
 }
 
 // K4: dispatch to exact BK sizes to minimize register pressure
