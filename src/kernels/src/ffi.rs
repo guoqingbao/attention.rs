@@ -1189,6 +1189,28 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn moe_fp8_scatter_rows_f32_to_f16(
+        input: *const f32,
+        src2dst_map: *const i32,
+        output: *mut c_void,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        weights: *const f32,
+        stream: i64,
+    );
+
+    pub fn moe_fp8_scatter_rows_f32_to_bf16(
+        input: *const f32,
+        src2dst_map: *const i32,
+        output: *mut c_void,
+        num_src_rows: i64,
+        num_dst_rows: i64,
+        num_cols: i64,
+        weights: *const f32,
+        stream: i64,
+    );
+
     pub fn moe_fp8_grouped_gemm_f16(
         a: *const u8,
         b: *const u8,
@@ -1833,6 +1855,25 @@ extern "C" {
     ) -> i32;
 
     pub fn nvfp4_cutlass_moe_gemm_bf16(
+        output: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_blockscale: *const c_void,
+        b_blockscales: *const c_void,
+        alphas: *const f32,
+        expert_offsets: *const i32,
+        sf_offsets: *const i32,
+        problem_sizes: *const i32,
+        num_experts: i32,
+        total_tokens: i32,
+        N: i32,
+        K: i32,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        stream: i64,
+    ) -> i32;
+
+    pub fn nvfp4_cutlass_moe_gemm_f32(
         output: *mut c_void,
         a: *const c_void,
         b: *const c_void,

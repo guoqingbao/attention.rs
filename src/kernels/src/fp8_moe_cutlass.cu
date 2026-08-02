@@ -178,6 +178,37 @@ __global__ void scatter_rows_kernel(
   }
 }
 
+// The hardware NVFP4 grouped GEMM keeps its alpha-scaled result in FP32.
+// Apply the route weight before converting to the model output dtype so the
+// output is rounded only once, matching the FP32 PyTorch reference.
+template <typename OutputT>
+__global__ void scatter_rows_from_float_kernel(
+    const float* input,
+    const int32_t* src2dst_map,
+    OutputT* output,
+    int64_t num_src_rows,
+    int64_t num_dst_rows,
+    int64_t num_cols,
+    const float* weights) {
+  int64_t src_row = blockIdx.x;
+  if (src_row >= num_src_rows) {
+    return;
+  }
+  int64_t dst_row = src2dst_map[src_row];
+  if (dst_row >= num_dst_rows) {
+    return;
+  }
+
+  float w = 1.0f;
+  if (weights != nullptr) {
+    w = weights[dst_row];
+  }
+  for (int64_t i = threadIdx.x; i < num_cols; i += blockDim.x) {
+    output[dst_row * num_cols + i] =
+        from_float<OutputT>(input[src_row * num_cols + i] * w);
+  }
+}
+
 #if defined(USE_CUTLASS)
 template <typename ScaleConfig, typename LayoutSFA, typename LayoutSFB, typename StrideA, typename StrideB, typename StrideC,
           typename UnderlyingProblemShape, typename OutType>
@@ -611,6 +642,36 @@ extern "C" void moe_fp8_scatter_rows_bf16(
       input, src2dst_map, output, num_src_rows, num_dst_rows, num_cols, weights);
 }
 
+extern "C" void moe_fp8_scatter_rows_f32_to_f16(
+    const float* input,
+    const int32_t* src2dst_map,
+    half* output,
+    int64_t num_src_rows,
+    int64_t num_dst_rows,
+    int64_t num_cols,
+    const float* weights,
+    cudaStream_t stream) {
+  dim3 grid(static_cast<uint32_t>(num_src_rows));
+  dim3 block(256);
+  vllm_rs_moe::scatter_rows_from_float_kernel<half><<<grid, block, 0, stream>>>(
+      input, src2dst_map, output, num_src_rows, num_dst_rows, num_cols, weights);
+}
+
+extern "C" void moe_fp8_scatter_rows_f32_to_bf16(
+    const float* input,
+    const int32_t* src2dst_map,
+    __nv_bfloat16* output,
+    int64_t num_src_rows,
+    int64_t num_dst_rows,
+    int64_t num_cols,
+    const float* weights,
+    cudaStream_t stream) {
+  dim3 grid(static_cast<uint32_t>(num_src_rows));
+  dim3 block(256);
+  vllm_rs_moe::scatter_rows_from_float_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+      input, src2dst_map, output, num_src_rows, num_dst_rows, num_cols, weights);
+}
+
 extern "C" void moe_fp8_grouped_gemm_f16(
     const uint8_t* a,
     const uint8_t* b,
@@ -724,4 +785,3 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
 #endif
   printf("moe_fp8_grouped_gemm_bf16 unsupported sm_version %d\n", sm_version);
 }
-

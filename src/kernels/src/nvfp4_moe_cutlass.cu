@@ -767,6 +767,41 @@ int nvfp4_cutlass_moe_gemm_bf16(
 #endif
 }
 
+// FP32 output is used by the hardware MoE path to keep the alpha-scaled
+// grouped GEMM result precise until route weighting and final dtype conversion.
+int nvfp4_cutlass_moe_gemm_f32(
+    void* output,
+    const void* a,
+    const void* b,
+    const void* a_blockscale,
+    const void* b_blockscales,
+    const float* alphas,
+    const int32_t* expert_offsets,
+    const int32_t* sf_offsets,
+    const int32_t* problem_sizes,
+    int num_experts,
+    int total_tokens,
+    int N, int K,
+    void* workspace,
+    int64_t workspace_bytes,
+    int64_t stream)
+{
+  auto s = reinterpret_cast<cudaStream_t>(stream);
+#if defined(ENABLE_FP4_SM120)
+  return run_fp4_moe_grouped_gemm_sm120<float>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
+#elif defined(ENABLE_FP4_SM100)
+  return run_fp4_moe_grouped_gemm_sm100<float>(
+      output, a, b, a_blockscale, b_blockscales, alphas,
+      expert_offsets, sf_offsets, problem_sizes,
+      num_experts, total_tokens, N, K, workspace, static_cast<size_t>(workspace_bytes), s);
+#else
+  return -1;
+#endif
+}
+
 }  // extern "C"
 
 #else  // !ENABLE_FP4
@@ -782,6 +817,14 @@ int nvfp4_cutlass_moe_gemm_f16(
 }
 
 int nvfp4_cutlass_moe_gemm_bf16(
+    void*, const void*, const void*, const void*, const void*,
+    const float*, const int32_t*, const int32_t*, const int32_t*,
+    int, int, int, int, void*, int64_t, int64_t)
+{
+  return -1;
+}
+
+int nvfp4_cutlass_moe_gemm_f32(
     void*, const void*, const void*, const void*, const void*,
     const float*, const int32_t*, const int32_t*, const int32_t*,
     int, int, int, int, void*, int64_t, int64_t)
