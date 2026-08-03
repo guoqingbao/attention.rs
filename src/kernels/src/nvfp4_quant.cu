@@ -551,6 +551,71 @@ __global__ void nvfp4_moe_build_metadata_kernel(
   }
 }
 
+// Per-expert online activation scale from the gathered routed rows.
+// Overwrites checkpoint-calibrated scales so deep / long-context runs do not
+// clip when activation magnitudes drift beyond calibration.
+template <typename T>
+__global__ void nvfp4_moe_compute_online_scales_kernel(
+    const T* __restrict__ input,
+    const int32_t* __restrict__ expert_offsets,
+    const float* __restrict__ weight_global_scales,
+    float* __restrict__ alphas,
+    float* __restrict__ input_scale_invs,
+    int num_experts,
+    int K) {
+  int expert_id = blockIdx.x;
+  if (expert_id >= num_experts) return;
+
+  int row_start = expert_offsets[expert_id];
+  int row_end = expert_offsets[expert_id + 1];
+  int64_t num_elements = static_cast<int64_t>(row_end - row_start) * K;
+  const T* expert_input = input + static_cast<int64_t>(row_start) * K;
+
+  float local_max = 0.0f;
+  for (int64_t i = threadIdx.x; i < num_elements; i += blockDim.x) {
+    float v;
+    if constexpr (std::is_same_v<T, half>) {
+      v = __half2float(expert_input[i]);
+    } else {
+      v = __bfloat162float(expert_input[i]);
+    }
+    local_max = fmaxf(local_max, fabsf(v));
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+  }
+
+  __shared__ float warp_max[8];
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_max[warp] = local_max;
+  __syncthreads();
+
+  if (warp == 0) {
+    float expert_max = lane < 8 ? warp_max[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      expert_max = fmaxf(expert_max, __shfl_down_sync(0xffffffff, expert_max, offset));
+    }
+    if (lane == 0) {
+      float input_scale = expert_max / 6.0f;
+      if (!(input_scale >= 1e-12f) || !isfinite(input_scale)) {
+        input_scale = 1.0f;
+      }
+      // Prefer the larger of online vs calibrated so we never clip below the
+      // jointly-tuned checkpoint scale, while still adapting when activations
+      // exceed calibration (common on deep MoE / long context).
+      float calibrated_inv = input_scale_invs[expert_id];
+      float calibrated = (calibrated_inv > 1e-12f) ? (1.0f / calibrated_inv) : 1.0f;
+      if (input_scale < calibrated) {
+        input_scale = calibrated;
+      }
+      input_scale_invs[expert_id] = 1.0f / input_scale;
+      alphas[expert_id] = input_scale * weight_global_scales[expert_id];
+    }
+  }
+}
+
 
 template <typename InType>
 __global__ void nvfp4_quantize_activation_hw_grouped_kernel(
@@ -759,6 +824,48 @@ void nvfp4_moe_build_metadata(
       K);
 }
 
+void nvfp4_moe_compute_online_scales_f16(
+    const void* input,
+    const int32_t* expert_offsets,
+    const float* weight_global_scales,
+    float* alphas,
+    float* input_scale_invs,
+    int num_experts,
+    int K,
+    int64_t stream)
+{
+  nvfp4_moe_compute_online_scales_kernel<half>
+      <<<num_experts, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const half*>(input),
+      expert_offsets,
+      weight_global_scales,
+      alphas,
+      input_scale_invs,
+      num_experts,
+      K);
+}
+
+void nvfp4_moe_compute_online_scales_bf16(
+    const void* input,
+    const int32_t* expert_offsets,
+    const float* weight_global_scales,
+    float* alphas,
+    float* input_scale_invs,
+    int num_experts,
+    int K,
+    int64_t stream)
+{
+  nvfp4_moe_compute_online_scales_kernel<nv_bfloat16>
+      <<<num_experts, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const nv_bfloat16*>(input),
+      expert_offsets,
+      weight_global_scales,
+      alphas,
+      input_scale_invs,
+      num_experts,
+      K);
+}
+
 
 void nvfp4_quantize_activation_grouped_f16(
     const void* input,
@@ -868,6 +975,12 @@ void nvfp4_quantize_activation_grouped_bf16(
 
 void nvfp4_moe_build_metadata(
     const int32_t*, const float*, const float*, int32_t*, int32_t*, float*, float*, int, int, int, int64_t) {}
+
+void nvfp4_moe_compute_online_scales_f16(
+    const void*, const int32_t*, const float*, float*, float*, int, int, int64_t) {}
+
+void nvfp4_moe_compute_online_scales_bf16(
+    const void*, const int32_t*, const float*, float*, float*, int, int, int64_t) {}
 
 void nvfp4_swizzle_weight_scales(
     const void*, void*, int, int, int, int, int64_t) {}

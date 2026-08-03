@@ -318,11 +318,23 @@ pub fn nvfp4_matmul(
                         &wscale_sw_owned
                     };
 
-                    // Use the checkpoint's calibrated input_scale directly.
-                    // When input_scale==1.0 (no calibration data in checkpoint),
-                    // pass through without scaling — matching the original behavior
-                    // where alpha = weight_global_scale and input_scale_inv = 1.0.
-                    let (hw_input_scale, hw_input_scale_inv) = if input_scale > 1e-12 {
+                    // Default: checkpoint-calibrated input_scale (ModelOpt joint
+                    // PTQ). Optional XINFER_NVFP4_ONLINE_SCALE=1 raises the scale
+                    // to max(online_amax/6, calibrated) to avoid FP4 clipping.
+                    let (hw_input_scale, hw_input_scale_inv) = if crate::nvfp4_online_scale() {
+                        let (online_scale, online_inv) = compute_online_input_scale(&input)?;
+                        if input_scale > 1e-12 {
+                            if online_scale > input_scale {
+                                (online_scale, online_inv)
+                            } else {
+                                (input_scale, 1.0 / input_scale)
+                            }
+                        } else if online_scale > 1e-12 {
+                            (online_scale, online_inv)
+                        } else {
+                            (1.0, 1.0)
+                        }
+                    } else if input_scale > 1e-12 {
                         (input_scale, 1.0 / input_scale)
                     } else {
                         (1.0, 1.0)

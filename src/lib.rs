@@ -194,6 +194,7 @@ where
 pub mod trtllm_cubin_loader;
 
 static NVFP4_FORCE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static NVFP4_ONLINE_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Returns true if `XINFER_NVFP4_FORCE_LUT=1` is set, forcing the software
 /// GEMM decode path to use the higher-precision LUT-based dequantization
@@ -201,6 +202,22 @@ static NVFP4_FORCE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub fn nvfp4_force_lut() -> bool {
     *NVFP4_FORCE_LUT.get_or_init(|| {
         std::env::var("XINFER_NVFP4_FORCE_LUT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Returns true if `XINFER_NVFP4_ONLINE_SCALE=1` is set.
+///
+/// Default is **off**: hardware NVFP4 keeps ModelOpt checkpoint-calibrated
+/// `input_scale` (the behavior restored after the pure-online experiment
+/// regressed). When enabled, the runtime raises the effective scale to
+/// `max(online_amax/6, calibrated)` so deep/long-context runs do not clip
+/// when activations exceed calibration. Opt-in only — affects all hardware
+/// NVFP4 paths (pure and mixed).
+pub fn nvfp4_online_scale() -> bool {
+    *NVFP4_ONLINE_SCALE.get_or_init(|| {
+        std::env::var("XINFER_NVFP4_ONLINE_SCALE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
