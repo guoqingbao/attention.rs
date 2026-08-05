@@ -19,7 +19,10 @@ cudaError_t ds_ensure_bf16_scratch(
     __nv_bfloat16 **ptr, size_t *capacity, size_t required) {
   if (*capacity >= required) return cudaSuccess;
   if (*ptr != nullptr) {
-    cudaError_t err = cudaFree(*ptr);
+    // Wait for in-flight kernels that may still read/write *ptr before free.
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return err;
+    err = cudaFree(*ptr);
     if (err != cudaSuccess) return err;
     *ptr = nullptr;
     *capacity = 0;

@@ -41,6 +41,7 @@
 //! Workspaces are thread-local to avoid synchronization overhead. Each thread
 //! maintains its own workspace buffers, which are lazily initialized on first use.
 
+use candle_core::backend::BackendDevice;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 #[cfg(feature = "cuda")]
@@ -434,6 +435,11 @@ mod cuda {
             };
 
             if needs_realloc {
+                if slot.as_ref().is_some() {
+                    // Sync before freeing/reallocating so in-flight MoE kernels
+                    // cannot race with free_async/reuse of the old pool buffers.
+                    BackendDevice::synchronize(dev)?;
+                }
                 let old = slot.take();
                 let (g_sz, ap_sz, as_sz, r_sz, m_sz) = if let Some(ref prev) = old {
                     (

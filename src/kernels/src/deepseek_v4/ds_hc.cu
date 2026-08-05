@@ -32,7 +32,10 @@ cudaError_t ds_hc_scratch_for_device(DsHcGemmScratch **out) {
 cudaError_t ds_hc_ensure_scratch(DsHcGemmScratch &scratch, size_t elements) {
   if (elements <= scratch.x_capacity) return cudaSuccess;
   if (scratch.x_f32 != nullptr) {
-    cudaError_t err = cudaFree(scratch.x_f32);
+    // Wait for in-flight kernels/cublas that may still use x_f32 before free.
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return err;
+    err = cudaFree(scratch.x_f32);
     if (err != cudaSuccess) return err;
     scratch.x_f32 = nullptr;
     scratch.x_capacity = 0;
