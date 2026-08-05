@@ -60,6 +60,41 @@ fn get_cuda_stream(device: &Device) -> Result<i64> {
     }
 }
 
+/// Prewarm grow-only V4 scratch buffers and cuBLAS handles before graph capture.
+#[cfg(feature = "cuda")]
+pub fn prewarm_decode_scratch(
+    device: &Device,
+    hc_max_elements: usize,
+    fp4_max_elems: usize,
+) -> Result<()> {
+    let stream = get_cuda_stream(device)?;
+    unsafe {
+        let ret = kernels::ffi::ds_v4_hc_prewarm(hc_max_elements as i32, stream);
+        if ret != 0 {
+            candle_core::bail!("ds_v4_hc_prewarm CUDA error: {}", ret);
+        }
+        let ret = kernels::ffi::ds_v4_indexer_fp4_prewarm(fp4_max_elems as i32, stream);
+        if ret != 0 {
+            candle_core::bail!("ds_v4_indexer_fp4_prewarm CUDA error: {}", ret);
+        }
+        let ret = kernels::ffi::ds_v4_compressor_prewarm(stream);
+        if ret != 0 {
+            candle_core::bail!("ds_v4_compressor_prewarm CUDA error: {}", ret);
+        }
+    }
+    device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn prewarm_decode_scratch(
+    _device: &Device,
+    _hc_max_elements: usize,
+    _fp4_max_elems: usize,
+) -> Result<()> {
+    candle_core::bail!("prewarm_decode_scratch requires cuda feature")
+}
+
 /// Bounds-checked asynchronous device-to-device copy for contiguous tensors.
 ///
 /// Candle's current `Tensor::copy_` passes the destination layout to the
@@ -251,7 +286,7 @@ pub fn hc_pre_from_mixes(
 /// Fused sinkhorn + pre-output + RMSNorm (hc=4 only).
 ///
 /// x: [seq, hc, dim], mixes: [seq, mix_hc],
-/// hc_scale: [3], hc_base: [mix_hc], norm_weight: [dim]
+/// hc_scale: [3], hc_base: [mix_hc], norm_weight: [dim] F32
 /// Returns (normed_out: [seq, dim], post: [seq, hc], comb: [seq, hc, hc])
 pub fn hc_pre_norm_from_mixes(
     x: &Tensor,
@@ -267,6 +302,12 @@ pub fn hc_pre_norm_from_mixes(
 ) -> Result<(Tensor, Tensor, Tensor)> {
     #[cfg(feature = "cuda")]
     {
+        if norm_weight.dtype() != DType::F32 {
+            candle_core::bail!(
+                "hc_pre_norm_from_mixes expects F32 norm_weight, got {:?}",
+                norm_weight.dtype()
+            );
+        }
         let seq_len = x.dim(0)?;
         let post = Tensor::zeros((seq_len, hc), DType::F32, x.device())?;
         let comb = Tensor::zeros((seq_len, hc, hc), DType::F32, x.device())?;
@@ -545,23 +586,13 @@ pub fn hc_post_f32_branch(
 pub fn rms_norm_v4(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
-        let rows = x.dim(0)?;
-        let out = Tensor::zeros_like(x)?;
-        let stream = get_cuda_stream(x.device())?;
-        let ret = unsafe {
-            kernels::ffi::ds_v4_rms_norm(
-                get_cuda_ptr(x)?,
-                get_cuda_ptr(weight)?,
-                get_cuda_mut_ptr(&out)?,
-                rows as i32,
-                dim as i32,
-                eps,
-                stream,
-            )
+        let x = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous()?
         };
-        if ret != 0 {
-            candle_core::bail!("ds_v4_rms_norm CUDA error: {}", ret);
-        }
+        let out = Tensor::zeros_like(&x)?;
+        rms_norm_v4_launch(&x, weight, &out, dim, eps)?;
         Ok(out)
     }
     #[cfg(not(feature = "cuda"))]
@@ -569,6 +600,59 @@ pub fn rms_norm_v4(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) -> Result<
         let _ = (weight, dim, eps);
         candle_core::bail!("rms_norm_v4 requires cuda feature")
     }
+}
+
+/// In-place ATen-order RMSNorm. Safe because the kernel fully reduces before writing.
+/// `x` must be contiguous BF16 `[rows, dim]`; `weight` must be F32 `[dim]`.
+pub fn rms_norm_v4_inplace(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if !x.is_contiguous() {
+            candle_core::bail!("rms_norm_v4_inplace requires contiguous input");
+        }
+        if x.dtype() != DType::BF16 {
+            candle_core::bail!(
+                "rms_norm_v4_inplace expects BF16 input, got {:?}",
+                x.dtype()
+            );
+        }
+        rms_norm_v4_launch(x, weight, x, dim, eps)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (weight, dim, eps);
+        candle_core::bail!("rms_norm_v4_inplace requires cuda feature")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn rms_norm_v4_launch(
+    x: &Tensor,
+    weight: &Tensor,
+    out: &Tensor,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    let rows = x.dim(0)?;
+    if weight.dtype() != DType::F32 {
+        candle_core::bail!("rms_norm_v4 expects F32 weight, got {:?}", weight.dtype());
+    }
+    let stream = get_cuda_stream(x.device())?;
+    let ret = unsafe {
+        kernels::ffi::ds_v4_rms_norm(
+            get_cuda_ptr(x)?,
+            get_cuda_ptr(weight)?,
+            get_cuda_mut_ptr(out)?,
+            rows as i32,
+            dim as i32,
+            eps,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("ds_v4_rms_norm CUDA error: {}", ret);
+    }
+    Ok(())
 }
 
 pub fn head_rms_norm(x: &Tensor, num_heads: usize, head_dim: usize, eps: f32) -> Result<Tensor> {
@@ -706,6 +790,56 @@ pub fn apply_rope_hidden_strided_inplace(
     {
         let _ = (x, cos, sin, start_pos, position_stride, rope_dim, inverse);
         candle_core::bail!("apply_rope_hidden requires cuda feature")
+    }
+}
+
+/// CUDA-graph safe RoPE: reads per-token positions from a GPU `positions` buffer.
+pub fn apply_rope_hidden_from_positions(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &Tensor,
+    rope_dim: usize,
+    position_offset: i64,
+    inverse: bool,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let (seq_len, local_heads, head_dim) = rope_hidden_shape(x)?;
+        if positions.dtype() != DType::I64 {
+            candle_core::bail!(
+                "apply_rope_hidden_from_positions expects I64 positions, got {:?}",
+                positions.dtype()
+            );
+        }
+        if positions.dim(0)? != seq_len {
+            candle_core::bail!("positions length must match seq_len");
+        }
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_apply_rope_hidden_from_pos(
+                get_cuda_mut_ptr(x)?,
+                get_cuda_ptr(cos)?,
+                get_cuda_ptr(sin)?,
+                get_cuda_ptr(positions)?,
+                seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope_dim as i32,
+                position_offset as i32,
+                if inverse { 1 } else { 0 },
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("apply_rope_hidden_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x, cos, sin, positions, rope_dim, position_offset, inverse);
+        candle_core::bail!("apply_rope_hidden_from_positions requires cuda feature")
     }
 }
 
@@ -1043,6 +1177,141 @@ pub fn compressor_overlap_decode_at(
     }
 }
 
+/// Graph-safe non-overlap compressor decode: fixed topology, position from GPU.
+pub fn compressor_nonoverlap_decode_at_graph(
+    x: &Tensor,
+    wkv: &Tensor,
+    wgate: &Tensor,
+    ape: &Tensor,
+    norm: &Tensor,
+    kv_state: &Tensor,
+    score_state: &Tensor,
+    positions: &Tensor,
+    weighted: &Tensor,
+    out: &Tensor,
+    hidden_dim: usize,
+    head_dim: usize,
+    ratio: usize,
+    state_offset: usize,
+    eps: f32,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compressor_nonoverlap_decode_at_graph(
+                get_cuda_ptr(x)?,
+                get_cuda_ptr(wkv)?,
+                get_cuda_ptr(wgate)?,
+                get_cuda_ptr(ape)?,
+                get_cuda_ptr(norm)?,
+                get_cuda_mut_ptr(kv_state)? as *mut f32,
+                get_cuda_mut_ptr(score_state)? as *mut f32,
+                get_cuda_mut_ptr(weighted)? as *mut f32,
+                get_cuda_mut_ptr(out)?,
+                get_cuda_ptr(positions)?,
+                hidden_dim as i32,
+                head_dim as i32,
+                ratio as i32,
+                state_offset as i32,
+                eps,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compressor_nonoverlap_decode_at_graph CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x,
+            wkv,
+            wgate,
+            ape,
+            norm,
+            kv_state,
+            score_state,
+            positions,
+            weighted,
+            out,
+            hidden_dim,
+            head_dim,
+            ratio,
+            state_offset,
+            eps,
+        );
+        candle_core::bail!("compressor_nonoverlap_decode_at_graph requires cuda feature")
+    }
+}
+
+/// Graph-safe overlap compressor decode: fixed topology, position from GPU.
+pub fn compressor_overlap_decode_at_graph(
+    x: &Tensor,
+    wkv: &Tensor,
+    wgate: &Tensor,
+    ape: &Tensor,
+    norm: &Tensor,
+    kv_state: &Tensor,
+    score_state: &Tensor,
+    positions: &Tensor,
+    weighted: &Tensor,
+    out: &Tensor,
+    hidden_dim: usize,
+    head_dim: usize,
+    state_offset: usize,
+    eps: f32,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compressor_overlap_decode_at_graph(
+                get_cuda_ptr(x)?,
+                get_cuda_ptr(wkv)?,
+                get_cuda_ptr(wgate)?,
+                get_cuda_ptr(ape)?,
+                get_cuda_ptr(norm)?,
+                get_cuda_mut_ptr(kv_state)? as *mut f32,
+                get_cuda_mut_ptr(score_state)? as *mut f32,
+                get_cuda_mut_ptr(weighted)? as *mut f32,
+                get_cuda_mut_ptr(out)?,
+                get_cuda_ptr(positions)?,
+                hidden_dim as i32,
+                head_dim as i32,
+                state_offset as i32,
+                eps,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compressor_overlap_decode_at_graph CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x,
+            wkv,
+            wgate,
+            ape,
+            norm,
+            kv_state,
+            score_state,
+            positions,
+            weighted,
+            out,
+            hidden_dim,
+            head_dim,
+            state_offset,
+            eps,
+        );
+        candle_core::bail!("compressor_overlap_decode_at_graph requires cuda feature")
+    }
+}
+
 // ============================================================================
 // Indexer kernels
 // ============================================================================
@@ -1291,6 +1560,53 @@ pub fn indexer_scores_prefill(
     }
 }
 
+pub fn indexer_scores_decode_into(
+    q: &Tensor,
+    kv: &Tensor,
+    weights: &Tensor,
+    local_heads: usize,
+    head_dim: usize,
+    compressed_len: usize,
+    score_scale: f32,
+    scores: &Tensor,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(q.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_indexer_scores_decode(
+                get_cuda_ptr(q)?,
+                get_cuda_ptr(kv)?,
+                get_cuda_ptr(weights)?,
+                get_cuda_mut_ptr(scores)? as *mut f32,
+                local_heads as i32,
+                head_dim as i32,
+                compressed_len as i32,
+                score_scale,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("indexer_scores_decode CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            q,
+            kv,
+            weights,
+            local_heads,
+            head_dim,
+            compressed_len,
+            score_scale,
+            scores,
+        );
+        candle_core::bail!("indexer_scores_decode requires cuda feature")
+    }
+}
+
 /// Compute indexer scores for decode (single token).
 ///
 /// q: [1, local_heads*head_dim] BF16
@@ -1306,40 +1622,52 @@ pub fn indexer_scores_decode(
     compressed_len: usize,
     score_scale: f32,
 ) -> Result<Tensor> {
+    let scores = Tensor::zeros(compressed_len, DType::F32, q.device())?;
+    indexer_scores_decode_into(
+        q,
+        kv,
+        weights,
+        local_heads,
+        head_dim,
+        compressed_len,
+        score_scale,
+        &scores,
+    )?;
+    Ok(scores)
+}
+
+/// Zero out indexer score slots beyond `(position + 1) / ratio` for graph decode.
+/// Keeps launch dimensions fixed while matching eager `end_compressed` semantics.
+pub fn indexer_mask_scores_by_position(
+    scores: &Tensor,
+    positions: &Tensor,
+    ratio: usize,
+) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let scores = Tensor::zeros(compressed_len, DType::F32, q.device())?;
-        let stream = get_cuda_stream(q.device())?;
+        let compressed_len = scores.elem_count();
+        if compressed_len == 0 || ratio == 0 {
+            return Ok(());
+        }
+        let stream = get_cuda_stream(scores.device())?;
         let ret = unsafe {
-            kernels::ffi::ds_indexer_scores_decode(
-                get_cuda_ptr(q)?,
-                get_cuda_ptr(kv)?,
-                get_cuda_ptr(weights)?,
-                get_cuda_mut_ptr(&scores)? as *mut f32,
-                local_heads as i32,
-                head_dim as i32,
+            kernels::ffi::ds_indexer_mask_scores_by_pos(
+                get_cuda_mut_ptr(scores)? as *mut f32,
                 compressed_len as i32,
-                score_scale,
+                get_cuda_ptr(positions)? as *const i64,
+                ratio as i32,
                 stream,
             )
         };
         if ret != 0 {
-            candle_core::bail!("indexer_scores_decode CUDA error: {}", ret);
+            candle_core::bail!("indexer_mask_scores_by_pos CUDA error: {}", ret);
         }
-        Ok(scores)
+        Ok(())
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (
-            q,
-            kv,
-            weights,
-            local_heads,
-            head_dim,
-            compressed_len,
-            score_scale,
-        );
-        candle_core::bail!("indexer_scores_decode requires cuda feature")
+        let _ = (scores, positions, ratio);
+        candle_core::bail!("indexer_mask_scores_by_position requires cuda feature")
     }
 }
 
@@ -1384,23 +1712,20 @@ pub fn indexer_topk_prefill(
 }
 
 /// Top-k selection from indexer scores (decode, single token).
-///
-/// scores: [compressed_len] F32
-/// Returns: [topk] I32 indices
-pub fn indexer_topk_decode(
+pub fn indexer_topk_decode_into(
     scores: &Tensor,
     compressed_len: usize,
     topk: usize,
     offset: usize,
-) -> Result<Tensor> {
+    topk_idxs: &Tensor,
+) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let topk_idxs = Tensor::zeros(topk, DType::U32, scores.device())?;
         let stream = get_cuda_stream(scores.device())?;
         let ret = unsafe {
             kernels::ffi::ds_indexer_topk_decode(
                 get_cuda_ptr(scores)? as *const f32,
-                get_cuda_mut_ptr(&topk_idxs)? as *mut i32,
+                get_cuda_mut_ptr(topk_idxs)? as *mut i32,
                 compressed_len as i32,
                 topk as i32,
                 offset as i32,
@@ -1410,13 +1735,28 @@ pub fn indexer_topk_decode(
         if ret != 0 {
             candle_core::bail!("indexer_topk_decode CUDA error: {}", ret);
         }
-        Ok(topk_idxs)
+        Ok(())
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (scores, compressed_len, topk, offset);
+        let _ = (scores, compressed_len, topk, offset, topk_idxs);
         candle_core::bail!("indexer_topk_decode requires cuda feature")
     }
+}
+
+/// Top-k selection from indexer scores (decode, single token).
+///
+/// scores: [compressed_len] F32
+/// Returns: [topk] I32 indices
+pub fn indexer_topk_decode(
+    scores: &Tensor,
+    compressed_len: usize,
+    topk: usize,
+    offset: usize,
+) -> Result<Tensor> {
+    let topk_idxs = Tensor::zeros(topk, DType::U32, scores.device())?;
+    indexer_topk_decode_into(scores, compressed_len, topk, offset, &topk_idxs)?;
+    Ok(topk_idxs)
 }
 
 /// Generate window-based top-k indices for prefill.
@@ -1481,6 +1821,146 @@ pub fn window_topk_indices_decode(
     {
         let _ = (start_pos, window_size, device);
         candle_core::bail!("window_topk_indices_decode requires cuda feature")
+    }
+}
+
+/// CUDA-graph safe window topk: reads `start_pos` from GPU `positions[0]`.
+pub fn window_topk_indices_decode_from_pos_into(
+    positions: &Tensor,
+    window_size: usize,
+    out: &Tensor,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(positions.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_window_topk_indices_decode_from_pos(
+                get_cuda_mut_ptr(out)? as *mut i32,
+                get_cuda_ptr(positions)?,
+                window_size as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("window_topk_indices_decode_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (positions, window_size, out);
+        candle_core::bail!("window_topk_indices_decode_from_pos requires cuda feature")
+    }
+}
+
+/// CUDA-graph safe window topk: reads `start_pos` from GPU `positions[0]`.
+pub fn window_topk_indices_decode_from_pos(
+    positions: &Tensor,
+    window_size: usize,
+) -> Result<Tensor> {
+    let out = Tensor::zeros((1, window_size), DType::U32, positions.device())?;
+    window_topk_indices_decode_from_pos_into(positions, window_size, &out)?;
+    Ok(out)
+}
+
+/// Write one decode KV token into the sparse cache ring buffer using GPU position.
+pub fn write_kv_row_from_pos(
+    cache: &Tensor,
+    token: &Tensor,
+    positions: &Tensor,
+    window_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(cache.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_write_kv_row_from_pos(
+                get_cuda_mut_ptr(cache)?,
+                get_cuda_ptr(token)?,
+                get_cuda_ptr(positions)?,
+                window_size as i32,
+                head_dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_write_kv_row_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cache, token, positions, window_size, head_dim);
+        candle_core::bail!("write_kv_row_from_pos requires cuda feature")
+    }
+}
+
+/// Write compressed row into sparse cache when `(pos+1) % ratio == 0`.
+pub fn write_compressed_row_from_pos(
+    cache: &Tensor,
+    row: &Tensor,
+    positions: &Tensor,
+    window_size: usize,
+    head_dim: usize,
+    ratio: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(cache.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_write_compressed_row_from_pos(
+                get_cuda_mut_ptr(cache)?,
+                get_cuda_ptr(row)?,
+                get_cuda_ptr(positions)?,
+                window_size as i32,
+                head_dim as i32,
+                ratio as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_write_compressed_row_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cache, row, positions, window_size, head_dim, ratio);
+        candle_core::bail!("write_compressed_row_from_pos requires cuda feature")
+    }
+}
+
+/// Write indexer compressed row at `pos // ratio` when on ratio boundary.
+pub fn write_indexer_row_from_pos(
+    cache: &Tensor,
+    row: &Tensor,
+    positions: &Tensor,
+    head_dim: usize,
+    ratio: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(cache.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_write_indexer_row_from_pos(
+                get_cuda_mut_ptr(cache)?,
+                get_cuda_ptr(row)?,
+                get_cuda_ptr(positions)?,
+                head_dim as i32,
+                ratio as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_write_indexer_row_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cache, row, positions, head_dim, ratio);
+        candle_core::bail!("write_indexer_row_from_pos requires cuda feature")
     }
 }
 
@@ -1550,6 +2030,85 @@ pub fn compress_topk_indices_decode(
     }
 }
 
+/// Graph-safe compressed topk indices with validity derived from GPU position.
+pub fn compress_topk_indices_decode_from_pos_into(
+    positions: &Tensor,
+    compressed: usize,
+    offset: usize,
+    ratio: usize,
+    out: &Tensor,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(positions.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compress_topk_indices_decode_from_pos(
+                get_cuda_mut_ptr(out)? as *mut i32,
+                get_cuda_ptr(positions)?,
+                compressed as i32,
+                offset as i32,
+                ratio as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compress_topk_indices_decode_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (positions, compressed, offset, ratio, out);
+        candle_core::bail!("compress_topk_indices_decode_from_pos requires cuda feature")
+    }
+}
+
+/// Graph-safe compressed topk indices with validity derived from GPU position.
+pub fn compress_topk_indices_decode_from_pos(
+    positions: &Tensor,
+    compressed: usize,
+    offset: usize,
+    ratio: usize,
+) -> Result<Tensor> {
+    let out = Tensor::zeros((1, compressed), DType::U32, positions.device())?;
+    compress_topk_indices_decode_from_pos_into(positions, compressed, offset, ratio, &out)?;
+    Ok(out)
+}
+
+pub fn concat_topk_indices_into(
+    a: &Tensor,
+    b: &Tensor,
+    seq_len: usize,
+    a_topk: usize,
+    b_topk: usize,
+    out: &Tensor,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(a.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_concat_topk_indices(
+                get_cuda_ptr(a)? as *const i32,
+                get_cuda_ptr(b)? as *const i32,
+                get_cuda_mut_ptr(out)? as *mut i32,
+                seq_len as i32,
+                a_topk as i32,
+                b_topk as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("concat_topk_indices CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (a, b, seq_len, a_topk, b_topk, out);
+        candle_core::bail!("concat_topk_indices requires cuda feature")
+    }
+}
+
 /// Concatenate two top-k index arrays along the topk dimension.
 ///
 /// a: [seq_len, a_topk] I32, b: [seq_len, b_topk] I32
@@ -1561,31 +2120,9 @@ pub fn concat_topk_indices(
     a_topk: usize,
     b_topk: usize,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    {
-        let out = Tensor::zeros((seq_len, a_topk + b_topk), DType::U32, a.device())?;
-        let stream = get_cuda_stream(a.device())?;
-        let ret = unsafe {
-            kernels::ffi::ds_concat_topk_indices(
-                get_cuda_ptr(a)? as *const i32,
-                get_cuda_ptr(b)? as *const i32,
-                get_cuda_mut_ptr(&out)? as *mut i32,
-                seq_len as i32,
-                a_topk as i32,
-                b_topk as i32,
-                stream,
-            )
-        };
-        if ret != 0 {
-            candle_core::bail!("concat_topk_indices CUDA error: {}", ret);
-        }
-        Ok(out)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (a, b, seq_len, a_topk, b_topk);
-        candle_core::bail!("concat_topk_indices requires cuda feature")
-    }
+    let out = Tensor::zeros((seq_len, a_topk + b_topk), DType::U32, a.device())?;
+    concat_topk_indices_into(a, b, seq_len, a_topk, b_topk, &out)?;
+    Ok(out)
 }
 
 // ============================================================================
@@ -1601,21 +2138,21 @@ pub fn concat_topk_indices(
 /// Returns: [seq_len, num_heads, head_dim] BF16
 ///
 /// No cudaMalloc — fully CUDA-graph compatible.
-pub fn sparse_attention(
+pub fn sparse_attention_into(
     q: &Tensor,
     kv: &Tensor,
     attn_sink: &Tensor,
     topk_idxs: &Tensor,
+    out: &Tensor,
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
     kv_len: usize,
     topk: usize,
     softmax_scale: f32,
-) -> Result<Tensor> {
+) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let out = Tensor::zeros((seq_len, num_heads, head_dim), DType::BF16, q.device())?;
         let stream = get_cuda_stream(q.device())?;
         let ret = unsafe {
             kernels::ffi::ds_sparse_attn_dispatch(
@@ -1623,7 +2160,7 @@ pub fn sparse_attention(
                 get_cuda_ptr(kv)?,
                 get_cuda_ptr(attn_sink)? as *const core::ffi::c_void,
                 get_cuda_ptr(topk_idxs)? as *const i32,
-                get_cuda_mut_ptr(&out)?,
+                get_cuda_mut_ptr(out)?,
                 seq_len as i32,
                 num_heads as i32,
                 head_dim as i32,
@@ -1636,7 +2173,7 @@ pub fn sparse_attention(
         if ret != 0 {
             candle_core::bail!("sparse_attention CUDA error: {}", ret);
         }
-        Ok(out)
+        Ok(())
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -1645,6 +2182,7 @@ pub fn sparse_attention(
             kv,
             attn_sink,
             topk_idxs,
+            out,
             seq_len,
             num_heads,
             head_dim,
@@ -1654,6 +2192,36 @@ pub fn sparse_attention(
         );
         candle_core::bail!("sparse_attention requires cuda feature")
     }
+}
+
+/// Sparse indexed attention (works for both prefill and decode).
+pub fn sparse_attention(
+    q: &Tensor,
+    kv: &Tensor,
+    attn_sink: &Tensor,
+    topk_idxs: &Tensor,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    topk: usize,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    let out = Tensor::zeros((seq_len, num_heads, head_dim), DType::BF16, q.device())?;
+    sparse_attention_into(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        &out,
+        seq_len,
+        num_heads,
+        head_dim,
+        kv_len,
+        topk,
+        softmax_scale,
+    )?;
+    Ok(out)
 }
 
 // ============================================================================

@@ -125,3 +125,112 @@ extern "C" int ds_fp8_act_quant_nope_bf16(
       block_size);
   return static_cast<int>(cudaGetLastError());
 }
+
+__global__ void ds_write_kv_row_from_pos_kernel(
+    __nv_bfloat16 *__restrict__ cache,
+    const __nv_bfloat16 *__restrict__ token,
+    const int64_t *__restrict__ positions,
+    int window_size,
+    int head_dim) {
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  if (dim >= head_dim) return;
+  int start_pos = static_cast<int>(positions[0]);
+  int slot = start_pos % window_size;
+  cache[slot * head_dim + dim] = token[dim];
+}
+
+__global__ void ds_write_compressed_row_from_pos_kernel(
+    __nv_bfloat16 *__restrict__ cache,
+    const __nv_bfloat16 *__restrict__ row,
+    const int64_t *__restrict__ positions,
+    int window_size,
+    int head_dim,
+    int ratio) {
+  int start_pos = static_cast<int>(positions[0]);
+  if (((start_pos + 1) % ratio) != 0) return;
+  int row_idx = start_pos / ratio;
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  if (dim >= head_dim) return;
+  cache[(window_size + row_idx) * head_dim + dim] = row[dim];
+}
+
+__global__ void ds_write_indexer_row_from_pos_kernel(
+    __nv_bfloat16 *__restrict__ cache,
+    const __nv_bfloat16 *__restrict__ row,
+    const int64_t *__restrict__ positions,
+    int head_dim,
+    int ratio) {
+  int start_pos = static_cast<int>(positions[0]);
+  if (((start_pos + 1) % ratio) != 0) return;
+  int row_idx = start_pos / ratio;
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  if (dim >= head_dim) return;
+  cache[row_idx * head_dim + dim] = row[dim];
+}
+
+extern "C" int ds_write_kv_row_from_pos(
+    void *cache,
+    const void *token,
+    const void *positions,
+    int window_size,
+    int head_dim,
+    int64_t stream_i64) {
+  if (cache == nullptr || token == nullptr || positions == nullptr ||
+      window_size <= 0 || head_dim <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
+  constexpr int threads = 256;
+  int blocks = (head_dim + threads - 1) / threads;
+  ds_write_kv_row_from_pos_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 *>(cache),
+      reinterpret_cast<const __nv_bfloat16 *>(token),
+      reinterpret_cast<const int64_t *>(positions),
+      window_size, head_dim);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int ds_write_compressed_row_from_pos(
+    void *cache,
+    const void *row,
+    const void *positions,
+    int window_size,
+    int head_dim,
+    int ratio,
+    int64_t stream_i64) {
+  if (cache == nullptr || row == nullptr || positions == nullptr ||
+      window_size <= 0 || head_dim <= 0 || ratio <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
+  constexpr int threads = 256;
+  int blocks = (head_dim + threads - 1) / threads;
+  ds_write_compressed_row_from_pos_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 *>(cache),
+      reinterpret_cast<const __nv_bfloat16 *>(row),
+      reinterpret_cast<const int64_t *>(positions),
+      window_size, head_dim, ratio);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int ds_write_indexer_row_from_pos(
+    void *cache,
+    const void *row,
+    const void *positions,
+    int head_dim,
+    int ratio,
+    int64_t stream_i64) {
+  if (cache == nullptr || row == nullptr || positions == nullptr ||
+      head_dim <= 0 || ratio <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
+  constexpr int threads = 256;
+  int blocks = (head_dim + threads - 1) / threads;
+  ds_write_indexer_row_from_pos_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 *>(cache),
+      reinterpret_cast<const __nv_bfloat16 *>(row),
+      reinterpret_cast<const int64_t *>(positions),
+      head_dim, ratio);
+  return static_cast<int>(cudaGetLastError());
+}

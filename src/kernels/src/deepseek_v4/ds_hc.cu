@@ -11,14 +11,23 @@ namespace {
 
 constexpr int kDsHcMaxDevices = 16;
 
-struct DsHcGemmScratch {
-  cublasHandle_t handle = nullptr;
+struct DsHcGemmScratchSlot {
   float *x_f32 = nullptr;
   size_t x_capacity = 0;
+};
+
+struct DsHcGemmScratch {
+  cublasHandle_t handle = nullptr;
+  DsHcGemmScratchSlot eager;
+  DsHcGemmScratchSlot decode_graph;
   std::mutex mutex;
 };
 
 DsHcGemmScratch g_ds_hc_gemm_scratch[kDsHcMaxDevices];
+
+DsHcGemmScratchSlot &ds_hc_active_slot(DsHcGemmScratch &scratch) {
+  return scratch.decode_graph;
+}
 
 cudaError_t ds_hc_scratch_for_device(DsHcGemmScratch **out) {
   int device = 0;
@@ -29,21 +38,26 @@ cudaError_t ds_hc_scratch_for_device(DsHcGemmScratch **out) {
   return cudaSuccess;
 }
 
-cudaError_t ds_hc_ensure_scratch(DsHcGemmScratch &scratch, size_t elements) {
-  if (elements <= scratch.x_capacity) return cudaSuccess;
-  if (scratch.x_f32 != nullptr) {
-    // Wait for in-flight kernels/cublas that may still use x_f32 before free.
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) return err;
-    err = cudaFree(scratch.x_f32);
-    if (err != cudaSuccess) return err;
-    scratch.x_f32 = nullptr;
-    scratch.x_capacity = 0;
+// Grow-only scratch on `stream`. Never malloc/free while stream is capturing.
+cudaError_t ds_hc_ensure_scratch(
+    DsHcGemmScratchSlot &slot, size_t elements, cudaStream_t stream) {
+  if (elements <= slot.x_capacity) return cudaSuccess;
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  cudaError_t cap_err = cudaStreamIsCapturing(stream, &capture_status);
+  if (cap_err == cudaSuccess &&
+      capture_status == cudaStreamCaptureStatusActive) {
+    return cudaErrorNotSupported;
   }
-  cudaError_t err = cudaMalloc(
-      reinterpret_cast<void **>(&scratch.x_f32), elements * sizeof(float));
+  if (slot.x_f32 != nullptr) {
+    cudaError_t err = cudaFreeAsync(slot.x_f32, stream);
+    if (err != cudaSuccess) return err;
+    slot.x_f32 = nullptr;
+    slot.x_capacity = 0;
+  }
+  cudaError_t err = cudaMallocAsync(
+      reinterpret_cast<void **>(&slot.x_f32), elements * sizeof(float), stream);
   if (err != cudaSuccess) return err;
-  scratch.x_capacity = elements;
+  slot.x_capacity = elements;
   return cudaSuccess;
 }
 
@@ -399,24 +413,29 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
     const float *__restrict__ mixes,
     const float *__restrict__ hc_scale,
     const float *__restrict__ hc_base,
-    const __nv_bfloat16 *__restrict__ norm_weight,
+    const float *__restrict__ norm_weight,
     float *__restrict__ post,
     float *__restrict__ comb,
     __nv_bfloat16 *__restrict__ out,
     int seq_len, int dim, int sinkhorn_iters, float hc_eps, float norm_eps) {
   constexpr int hc = 4;
   constexpr int mix_hc = (2 + hc) * hc;
-  int token = blockIdx.x;
+  const int token = blockIdx.x;
   if (token >= seq_len) return;
 
+  // Shared: pre activations [dim] then ATen-order reduction scratch [block threads].
   extern __shared__ float shared[];
-  float* pre_values = shared;
-  float* reduction = shared + dim;
+  float *pre_values = shared;
+  float *scratch = shared + dim;
   __shared__ float pre_shared[hc];
 
-  if (threadIdx.x == 0) {
+  const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+  const int n_threads = blockDim.x * blockDim.y;
+
+  // Sinkhorn + gating on a single thread; remaining threads wait.
+  if (tid == 0) {
     float comb_frag[hc * hc];
-    const float* mix = mixes + token * mix_hc;
+    const float *mix = mixes + token * mix_hc;
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
       pre_shared[j] = ds_sigmoid(mix[j] * hc_scale[0] + hc_base[j]) + hc_eps;
@@ -497,26 +516,67 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
   }
   __syncthreads();
 
-  float sumsq = 0.0f;
-  for (int dim_idx = threadIdx.x; dim_idx < dim; dim_idx += blockDim.x) {
+  // HC pre weighted sum -> BF16 boundary (kept in shared for fused RMS).
+  for (int dim_idx = tid; dim_idx < dim; dim_idx += n_threads) {
     float sum = 0.0f;
     #pragma unroll
     for (int h = 0; h < hc; ++h)
       sum += pre_shared[h] * __bfloat162float(x[(token * hc + h) * dim + dim_idx]);
-    float rounded = round_to_bf16_float(sum);
-    pre_values[dim_idx] = rounded;
-    sumsq += rounded * rounded;
+    pre_values[dim_idx] = round_to_bf16_float(sum);
   }
-  reduction[threadIdx.x] = sumsq;
   __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-    __syncthreads();
+
+  // ATen-order RMS over pre_values (same (128,4) reduction as ds_v4_rms_norm_kernel).
+  float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const int vec_end = dim / 4;
+  for (int vec = tid; vec < vec_end; vec += n_threads) {
+    const int base = vec * 4;
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      float value = pre_values[base + lane];
+      sums[lane] = __fadd_rn(sums[lane], __fmul_rn(value, value));
+    }
   }
-  float inv_rms = rsqrtf(reduction[0] / static_cast<float>(dim) + norm_eps);
-  for (int dim_idx = threadIdx.x; dim_idx < dim; dim_idx += blockDim.x) {
-    float value = pre_values[dim_idx] * inv_rms * __bfloat162float(norm_weight[dim_idx]);
-    out[token * dim + dim_idx] = __float2bfloat16(value);
+  float sumsq = sums[0];
+  sumsq = __fadd_rn(sumsq, sums[1]);
+  sumsq = __fadd_rn(sumsq, sums[2]);
+  sumsq = __fadd_rn(sumsq, sums[3]);
+  if (tid == 0) {
+    for (int k = vec_end * 4; k < dim; ++k) {
+      float value = pre_values[k];
+      sumsq = __fadd_rn(sumsq, __fmul_rn(value, value));
+    }
+  }
+  scratch[tid] = sumsq;
+
+  for (int offset = blockDim.x / 2; offset >= warpSize; offset >>= 1) {
+    __syncthreads();
+    if (threadIdx.x < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset]);
+      scratch[tid] = sumsq;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      sumsq = __fadd_rn(sumsq, __shfl_down_sync(0xffffffff, sumsq, offset));
+    }
+  }
+
+  scratch[tid] = sumsq;
+  for (int offset = blockDim.y / 2; offset > 0; offset >>= 1) {
+    __syncthreads();
+    if (threadIdx.y < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset * blockDim.x]);
+      scratch[tid] = sumsq;
+    }
+  }
+  __syncthreads();
+  const float mean = __fmul_rn(scratch[0], 1.0f / static_cast<float>(dim));
+  const float scale = rsqrtf(__fadd_rn(mean, norm_eps));
+  for (int d = tid; d < dim; d += n_threads) {
+    float value = __fmul_rn(__fmul_rn(pre_values[d], scale), norm_weight[d]);
+    out[token * dim + d] = __float2bfloat16(value);
   }
 }
 
@@ -700,11 +760,12 @@ cudaError_t ds_v4_hc_mixes(
   DsHcGemmScratch &scratch = *scratch_ptr;
   std::lock_guard<std::mutex> lock(scratch.mutex);
 
-  err = ds_hc_ensure_scratch(scratch, static_cast<size_t>(total));
+  err = ds_hc_ensure_scratch(ds_hc_active_slot(scratch), static_cast<size_t>(total), stream);
   if (err != cudaSuccess) return err;
+  DsHcGemmScratchSlot &slot = ds_hc_active_slot(scratch);
   const int blocks = (total + threads - 1) / threads;
   ds_hc_bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(
-      (const __nv_bfloat16 *)x, scratch.x_f32, total);
+      (const __nv_bfloat16 *)x, slot.x_f32, total);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
@@ -720,14 +781,14 @@ cudaError_t ds_v4_hc_mixes(
   if (seq_len == 1) {
     status = cublasSgemv(
         scratch.handle, CUBLAS_OP_T, hc_dim, mix_hc, &alpha,
-        (const float *)hc_fn, hc_dim, scratch.x_f32, 1, &beta,
+        (const float *)hc_fn, hc_dim, slot.x_f32, 1, &beta,
         (float *)mixes, 1);
   } else {
     status = cublasGemmEx(
         scratch.handle, CUBLAS_OP_T, CUBLAS_OP_N,
         mix_hc, seq_len, hc_dim, &alpha,
         hc_fn, CUDA_R_32F, hc_dim,
-        scratch.x_f32, CUDA_R_32F, hc_dim,
+        slot.x_f32, CUDA_R_32F, hc_dim,
         &beta, mixes, CUDA_R_32F, mix_hc,
         CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
   }
@@ -782,13 +843,15 @@ cudaError_t ds_v4_hc_pre_norm_from_mixes(
     int seq_len, int hc, int dim, int sinkhorn_iters,
     float hc_eps, float norm_eps, int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
-  if (hc != 4) return cudaErrorInvalidValue;
-  constexpr int threads = 256;
-  size_t shared_bytes = ((size_t)dim + threads) * sizeof(float);
+  if (hc != 4 || dim <= 0 || (dim % 4) != 0) return cudaErrorInvalidValue;
+  // Match standalone V4 RMSNorm launch geometry for ATen-order reduction.
+  const dim3 threads(128, 4);
+  constexpr int thread_count = 512;
+  size_t shared_bytes = (static_cast<size_t>(dim) + thread_count) * sizeof(float);
   ds_hc_pre_norm_from_mixes_kernel<<<seq_len, threads, shared_bytes, stream>>>(
       (const __nv_bfloat16*)x, (const float*)mixes,
       (const float*)hc_scale, (const float*)hc_base,
-      (const __nv_bfloat16*)norm_weight,
+      (const float*)norm_weight,
       (float*)post, (float*)comb, (__nv_bfloat16*)out,
       seq_len, dim, sinkhorn_iters, hc_eps, norm_eps);
   return cudaGetLastError();
@@ -861,6 +924,21 @@ cudaError_t ds_v4_head_rms_norm(
       (const __nv_bfloat16*)x, (__nv_bfloat16*)out,
       seq_len, num_heads, head_dim, eps);
   return cudaGetLastError();
+}
+
+cudaError_t ds_v4_hc_prewarm(int max_elements, int64_t stream_) {
+  if (max_elements <= 0) return cudaErrorInvalidValue;
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  DsHcGemmScratch *scratch_ptr = nullptr;
+  cudaError_t err = ds_hc_scratch_for_device(&scratch_ptr);
+  if (err != cudaSuccess) return err;
+  DsHcGemmScratch &scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  err = ds_hc_ensure_scratch(scratch.eager, static_cast<size_t>(max_elements), stream);
+  if (err != cudaSuccess) return err;
+  err = ds_hc_ensure_scratch(scratch.decode_graph, static_cast<size_t>(max_elements), stream);
+  if (err != cudaSuccess) return err;
+  return ds_hc_ensure_handle(scratch);
 }
 
 } // extern "C"

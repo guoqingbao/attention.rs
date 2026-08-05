@@ -4041,6 +4041,14 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_indexer_mask_scores_by_pos(
+        scores: *mut f32,
+        compressed_len: c_int,
+        positions: *const i64,
+        ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_concat_topk_indices(
         a: *const c_int,
         b: *const c_int,
@@ -4066,6 +4074,98 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_window_topk_indices_decode_from_pos(
+        out: *mut c_int,
+        positions: *const c_void,
+        window_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_v4_hc_prewarm(max_elements: c_int, stream: i64) -> c_int;
+
+    pub fn ds_v4_indexer_fp4_prewarm(max_elems: c_int, stream: i64) -> c_int;
+
+    pub fn ds_v4_compressor_prewarm(stream: i64) -> c_int;
+
+    pub fn ds_apply_rope_hidden_from_pos(
+        x: *mut c_void,
+        cos_cache: *const c_void,
+        sin_cache: *const c_void,
+        positions: *const c_void,
+        seq_len: c_int,
+        local_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        position_offset: c_int,
+        inverse: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_nonoverlap_decode_at_graph(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const c_void,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        positions: *const c_void,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_decode_at_graph(
+        x: *const c_void,
+        wkv: *const c_void,
+        wgate: *const c_void,
+        ape: *const c_void,
+        norm: *const c_void,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut c_void,
+        positions: *const c_void,
+        hidden_dim: c_int,
+        head_dim: c_int,
+        state_offset: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_write_kv_row_from_pos(
+        cache: *mut c_void,
+        token: *const c_void,
+        positions: *const c_void,
+        window_size: c_int,
+        head_dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_write_compressed_row_from_pos(
+        cache: *mut c_void,
+        row: *const c_void,
+        positions: *const c_void,
+        window_size: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_write_indexer_row_from_pos(
+        cache: *mut c_void,
+        row: *const c_void,
+        positions: *const c_void,
+        head_dim: c_int,
+        ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_compress_topk_indices(
         out: *mut c_int,
         seq_len: c_int,
@@ -4079,6 +4179,15 @@ extern "C" {
         out: *mut c_int,
         compressed: c_int,
         offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compress_topk_indices_decode_from_pos(
+        out: *mut c_int,
+        positions: *const c_void,
+        compressed: c_int,
+        offset: c_int,
+        ratio: c_int,
         stream: i64,
     ) -> c_int;
 

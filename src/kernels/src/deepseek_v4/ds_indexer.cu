@@ -6,30 +6,45 @@
 
 namespace {
 
-struct DsFp4QuantScratch {
+struct DsFp4QuantScratchSlot {
   __nv_bfloat16 *rotated = nullptr;
   size_t rotated_elems = 0;
+};
+
+struct DsFp4QuantScratch {
+  DsFp4QuantScratchSlot eager;
+  DsFp4QuantScratchSlot decode_graph;
   std::mutex mutex;
 };
 
 constexpr int kDsMaxDevices = 16;
 DsFp4QuantScratch g_ds_fp4_quant_scratch[kDsMaxDevices];
 
+DsFp4QuantScratchSlot &ds_fp4_active_slot(DsFp4QuantScratch &scratch) {
+  return scratch.decode_graph;
+}
+
+// Grow-only scratch on `stream`. Never malloc/free while stream is capturing.
 cudaError_t ds_ensure_bf16_scratch(
-    __nv_bfloat16 **ptr, size_t *capacity, size_t required) {
-  if (*capacity >= required) return cudaSuccess;
-  if (*ptr != nullptr) {
-    // Wait for in-flight kernels that may still read/write *ptr before free.
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) return err;
-    err = cudaFree(*ptr);
-    if (err != cudaSuccess) return err;
-    *ptr = nullptr;
-    *capacity = 0;
+    DsFp4QuantScratchSlot &slot, size_t required, cudaStream_t stream) {
+  if (slot.rotated_elems >= required) return cudaSuccess;
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  cudaError_t cap_err = cudaStreamIsCapturing(stream, &capture_status);
+  if (cap_err == cudaSuccess &&
+      capture_status == cudaStreamCaptureStatusActive) {
+    return cudaErrorNotSupported;
   }
-  cudaError_t err = cudaMalloc(ptr, required * sizeof(__nv_bfloat16));
+  if (slot.rotated != nullptr) {
+    cudaError_t err = cudaFreeAsync(slot.rotated, stream);
+    if (err != cudaSuccess) return err;
+    slot.rotated = nullptr;
+    slot.rotated_elems = 0;
+  }
+  cudaError_t err = cudaMallocAsync(
+      reinterpret_cast<void **>(&slot.rotated),
+      required * sizeof(__nv_bfloat16), stream);
   if (err != cudaSuccess) return err;
-  *capacity = required;
+  slot.rotated_elems = required;
   return cudaSuccess;
 }
 
@@ -617,6 +632,22 @@ __global__ void ds_window_topk_indices_decode_kernel(
   }
 }
 
+__global__ void ds_window_topk_indices_decode_from_pos_kernel(
+    int *__restrict__ out,
+    const int64_t *__restrict__ positions,
+    int window_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= window_size) return;
+  int start_pos = static_cast<int>(positions[0]);
+  if (start_pos >= window_size - 1) {
+    int pos = start_pos % window_size;
+    int first_count = window_size - 1 - pos;
+    out[idx] = idx < first_count ? pos + 1 + idx : idx - first_count;
+  } else {
+    out[idx] = idx <= start_pos ? idx : -1;
+  }
+}
+
 __global__ void ds_compress_topk_indices_kernel(
     int *__restrict__ out,
     int seq_len,
@@ -640,6 +671,19 @@ __global__ void ds_compress_topk_indices_decode_kernel(
   if (idx < compressed) out[idx] = offset + idx;
 }
 
+__global__ void ds_compress_topk_indices_decode_from_pos_kernel(
+    int *__restrict__ out,
+    const int64_t *__restrict__ positions,
+    int compressed,
+    int offset,
+    int ratio) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= compressed) return;
+  int start_pos = static_cast<int>(positions[0]);
+  int valid = (start_pos + 1) / ratio;
+  out[idx] = idx < valid ? offset + idx : -1;
+}
+
 extern "C" {
 
 cudaError_t ds_hadamard_fp4_quant_bf16(
@@ -660,14 +704,15 @@ cudaError_t ds_hadamard_fp4_quant_bf16(
   size_t elems = static_cast<size_t>(rows) * groups * dim;
   DsFp4QuantScratch &scratch = g_ds_fp4_quant_scratch[device];
   std::lock_guard<std::mutex> lock(scratch.mutex);
-  err = ds_ensure_bf16_scratch(&scratch.rotated, &scratch.rotated_elems, elems);
+  DsFp4QuantScratchSlot &slot = ds_fp4_active_slot(scratch);
+  err = ds_ensure_bf16_scratch(slot, elems, stream);
   if (err != cudaSuccess) return err;
 
   constexpr int threads = 256;
   int row_groups = rows * groups;
   int rotate_blocks = (row_groups + threads - 1) / threads;
   ds_hadamard_rotate_bf16_serial_kernel<<<rotate_blocks, threads, 0, stream>>>(
-      x, scratch.rotated, rows, groups, dim);
+      x, slot.rotated, rows, groups, dim);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
@@ -675,7 +720,7 @@ cudaError_t ds_hadamard_fp4_quant_bf16(
   int quant_blocks =
       (row_groups * quant_groups_per_row + threads - 1) / threads;
   ds_fp4_quant_dequant_bf16_kernel<<<quant_blocks, threads, 0, stream>>>(
-      scratch.rotated, x, rows, groups, dim);
+      slot.rotated, x, rows, groups, dim);
   return cudaGetLastError();
 }
 
@@ -806,6 +851,36 @@ cudaError_t ds_indexer_topk_decode(
   return cudaGetLastError();
 }
 
+__global__ void ds_indexer_mask_scores_by_pos_kernel(
+    float *scores,
+    int compressed_len,
+    const int64_t *positions,
+    int ratio) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= compressed_len || ratio <= 0) return;
+  int64_t pos = positions[0];
+  int valid = (int)((pos + 1) / ratio);
+  if (idx >= valid) {
+    scores[idx] = -INFINITY;
+  }
+}
+
+cudaError_t ds_indexer_mask_scores_by_pos(
+    float *scores,
+    int compressed_len,
+    const int64_t *positions,
+    int ratio,
+    cudaStream_t stream) {
+  if (scores == nullptr || positions == nullptr || compressed_len <= 0 || ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks = (compressed_len + threads - 1) / threads;
+  ds_indexer_mask_scores_by_pos_kernel<<<blocks, threads, 0, stream>>>(
+      scores, compressed_len, positions, ratio);
+  return cudaGetLastError();
+}
+
 cudaError_t ds_concat_topk_indices(
     const int *a,
     const int *b,
@@ -880,6 +955,53 @@ cudaError_t ds_compress_topk_indices_decode(
   ds_compress_topk_indices_decode_kernel<<<blocks, threads, 0, stream>>>(
       out, compressed, offset);
   return cudaGetLastError();
+}
+
+cudaError_t ds_compress_topk_indices_decode_from_pos(
+    int *out,
+    const int64_t *positions,
+    int compressed,
+    int offset,
+    int ratio,
+    cudaStream_t stream) {
+  if (out == nullptr || positions == nullptr || compressed <= 0 || ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks = (compressed + threads - 1) / threads;
+  ds_compress_topk_indices_decode_from_pos_kernel<<<blocks, threads, 0, stream>>>(
+      out, positions, compressed, offset, ratio);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_window_topk_indices_decode_from_pos(
+    int *out,
+    const int64_t *positions,
+    int window_size,
+    cudaStream_t stream) {
+  if (out == nullptr || positions == nullptr || window_size <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks = (window_size + threads - 1) / threads;
+  ds_window_topk_indices_decode_from_pos_kernel<<<blocks, threads, 0, stream>>>(
+      out, positions, window_size);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_v4_indexer_fp4_prewarm(int max_elems, int64_t stream_) {
+  if (max_elems <= 0) return cudaErrorInvalidValue;
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return err;
+  if (device < 0 || device >= kDsMaxDevices) return cudaErrorInvalidDevice;
+  DsFp4QuantScratch &scratch = g_ds_fp4_quant_scratch[device];
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  err = ds_ensure_bf16_scratch(scratch.eager, static_cast<size_t>(max_elems), stream);
+  if (err != cudaSuccess) return err;
+  return ds_ensure_bf16_scratch(
+      scratch.decode_graph, static_cast<size_t>(max_elems), stream);
 }
 
 }  // extern "C"
