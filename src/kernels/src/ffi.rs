@@ -3850,6 +3850,16 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_v4_rms_norm(
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
     // ======== DeepSeek V4 Attention kernels (from ds_attention.cu) ========
 
     pub fn ds_sparse_attn_dispatch(

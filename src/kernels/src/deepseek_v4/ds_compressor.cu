@@ -131,12 +131,17 @@ __global__ void ds_compressor_norm_serial_kernel(
   int compressed = idx / head_dim;
   float sum_sq = 0.0f;
   for (int k = 0; k < head_dim; ++k) {
-    float value = weighted[compressed * head_dim + k];
+    // Official Compressor.forward casts pooled FP32 KV to the model dtype
+    // (BF16) before RMSNorm. Preserve weighted[] in FP32 for callers/state,
+    // but reproduce that explicit rounding boundary for normalization.
+    float value = __bfloat162float(
+        __float2bfloat16(weighted[compressed * head_dim + k]));
     sum_sq += value * value;
   }
   float inv_rms = rsqrtf(sum_sq / head_dim + eps);
-  float value = weighted[compressed * head_dim + dim] * inv_rms *
-                __bfloat162float(norm[dim]);
+  float value = __bfloat162float(
+                    __float2bfloat16(weighted[compressed * head_dim + dim])) *
+                inv_rms * __bfloat162float(norm[dim]);
   out[compressed * head_dim + dim] = __float2bfloat16(value);
 }
 
@@ -206,7 +211,8 @@ __global__ void ds_compressor_nonoverlap_fused_epilogue_kernel(
     }
     float w = acc / denom;
     weighted[c * head_dim + d] = w;
-    sum_sq_local += w * w;
+    float rounded = __bfloat162float(__float2bfloat16(w));
+    sum_sq_local += rounded * rounded;
   }
 
   // Block-wide reduction of sum_sq via warp-shfl + smem (mirrors overlap epilogue).
@@ -235,7 +241,8 @@ __global__ void ds_compressor_nonoverlap_fused_epilogue_kernel(
   float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
 
   for (int d = tid; d < head_dim; d += n_block) {
-    float w = weighted[c * head_dim + d];
+    float w = __bfloat162float(
+        __float2bfloat16(weighted[c * head_dim + d]));
     float ns = __bfloat162float(norm[d]);
     out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
   }
@@ -308,7 +315,8 @@ __global__ void ds_compressor_overlap_fused_epilogue_kernel(
     }
     float w = acc / denom;
     weighted[c * head_dim + d] = w;
-    sum_sq_local += w * w;
+    float rounded = __bfloat162float(__float2bfloat16(w));
+    sum_sq_local += rounded * rounded;
   }
 
   // Block-wide reduction of sum_sq via warp-shfl + smem.
@@ -337,7 +345,8 @@ __global__ void ds_compressor_overlap_fused_epilogue_kernel(
   float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
 
   for (int d = tid; d < head_dim; d += n_block) {
-    float w = weighted[c * head_dim + d];
+    float w = __bfloat162float(
+        __float2bfloat16(weighted[c * head_dim + d]));
     float ns = __bfloat162float(norm[d]);
     out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
   }

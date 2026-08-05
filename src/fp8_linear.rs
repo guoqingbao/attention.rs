@@ -129,22 +129,6 @@ pub fn fp8_matmul_with_input_scale(
         input.contiguous()?
     };
 
-    // Diagnostic reference path for DeepSeek-V4 QAT weights.  It emulates the
-    // checkpoint's activation FP8 round-trip, then uses the scalar-weight
-    // dequantizing GEMM.  Keep this behind an environment switch while the
-    // optimized SM90 block-scaled GEMM is compared against the reference.
-    #[cfg(feature = "cuda")]
-    if std::env::var_os("XINFER_DSV4_FP8_REFERENCE").is_some()
-        && input.dtype() == DType::BF16
-        && block_size == [128, 128]
-    {
-        let (m, k) = input.dims2()?;
-        let quantized = Tensor::zeros((m, k), DType::BF16, input.device())?;
-        crate::deepseek_v4::copy_contiguous_into(&quantized, &input, 0)?;
-        crate::deepseek_v4::fp8_act_quant_nope_bf16_inplace(&quantized, m, k, 0, 128)?;
-        return fp8_matmul_fallback(&quantized, weight, weight_scale, block_size);
-    }
-
     #[cfg(feature = "cuda")]
     let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
         crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
@@ -196,6 +180,37 @@ pub fn fp8_matmul_with_input_scale(
     }
 
     fp8_matmul_fallback(&input, weight, weight_scale, block_size)
+}
+
+/// FP8 matrix multiplication for checkpoints whose activation scales use
+/// UE8M0 (power-of-two) rounding, such as DeepSeek-V4-Flash.
+///
+/// The regular SM90 CUTLASS path computes unrounded `amax / 448` activation
+/// scales. That is a different quantizer from UE8M0 QAT and causes material
+/// model drift. Quantize/dequantize the BF16 activation with the same
+/// power-of-two rule as the checkpoint, then multiply by the dequantized FP8
+/// weights. This path is the numerical reference until the optimized CUTLASS
+/// kernel accepts UE8M0 activation scales directly.
+#[cfg(feature = "cuda")]
+pub fn fp8_matmul_ue8m0(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    block_size: &[usize],
+) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 || block_size != [128, 128] {
+        candle_core::bail!("UE8M0 FP8 matmul requires BF16 input and 128x128 weight blocks");
+    }
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let (m, k) = input.dims2()?;
+    let quantized = Tensor::zeros((m, k), DType::BF16, input.device())?;
+    crate::deepseek_v4::copy_contiguous_into(&quantized, &input, 0)?;
+    crate::deepseek_v4::fp8_act_quant_nope_bf16_inplace(&quantized, m, k, 0, 128)?;
+    fp8_matmul_fallback(&quantized, weight, weight_scale, block_size)
 }
 
 /// FP8 Matrix Multiplication: C = A * B^T (conventional path).

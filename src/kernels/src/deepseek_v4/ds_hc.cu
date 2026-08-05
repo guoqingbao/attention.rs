@@ -73,6 +73,19 @@ static __device__ __forceinline__ float ds_sigmoid(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
 
+// TileLang AllReduce<..., 4, 1> and AllReduce<..., 16, 4> both use an
+// XOR-butterfly: pair lanes (0,2)/(1,3), then combine those pairs.  Preserve
+// that F32 order instead of a sequential four-value accumulation.
+static __device__ __forceinline__ float ds_tl_sum4(
+    float v0, float v1, float v2, float v3) {
+  return __fadd_rn(__fadd_rn(v0, v2), __fadd_rn(v1, v3));
+}
+
+static __device__ __forceinline__ float ds_tl_max4(
+    float v0, float v1, float v2, float v3) {
+  return fmaxf(fmaxf(v0, v2), fmaxf(v1, v3));
+}
+
 // ============ Kernels ============
 
 __global__ void ds_hc_bf16_to_f32_kernel(
@@ -101,13 +114,18 @@ __global__ void ds_hc_scale_mixes_block_kernel(
     float *__restrict__ rms_scales,
     int seq_len, int hc_dim, int mix_hc, float eps) {
   int token = blockIdx.x;
-  int tid = threadIdx.x;
+  // Match PyTorch's contiguous F32 mean reduction for hc_dim=8192.  ATen's
+  // ReduceConfig vectorizes four inputs per load and launches (128, 4), then
+  // reduces block.x before block.y.  A flat 512-thread binary tree changes
+  // the last few F32 bits of the RMS scale; HC keeps post/comb in F32, so that
+  // otherwise tiny error compounds through all 86 hyper-connection updates.
+  int tid = threadIdx.x + threadIdx.y * blockDim.x;
   if (token >= seq_len) return;
 
   extern __shared__ float scratch[];
   float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   int vec_end = hc_dim / 4;
-  for (int vec = tid; vec < vec_end; vec += blockDim.x) {
+  for (int vec = tid; vec < vec_end; vec += blockDim.x * blockDim.y) {
     int base = token * hc_dim + vec * 4;
     #pragma unroll
     for (int lane = 0; lane < 4; ++lane) {
@@ -127,16 +145,110 @@ __global__ void ds_hc_scale_mixes_block_kernel(
     }
   }
   scratch[tid] = sumsq;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) scratch[tid] = __fadd_rn(scratch[tid], scratch[tid + stride]);
+
+  // ATen Reduce.cuh::block_x_reduce for blockDim.x=128.
+  for (int offset = blockDim.x / 2; offset >= warpSize; offset >>= 1) {
     __syncthreads();
+    if (threadIdx.x < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset]);
+      scratch[tid] = sumsq;
+    }
   }
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      sumsq = __fadd_rn(sumsq, __shfl_down_sync(0xffffffff, sumsq, offset));
+    }
+  }
+
+  // ATen Reduce.cuh::block_y_reduce for blockDim.y=4.
+  scratch[tid] = sumsq;
+  for (int offset = blockDim.y / 2; offset > 0; offset >>= 1) {
+    __syncthreads();
+    if (threadIdx.y < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset * blockDim.x]);
+      scratch[tid] = sumsq;
+    }
+  }
+  __syncthreads();
   float mean = __fmul_rn(scratch[0], 1.0f / static_cast<float>(hc_dim));
   float scale = rsqrtf(__fadd_rn(mean, eps));
   if (tid == 0 && rms_scales != nullptr) rms_scales[token] = scale;
   for (int mix = tid; mix < mix_hc; mix += blockDim.x) {
     mixes[token * mix_hc + mix] *= scale;
+  }
+}
+
+// ATen-order RMSNorm for DeepSeek V4 attn/ffn/q/kv norms.
+// Golden: x.float(); var = x.square().mean(-1); (weight.float() * x * rsqrt(var+eps)).to(dtype).
+// ATen mean over the last dim uses vectorized 4-wide loads with block (128, 4):
+// each thread accumulates 4 separate sums over its vec groups, folds them in
+// order, block.x tree-reduces (128), then block.y reduces (4).  Candle's
+// generic rmsnorm kernel uses a strided + XOR-butterfly order which diverges
+// in the last F32 bits and compounds through the 86 HC updates.
+__global__ void ds_v4_rms_norm_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ weight,
+    __nv_bfloat16 *__restrict__ out,
+    int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+
+  extern __shared__ float scratch[];
+  float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const int vec_end = dim / 4;
+  for (int vec = tid; vec < vec_end; vec += blockDim.x * blockDim.y) {
+    const int base = row * dim + vec * 4;
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      float value = __bfloat162float(x[base + lane]);
+      sums[lane] = __fadd_rn(sums[lane], __fmul_rn(value, value));
+    }
+  }
+  float sumsq = sums[0];
+  sumsq = __fadd_rn(sumsq, sums[1]);
+  sumsq = __fadd_rn(sumsq, sums[2]);
+  sumsq = __fadd_rn(sumsq, sums[3]);
+  if (tid == 0) {
+    for (int k = vec_end * 4; k < dim; ++k) {
+      float value = __bfloat162float(x[row * dim + k]);
+      sumsq = __fadd_rn(sumsq, __fmul_rn(value, value));
+    }
+  }
+  scratch[tid] = sumsq;
+
+  // ATen Reduce.cuh::block_x_reduce for blockDim.x=128.
+  for (int offset = blockDim.x / 2; offset >= warpSize; offset >>= 1) {
+    __syncthreads();
+    if (threadIdx.x < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset]);
+      scratch[tid] = sumsq;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      sumsq = __fadd_rn(sumsq, __shfl_down_sync(0xffffffff, sumsq, offset));
+    }
+  }
+
+  // ATen Reduce.cuh::block_y_reduce for blockDim.y=4.
+  scratch[tid] = sumsq;
+  for (int offset = blockDim.y / 2; offset > 0; offset >>= 1) {
+    __syncthreads();
+    if (threadIdx.y < offset) {
+      sumsq = __fadd_rn(sumsq, scratch[tid + offset * blockDim.x]);
+      scratch[tid] = sumsq;
+    }
+  }
+  __syncthreads();
+  const float mean = __fmul_rn(scratch[0], 1.0f / static_cast<float>(dim));
+  const float scale = rsqrtf(__fadd_rn(mean, eps));
+  for (int d = tid; d < dim; d += blockDim.x * blockDim.y) {
+    float value = __bfloat162float(x[row * dim + d]);
+    float w = (weight != nullptr) ? weight[d] : 1.0f;
+    out[row * dim + d] = __float2bfloat16(__fmul_rn(__fmul_rn(value, scale), w));
   }
 }
 
@@ -196,21 +308,20 @@ __global__ void ds_hc_pre_from_mixes_kernel(
     float row_sum[hc], col_sum[hc], row_max[hc];
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
-      float mx = comb_frag[j * hc];
-      #pragma unroll
-      for (int k = 1; k < hc; ++k) mx = fmaxf(mx, comb_frag[j * hc + k]);
-      row_max[j] = mx;
+      row_max[j] = ds_tl_max4(
+          comb_frag[j * hc], comb_frag[j * hc + 1],
+          comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
-      float s = 0.0f;
       #pragma unroll
       for (int k = 0; k < hc; ++k) {
         float v = expf(comb_frag[j * hc + k] - row_max[j]);
         comb_frag[j * hc + k] = v;
-        s += v;
       }
-      row_sum[j] = s;
+      row_sum[j] = ds_tl_sum4(
+          comb_frag[j * hc], comb_frag[j * hc + 1],
+          comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
@@ -222,10 +333,9 @@ __global__ void ds_hc_pre_from_mixes_kernel(
     // Column normalization
     #pragma unroll
     for (int k = 0; k < hc; ++k) {
-      float s = 0.0f;
-      #pragma unroll
-      for (int j = 0; j < hc; ++j) s += comb_frag[j * hc + k];
-      col_sum[k] = s;
+      col_sum[k] = ds_tl_sum4(
+          comb_frag[k], comb_frag[hc + k],
+          comb_frag[2 * hc + k], comb_frag[3 * hc + k]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
@@ -238,10 +348,9 @@ __global__ void ds_hc_pre_from_mixes_kernel(
     for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
       #pragma unroll
       for (int j = 0; j < hc; ++j) {
-        float s = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < hc; ++k) s += comb_frag[j * hc + k];
-        row_sum[j] = s;
+        row_sum[j] = ds_tl_sum4(
+            comb_frag[j * hc], comb_frag[j * hc + 1],
+            comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
       }
       #pragma unroll
       for (int j = 0; j < hc; ++j) {
@@ -251,10 +360,9 @@ __global__ void ds_hc_pre_from_mixes_kernel(
       }
       #pragma unroll
       for (int k = 0; k < hc; ++k) {
-        float s = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < hc; ++j) s += comb_frag[j * hc + k];
-        col_sum[k] = s;
+        col_sum[k] = ds_tl_sum4(
+            comb_frag[k], comb_frag[hc + k],
+            comb_frag[2 * hc + k], comb_frag[3 * hc + k]);
       }
       #pragma unroll
       for (int j = 0; j < hc; ++j) {
@@ -322,20 +430,20 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
     float row_sum[hc], col_sum[hc], row_max[hc];
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
-      float mx = comb_frag[j * hc];
-      #pragma unroll
-      for (int k = 1; k < hc; ++k) mx = fmaxf(mx, comb_frag[j * hc + k]);
-      row_max[j] = mx;
+      row_max[j] = ds_tl_max4(
+          comb_frag[j * hc], comb_frag[j * hc + 1],
+          comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j) {
-      float s = 0.0f;
       #pragma unroll
       for (int k = 0; k < hc; ++k) {
         float v = expf(comb_frag[j * hc + k] - row_max[j]);
-        comb_frag[j * hc + k] = v; s += v;
+        comb_frag[j * hc + k] = v;
       }
-      row_sum[j] = s;
+      row_sum[j] = ds_tl_sum4(
+          comb_frag[j * hc], comb_frag[j * hc + 1],
+          comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j)
@@ -344,10 +452,9 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
         comb_frag[j * hc + k] = comb_frag[j * hc + k] / row_sum[j] + hc_eps;
     #pragma unroll
     for (int k = 0; k < hc; ++k) {
-      float s = 0.0f;
-      #pragma unroll
-      for (int j = 0; j < hc; ++j) s += comb_frag[j * hc + k];
-      col_sum[k] = s;
+      col_sum[k] = ds_tl_sum4(
+          comb_frag[k], comb_frag[hc + k],
+          comb_frag[2 * hc + k], comb_frag[3 * hc + k]);
     }
     #pragma unroll
     for (int j = 0; j < hc; ++j)
@@ -358,10 +465,9 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
     for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
       #pragma unroll
       for (int j = 0; j < hc; ++j) {
-        float s = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < hc; ++k) s += comb_frag[j * hc + k];
-        row_sum[j] = s;
+        row_sum[j] = ds_tl_sum4(
+            comb_frag[j * hc], comb_frag[j * hc + 1],
+            comb_frag[j * hc + 2], comb_frag[j * hc + 3]);
       }
       #pragma unroll
       for (int j = 0; j < hc; ++j)
@@ -370,10 +476,9 @@ __global__ void ds_hc_pre_norm_from_mixes_kernel(
           comb_frag[j * hc + k] = comb_frag[j * hc + k] / (row_sum[j] + hc_eps);
       #pragma unroll
       for (int k = 0; k < hc; ++k) {
-        float s = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < hc; ++j) s += comb_frag[j * hc + k];
-        col_sum[k] = s;
+        col_sum[k] = ds_tl_sum4(
+            comb_frag[k], comb_frag[hc + k],
+            comb_frag[2 * hc + k], comb_frag[3 * hc + k]);
       }
       #pragma unroll
       for (int j = 0; j < hc; ++j)
@@ -504,35 +609,63 @@ __global__ void ds_head_rms_norm_kernel(
     const __nv_bfloat16 *__restrict__ x,
     __nv_bfloat16 *__restrict__ out,
     int seq_len, int num_heads, int head_dim, float eps) {
-  int token = blockIdx.x;
-  int head = blockIdx.y;
-  int tid = threadIdx.x;
-  if (token >= seq_len || head >= num_heads) return;
+  // Match the ATen contiguous F32 mean reduction selected by the official
+  // implementation for rows of 512 values:
+  //   reduce_kernel<512, 1, ..., 4, 4>, grid=(ceil(rows/16),1,1),
+  //   block=(32,16,1).
+  // Each warp owns one head row.  Its lanes each accumulate four contiguous
+  // vector lanes over four iterations, fold those four accumulators in order,
+  // then perform the warp-x reduction.
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int rows = seq_len * num_heads;
+  const int lane = threadIdx.x;
+  if (row >= rows) return;
 
-  extern __shared__ float scratch[];
-  int base = token * num_heads * head_dim + head * head_dim;
-  float partial = 0.0f;
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    float value = __bfloat162float(x[base + d]);
-    partial += round_to_bf16_float(value * value);
+  const int base = row * head_dim;
+  float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const int vec_end = head_dim / 4;
+  for (int vec = lane; vec < vec_end; vec += blockDim.x) {
+    const int vec_base = base + vec * 4;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float value = __bfloat162float(x[vec_base + i]);
+      sums[i] = __fadd_rn(sums[i], __fmul_rn(value, value));
+    }
   }
-  scratch[tid] = partial;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) scratch[tid] += scratch[tid + stride];
-    __syncthreads();
-  }
-  float mean_sq = round_to_bf16_float(scratch[0] / head_dim);
-  float inv_rms = round_to_bf16_float(rsqrtf(round_to_bf16_float(mean_sq + eps)));
-  for (int d = tid; d < head_dim; d += blockDim.x) {
+  float partial = sums[0];
+  partial = __fadd_rn(partial, sums[1]);
+  partial = __fadd_rn(partial, sums[2]);
+  partial = __fadd_rn(partial, sums[3]);
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    partial = __fadd_rn(
+        partial, __shfl_down_sync(0xffffffff, partial, offset));
+  partial = __shfl_sync(0xffffffff, partial, 0);
+
+  float mean_sq = __fmul_rn(partial, 1.0f / static_cast<float>(head_dim));
+  float inv_rms = rsqrtf(__fadd_rn(mean_sq, eps));
+  for (int d = lane; d < head_dim; d += blockDim.x) {
     float value = __bfloat162float(x[base + d]);
-    out[base + d] = __float2bfloat16(value * inv_rms);
+    out[base + d] = __float2bfloat16(__fmul_rn(value, inv_rms));
   }
 }
 
 // ============ Extern "C" entry points ============
 
 extern "C" {
+
+cudaError_t ds_v4_rms_norm(
+    const void *x, const void *weight, void *out,
+    int rows, int dim, float eps, int64_t stream_) {
+  const cudaStream_t stream = (cudaStream_t)stream_;
+  if (rows <= 0 || dim <= 0 || dim % 4 != 0) return cudaErrorInvalidValue;
+  const dim3 threads(128, 4);
+  constexpr int thread_count = 512;
+  ds_v4_rms_norm_kernel<<<rows, threads, thread_count * sizeof(float), stream>>>(
+      (const __nv_bfloat16*)x, (const float*)weight, (__nv_bfloat16*)out,
+      rows, dim, eps);
+  return cudaGetLastError();
+}
 
 cudaError_t ds_v4_hc_expand(
     const void *x, void *out,
@@ -599,9 +732,10 @@ cudaError_t ds_v4_hc_mixes(
 
   // Keep the exact reference ordering: normalize the source hidden state
   // after the GEMM, on the same stream, without a host-visible fence.
-  constexpr int scale_threads = 512;
+  const dim3 scale_threads(128, 4);
+  constexpr int scale_thread_count = 512;
   ds_hc_scale_mixes_block_kernel<<<
-      seq_len, scale_threads, scale_threads * sizeof(float), stream>>>(
+      seq_len, scale_threads, scale_thread_count * sizeof(float), stream>>>(
           (const __nv_bfloat16 *)x, (float *)mixes, nullptr,
           seq_len, hc_dim, mix_hc, eps);
   return cudaGetLastError();
@@ -612,9 +746,10 @@ cudaError_t ds_v4_hc_scale_mixes(
     int seq_len, int hc, int dim, int mix_hc,
     float eps, int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
-  constexpr int scale_threads = 512;
+  const dim3 scale_threads(128, 4);
+  constexpr int scale_thread_count = 512;
   int hc_dim = hc * dim;
-  ds_hc_scale_mixes_block_kernel<<<seq_len, scale_threads, scale_threads * sizeof(float), stream>>>(
+  ds_hc_scale_mixes_block_kernel<<<seq_len, scale_threads, scale_thread_count * sizeof(float), stream>>>(
       (const __nv_bfloat16*)x, (float*)mixes, nullptr, seq_len, hc_dim, mix_hc, eps);
   return cudaGetLastError();
 }
@@ -716,11 +851,10 @@ cudaError_t ds_v4_head_rms_norm(
     const void *x, void *out,
     int seq_len, int num_heads, int head_dim, float eps, int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
-  // Match openinfer: 512 threads for head_dim=512 (covers one dim per thread).
-  constexpr int threads = 512;
-  dim3 grid(seq_len, num_heads);
-  size_t shared_bytes = threads * sizeof(float);
-  ds_head_rms_norm_kernel<<<grid, threads, shared_bytes, stream>>>(
+  if (head_dim != 512) return cudaErrorInvalidValue;
+  dim3 threads(32, 16);
+  dim3 grid((seq_len * num_heads + threads.y - 1) / threads.y);
+  ds_head_rms_norm_kernel<<<grid, threads, 0, stream>>>(
       (const __nv_bfloat16*)x, (__nv_bfloat16*)out,
       seq_len, num_heads, head_dim, eps);
   return cudaGetLastError();

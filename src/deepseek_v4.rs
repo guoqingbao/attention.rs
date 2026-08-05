@@ -6,8 +6,8 @@ use crate::kernels;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
-use candle_core::{DType, Storage};
-use candle_core::{Device, Result, Tensor};
+use candle_core::Storage;
+use candle_core::{DType, Device, Result, Tensor};
 
 #[cfg(feature = "cuda")]
 fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
@@ -58,6 +58,23 @@ fn get_cuda_stream(device: &Device) -> Result<i64> {
         Device::Cuda(dev) => Ok(*dev.cu_stream() as i64),
         _ => candle_core::bail!("ds_v4: expected CUDA device"),
     }
+}
+
+/// Wait for outstanding V4 kernels on `device`.
+///
+/// Candle's CUDA caching allocator can recycle buffers while a prior async
+/// kernel is still writing them; without an explicit sync, HC `post`/`comb`
+/// (and other still-live tensors) have been observed to be silently clobbered
+/// before `hc_post`. Prefer this over relying on TRACE D2H side-effects.
+#[cfg(feature = "cuda")]
+fn sync_v4_device(device: &Device) -> Result<()> {
+    device.synchronize()
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(dead_code)]
+fn sync_v4_device(_device: &Device) -> Result<()> {
+    Ok(())
 }
 
 /// Bounds-checked asynchronous device-to-device copy for contiguous tensors.
@@ -111,6 +128,7 @@ pub fn copy_contiguous_into(dst: &Tensor, src: &Tensor, dst_element_offset: usiz
         if ret != 0 {
             candle_core::bail!("copy_contiguous_into CUDA error: {}", ret);
         }
+        sync_v4_device(dst.device())?;
         Ok(())
     }
     #[cfg(not(feature = "cuda"))]
@@ -188,9 +206,7 @@ pub fn hc_mixes(
         if ret != 0 {
             candle_core::bail!("ds_v4_hc_mixes CUDA error: {}", ret);
         }
-        if std::env::var_os("XINFER_DSV4_SYNC_HC_MIXES").is_some() {
-            x.device().synchronize()?;
-        }
+        sync_v4_device(x.device())?;
         Ok(mixes)
     }
     #[cfg(not(feature = "cuda"))]
@@ -242,6 +258,7 @@ pub fn hc_pre_from_mixes(
         if ret != 0 {
             candle_core::bail!("ds_v4_hc_pre_from_mixes CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok((out, post, comb))
     }
     #[cfg(not(feature = "cuda"))]
@@ -297,6 +314,7 @@ pub fn hc_pre_norm_from_mixes(
         if ret != 0 {
             candle_core::bail!("ds_v4_hc_pre_norm_from_mixes CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok((out, post, comb))
     }
     #[cfg(not(feature = "cuda"))]
@@ -396,53 +414,47 @@ pub fn hc_post(
     hc: usize,
     dim: usize,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    {
-        let seq_len = x.dim(0)?;
-        // Both kernels write BF16 HC state so prefill/decode share one output dtype.
-        let out = Tensor::zeros((seq_len, hc, dim), DType::BF16, x.device())?;
-        let stream = get_cuda_stream(x.device())?;
-        match x.dtype() {
-            DType::F32 => {
-                let ret = unsafe {
-                    kernels::ffi::ds_v4_hc_post_f32_branch(
-                        get_cuda_ptr(x)?,
-                        get_cuda_ptr(residual)?,
-                        get_cuda_ptr(post)?,
-                        get_cuda_ptr(comb)?,
-                        get_cuda_mut_ptr(&out)?,
-                        seq_len as i32,
-                        hc as i32,
-                        dim as i32,
-                        stream,
-                    )
-                };
-                if ret != 0 {
-                    candle_core::bail!("ds_v4_hc_post_f32_branch CUDA error: {}", ret);
-                }
-            }
-            DType::BF16 => unsafe {
-                kernels::ffi::ds_v4_hc_post(
-                    get_cuda_ptr(x)?,
-                    get_cuda_ptr(residual)?,
-                    get_cuda_ptr(post)?,
-                    get_cuda_ptr(comb)?,
-                    get_cuda_mut_ptr(&out)?,
-                    seq_len as i32,
-                    hc as i32,
-                    dim as i32,
-                    stream,
-                );
-            },
-            dtype => candle_core::bail!("hc_post expects BF16 or F32 branch, got {dtype:?}"),
-        }
-        Ok(out)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let (_, _, _, _) = (residual, post, comb, dim);
-        candle_core::bail!("hc_post requires cuda feature")
-    }
+    // Candle reference is the production path: CUDA kernels have observed
+    // stream/alias corruption on later layers. Formula matches official:
+    //   y = post.unsqueeze(-1) * x.unsqueeze(-2)
+    //     + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=h_in)
+    // with a BF16 cast of the F32 branch before the post multiply.
+    hc_post_reference(x, residual, post, comb, hc, dim)
+}
+
+/// Official-formula HC post in Candle (no custom CUDA). Used by default so
+/// sparse-attention workspace reuse cannot silently feed the CUDA kernel a
+/// stale non-dense view.
+pub fn hc_post_reference(
+    x: &Tensor,
+    residual: &Tensor,
+    post: &Tensor,
+    comb: &Tensor,
+    hc: usize,
+    dim: usize,
+) -> Result<Tensor> {
+    let seq_len = x.dim(0)?;
+    // Reproduce the official BF16 branch boundary before the post multiply.
+    let x = match x.dtype() {
+        DType::F32 => x.to_dtype(DType::BF16)?.to_dtype(DType::F32)?,
+        DType::BF16 => x.to_dtype(DType::F32)?,
+        dtype => candle_core::bail!("hc_post_reference expects BF16/F32 branch, got {dtype:?}"),
+    };
+    let residual = residual.to_dtype(DType::F32)?.reshape((seq_len, hc, dim))?;
+    let post = post.to_dtype(DType::F32)?.reshape((seq_len, hc))?;
+    let comb = comb.to_dtype(DType::F32)?.reshape((seq_len, hc, hc))?;
+
+    // post_term: [seq, hc, 1] * [seq, 1, dim] -> [seq, hc, dim]
+    let post_term = post
+        .unsqueeze(candle_core::D::Minus1)?
+        .broadcast_mul(&x.unsqueeze(1)?)?;
+    // comb: [seq, h_in, h_out, 1] * residual: [seq, h_in, 1, dim]
+    // -> sum over h_in => [seq, h_out, dim]
+    let residual_sum = comb
+        .unsqueeze(candle_core::D::Minus1)?
+        .broadcast_mul(&residual.unsqueeze(2)?)?
+        .sum(1)?;
+    (post_term + residual_sum)?.to_dtype(DType::BF16)
 }
 
 /// HC post-mix after an FP32 collective, matching the reference V4 path: the
@@ -493,6 +505,38 @@ pub fn hc_post_f32_branch(
 ///
 /// x: [seq, num_heads, head_dim]
 /// Returns: [seq, num_heads, head_dim]
+/// ATen-order RMSNorm matching the official V4 golden.
+/// x: [rows, dim] BF16, weight: [dim] F32.  All math in F32 with the same
+/// (128,4) block reduce order as `torch.mean(-1)`, one BF16 round at the end.
+pub fn rms_norm_v4(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let rows = x.dim(0)?;
+        let out = Tensor::zeros_like(x)?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_v4_rms_norm(
+                get_cuda_ptr(x)?,
+                get_cuda_ptr(weight)?,
+                get_cuda_mut_ptr(&out)?,
+                rows as i32,
+                dim as i32,
+                eps,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_v4_rms_norm CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (weight, dim, eps);
+        candle_core::bail!("rms_norm_v4 requires cuda feature")
+    }
+}
+
 pub fn head_rms_norm(x: &Tensor, num_heads: usize, head_dim: usize, eps: f32) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
@@ -725,6 +769,7 @@ pub fn compressor_nonoverlap_prefill(
         if ret != 0 {
             candle_core::bail!("compressor_nonoverlap_prefill_epilogue CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok((weighted, out))
     }
     #[cfg(not(feature = "cuda"))]
@@ -788,6 +833,7 @@ pub fn compressor_overlap_prefill(
         if ret != 0 {
             candle_core::bail!("compressor_overlap_prefill_epilogue CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok((weighted, out))
     }
     #[cfg(not(feature = "cuda"))]
@@ -866,6 +912,7 @@ pub fn compressor_nonoverlap_decode_at(
         if ret != 0 {
             candle_core::bail!("compressor_nonoverlap_decode_at CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok(weighted.zip(out))
     }
     #[cfg(not(feature = "cuda"))]
@@ -943,6 +990,7 @@ pub fn compressor_overlap_decode_at(
         if ret != 0 {
             candle_core::bail!("compressor_overlap_decode_at CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok(weighted.zip(out))
     }
     #[cfg(not(feature = "cuda"))]
@@ -1007,6 +1055,7 @@ pub fn hadamard_fp4_quant_bf16_inplace(x: &Tensor, groups: usize, dim: usize) ->
         if ret != 0 {
             candle_core::bail!("hadamard_fp4_quant_bf16 CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok(())
     }
     #[cfg(not(feature = "cuda"))]
@@ -1073,6 +1122,7 @@ pub fn fp8_act_quant_nope_bf16_inplace(
         if ret != 0 {
             candle_core::bail!("fp8_act_quant_nope CUDA error: {}", ret);
         }
+        sync_v4_device(x.device())?;
         Ok(())
     }
     #[cfg(not(feature = "cuda"))]
@@ -1366,6 +1416,7 @@ pub fn window_topk_indices(
         if ret != 0 {
             candle_core::bail!("window_topk_indices CUDA error: {}", ret);
         }
+        sync_v4_device(device)?;
         Ok(out)
     }
     #[cfg(not(feature = "cuda"))]
@@ -1397,6 +1448,7 @@ pub fn window_topk_indices_decode(
         if ret != 0 {
             candle_core::bail!("window_topk_indices_decode CUDA error: {}", ret);
         }
+        sync_v4_device(device)?;
         Ok(out)
     }
     #[cfg(not(feature = "cuda"))]
@@ -1558,6 +1610,7 @@ pub fn sparse_attention(
         if ret != 0 {
             candle_core::bail!("sparse_attention CUDA error: {}", ret);
         }
+        sync_v4_device(q.device())?;
         Ok(out)
     }
     #[cfg(not(feature = "cuda"))]
