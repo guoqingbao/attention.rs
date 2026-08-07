@@ -4078,6 +4078,16 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_window_topk_indices_chrono_from_pos(
+        out: *mut c_int,
+        positions: *const i64,
+        seq_len: c_int,
+        window_size: c_int,
+        gather_start: c_int,
+        gather_len: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_compress_topk_indices_prefill_from_pos(
         out: *mut c_int,
         positions: *const i64,
@@ -4093,6 +4103,16 @@ extern "C" {
         rows: *const c_void,
         positions: *const i64,
         seq_len: c_int,
+        window_size: c_int,
+        head_dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_gather_ring_chrono(
+        out: *mut c_void,
+        cache: *const c_void,
+        start_abs: c_int,
+        n: c_int,
         window_size: c_int,
         head_dim: c_int,
         stream: i64,

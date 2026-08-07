@@ -85,8 +85,10 @@ __global__ void ds_apply_rope_hidden_from_pos_kernel(
   int head = tmp % local_heads;
   int token = tmp / local_heads;
   int nope_dim = head_dim - rotary_dim;
-  int start_pos = static_cast<int>(positions[token]) + position_offset;
-  int pos = start_pos + token;
+  // `positions[token]` is the absolute RoPE position for this token (prefill
+  // continue / decode / MTP). Do NOT add `token` again — that double-counts
+  // and corrupts every multi-token from_positions path.
+  int pos = static_cast<int>(positions[token]) + position_offset;
   int offset =
       token * local_heads * head_dim + head * head_dim + nope_dim + 2 * rotary_pair;
   ds_apply_rope_pair(

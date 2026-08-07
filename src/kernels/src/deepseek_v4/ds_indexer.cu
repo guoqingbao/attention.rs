@@ -1145,6 +1145,33 @@ __global__ void ds_window_topk_indices_prefill_from_pos_kernel(
   }
 }
 
+// Chrono-gather window topk (vLLM continued-prefill layout).
+// KV workspace is chronological: index 0 = absolute position `gather_start`.
+// For query at absolute `pos`, visible SWA keys are [max(0, pos-(window-1)), pos]
+// mapped into the gather buffer as (key_abs - gather_start).
+__global__ void ds_window_topk_indices_chrono_from_pos_kernel(
+    int *__restrict__ out,
+    const int64_t *__restrict__ positions,
+    int seq_len,
+    int window_size,
+    int gather_start,
+    int gather_len) {
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+  int route = blockIdx.y * blockDim.x + threadIdx.x;
+  if (route >= window_size) return;
+  int abs_pos = static_cast<int>(positions[token]);
+  int key_start = abs_pos - (window_size - 1);
+  if (key_start < 0) key_start = 0;
+  int key_abs = key_start + route;
+  if (key_abs > abs_pos || key_abs < gather_start ||
+      key_abs >= gather_start + gather_len) {
+    out[token * window_size + route] = -1;
+  } else {
+    out[token * window_size + route] = key_abs - gather_start;
+  }
+}
+
 __global__ void ds_compress_topk_indices_prefill_from_pos_kernel(
     int *__restrict__ out,
     const int64_t *__restrict__ positions,
@@ -1175,6 +1202,23 @@ __global__ void ds_write_window_rows_from_pos_kernel(
   int start_pos = static_cast<int>(positions[token]);
   int slot = start_pos % window_size;
   cache[slot * head_dim + dim] = rows[token * head_dim + dim];
+}
+
+// Gather chronological rows from a ring cache into a contiguous buffer.
+// out[i] = cache[(start_abs + i) % window_size] for i in [0, n).
+__global__ void ds_gather_ring_chrono_kernel(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ cache,
+    int start_abs,
+    int n,
+    int window_size,
+    int head_dim) {
+  int row = blockIdx.x;
+  if (row >= n) return;
+  int dim = blockIdx.y * blockDim.x + threadIdx.x;
+  if (dim >= head_dim) return;
+  int slot = (start_abs + row) % window_size;
+  out[row * head_dim + dim] = cache[slot * head_dim + dim];
 }
 
 
@@ -1243,6 +1287,26 @@ cudaError_t ds_window_topk_indices_prefill_from_pos(
   return cudaGetLastError();
 }
 
+cudaError_t ds_window_topk_indices_chrono_from_pos(
+    int *out,
+    const int64_t *positions,
+    int seq_len,
+    int window_size,
+    int gather_start,
+    int gather_len,
+    cudaStream_t stream) {
+  if (out == nullptr || positions == nullptr || seq_len <= 0 || window_size <= 0 ||
+      gather_len <= 0 || gather_start < 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks_y = (window_size + threads - 1) / threads;
+  dim3 grid(seq_len, blocks_y);
+  ds_window_topk_indices_chrono_from_pos_kernel<<<grid, threads, 0, stream>>>(
+      out, positions, seq_len, window_size, gather_start, gather_len);
+  return cudaGetLastError();
+}
+
 cudaError_t ds_compress_topk_indices_prefill_from_pos(
     int *out,
     const int64_t *positions,
@@ -1280,6 +1344,26 @@ cudaError_t ds_write_window_rows_from_pos(
   dim3 grid(seq_len, blocks_y);
   ds_write_window_rows_from_pos_kernel<<<grid, threads, 0, stream>>>(
       cache, rows, positions, seq_len, window_size, head_dim);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_gather_ring_chrono(
+    __nv_bfloat16 *out,
+    const __nv_bfloat16 *cache,
+    int start_abs,
+    int n,
+    int window_size,
+    int head_dim,
+    cudaStream_t stream) {
+  if (out == nullptr || cache == nullptr || n <= 0 || window_size <= 0 ||
+      head_dim <= 0 || start_abs < 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks_y = (head_dim + threads - 1) / threads;
+  dim3 grid(n, blocks_y);
+  ds_gather_ring_chrono_kernel<<<grid, threads, 0, stream>>>(
+      out, cache, start_abs, n, window_size, head_dim);
   return cudaGetLastError();
 }
 

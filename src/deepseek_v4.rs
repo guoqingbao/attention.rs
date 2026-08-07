@@ -1799,6 +1799,51 @@ pub fn window_topk_indices_prefill_from_pos(
     }
 }
 
+/// Chrono-gather window topk for continued prefill (vLLM layout).
+///
+/// Workspace KV is chronological with absolute position `gather_start` at index 0.
+/// Returns `[seq_len, window_size]` I32 indices into that gather buffer (-1 pad).
+pub fn window_topk_indices_chrono_from_pos(
+    positions: &Tensor,
+    window_size: usize,
+    seq_len: usize,
+    gather_start: usize,
+    gather_len: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if gather_len == 0 || window_size == 0 || seq_len == 0 {
+            return Tensor::zeros(
+                (seq_len, window_size.max(1)),
+                DType::U32,
+                positions.device(),
+            );
+        }
+        let out = Tensor::zeros((seq_len, window_size), DType::U32, positions.device())?;
+        let stream = get_cuda_stream(positions.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_window_topk_indices_chrono_from_pos(
+                get_cuda_mut_ptr(&out)? as *mut i32,
+                get_cuda_ptr(positions)? as *const i64,
+                seq_len as i32,
+                window_size as i32,
+                gather_start as i32,
+                gather_len as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("window_topk_indices_chrono_from_pos CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (positions, window_size, seq_len, gather_start, gather_len);
+        candle_core::bail!("window_topk_indices_chrono_from_pos requires cuda feature")
+    }
+}
+
 /// Per-query compressed-cache indices for (possibly continued) prefill.
 pub fn compress_topk_indices_prefill_from_pos(
     positions: &Tensor,
@@ -1866,6 +1911,46 @@ pub fn write_window_rows_from_pos(
     {
         let _ = (cache, rows, positions, window_size, head_dim);
         candle_core::bail!("write_window_rows_from_pos requires cuda feature")
+    }
+}
+
+/// Gather `n` chronological rows from a ring cache into a contiguous buffer.
+///
+/// `out[i] = cache[(start_abs + i) % window_size]`.
+pub fn gather_ring_chrono(
+    cache: &Tensor,
+    start_abs: usize,
+    n: usize,
+    window_size: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if n == 0 {
+            return Tensor::zeros((0, head_dim), DType::BF16, cache.device());
+        }
+        let out = Tensor::zeros((n, head_dim), DType::BF16, cache.device())?;
+        let stream = get_cuda_stream(cache.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_gather_ring_chrono(
+                get_cuda_mut_ptr(&out)?,
+                get_cuda_ptr(cache)?,
+                start_abs as i32,
+                n as i32,
+                window_size as i32,
+                head_dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("gather_ring_chrono CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cache, start_abs, n, window_size, head_dim);
+        candle_core::bail!("gather_ring_chrono requires cuda feature")
     }
 }
 
