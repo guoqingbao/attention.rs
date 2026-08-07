@@ -2545,6 +2545,20 @@ pub fn concat_topk_indices(
 // Attention utility kernels
 // ============================================================================
 
+/// Returns true when `XINFER_DISABLE_FLASHMLA=1` (or `true`) is set.
+///
+/// Disables **both** FlashMLA (SM90) and FlashInfer SM120 sparse MLA fast
+/// paths; [`sparse_attention_into`] falls back to the custom BF16 kernel.
+/// Default is off — accelerated sparse is used when the arch/shape allow it.
+pub fn flash_sparse_mla_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("XINFER_DISABLE_FLASHMLA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Sparse indexed attention (works for both prefill and decode).
 ///
 /// q: [seq_len, num_heads, head_dim] BF16
@@ -2553,7 +2567,11 @@ pub fn concat_topk_indices(
 /// topk_idxs: [seq_len, topk] I32 (-1 = invalid/skip)
 /// Returns: [seq_len, num_heads, head_dim] BF16
 ///
-/// No cudaMalloc — fully CUDA-graph compatible.
+/// Prefers FlashMLA (SM90) / FlashInfer SM120 sparse paths with auto FP8
+/// paged KV packing when shapes are supported; falls back to the custom
+/// BF16 kernel otherwise. Decode workspaces are grow-only (eager-safe;
+/// optional [`prewarm_flashmla_decode`] for CUDA graphs).
+/// Set `XINFER_DISABLE_FLASHMLA=1` to force the BF16 path.
 pub fn sparse_attention_into(
     q: &Tensor,
     kv: &Tensor,
@@ -2570,6 +2588,102 @@ pub fn sparse_attention_into(
     #[cfg(feature = "cuda")]
     {
         let stream = get_cuda_stream(q.device())?;
+        let flash_sparse_disabled = flash_sparse_mla_disabled();
+
+        // Fast path: FlashMLA SM90 sparse (FP8 decode / BF16 prefill).
+        // Prefill requires topk % 128 == 0; decode requires topk % 64 == 0.
+        // Decode must not H2D/cat: only pass through when already aligned
+        // (DSV4 decode topk = window + index_topk is typically 128+512=640).
+        if !flash_sparse_disabled
+            && head_dim == 512
+            && unsafe { kernels::ffi::flashmla_dsv4_supported(num_heads as i32) } != 0
+        {
+            let align = if seq_len > 1 { 128 } else { 64 };
+            let aligned_topk = ((topk + align - 1) / align) * align;
+            let flashmla_result = if aligned_topk == topk {
+                sparse_attention_flashmla_into(
+                    q,
+                    kv,
+                    attn_sink,
+                    topk_idxs,
+                    out,
+                    seq_len,
+                    num_heads,
+                    kv_len,
+                    topk,
+                    softmax_scale,
+                    stream,
+                )
+            } else if seq_len == 1 {
+                // Decode under CUDA graph cannot allocate / H2D — fall back.
+                Err(candle_core::Error::Msg(format!(
+                    "flashmla decode topk {topk} not aligned to {align}"
+                )))
+            } else {
+                // Prefill (eager): pad with -1 via H2D once.
+                let fill =
+                    Tensor::full(u32::MAX, (seq_len, aligned_topk - topk), topk_idxs.device())?;
+                let fill = if topk_idxs.dtype() == DType::U32 {
+                    fill
+                } else {
+                    fill.to_dtype(topk_idxs.dtype())?
+                };
+                let joined = Tensor::cat(&[topk_idxs, &fill], 1)?.contiguous()?;
+                sparse_attention_flashmla_into(
+                    q,
+                    kv,
+                    attn_sink,
+                    &joined,
+                    out,
+                    seq_len,
+                    num_heads,
+                    kv_len,
+                    aligned_topk,
+                    softmax_scale,
+                    stream,
+                )
+            };
+            match flashmla_result {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    // Fall through to FlashInfer SM120 / BF16.
+                }
+            }
+        }
+
+        // Fast path: FlashInfer SM120 sparse decode (FP8 FOOTER, page_block=64).
+        // Instantiated topk ∈ {128,512,1024}; pad shorter topk with -1 + topk_length.
+        if !flash_sparse_disabled && seq_len == 1 && head_dim == 512 {
+            if let Some(kernel_topk) = flashinfer_sm120_kernel_topk(topk) {
+                if unsafe {
+                    kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(
+                        num_heads as i32,
+                        kernel_topk as i32,
+                    )
+                } != 0
+                {
+                    match sparse_attention_flashinfer_sm120_into(
+                        q,
+                        kv,
+                        attn_sink,
+                        topk_idxs,
+                        out,
+                        num_heads,
+                        kv_len,
+                        topk,
+                        kernel_topk,
+                        softmax_scale,
+                        stream,
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(_) => {
+                            // Fall through to custom BF16 sparse kernel.
+                        }
+                    }
+                }
+            }
+        }
+
         let ret = unsafe {
             kernels::ffi::ds_sparse_attn_dispatch(
                 get_cuda_ptr(q)?,
@@ -2610,6 +2724,892 @@ pub fn sparse_attention_into(
     }
 }
 
+/// FlashMLA MODEL1 sparse FP8 only instantiates h_q ∈ {64, 128}. Match SGLang:
+/// pad local TP heads up to 64 when they fit.
+#[cfg(feature = "cuda")]
+fn flashmla_padded_heads(num_heads: usize) -> Option<usize> {
+    if num_heads == 0 {
+        None
+    } else if num_heads <= 64 {
+        Some(64)
+    } else if num_heads == 128 {
+        Some(128)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct FlashMlaWs {
+    tile_meta: Option<Tensor>,
+    num_splits: Option<Tensor>,
+    lse_accum: Option<Tensor>,
+    o_accum: Option<Tensor>,
+    lse: Option<Tensor>,
+    kv_fp8: Option<Tensor>,
+    topk_idxs_pad: Option<Tensor>,
+    topk_fill: Option<Tensor>,
+    max_logits: Option<Tensor>,
+    q_pad: Option<Tensor>,
+    out_pad: Option<Tensor>,
+    sink_pad: Option<Tensor>,
+    decode_kv_len: usize,
+    decode_topk: usize,
+    decode_pad_h: usize,
+    logged: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn flashmla_ws() -> std::sync::MutexGuard<'static, Option<FlashMlaWs>> {
+    use std::sync::Mutex;
+    static WS: Mutex<Option<FlashMlaWs>> = Mutex::new(None);
+    WS.lock().unwrap()
+}
+
+/// Pre-allocate FlashMLA decode workspaces for CUDA graph capture.
+///
+/// Must run **outside** stream capture. After this, decode (`seq_len==1`) must
+/// not allocate, perform H2D/D2H, or synchronize.
+#[cfg(feature = "cuda")]
+pub fn prewarm_flashmla_decode(
+    device: &Device,
+    num_heads: usize,
+    topk: usize,
+    kv_len: usize,
+) -> Result<()> {
+    if flash_sparse_mla_disabled() {
+        return Ok(());
+    }
+    let pad_h = flashmla_padded_heads(num_heads).ok_or_else(|| {
+        candle_core::Error::Msg(format!("flashmla unsupported local head count {num_heads}"))
+    })?;
+    let align = 64usize;
+    let aligned_topk = ((topk.max(1) + align - 1) / align) * align;
+    let page_block_size = ((kv_len.max(1) + 63) / 64 * 64).max(64);
+    let bytes_per_token = unsafe { kernels::ffi::flashmla_dsv4_bytes_per_token() } as usize;
+    let fp8_elems = page_block_size * bytes_per_token;
+
+    let mut num_sm_parts: i32 = 0;
+    let mut tile_bytes: usize = 0;
+    let mut splits_bytes: usize = 0;
+    let mut lse_accum_bytes: usize = 0;
+    let mut o_accum_bytes: usize = 0;
+    let ret = unsafe {
+        kernels::ffi::flashmla_dsv4_decode_workspace_bytes(
+            1,
+            1,
+            pad_h as i32,
+            &mut num_sm_parts,
+            &mut tile_bytes,
+            &mut splits_bytes,
+            &mut lse_accum_bytes,
+            &mut o_accum_bytes,
+        )
+    };
+    if ret != 0 || num_sm_parts <= 0 {
+        candle_core::bail!("flashmla prewarm workspace query failed: {}", ret);
+    }
+
+    let mut guard = flashmla_ws();
+    let ws = guard.get_or_insert_with(|| FlashMlaWs {
+        tile_meta: None,
+        num_splits: None,
+        lse_accum: None,
+        o_accum: None,
+        lse: None,
+        kv_fp8: None,
+        topk_idxs_pad: None,
+        topk_fill: None,
+        max_logits: None,
+        q_pad: None,
+        out_pad: None,
+        sink_pad: None,
+        decode_kv_len: 0,
+        decode_topk: 0,
+        decode_pad_h: 0,
+        logged: false,
+    });
+
+    if ws.q_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h * 512 {
+        ws.q_pad = Some(Tensor::zeros((1, pad_h, 512), DType::BF16, device)?);
+    }
+    if ws.out_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h * 512 {
+        ws.out_pad = Some(Tensor::zeros((1, pad_h, 512), DType::BF16, device)?);
+    }
+    if ws.sink_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h {
+        ws.sink_pad = Some(Tensor::zeros((pad_h,), DType::F32, device)?);
+    }
+    if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
+        ws.kv_fp8 = Some(Tensor::zeros((fp8_elems,), DType::U8, device)?);
+    }
+    if ws.lse.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h {
+        ws.lse = Some(Tensor::zeros((1, 1, pad_h), DType::F32, device)?);
+    }
+    let tile_elems = tile_bytes / 4;
+    if ws.tile_meta.as_ref().map(|t| t.elem_count()).unwrap_or(0) < tile_elems {
+        ws.tile_meta = Some(Tensor::zeros((tile_elems,), DType::U32, device)?);
+    }
+    let split_elems = splits_bytes / 4;
+    if ws.num_splits.as_ref().map(|t| t.elem_count()).unwrap_or(0) < split_elems {
+        ws.num_splits = Some(Tensor::zeros((split_elems,), DType::U32, device)?);
+    }
+    let lse_acc_elems = lse_accum_bytes / 4;
+    if ws.lse_accum.as_ref().map(|t| t.elem_count()).unwrap_or(0) < lse_acc_elems {
+        ws.lse_accum = Some(Tensor::zeros((lse_acc_elems,), DType::F32, device)?);
+    }
+    let o_acc_elems = o_accum_bytes / 4;
+    if ws.o_accum.as_ref().map(|t| t.elem_count()).unwrap_or(0) < o_acc_elems {
+        ws.o_accum = Some(Tensor::zeros((o_acc_elems,), DType::F32, device)?);
+    }
+    if ws
+        .topk_idxs_pad
+        .as_ref()
+        .map(|t| t.dim(1).unwrap_or(0))
+        .unwrap_or(0)
+        < aligned_topk
+    {
+        ws.topk_idxs_pad = Some(Tensor::zeros((1, aligned_topk), DType::U32, device)?);
+    }
+    if ws.topk_fill.as_ref().map(|t| t.elem_count()).unwrap_or(0) < aligned_topk {
+        ws.topk_fill = Some(Tensor::full(u32::MAX, (aligned_topk,), device)?);
+    }
+
+    ws.decode_kv_len = kv_len.max(1);
+    ws.decode_topk = aligned_topk;
+    ws.decode_pad_h = pad_h;
+    if !ws.logged {
+        eprintln!(
+            "[FlashMLA] SM90 sparse decode prewarmed (local_heads={num_heads}, pad_heads={pad_h}, topk={aligned_topk}, kv_len={})",
+            ws.decode_kv_len
+        );
+        ws.logged = true;
+    }
+    device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn prewarm_flashmla_decode(
+    _device: &Device,
+    _num_heads: usize,
+    _topk: usize,
+    _kv_len: usize,
+) -> Result<()> {
+    Ok(())
+}
+
+/// FlashInfer SM120 decode instantiates topk ∈ {128, 512, 1024}.
+#[cfg(feature = "cuda")]
+fn flashinfer_sm120_kernel_topk(topk: usize) -> Option<usize> {
+    for &k in &[128usize, 512, 1024] {
+        if topk <= k {
+            return Some(k);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn flashinfer_sm120_num_splits(kernel_topk: usize) -> usize {
+    (kernel_topk + 63) / 64
+}
+
+#[cfg(feature = "cuda")]
+struct FlashInferSm120Ws {
+    kv_fp8: Option<Tensor>,
+    mid_out: Option<Tensor>,
+    mid_lse: Option<Tensor>,
+    out_lse: Option<Tensor>,
+    topk_idxs_pad: Option<Tensor>,
+    topk_length: Option<Tensor>,
+    decode_kv_len: usize,
+    decode_kernel_topk: usize,
+    decode_num_heads: usize,
+    logged: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn flashinfer_sm120_ws() -> std::sync::MutexGuard<'static, Option<FlashInferSm120Ws>> {
+    use std::sync::Mutex;
+    static WS: Mutex<Option<FlashInferSm120Ws>> = Mutex::new(None);
+    WS.lock().unwrap()
+}
+
+/// Pre-allocate FlashInfer SM120 sparse decode workspaces (grow-only).
+///
+/// Safe to call on non-SM120 builds/GPUs — no-ops when the kernel is unsupported.
+#[cfg(feature = "cuda")]
+pub fn prewarm_flashinfer_sm120_decode(
+    device: &Device,
+    num_heads: usize,
+    topk: usize,
+    kv_len: usize,
+) -> Result<()> {
+    if flash_sparse_mla_disabled() {
+        return Ok(());
+    }
+    let Some(kernel_topk) = flashinfer_sm120_kernel_topk(topk.max(1)) else {
+        return Ok(());
+    };
+    if unsafe {
+        kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, kernel_topk as i32)
+    } == 0
+    {
+        return Ok(());
+    }
+
+    let page_block_size = 64usize;
+    let num_pages = (kv_len.max(1) + page_block_size - 1) / page_block_size;
+    let bytes_per_token = unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() } as usize;
+    let fp8_elems = num_pages * page_block_size * bytes_per_token;
+    let num_splits = flashinfer_sm120_num_splits(kernel_topk);
+
+    let mut guard = flashinfer_sm120_ws();
+    let ws = guard.get_or_insert_with(|| FlashInferSm120Ws {
+        kv_fp8: None,
+        mid_out: None,
+        mid_lse: None,
+        out_lse: None,
+        topk_idxs_pad: None,
+        topk_length: None,
+        decode_kv_len: 0,
+        decode_kernel_topk: 0,
+        decode_num_heads: 0,
+        logged: false,
+    });
+
+    if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
+        ws.kv_fp8 = Some(Tensor::zeros((fp8_elems,), DType::U8, device)?);
+    }
+    let mid_ok = ws
+        .mid_out
+        .as_ref()
+        .is_some_and(|t| t.dim(1).unwrap_or(0) == num_heads && t.dim(2).unwrap_or(0) == num_splits);
+    if !mid_ok {
+        ws.mid_out = Some(Tensor::zeros(
+            (1, num_heads, num_splits, 512),
+            DType::BF16,
+            device,
+        )?);
+    }
+    let mid_lse_ok = ws
+        .mid_lse
+        .as_ref()
+        .is_some_and(|t| t.dim(1).unwrap_or(0) == num_heads && t.dim(2).unwrap_or(0) == num_splits);
+    if !mid_lse_ok {
+        ws.mid_lse = Some(Tensor::zeros(
+            (1, num_heads, num_splits),
+            DType::F32,
+            device,
+        )?);
+    }
+    if ws.out_lse.as_ref().map(|t| t.elem_count()).unwrap_or(0) < num_heads {
+        ws.out_lse = Some(Tensor::zeros((1, num_heads), DType::F32, device)?);
+    }
+    if ws
+        .topk_idxs_pad
+        .as_ref()
+        .map(|t| t.dim(1).unwrap_or(0))
+        .unwrap_or(0)
+        < kernel_topk
+    {
+        // u32::MAX bit-casts to i32 -1 (FlashInfer invalid index).
+        ws.topk_idxs_pad = Some(Tensor::full(u32::MAX, (1, kernel_topk), device)?);
+    }
+    if ws.topk_length.as_ref().map(|t| t.elem_count()).unwrap_or(0) < 1 {
+        ws.topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
+    }
+
+    ws.decode_kv_len = kv_len.max(1);
+    ws.decode_kernel_topk = kernel_topk;
+    ws.decode_num_heads = num_heads;
+    if !ws.logged {
+        eprintln!(
+            "[FlashInfer] SM120 sparse decode prewarmed (local_heads={num_heads}, kernel_topk={kernel_topk}, kv_len={})",
+            ws.decode_kv_len
+        );
+        ws.logged = true;
+    }
+    device.synchronize()?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn prewarm_flashinfer_sm120_decode(
+    _device: &Device,
+    _num_heads: usize,
+    _topk: usize,
+    _kv_len: usize,
+) -> Result<()> {
+    Ok(())
+}
+
+/// True when FlashInfer SM120 sparse decode is available for this shape.
+pub fn flashinfer_sm120_sparse_available(num_heads: usize, topk: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        if flash_sparse_mla_disabled() {
+            return false;
+        }
+        match flashinfer_sm120_kernel_topk(topk) {
+            Some(k) => unsafe {
+                kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, k as i32)
+                    != 0
+            },
+            None => false,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (num_heads, topk);
+        false
+    }
+}
+
+/// FlashInfer SM120 decode path: FP8 FOOTER pages with page_block_size=64.
+#[cfg(feature = "cuda")]
+fn sparse_attention_flashinfer_sm120_into(
+    q: &Tensor,
+    kv: &Tensor,
+    attn_sink: &Tensor,
+    topk_idxs: &Tensor,
+    out: &Tensor,
+    num_heads: usize,
+    kv_len: usize,
+    topk: usize,
+    kernel_topk: usize,
+    softmax_scale: f32,
+    stream: i64,
+) -> Result<()> {
+    let device = q.device();
+    let page_block_size = 64usize;
+    let num_pages = (kv_len.max(1) + page_block_size - 1) / page_block_size;
+    let bytes_per_token = unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() } as usize;
+    let fp8_elems = num_pages * page_block_size * bytes_per_token;
+
+    // Prefer the prewarmed (max) kernel topk so mid_* shapes stay stable across
+    // SWA (128) and CSA (640→1024) layers in the same forward.
+    let launch_topk = {
+        let guard = flashinfer_sm120_ws();
+        let warmed = guard.as_ref().map(|w| w.decode_kernel_topk).unwrap_or(0);
+        let t = warmed.max(kernel_topk);
+        flashinfer_sm120_kernel_topk(t).unwrap_or(kernel_topk)
+    };
+    if unsafe {
+        kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, launch_topk as i32)
+    } == 0
+    {
+        candle_core::bail!("flashinfer sm120 unsupported for heads={num_heads} topk={launch_topk}");
+    }
+    let num_splits = flashinfer_sm120_num_splits(launch_topk);
+
+    // Grow workspaces if needed (DSV4 CUDA graphs are disabled; still avoid per-step alloc churn).
+    {
+        let mut guard = flashinfer_sm120_ws();
+        let ws = guard.get_or_insert_with(|| FlashInferSm120Ws {
+            kv_fp8: None,
+            mid_out: None,
+            mid_lse: None,
+            out_lse: None,
+            topk_idxs_pad: None,
+            topk_length: None,
+            decode_kv_len: 0,
+            decode_kernel_topk: 0,
+            decode_num_heads: 0,
+            logged: false,
+        });
+        if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
+            ws.kv_fp8 = Some(Tensor::zeros((fp8_elems,), DType::U8, device)?);
+        }
+        // mid_* strides are `num_splits` from the launch args — require exact match.
+        let mid_ok = ws.mid_out.as_ref().is_some_and(|t| {
+            t.dim(1).unwrap_or(0) == num_heads && t.dim(2).unwrap_or(0) == num_splits
+        });
+        if !mid_ok {
+            ws.mid_out = Some(Tensor::zeros(
+                (1, num_heads, num_splits, 512),
+                DType::BF16,
+                device,
+            )?);
+        }
+        let mid_lse_ok = ws.mid_lse.as_ref().is_some_and(|t| {
+            t.dim(1).unwrap_or(0) == num_heads && t.dim(2).unwrap_or(0) == num_splits
+        });
+        if !mid_lse_ok {
+            ws.mid_lse = Some(Tensor::zeros(
+                (1, num_heads, num_splits),
+                DType::F32,
+                device,
+            )?);
+        }
+        if ws.out_lse.as_ref().map(|t| t.elem_count()).unwrap_or(0) < num_heads
+            || ws
+                .out_lse
+                .as_ref()
+                .map(|t| t.dim(1).unwrap_or(0))
+                .unwrap_or(0)
+                != num_heads
+        {
+            ws.out_lse = Some(Tensor::zeros((1, num_heads), DType::F32, device)?);
+        }
+        if ws
+            .topk_idxs_pad
+            .as_ref()
+            .map(|t| t.dim(1).unwrap_or(0))
+            .unwrap_or(0)
+            < launch_topk
+        {
+            ws.topk_idxs_pad = Some(Tensor::full(u32::MAX, (1, launch_topk), device)?);
+        }
+        if ws.topk_length.as_ref().map(|t| t.elem_count()).unwrap_or(0) < 1 {
+            ws.topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
+        }
+        ws.decode_kv_len = ws.decode_kv_len.max(kv_len.max(1));
+        ws.decode_kernel_topk = launch_topk;
+        ws.decode_num_heads = num_heads;
+    }
+
+    let guard = flashinfer_sm120_ws();
+    let ws = guard
+        .as_ref()
+        .ok_or_else(|| candle_core::Error::Msg("flashinfer sm120 workspace missing".into()))?;
+
+    let kv_fp8 = ws.kv_fp8.as_ref().unwrap().narrow(0, 0, fp8_elems)?;
+    let mid_out = ws.mid_out.as_ref().unwrap();
+    let mid_lse = ws.mid_lse.as_ref().unwrap();
+    let out_lse = ws.out_lse.as_ref().unwrap();
+    let topk_idxs_pad = ws.topk_idxs_pad.as_ref().unwrap();
+    let topk_length = ws.topk_length.as_ref().unwrap();
+
+    // Pack BF16 KV into multi-page FOOTER layout (page_block_size=64).
+    let kv_2d = kv.reshape((kv_len, 512))?.contiguous()?;
+    let ret = unsafe {
+        kernels::ffi::ds_fp8_kv_pack_footer(
+            get_cuda_ptr(&kv_2d)?,
+            get_cuda_mut_ptr(&kv_fp8)?,
+            kv_len as i32,
+            page_block_size as i32,
+            512,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("ds_fp8_kv_pack_footer error: {}", ret);
+    }
+
+    // Indices: copy actual topk into a -1-padded launch_topk buffer.
+    let indices = if topk == launch_topk {
+        topk_idxs.reshape((1, launch_topk))?.contiguous()?
+    } else {
+        // Re-fill pad with -1 then overwrite the valid prefix.
+        let fill = Tensor::full(u32::MAX, (1, launch_topk), device)?;
+        copy_contiguous_into(topk_idxs_pad, &fill, 0)?;
+        let src = topk_idxs.reshape((topk,))?.contiguous()?;
+        let src = if src.dtype() == DType::U32 {
+            src
+        } else {
+            src.to_dtype(DType::U32)?
+        };
+        copy_contiguous_into(topk_idxs_pad, &src, 0)?;
+        topk_idxs_pad.clone()
+    };
+
+    // topk_length[0] = actual topk (not launch_topk).
+    let tl = Tensor::full(topk as u32, (1,), device)?;
+    copy_contiguous_into(topk_length, &tl, 0)?;
+
+    let q_in = q.reshape((1, num_heads, 512))?.contiguous()?;
+    let sink = attn_sink
+        .reshape((num_heads,))?
+        .to_dtype(DType::F32)?
+        .contiguous()?;
+    let out_in = out.reshape((1, num_heads, 512))?;
+
+    let ret = unsafe {
+        kernels::ffi::flashinfer_dsv4_sparse_decode_sm120(
+            get_cuda_ptr(&q_in)?,
+            get_cuda_ptr(&kv_fp8)?,
+            get_cuda_ptr(&indices)? as *const i32,
+            get_cuda_ptr(topk_length)? as *const i32,
+            get_cuda_ptr(&sink)? as *const f32,
+            get_cuda_mut_ptr(&out_in)?,
+            get_cuda_mut_ptr(out_lse)? as *mut f32,
+            get_cuda_mut_ptr(mid_out)?,
+            get_cuda_mut_ptr(mid_lse)? as *mut f32,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // num_tokens
+            num_heads as i32,
+            launch_topk as i32,
+            num_splits as i32,
+            page_block_size as i32,
+            0,  // extra_topk
+            0,  // extra_page_block_size
+            -1, // chunks_per_block_override (auto)
+            softmax_scale,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("flashinfer sm120 sparse decode error: {}", ret);
+    }
+    Ok(())
+}
+
+/// FlashMLA SM90 path: BF16 prefill via sparse_fwd; FP8 FOOTER decode via sparse_fp8.
+///
+/// Decode (`seq_len == 1`): grow-only workspaces (eager-safe). Optional
+/// [`prewarm_flashmla_decode`] avoids first-token alloc; required for CUDA
+/// graph capture.
+#[cfg(feature = "cuda")]
+fn sparse_attention_flashmla_into(
+    q: &Tensor,
+    kv: &Tensor,
+    attn_sink: &Tensor,
+    topk_idxs: &Tensor,
+    out: &Tensor,
+    seq_len: usize,
+    num_heads: usize,
+    kv_len: usize,
+    topk: usize,
+    softmax_scale: f32,
+    stream: i64,
+) -> Result<()> {
+    let pad_h = flashmla_padded_heads(num_heads).ok_or_else(|| {
+        candle_core::Error::Msg(format!("flashmla unsupported local head count {num_heads}"))
+    })?;
+    let device = q.device();
+    let mut guard = flashmla_ws();
+    let ws = guard.get_or_insert_with(|| FlashMlaWs {
+        tile_meta: None,
+        num_splits: None,
+        lse_accum: None,
+        o_accum: None,
+        lse: None,
+        kv_fp8: None,
+        topk_idxs_pad: None,
+        topk_fill: None,
+        max_logits: None,
+        q_pad: None,
+        out_pad: None,
+        sink_pad: None,
+        decode_kv_len: 0,
+        decode_topk: 0,
+        decode_pad_h: 0,
+        logged: false,
+    });
+
+    // Prefill is outside CUDA graphs — grow-only alloc allowed.
+    if seq_len > 1 {
+        if topk == 0 || topk % 128 != 0 {
+            candle_core::bail!("flashmla prefill requires topk % 128 == 0 (got {topk})");
+        }
+        let q_in = if pad_h == num_heads {
+            q.contiguous()?
+        } else {
+            if ws
+                .q_pad
+                .as_ref()
+                .map(|t| t.dim(0).unwrap_or(0))
+                .unwrap_or(0)
+                < seq_len
+                || ws
+                    .q_pad
+                    .as_ref()
+                    .map(|t| t.dim(1).unwrap_or(0))
+                    .unwrap_or(0)
+                    != pad_h
+            {
+                ws.q_pad = Some(Tensor::zeros((seq_len, pad_h, 512), q.dtype(), device)?);
+            }
+            let q_pad = ws
+                .q_pad
+                .as_ref()
+                .unwrap()
+                .narrow(0, 0, seq_len)?
+                .contiguous()?;
+            let q_src = q.reshape((seq_len, num_heads, 512))?.contiguous()?;
+            for s in 0..seq_len {
+                let src_row = q_src.narrow(0, s, 1)?.contiguous()?;
+                copy_contiguous_into(&q_pad, &src_row, s * pad_h * 512)?;
+            }
+            q_pad
+        };
+        let sink_in = if pad_h == num_heads {
+            attn_sink.to_dtype(DType::F32)?.contiguous()?
+        } else {
+            if ws.sink_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h {
+                ws.sink_pad = Some(Tensor::zeros((pad_h,), DType::F32, device)?);
+            }
+            let sink_pad = ws.sink_pad.as_ref().unwrap().clone();
+            let sink_src = attn_sink
+                .reshape((num_heads,))?
+                .to_dtype(DType::F32)?
+                .contiguous()?;
+            copy_contiguous_into(&sink_pad, &sink_src, 0)?;
+            sink_pad
+        };
+        let out_kernel = if pad_h == num_heads {
+            out.clone()
+        } else {
+            if ws
+                .out_pad
+                .as_ref()
+                .map(|t| t.dim(0).unwrap_or(0))
+                .unwrap_or(0)
+                < seq_len
+                || ws
+                    .out_pad
+                    .as_ref()
+                    .map(|t| t.dim(1).unwrap_or(0))
+                    .unwrap_or(0)
+                    != pad_h
+            {
+                ws.out_pad = Some(Tensor::zeros((seq_len, pad_h, 512), out.dtype(), device)?);
+            }
+            ws.out_pad
+                .as_ref()
+                .unwrap()
+                .narrow(0, 0, seq_len)?
+                .contiguous()?
+        };
+
+        let kv_3d = kv.reshape((kv_len, 1, 512))?.contiguous()?;
+        let indices = topk_idxs.reshape((seq_len, 1, topk))?.contiguous()?;
+        if ws.lse.as_ref().map(|t| t.dim(0).unwrap_or(0)).unwrap_or(0) < seq_len
+            || ws.lse.as_ref().map(|t| t.dim(1).unwrap_or(0)).unwrap_or(0) < pad_h
+        {
+            ws.lse = Some(Tensor::zeros((seq_len, pad_h), DType::F32, device)?);
+        }
+        if ws
+            .max_logits
+            .as_ref()
+            .map(|t| t.dim(0).unwrap_or(0))
+            .unwrap_or(0)
+            < seq_len
+            || ws
+                .max_logits
+                .as_ref()
+                .map(|t| t.dim(1).unwrap_or(0))
+                .unwrap_or(0)
+                < pad_h
+        {
+            ws.max_logits = Some(Tensor::zeros((seq_len, pad_h), DType::F32, device)?);
+        }
+        let lse = ws
+            .lse
+            .as_ref()
+            .unwrap()
+            .narrow(0, 0, seq_len)?
+            .narrow(1, 0, pad_h)?;
+        let max_logits = ws
+            .max_logits
+            .as_ref()
+            .unwrap()
+            .narrow(0, 0, seq_len)?
+            .narrow(1, 0, pad_h)?;
+
+        let ret = unsafe {
+            kernels::ffi::flashmla_dsv4_sparse_prefill(
+                get_cuda_ptr(&q_in)?,
+                get_cuda_ptr(&kv_3d)?,
+                get_cuda_ptr(&indices)? as *const i32,
+                get_cuda_ptr(&sink_in)? as *const f32,
+                std::ptr::null(),
+                get_cuda_mut_ptr(&out_kernel)?,
+                get_cuda_mut_ptr(&lse)? as *mut f32,
+                get_cuda_mut_ptr(&max_logits)? as *mut f32,
+                seq_len as i32,
+                kv_len as i32,
+                pad_h as i32,
+                topk as i32,
+                softmax_scale,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("flashmla sparse prefill error: {}", ret);
+        }
+        if pad_h != num_heads {
+            let out_view = out.reshape((seq_len, num_heads, 512))?;
+            for s in 0..seq_len {
+                let src_row = out_kernel
+                    .narrow(0, s, 1)?
+                    .narrow(1, 0, num_heads)?
+                    .contiguous()?;
+                copy_contiguous_into(&out_view, &src_row, s * num_heads * 512)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Decode: grow-only workspaces (eager). After prewarm, sizes are stable
+    // for CUDA graph capture (no first-touch alloc).
+    if topk == 0 || topk % 64 != 0 {
+        candle_core::bail!("flashmla decode requires topk % 64 == 0 (got {topk})");
+    }
+
+    let page_block_size = ((kv_len + 63) / 64 * 64).max(64);
+    let bytes_per_token = unsafe { kernels::ffi::flashmla_dsv4_bytes_per_token() } as usize;
+    let fp8_elems = page_block_size * bytes_per_token;
+
+    let mut num_sm_parts: i32 = 0;
+    let mut tile_bytes: usize = 0;
+    let mut splits_bytes: usize = 0;
+    let mut lse_accum_bytes: usize = 0;
+    let mut o_accum_bytes: usize = 0;
+    let ret = unsafe {
+        kernels::ffi::flashmla_dsv4_decode_workspace_bytes(
+            1,
+            1,
+            pad_h as i32,
+            &mut num_sm_parts,
+            &mut tile_bytes,
+            &mut splits_bytes,
+            &mut lse_accum_bytes,
+            &mut o_accum_bytes,
+        )
+    };
+    if ret != 0 || num_sm_parts <= 0 {
+        candle_core::bail!("flashmla workspace query failed: {}", ret);
+    }
+
+    if ws.q_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h * 512 {
+        ws.q_pad = Some(Tensor::zeros((1, pad_h, 512), DType::BF16, device)?);
+    }
+    if ws.out_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h * 512 {
+        ws.out_pad = Some(Tensor::zeros((1, pad_h, 512), DType::BF16, device)?);
+    }
+    if ws.sink_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h {
+        ws.sink_pad = Some(Tensor::zeros((pad_h,), DType::F32, device)?);
+    }
+    if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
+        ws.kv_fp8 = Some(Tensor::zeros((fp8_elems,), DType::U8, device)?);
+    }
+    if ws.lse.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h {
+        ws.lse = Some(Tensor::zeros((1, 1, pad_h), DType::F32, device)?);
+    }
+    let tile_elems = tile_bytes / 4;
+    if ws.tile_meta.as_ref().map(|t| t.elem_count()).unwrap_or(0) < tile_elems {
+        ws.tile_meta = Some(Tensor::zeros((tile_elems,), DType::U32, device)?);
+    }
+    let split_elems = splits_bytes / 4;
+    if ws.num_splits.as_ref().map(|t| t.elem_count()).unwrap_or(0) < split_elems {
+        ws.num_splits = Some(Tensor::zeros((split_elems,), DType::U32, device)?);
+    }
+    let lse_acc_elems = lse_accum_bytes / 4;
+    if ws.lse_accum.as_ref().map(|t| t.elem_count()).unwrap_or(0) < lse_acc_elems {
+        ws.lse_accum = Some(Tensor::zeros((lse_acc_elems,), DType::F32, device)?);
+    }
+    let o_acc_elems = o_accum_bytes / 4;
+    if ws.o_accum.as_ref().map(|t| t.elem_count()).unwrap_or(0) < o_acc_elems {
+        ws.o_accum = Some(Tensor::zeros((o_acc_elems,), DType::F32, device)?);
+    }
+    if !ws.logged {
+        eprintln!(
+            "[FlashMLA] SM90 sparse decode active (local_heads={num_heads}, pad_heads={pad_h}, topk={topk})"
+        );
+        ws.logged = true;
+    }
+
+    let q_pad = ws.q_pad.as_ref().unwrap();
+    let q_src = q.reshape((num_heads, 512))?.contiguous()?;
+    copy_contiguous_into(q_pad, &q_src, 0)?;
+
+    let sink_pad = ws.sink_pad.as_ref().unwrap();
+    let sink_src = attn_sink
+        .reshape((num_heads,))?
+        .to_dtype(DType::F32)?
+        .contiguous()?;
+    copy_contiguous_into(sink_pad, &sink_src, 0)?;
+
+    let out_pad = ws.out_pad.as_ref().unwrap();
+    let kv_fp8 = ws.kv_fp8.as_ref().unwrap().narrow(0, 0, fp8_elems)?;
+
+    let ret = unsafe {
+        kernels::ffi::ds_fp8_kv_pack_rows(
+            get_cuda_ptr(kv)?,
+            get_cuda_mut_ptr(&kv_fp8)?,
+            kv_len as i32,
+            page_block_size as i32,
+            512,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("ds_fp8_kv_pack_rows error: {}", ret);
+    }
+
+    let tile_meta = ws
+        .tile_meta
+        .as_ref()
+        .unwrap()
+        .narrow(0, 0, tile_bytes / 4)?;
+    let num_splits = ws
+        .num_splits
+        .as_ref()
+        .unwrap()
+        .narrow(0, 0, splits_bytes / 4)?;
+    let lse_accum = ws
+        .lse_accum
+        .as_ref()
+        .unwrap()
+        .narrow(0, 0, lse_accum_bytes / 4)?;
+    let o_accum = ws
+        .o_accum
+        .as_ref()
+        .unwrap()
+        .narrow(0, 0, o_accum_bytes / 4)?;
+    let lse = ws.lse.as_ref().unwrap();
+
+    let q4 = q_pad.reshape((1, 1, pad_h, 512))?;
+    let idx = topk_idxs.reshape((1, 1, topk))?.contiguous()?;
+    let out4 = out_pad.reshape((1, 1, pad_h, 512))?;
+
+    let ret = unsafe {
+        kernels::ffi::flashmla_dsv4_sparse_decode(
+            get_cuda_ptr(&q4)?,
+            get_cuda_ptr(&kv_fp8)?,
+            get_cuda_ptr(&idx)? as *const i32,
+            std::ptr::null(),
+            get_cuda_ptr(sink_pad)? as *const f32,
+            get_cuda_mut_ptr(&out4)?,
+            get_cuda_mut_ptr(lse)? as *mut f32,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            get_cuda_mut_ptr(&tile_meta)? as *mut i32,
+            get_cuda_mut_ptr(&num_splits)? as *mut i32,
+            get_cuda_mut_ptr(&lse_accum)? as *mut f32,
+            get_cuda_mut_ptr(&o_accum)? as *mut f32,
+            1,
+            1,
+            pad_h as i32,
+            topk as i32,
+            1,
+            page_block_size as i32,
+            0,
+            0,
+            0,
+            num_sm_parts,
+            softmax_scale,
+            stream,
+        )
+    };
+    if ret != 0 {
+        candle_core::bail!("flashmla sparse decode error: {}", ret);
+    }
+
+    if pad_h != num_heads {
+        let src = out_pad.narrow(1, 0, num_heads)?.contiguous()?;
+        copy_contiguous_into(out, &src.reshape(out.dims())?, 0)?;
+    } else {
+        copy_contiguous_into(out, out_pad, 0)?;
+    }
+    Ok(())
+}
+
 /// Sparse indexed attention (works for both prefill and decode).
 pub fn sparse_attention(
     q: &Tensor,
@@ -2638,6 +3638,65 @@ pub fn sparse_attention(
         softmax_scale,
     )?;
     Ok(out)
+}
+
+/// True when FlashMLA SM90 sparse path is available for this head count.
+pub fn flashmla_dsv4_sparse_available(num_heads: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        if flash_sparse_mla_disabled() {
+            return false;
+        }
+        unsafe { kernels::ffi::flashmla_dsv4_supported(num_heads as i32) != 0 }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = num_heads;
+        false
+    }
+}
+
+/// Pack BF16 KV rows `[N, 512]` into FlashMLA/FlashInfer FOOTER FP8 pages.
+pub fn pack_fp8_kv_footer(
+    src_bf16: &Tensor,
+    dst_u8: &Tensor,
+    num_tokens: usize,
+    page_block_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let stream = get_cuda_stream(src_bf16.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_fp8_kv_pack_footer(
+                get_cuda_ptr(src_bf16)?,
+                get_cuda_mut_ptr(dst_u8)?,
+                num_tokens as i32,
+                page_block_size as i32,
+                512,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("pack_fp8_kv_footer CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (src_bf16, dst_u8, num_tokens, page_block_size);
+        candle_core::bail!("pack_fp8_kv_footer requires cuda feature")
+    }
+}
+
+pub fn fp8_kv_bytes_per_token() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() as usize }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        584
+    }
 }
 
 // ============================================================================

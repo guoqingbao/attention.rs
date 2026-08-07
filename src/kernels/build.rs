@@ -50,6 +50,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_sparse_attn.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_quant.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_moe.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_fp8_kv_pack.cu");
+    println!("cargo:rerun-if-changed=src/flashmla_sparse_mla.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_sparse_mla_dsv4.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_batched_gemm_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");
@@ -162,7 +165,7 @@ fn main() -> Result<()> {
     {
         builder = builder
             .arg("-DUSE_CUTLASS")
-            .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
+            .with_cutlass(Some("b46b16d003484063bca4ed365e44095c4c6ed633"));
 
         if compute_cap >= 100 {
             builder = builder
@@ -210,16 +213,17 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_prefill_fp8_fa2.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
-        // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
-        // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support
+        // guoqingbao/flashinfer upstream branch: official DSV4 sparse MLA + GQA/FP8 patches
+        // Pin: github/upstream @ 0f06c230 (DSV4 sparse + GQA patches + fastdiv/flat compat)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "377611ceeb404b31768b17983ac00a2415b26942", // v0.6.7
+            "0f06c2305a276bcb704277705b32025575cb567f", // upstream + fastdiv/flat compat
             vec![
                 "include",
                 "include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export",
                 "include/flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+                "include/flashinfer/attention/sparse_mla_sm120",
                 "csrc/nv_internal",
                 "csrc/nv_internal/include",
                 "csrc/nv_internal/tensorrt_llm/cutlass_extensions/include",
@@ -227,6 +231,7 @@ fn main() -> Result<()> {
             vec![
                 "csrc/nv_internal/cpp/common",
                 "csrc/nv_internal/tensorrt_llm",
+                "csrc/sparse_mla_sm120_decode_dsv4.cu",
             ],
             false,
         );
@@ -353,6 +358,157 @@ fn main() -> Result<()> {
         }
     }
 
+    // FlashMLA (SM90 DeepSeek V4 sparse). Built as a separate static library with
+    // FlashMLA's own CUTLASS pin so it does not clash with attention.rs CUTLASS.
+    let mut link_flashmla = false;
+    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 90 {
+        // cudaforge only treats a checkout as cached when <root>/include exists.
+        // FlashMLA has no top-level include/, so without this marker every build
+        // re-runs `git fetch` (and hangs when GitHub is slow/unreachable).
+        let fm_commit = "05e26647fe840b8baedae486c2d86d5ce4efeb7c";
+        if let Some(cache) = std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h).join(format!(
+                ".cudaforge/git/checkouts/flashmla-{}",
+                &fm_commit[..16]
+            ))
+        }) {
+            if cache.exists() {
+                let _ = std::fs::create_dir_all(cache.join("include"));
+            }
+        }
+        builder = builder.with_git_dependency(
+            "flashmla",
+            "https://github.com/sgl-project/FlashMLA.git",
+            fm_commit,
+            vec![
+                "csrc",
+                "csrc/kerutils/include",
+                "csrc/sm90",
+                "csrc/cutlass/include",
+                "csrc/cutlass/tools/util/include",
+            ],
+            vec![
+                "csrc/sm90/decode/sparse_fp8",
+                "csrc/sm90/prefill/sparse",
+                "csrc/smxx/decode",
+                "csrc/kerutils",
+                "csrc/params.h",
+                "csrc/cutlass",
+            ],
+            true,
+        );
+        let flashmla_root = builder.fetch_git_dependency("flashmla")?;
+        let fm_csrc = flashmla_root.join("csrc");
+        let fm_cutlass_hdr = fm_csrc.join("cutlass/include/cutlass/bfloat16.h");
+        if !fm_cutlass_hdr.exists() {
+            let _ = std::process::Command::new("git")
+                .args([
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--depth",
+                    "1",
+                    "csrc/cutlass",
+                ])
+                .current_dir(&flashmla_root)
+                .status();
+        }
+        if fm_csrc.join("cutlass/include/cutlass/bfloat16.h").exists() {
+            let fm_out = build_dir.join("flashmla_objs");
+            std::fs::create_dir_all(&fm_out)?;
+            let nvcc = std::env::var("CUDACXX").unwrap_or_else(|_| "nvcc".into());
+            let sources = [
+                fm_csrc.join("sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu"),
+                fm_csrc.join("sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu"),
+                fm_csrc.join("sm90/prefill/sparse/instantiations/phase1_k512.cu"),
+                fm_csrc.join("sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu"),
+                fm_csrc.join("smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
+                fm_csrc.join("smxx/decode/combine/combine.cu"),
+                PathBuf::from("src/flashmla_sparse_mla.cu"),
+            ];
+            let mut objs = Vec::new();
+            let mut ok = true;
+            for src in &sources {
+                let obj = fm_out.join(format!(
+                    "{}.o",
+                    src.file_stem().and_then(|s| s.to_str()).unwrap_or("obj")
+                ));
+                let mut cmd = std::process::Command::new(&nvcc);
+                cmd.arg("-c")
+                    .arg(src)
+                    .arg("-o")
+                    .arg(&obj)
+                    .arg("-std=c++20")
+                    .arg("-O3")
+                    .arg("--expt-relaxed-constexpr")
+                    .arg("--expt-extended-lambda")
+                    .arg("--use_fast_math")
+                    .arg("-Xcompiler")
+                    .arg("-fPIC")
+                    .arg("-DATTENTION_RS_USE_FLASHMLA")
+                    .arg(format!("-I{}", fm_csrc.display()))
+                    .arg(format!("-I{}", fm_csrc.join("kerutils/include").display()))
+                    .arg(format!("-I{}", fm_csrc.join("sm90").display()))
+                    .arg(format!("-I{}", fm_csrc.join("cutlass/include").display()))
+                    .arg(format!(
+                        "-I{}",
+                        fm_csrc.join("cutlass/tools/util/include").display()
+                    ))
+                    .arg("-gencode=arch=compute_90a,code=sm_90a");
+                let status = cmd.status();
+                match status {
+                    Ok(st) if st.success() => objs.push(obj),
+                    Ok(st) => {
+                        println!(
+                            "cargo:warning=FlashMLA nvcc failed for {}: status={}",
+                            src.display(),
+                            st
+                        );
+                        ok = false;
+                        break;
+                    }
+                    Err(e) => {
+                        println!("cargo:warning=FlashMLA nvcc spawn failed: {e}");
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !objs.is_empty() {
+                let lib = build_dir.join("libflashmla_dsv4.a");
+                let _ = std::fs::remove_file(&lib);
+                let mut ar = std::process::Command::new("ar");
+                ar.arg("rcs").arg(&lib);
+                for o in &objs {
+                    ar.arg(o);
+                }
+                if ar.status().map(|s| s.success()).unwrap_or(false) {
+                    link_flashmla = true;
+                    // Exclude the in-tree wrapper from the main lib (compiled into flashmla lib).
+                    builder = builder.exclude(&["flashmla_sparse_mla.cu"]);
+                    println!("cargo:warning=FlashMLA DSV4 sparse static lib built");
+                } else {
+                    println!("cargo:warning=Failed to archive FlashMLA objects");
+                }
+            }
+        } else {
+            println!("cargo:warning=FlashMLA CUTLASS missing; sparse FlashMLA stub only");
+        }
+    }
+
+    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 120 {
+        if let Ok(flashinfer_root) = builder.fetch_git_dependency("flashinfer") {
+            let csrc_dir = flashinfer_root.join("csrc");
+            let dsv4_cu = csrc_dir.join("sparse_mla_sm120_decode_dsv4.cu");
+            if dsv4_cu.exists() {
+                builder = builder
+                    .arg("-DATTENTION_RS_USE_FLASHINFER_SPARSE_MLA_SM120")
+                    .source_files(vec![dsv4_cu]);
+                println!("cargo:warning=FlashInfer SM120 DSV4 sparse MLA enabled");
+            }
+        }
+    }
+
     // Target handling
     let mut is_target_msvc = false;
     if let Ok(target) = std::env::var("TARGET") {
@@ -377,6 +533,9 @@ fn main() -> Result<()> {
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
+    if link_flashmla {
+        println!("cargo:rustc-link-lib=static=flashmla_dsv4");
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 

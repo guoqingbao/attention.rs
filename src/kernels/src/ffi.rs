@@ -3877,6 +3877,114 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    // FlashMLA-ABI FP8 FOOTER pack (584 B/token)
+    pub fn ds_fp8_kv_pack_footer(
+        src_bf16: *const c_void,
+        dst_u8: *mut c_void,
+        num_tokens: c_int,
+        page_block_size: c_int,
+        src_stride: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_fp8_kv_pack_rows(
+        src_bf16: *const c_void,
+        dst_page_u8: *mut c_void,
+        num_tokens: c_int,
+        page_block_size: c_int,
+        src_stride: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_fp8_kv_bytes_per_token() -> c_int;
+
+    // FlashMLA SM90 sparse MLA
+    pub fn flashmla_dsv4_supported(num_heads: c_int) -> c_int;
+    pub fn flashmla_dsv4_bytes_per_token() -> c_int;
+    pub fn flashmla_dsv4_decode_workspace_bytes(
+        batch_size: c_int,
+        s_q: c_int,
+        num_heads: c_int,
+        num_sm_parts_out: *mut c_int,
+        tile_meta_bytes_out: *mut usize,
+        num_splits_bytes_out: *mut usize,
+        lse_accum_bytes_out: *mut usize,
+        o_accum_bytes_out: *mut usize,
+    ) -> c_int;
+
+    pub fn flashmla_dsv4_sparse_decode(
+        q_bf16: *const c_void,
+        kv_fp8: *const c_void,
+        indices: *const c_int,
+        topk_length: *const c_int,
+        attn_sink: *const f32,
+        out_bf16: *mut c_void,
+        lse: *mut f32,
+        extra_kv_fp8: *const c_void,
+        extra_indices: *const c_int,
+        extra_topk_length: *const c_int,
+        tile_scheduler_metadata: *mut c_int,
+        num_splits: *mut c_int,
+        lse_accum: *mut f32,
+        o_accum: *mut f32,
+        batch_size: c_int,
+        s_q: c_int,
+        num_heads: c_int,
+        topk: c_int,
+        num_blocks: c_int,
+        page_block_size: c_int,
+        extra_num_blocks: c_int,
+        extra_page_block_size: c_int,
+        extra_topk: c_int,
+        num_sm_parts: c_int,
+        sm_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn flashmla_dsv4_sparse_prefill(
+        q_bf16: *const c_void,
+        kv_bf16: *const c_void,
+        indices: *const c_int,
+        attn_sink: *const f32,
+        topk_length: *const c_int,
+        out_bf16: *mut c_void,
+        lse: *mut f32,
+        max_logits: *mut f32,
+        s_q: c_int,
+        s_kv: c_int,
+        num_heads: c_int,
+        topk: c_int,
+        sm_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    // FlashInfer SM120 sparse MLA
+    pub fn flashinfer_dsv4_sparse_sm120_supported(num_heads: c_int, topk: c_int) -> c_int;
+    pub fn flashinfer_dsv4_sparse_decode_sm120(
+        q_bf16: *const c_void,
+        kv_fp8: *const c_void,
+        indices: *const c_int,
+        topk_length: *const c_int,
+        attn_sink: *const f32,
+        out_bf16: *mut c_void,
+        out_lse: *mut f32,
+        mid_out_bf16: *mut c_void,
+        mid_lse: *mut f32,
+        extra_kv_fp8: *const c_void,
+        extra_indices: *const c_int,
+        extra_topk_length: *const c_int,
+        num_tokens: c_int,
+        num_heads: c_int,
+        topk: c_int,
+        num_splits: c_int,
+        page_block_size: c_int,
+        extra_topk: c_int,
+        extra_page_block_size: c_int,
+        chunks_per_block_override: c_int,
+        sm_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
     // ======== DeepSeek V4 Compressor kernels (from ds_compressor.cu) ========
 
     pub fn ds_apply_rope_hidden(

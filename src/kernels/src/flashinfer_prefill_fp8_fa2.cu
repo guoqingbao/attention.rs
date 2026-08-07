@@ -217,7 +217,7 @@ void flashinfer_prefill_plan_fp8_fa2(
         enable_cuda_graph,
         static_cast<uint32_t>(out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
         window_left > 0 ? window_left : -1, 0, false, static_cast<int64_t>(0),
-        stream
+        /*uniform_q_len=*/static_cast<int64_t>(0), stream
     );
     if (!ValidatePrefillPlanInfoBounds(
             plan_info, workspace_float_size, workspace_int_size)) {

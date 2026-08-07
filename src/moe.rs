@@ -3542,9 +3542,9 @@ pub fn moe_gemm_w2(
     let e = planes.dim(0)?;
     let size_m = experts_ids.elem_count();
 
-    // Always reject out-of-range expert ids (prefill used to skip this and
-    // silently OOB-read weight rows → NaNs that poisoned later decode steps).
-    {
+    // Prefill (eager): host-side bounds check. Decode runs under CUDA graph
+    // capture — `to_vec1` is a D2H sync that invalidates stream capture.
+    if is_prefill {
         let route_ids = experts_ids
             .to_dtype(candle_core::DType::U32)?
             .contiguous()?
@@ -3561,50 +3561,30 @@ pub fn moe_gemm_w2(
         }
     }
 
-    // Only use the compact path for decode.  The prefill route list contains
-    // one entry per token/expert assignment and can be larger than the number
-    // of unique experts; treating that route list as the expert dimension
-    // makes the grouped WMMA path both wasteful and fragile for small prompts.
-    //
-    // The unpack-by-ids kernel consumes a compact expert table, while
-    // `moe_gemm_fp8` consumes one compact expert id per sorted route.  The old
-    // code passed the route list as both, so duplicate routes produced duplicate
-    // weight rows and an invalid grouped-expert contract on decode.  Compact
-    // unique ids here and remap the sorted route list to those rows.
+    // Decode: unpack one weight row per route assignment (duplicates allowed)
+    // and remap to local `[0..size_m)` with a device arange — no D2H/H2D.
+    // Prefill with large M uses full unpack. Host-side unique compaction used
+    // to D2H+H2D every decode step and broke CUDA graph capture.
     let force_full = std::env::var("XINFER_W2_FULL_UNPACK").is_ok();
-    let (weights_u8, scales_f32, compact_route_ids) = if !force_full
-        && !is_prefill
-        && size_m > 0
-        && size_m < e
-    {
-        let route_ids_tensor = experts_ids
-            .to_dtype(candle_core::DType::U32)?
-            .contiguous()?;
-        let route_ids = route_ids_tensor.to_vec1::<u32>()?;
-        let mut unique = Vec::with_capacity(route_ids.len());
-        let mut remapped = Vec::with_capacity(route_ids.len());
-        for expert in route_ids {
-            let compact = match unique.iter().position(|&id| id == expert) {
-                Some(index) => index,
-                None => {
-                    let index = unique.len();
-                    unique.push(expert);
-                    index
-                }
-            };
-            remapped.push(compact as u32);
-        }
-        let unique_len = unique.len();
-        let unique_ids = Tensor::from_vec(unique, (unique_len,), experts_ids.device())?;
-        let route_ids =
-            Tensor::from_vec(remapped, experts_ids.dims().to_vec(), experts_ids.device())?;
-        let (w, s) =
-            crate::moe_w2::moe_w2_unpack_by_ids_to_fp8(planes, scale_planes, &unique_ids, n, k)?;
-        (w, s, route_ids)
-    } else {
-        let (w, s) = crate::moe_w2::moe_w2_unpack_to_fp8(planes, scale_planes, n, k)?;
-        (w, s, experts_ids.clone())
-    };
+    let (weights_u8, scales_f32, compact_route_ids) =
+        if !force_full && !is_prefill && size_m > 0 && size_m < e {
+            let route_ids_tensor = experts_ids
+                .to_dtype(candle_core::DType::U32)?
+                .contiguous()?;
+            let (w, s) = crate::moe_w2::moe_w2_unpack_by_ids_to_fp8(
+                planes,
+                scale_planes,
+                &route_ids_tensor,
+                n,
+                k,
+            )?;
+            let compact = Tensor::arange(0u32, size_m as u32, experts_ids.device())?
+                .reshape(experts_ids.dims())?;
+            (w, s, compact)
+        } else {
+            let (w, s) = crate::moe_w2::moe_w2_unpack_to_fp8(planes, scale_planes, n, k)?;
+            (w, s, experts_ids.clone())
+        };
 
     // W2 uses block_size_n=1 / block_size_k=32 scales. The decode FP8 GEMV
     // path has been observed to illegal-address with that layout on Hopper;
