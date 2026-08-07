@@ -1101,6 +1101,279 @@ cudaError_t ds_compressor_overlap_decode_at_graph(
   return cudaGetLastError();
 }
 
+// ============================================================================
+// Continued-prefill fused epilogues. Same pooling semantics as the standard
+// prefill epilogues, except the FIRST bulk row's "old block" (overlap) or head
+// routes (non-overlap) are read from the decoder state tensors instead of the
+// chunk arrays — those tokens belong to the previous chunk. The state's
+// scores already include the APE bias, so state-sourced routes skip the APE
+// add. `weighted`/`out` are indexed by `c` (0-based within the bulk) and must
+// be passed already offset by `first_row * head_dim`.
+// ============================================================================
+
+__global__ void ds_compressor_overlap_fused_epilogue_cont_kernel(
+    const float *__restrict__ scores_in,
+    const float *__restrict__ values_in,
+    const float *__restrict__ ape,
+    const __nv_bfloat16 *__restrict__ norm,
+    float *__restrict__ weighted,
+    __nv_bfloat16 *__restrict__ out,
+    const float *__restrict__ state_kv,
+    const float *__restrict__ state_scores,
+    int bulk_rows,
+    int seq_len,
+    int chunk_start,
+    int head_dim,
+    int sv_n_stride,
+    float eps) {
+  int c = blockIdx.x;
+  if (c >= bulk_rows) return;
+  int tid = threadIdx.x;
+  int n_block = blockDim.x;
+
+  constexpr int ratio = 4;
+  constexpr int routes = 8;
+  constexpr float neg_inf = -3.4028234663852886e38f;
+  const int state_dim = 2 * head_dim;
+  // Absolute token of the first route of this block's new half.
+  const int block_token = chunk_start + (c * ratio + (4 - (chunk_start % 4)) % 4);
+
+  float sum_sq_local = 0.0f;
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float scores[routes];
+    float values[routes];
+#pragma unroll
+    for (int r = 0; r < routes; ++r) {
+      if (r < ratio) {
+        if (c == 0) {
+          // Old block lives in the decoder state (scores already include APE).
+          scores[r] = state_scores[r * state_dim + d];
+          values[r] = state_kv[r * state_dim + d];
+        } else {
+          int token = block_token - ratio + r;  // previous block's tokens
+          int arr = token - chunk_start;
+          scores[r] = scores_in[arr * sv_n_stride + d] + ape[r * state_dim + d];
+          values[r] = values_in[arr * sv_n_stride + d];
+        }
+      } else {
+        int lr = r - ratio;
+        int arr = block_token - chunk_start + lr;
+        scores[r] = scores_in[arr * sv_n_stride + head_dim + d] +
+                    ape[lr * state_dim + head_dim + d];
+        values[r] = values_in[arr * sv_n_stride + head_dim + d];
+      }
+    }
+
+    float m = scores[0];
+#pragma unroll
+    for (int r = 1; r < routes; ++r) m = fmaxf(m, scores[r]);
+
+    float denom = 0.0f;
+    float acc = 0.0f;
+#pragma unroll
+    for (int r = 0; r < routes; ++r) {
+      float p = __expf(scores[r] - m);
+      denom += p;
+      acc += p * values[r];
+    }
+    float w = acc / denom;
+    weighted[c * head_dim + d] = w;
+    float rounded = __bfloat162float(__float2bfloat16(w));
+    sum_sq_local += rounded * rounded;
+  }
+
+  __shared__ float warp_sums[32];
+  int lane = tid & 31;
+  int warp = tid >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    sum_sq_local += __shfl_down_sync(0xffffffffu, sum_sq_local, off);
+  }
+  if (lane == 0) warp_sums[warp] = sum_sq_local;
+  __syncthreads();
+
+  int n_warps = (n_block + 31) >> 5;
+  float total = (tid < n_warps) ? warp_sums[tid] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      total += __shfl_down_sync(0xffffffffu, total, off);
+    }
+  }
+  __shared__ float total_sum;
+  if (tid == 0) total_sum = total;
+  __syncthreads();
+
+  float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float w = __bfloat162float(
+        __float2bfloat16(weighted[c * head_dim + d]));
+    float ns = __bfloat162float(norm[d]);
+    out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
+  }
+}
+
+__global__ void ds_compressor_nonoverlap_fused_epilogue_cont_kernel(
+    const float *__restrict__ scores_in,
+    const float *__restrict__ values_in,
+    const float *__restrict__ ape,
+    const __nv_bfloat16 *__restrict__ norm,
+    float *__restrict__ weighted,
+    __nv_bfloat16 *__restrict__ out,
+    const float *__restrict__ state_kv,
+    const float *__restrict__ state_scores,
+    int bulk_rows,
+    int seq_len,
+    int chunk_start,
+    int head_dim,
+    int ratio,
+    int sv_n_stride,
+    float eps) {
+  int c = blockIdx.x;
+  if (c >= bulk_rows) return;
+  int tid = threadIdx.x;
+  int n_block = blockDim.x;
+
+  constexpr float neg_inf = -3.4028234663852886e38f;
+  // Token offset of the head routes taken from the decoder state.
+  const int state_head = chunk_start % ratio;
+
+  float sum_sq_local = 0.0f;
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float m = neg_inf;
+    for (int r = 0; r < ratio; ++r) {
+      float s;
+      if (c == 0 && r < state_head) {
+        s = state_scores[r * head_dim + d];  // already includes APE
+      } else {
+        int arr = (c * ratio + r) - state_head;
+        s = scores_in[arr * sv_n_stride + d] + ape[r * head_dim + d];
+      }
+      m = fmaxf(m, s);
+    }
+
+    float denom = 0.0f;
+    float acc = 0.0f;
+    for (int r = 0; r < ratio; ++r) {
+      float s;
+      float v;
+      if (c == 0 && r < state_head) {
+        s = state_scores[r * head_dim + d];
+        v = state_kv[r * head_dim + d];
+      } else {
+        int arr = (c * ratio + r) - state_head;
+        s = scores_in[arr * sv_n_stride + d] + ape[r * head_dim + d];
+        v = values_in[arr * sv_n_stride + d];
+      }
+      float p = __expf(s - m);
+      denom += p;
+      acc += p * v;
+    }
+    float w = acc / denom;
+    weighted[c * head_dim + d] = w;
+    float rounded = __bfloat162float(__float2bfloat16(w));
+    sum_sq_local += rounded * rounded;
+  }
+
+  __shared__ float warp_sums[32];
+  int lane = tid & 31;
+  int warp = tid >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    sum_sq_local += __shfl_down_sync(0xffffffffu, sum_sq_local, off);
+  }
+  if (lane == 0) warp_sums[warp] = sum_sq_local;
+  __syncthreads();
+
+  int n_warps = (n_block + 31) >> 5;
+  float total = (tid < n_warps) ? warp_sums[tid] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      total += __shfl_down_sync(0xffffffffu, total, off);
+    }
+  }
+  __shared__ float total_sum;
+  if (tid == 0) total_sum = total;
+  __syncthreads();
+
+  float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float w = __bfloat162float(
+        __float2bfloat16(weighted[c * head_dim + d]));
+    float ns = __bfloat162float(norm[d]);
+    out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
+  }
+}
+
+cudaError_t ds_compressor_overlap_prefill_cont_epilogue(
+    const float *scores,
+    const float *values,
+    const float *ape,
+    const __nv_bfloat16 *norm,
+    float *weighted,
+    __nv_bfloat16 *out,
+    const float *state_kv,
+    const float *state_scores,
+    int bulk_rows,
+    int seq_len,
+    int chunk_start,
+    int head_dim,
+    float eps,
+    cudaStream_t stream) {
+  if (scores == nullptr || values == nullptr || ape == nullptr || norm == nullptr ||
+      weighted == nullptr || out == nullptr || state_kv == nullptr ||
+      state_scores == nullptr || bulk_rows <= 0 || seq_len <= 0 || head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int n = 2 * head_dim;
+  int epilogue_threads = head_dim;
+  if (epilogue_threads < 32) epilogue_threads = 32;
+  if (epilogue_threads > 1024) epilogue_threads = 1024;
+  epilogue_threads = (epilogue_threads + 31) & ~31;
+  ds_compressor_overlap_fused_epilogue_cont_kernel<<<bulk_rows, epilogue_threads, 0, stream>>>(
+      scores, values, ape, norm, weighted, out, state_kv, state_scores,
+      bulk_rows, seq_len, chunk_start, head_dim, n, eps);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_compressor_nonoverlap_prefill_cont_epilogue(
+    const float *scores,
+    const float *values,
+    const float *ape,
+    const __nv_bfloat16 *norm,
+    float *weighted,
+    __nv_bfloat16 *out,
+    const float *state_kv,
+    const float *state_scores,
+    int bulk_rows,
+    int seq_len,
+    int chunk_start,
+    int head_dim,
+    int ratio,
+    float eps,
+    cudaStream_t stream) {
+  if (scores == nullptr || values == nullptr || ape == nullptr || norm == nullptr ||
+      weighted == nullptr || out == nullptr || state_kv == nullptr ||
+      state_scores == nullptr || bulk_rows <= 0 || seq_len <= 0 || head_dim <= 0 ||
+      ratio <= 1 || ratio > 128) {
+    return cudaErrorInvalidValue;
+  }
+  int epilogue_threads = head_dim;
+  if (epilogue_threads < 32) epilogue_threads = 32;
+  if (epilogue_threads > 1024) epilogue_threads = 1024;
+  epilogue_threads = (epilogue_threads + 31) & ~31;
+  ds_compressor_nonoverlap_fused_epilogue_cont_kernel<<<bulk_rows, epilogue_threads, 0, stream>>>(
+      scores, values, ape, norm, weighted, out, state_kv, state_scores,
+      bulk_rows, seq_len, chunk_start, head_dim, ratio, head_dim, eps);
+  return cudaGetLastError();
+}
+
+
 cudaError_t ds_v4_compressor_prewarm(int64_t stream_) {
   const cudaStream_t stream = (cudaStream_t)stream_;
   DsCompressorGemmScratch *scratch_ptr = nullptr;

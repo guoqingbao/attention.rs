@@ -524,6 +524,52 @@ __global__ void ds_indexer_topk_decode_kernel(
   }
 }
 
+// Large-N path: serial select from global memory (no O(N) shared mem).
+__global__ void ds_indexer_topk_decode_global_kernel(
+    const float *__restrict__ scores,
+    int *__restrict__ topk_idxs,
+    int compressed_len,
+    int topk,
+    int offset) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  // Mark selected entries by writing -inf into a scratch slot via local mask:
+  // we cannot mutate `scores` (may be reused), so scan with exclusion list.
+  int selected[512];
+  int n_sel = topk < 512 ? topk : 512;
+  for (int route = 0; route < n_sel; ++route) {
+    selected[route] = -1;
+  }
+  for (int route = 0; route < topk; ++route) {
+    int best_idx = -1;
+    float best_score = -3.4028234663852886e38f;
+    for (int candidate = 0; candidate < compressed_len; ++candidate) {
+      bool taken = false;
+      int lim = route < n_sel ? route : n_sel;
+      for (int s = 0; s < lim; ++s) {
+        if (selected[s] == candidate) {
+          taken = true;
+          break;
+        }
+      }
+      if (taken) {
+        continue;
+      }
+      float score = scores[candidate];
+      if (score > best_score) {
+        best_score = score;
+        best_idx = candidate;
+      }
+    }
+    topk_idxs[route] =
+        best_idx >= 0 && best_score > -3.0e38f ? best_idx + offset : -1;
+    if (best_idx >= 0 && route < n_sel) {
+      selected[route] = best_idx;
+    }
+  }
+}
+
 template <int sort_n>
 __global__ void ds_indexer_topk_decode_bitonic_kernel(
     const float *__restrict__ scores,
@@ -844,8 +890,10 @@ cudaError_t ds_indexer_topk_decode(
     ds_indexer_topk_decode_bitonic_kernel<sort_n><<<1, threads, shared_bytes, stream>>>(
         scores, topk_idxs, compressed_len, topk, offset);
   } else {
-    size_t shared_bytes = (size_t)compressed_len * sizeof(float);
-    ds_indexer_topk_decode_kernel<<<1, threads, shared_bytes, stream>>>(
+    // Large N: select in global memory. Do not request O(N) dynamic shared
+    // memory (that exceeds the device limit once sparse capacity comes from
+    // config max_position_embeddings, e.g. 1M → 256k compressed slots).
+    ds_indexer_topk_decode_global_kernel<<<1, 1, 0, stream>>>(
         scores, topk_idxs, compressed_len, topk, offset);
   }
   return cudaGetLastError();
@@ -988,6 +1036,253 @@ cudaError_t ds_window_topk_indices_decode_from_pos(
       out, positions, window_size);
   return cudaGetLastError();
 }
+
+
+// ============================================================================
+// Continued-prefill (position-aware) kernels.
+// ============================================================================
+
+__global__ void ds_indexer_mask_scores_prefill_by_pos_kernel(
+    float *__restrict__ scores,
+    int seq_len,
+    int compressed_len,
+    const int64_t *__restrict__ positions,
+    int ratio) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * compressed_len;
+  if (idx >= total || ratio <= 0) return;
+  int token = idx / compressed_len;
+  int compressed = idx - token * compressed_len;
+  int64_t pos = positions[token];
+  int valid = (int)((pos + 1) / ratio);
+  if (compressed >= valid) scores[idx] = -INFINITY;
+}
+
+__global__ void ds_indexer_topk_prefill_from_pos_kernel(
+    const float *__restrict__ scores,
+    int *__restrict__ topk_idxs,
+    int seq_len,
+    int compressed_len,
+    int topk,
+    const int64_t *__restrict__ positions,
+    int ratio,
+    int offset) {
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+
+  extern __shared__ float scratch[];
+  float *select_scores = scratch;
+  float *thread_scores = select_scores + compressed_len;
+  int *thread_indices = reinterpret_cast<int *>(thread_scores + blockDim.x);
+  int64_t pos = positions[token];
+  int valid = (int)((pos + 1) / ratio);
+  for (int idx = threadIdx.x; idx < compressed_len; idx += blockDim.x) {
+    select_scores[idx] =
+        idx < valid ? scores[token * compressed_len + idx] : -3.4028234663852886e38f;
+  }
+  __syncthreads();
+
+  for (int route = 0; route < topk; ++route) {
+    int best_idx = -1;
+    float best_score = -3.4028234663852886e38f;
+    for (int candidate = threadIdx.x; candidate < compressed_len; candidate += blockDim.x) {
+      float score = select_scores[candidate];
+      if (score > best_score) {
+        best_score = score;
+        best_idx = candidate;
+      }
+    }
+    thread_scores[threadIdx.x] = best_score;
+    thread_indices[threadIdx.x] = best_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        float other_score = thread_scores[threadIdx.x + stride];
+        int other_idx = thread_indices[threadIdx.x + stride];
+        float current_score = thread_scores[threadIdx.x];
+        int current_idx = thread_indices[threadIdx.x];
+        if (other_score > current_score ||
+            (other_score == current_score && other_idx >= 0 &&
+             (current_idx < 0 || other_idx < current_idx))) {
+          thread_scores[threadIdx.x] = other_score;
+          thread_indices[threadIdx.x] = other_idx;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      int best_idx = thread_indices[0];
+      float best_score = thread_scores[0];
+      topk_idxs[token * topk + route] =
+          best_idx >= 0 && best_score > -3.0e38f ? best_idx + offset : -1;
+      if (best_idx >= 0) {
+        select_scores[best_idx] = -3.4028234663852886e38f;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void ds_window_topk_indices_prefill_from_pos_kernel(
+    int *__restrict__ out,
+    const int64_t *__restrict__ positions,
+    int seq_len,
+    int window_size) {
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+  int idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (idx >= window_size) return;
+  int start_pos = static_cast<int>(positions[token]);
+  if (start_pos >= window_size - 1) {
+    int pos = start_pos % window_size;
+    int first_count = window_size - 1 - pos;
+    out[token * window_size + idx] =
+        idx < first_count ? pos + 1 + idx : idx - first_count;
+  } else {
+    out[token * window_size + idx] = idx <= start_pos ? idx : -1;
+  }
+}
+
+__global__ void ds_compress_topk_indices_prefill_from_pos_kernel(
+    int *__restrict__ out,
+    const int64_t *__restrict__ positions,
+    int seq_len,
+    int compressed,
+    int offset,
+    int ratio) {
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+  int idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (idx >= compressed) return;
+  int start_pos = static_cast<int>(positions[token]);
+  int valid = (start_pos + 1) / ratio;
+  out[token * compressed + idx] = idx < valid ? offset + idx : -1;
+}
+
+__global__ void ds_write_window_rows_from_pos_kernel(
+    __nv_bfloat16 *__restrict__ cache,
+    const __nv_bfloat16 *__restrict__ rows,
+    const int64_t *__restrict__ positions,
+    int seq_len,
+    int window_size,
+    int head_dim) {
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+  int dim = blockIdx.y * blockDim.x + threadIdx.x;
+  if (dim >= head_dim) return;
+  int start_pos = static_cast<int>(positions[token]);
+  int slot = start_pos % window_size;
+  cache[slot * head_dim + dim] = rows[token * head_dim + dim];
+}
+
+
+cudaError_t ds_indexer_mask_scores_prefill_by_pos(
+    float *scores,
+    int seq_len,
+    int compressed_len,
+    const int64_t *positions,
+    int ratio,
+    cudaStream_t stream) {
+  if (scores == nullptr || positions == nullptr || seq_len <= 0 || compressed_len <= 0 ||
+      ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total = seq_len * compressed_len;
+  int blocks = (total + threads - 1) / threads;
+  ds_indexer_mask_scores_prefill_by_pos_kernel<<<blocks, threads, 0, stream>>>(
+      scores, seq_len, compressed_len, positions, ratio);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_indexer_topk_prefill_from_pos(
+    const float *scores,
+    int *topk_idxs,
+    int seq_len,
+    int compressed_len,
+    int topk,
+    const int64_t *positions,
+    int ratio,
+    int offset,
+    cudaStream_t stream) {
+  if (scores == nullptr || topk_idxs == nullptr || positions == nullptr ||
+      seq_len <= 0 || compressed_len <= 0 || topk <= 0 || ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  // Prefer serial shared-mem select when it fits; otherwise still use it with
+  // a hard cap check — fall back to per-token serial over global for huge N.
+  constexpr int threads = 256;
+  if (compressed_len <= 8192) {
+    size_t shared_bytes =
+        (size_t)compressed_len * sizeof(float) + threads * (sizeof(float) + sizeof(int));
+    ds_indexer_topk_prefill_from_pos_kernel<<<seq_len, threads, shared_bytes, stream>>>(
+        scores, topk_idxs, seq_len, compressed_len, topk, positions, ratio, offset);
+  } else {
+    // Huge compressed_len: reuse the same kernel but it needs O(N) smem — reject.
+    return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+cudaError_t ds_window_topk_indices_prefill_from_pos(
+    int *out,
+    const int64_t *positions,
+    int seq_len,
+    int window_size,
+    cudaStream_t stream) {
+  if (out == nullptr || positions == nullptr || seq_len <= 0 || window_size <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks_y = (window_size + threads - 1) / threads;
+  dim3 grid(seq_len, blocks_y);
+  ds_window_topk_indices_prefill_from_pos_kernel<<<grid, threads, 0, stream>>>(
+      out, positions, seq_len, window_size);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_compress_topk_indices_prefill_from_pos(
+    int *out,
+    const int64_t *positions,
+    int seq_len,
+    int compressed,
+    int offset,
+    int ratio,
+    cudaStream_t stream) {
+  if (out == nullptr || positions == nullptr || seq_len <= 0 || compressed <= 0 ||
+      ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks_y = (compressed + threads - 1) / threads;
+  dim3 grid(seq_len, blocks_y);
+  ds_compress_topk_indices_prefill_from_pos_kernel<<<grid, threads, 0, stream>>>(
+      out, positions, seq_len, compressed, offset, ratio);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_write_window_rows_from_pos(
+    __nv_bfloat16 *cache,
+    const __nv_bfloat16 *rows,
+    const int64_t *positions,
+    int seq_len,
+    int window_size,
+    int head_dim,
+    cudaStream_t stream) {
+  if (cache == nullptr || rows == nullptr || positions == nullptr ||
+      seq_len <= 0 || window_size <= 0 || head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks_y = (head_dim + threads - 1) / threads;
+  dim3 grid(seq_len, blocks_y);
+  ds_write_window_rows_from_pos_kernel<<<grid, threads, 0, stream>>>(
+      cache, rows, positions, seq_len, window_size, head_dim);
+  return cudaGetLastError();
+}
+
 
 cudaError_t ds_v4_indexer_fp4_prewarm(int max_elems, int64_t stream_) {
   if (max_elems <= 0) return cudaErrorInvalidValue;

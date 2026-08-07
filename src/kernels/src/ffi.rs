@@ -4049,6 +4049,90 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn ds_indexer_mask_scores_prefill_by_pos(
+        scores: *mut f32,
+        seq_len: c_int,
+        compressed_len: c_int,
+        positions: *const i64,
+        ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_indexer_topk_prefill_from_pos(
+        scores: *const f32,
+        topk_idxs: *mut c_int,
+        seq_len: c_int,
+        compressed_len: c_int,
+        topk: c_int,
+        positions: *const i64,
+        ratio: c_int,
+        offset: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_window_topk_indices_prefill_from_pos(
+        out: *mut c_int,
+        positions: *const i64,
+        seq_len: c_int,
+        window_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compress_topk_indices_prefill_from_pos(
+        out: *mut c_int,
+        positions: *const i64,
+        seq_len: c_int,
+        compressed: c_int,
+        offset: c_int,
+        ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_write_window_rows_from_pos(
+        cache: *mut c_void,
+        rows: *const c_void,
+        positions: *const i64,
+        seq_len: c_int,
+        window_size: c_int,
+        head_dim: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_overlap_prefill_cont_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        state_kv: *const f32,
+        state_scores: *const f32,
+        bulk_rows: c_int,
+        seq_len: c_int,
+        chunk_start: c_int,
+        head_dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_compressor_nonoverlap_prefill_cont_epilogue(
+        scores: *const f32,
+        values: *const f32,
+        ape: *const f32,
+        norm: *const c_void,
+        weighted: *mut f32,
+        out: *mut c_void,
+        state_kv: *const f32,
+        state_scores: *const f32,
+        bulk_rows: c_int,
+        seq_len: c_int,
+        chunk_start: c_int,
+        head_dim: c_int,
+        ratio: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
     pub fn ds_concat_topk_indices(
         a: *const c_int,
         b: *const c_int,

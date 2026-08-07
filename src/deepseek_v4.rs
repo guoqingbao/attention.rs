@@ -910,6 +910,13 @@ pub fn compressor_nonoverlap_prefill(
     #[cfg(feature = "cuda")]
     {
         let compressed_len = seq_len / ratio;
+        // Short / unaligned prompts: no compressed rows yet. Callers should
+        // usually guard with seq_len >= ratio; keep this defensive.
+        if compressed_len == 0 || ratio <= 1 {
+            let weighted = Tensor::zeros((0, head_dim), DType::F32, x.device())?;
+            let out = Tensor::zeros((0, head_dim), DType::BF16, x.device())?;
+            return Ok((weighted, out));
+        }
         // Keep BF16 operands and accumulate into F32.  Converting both
         // operands to F32 before Candle's matmul selected the SM90 default
         // math mode (and potentially TF32); it is not the OpenInfer path.
@@ -975,6 +982,11 @@ pub fn compressor_overlap_prefill(
     {
         let ratio = 4usize;
         let compressed_len = seq_len / ratio;
+        if compressed_len == 0 {
+            let weighted = Tensor::zeros((0, head_dim), DType::F32, x.device())?;
+            let out = Tensor::zeros((0, head_dim), DType::BF16, x.device())?;
+            return Ok((weighted, out));
+        }
         // Overlap projections go to 2*head_dim and use BF16 operands with F32
         // accumulation, matching the reference layout and math mode.
         let scores = compressor_bf16_linear_f32(x, wgate, seq_len, _hidden_dim, 2 * head_dim)?;
@@ -1668,6 +1680,325 @@ pub fn indexer_mask_scores_by_position(
     {
         let _ = (scores, positions, ratio);
         candle_core::bail!("indexer_mask_scores_by_position requires cuda feature")
+    }
+}
+
+/// Per-query causal mask for indexer scores during (possibly continued) prefill.
+///
+/// scores: [seq_len, compressed_len] F32, positions: [seq_len] I64 absolute.
+/// Sets `scores[q, c] = -inf` for `c >= (positions[q] + 1) / ratio`.
+pub fn indexer_mask_scores_prefill_by_pos(
+    scores: &Tensor,
+    positions: &Tensor,
+    ratio: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let (seq_len, compressed_len) = scores.dims2()?;
+        if seq_len == 0 || compressed_len == 0 || ratio == 0 {
+            return Ok(());
+        }
+        let stream = get_cuda_stream(scores.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_indexer_mask_scores_prefill_by_pos(
+                get_cuda_mut_ptr(scores)? as *mut f32,
+                seq_len as i32,
+                compressed_len as i32,
+                get_cuda_ptr(positions)? as *const i64,
+                ratio as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("indexer_mask_scores_prefill_by_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (scores, positions, ratio);
+        candle_core::bail!("indexer_mask_scores_prefill_by_pos requires cuda feature")
+    }
+}
+
+/// Top-k from indexer scores with per-query absolute positions (continued prefill).
+pub fn indexer_topk_prefill_from_pos(
+    scores: &Tensor,
+    positions: &Tensor,
+    seq_len: usize,
+    compressed_len: usize,
+    topk: usize,
+    ratio: usize,
+    offset: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let topk_idxs = Tensor::zeros((seq_len, topk), DType::U32, scores.device())?;
+        let stream = get_cuda_stream(scores.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_indexer_topk_prefill_from_pos(
+                get_cuda_ptr(scores)? as *const f32,
+                get_cuda_mut_ptr(&topk_idxs)? as *mut i32,
+                seq_len as i32,
+                compressed_len as i32,
+                topk as i32,
+                get_cuda_ptr(positions)? as *const i64,
+                ratio as i32,
+                offset as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("indexer_topk_prefill_from_pos CUDA error: {}", ret);
+        }
+        Ok(topk_idxs)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            scores,
+            positions,
+            seq_len,
+            compressed_len,
+            topk,
+            ratio,
+            offset,
+        );
+        candle_core::bail!("indexer_topk_prefill_from_pos requires cuda feature")
+    }
+}
+
+/// Per-query ring-buffer window indices for (possibly continued) prefill.
+pub fn window_topk_indices_prefill_from_pos(
+    positions: &Tensor,
+    window_size: usize,
+    seq_len: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let out = Tensor::zeros((seq_len, window_size), DType::U32, positions.device())?;
+        let stream = get_cuda_stream(positions.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_window_topk_indices_prefill_from_pos(
+                get_cuda_mut_ptr(&out)? as *mut i32,
+                get_cuda_ptr(positions)? as *const i64,
+                seq_len as i32,
+                window_size as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("window_topk_indices_prefill_from_pos CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (positions, window_size, seq_len);
+        candle_core::bail!("window_topk_indices_prefill_from_pos requires cuda feature")
+    }
+}
+
+/// Per-query compressed-cache indices for (possibly continued) prefill.
+pub fn compress_topk_indices_prefill_from_pos(
+    positions: &Tensor,
+    compressed: usize,
+    offset: usize,
+    ratio: usize,
+    seq_len: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        let out = Tensor::zeros((seq_len, compressed), DType::U32, positions.device())?;
+        let stream = get_cuda_stream(positions.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compress_topk_indices_prefill_from_pos(
+                get_cuda_mut_ptr(&out)? as *mut i32,
+                get_cuda_ptr(positions)? as *const i64,
+                seq_len as i32,
+                compressed as i32,
+                offset as i32,
+                ratio as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compress_topk_indices_prefill_from_pos CUDA error: {}", ret);
+        }
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (positions, compressed, offset, ratio, seq_len);
+        candle_core::bail!("compress_topk_indices_prefill_from_pos requires cuda feature")
+    }
+}
+
+/// Batched ring-buffer write of prefill token KV rows.
+pub fn write_window_rows_from_pos(
+    cache: &Tensor,
+    rows: &Tensor,
+    positions: &Tensor,
+    window_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let seq_len = rows.dim(0)?;
+        let stream = get_cuda_stream(cache.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_write_window_rows_from_pos(
+                get_cuda_mut_ptr(cache)?,
+                get_cuda_ptr(rows)?,
+                get_cuda_ptr(positions)? as *const i64,
+                seq_len as i32,
+                window_size as i32,
+                head_dim as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("write_window_rows_from_pos CUDA error: {}", ret);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cache, rows, positions, window_size, head_dim);
+        candle_core::bail!("write_window_rows_from_pos requires cuda feature")
+    }
+}
+
+/// Continued-prefill overlap (ratio=4) compressor epilogue.
+pub fn compressor_overlap_prefill_cont(
+    x: &Tensor,
+    wkv: &Tensor,
+    wgate: &Tensor,
+    ape: &Tensor,
+    norm: &Tensor,
+    state_kv: &Tensor,
+    state_scores: &Tensor,
+    seq_len: usize,
+    chunk_start: usize,
+    head_dim: usize,
+    bulk_rows: usize,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        let scores = compressor_bf16_linear_f32(x, wgate, seq_len, x.dim(1)?, 2 * head_dim)?;
+        let values = compressor_bf16_linear_f32(x, wkv, seq_len, x.dim(1)?, 2 * head_dim)?;
+        let weighted = Tensor::zeros((bulk_rows, head_dim), DType::F32, x.device())?;
+        let out = Tensor::zeros((bulk_rows, head_dim), DType::BF16, x.device())?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compressor_overlap_prefill_cont_epilogue(
+                get_cuda_ptr(&scores)? as *const f32,
+                get_cuda_ptr(&values)? as *const f32,
+                get_cuda_ptr(ape)? as *const f32,
+                get_cuda_ptr(norm)?,
+                get_cuda_mut_ptr(&weighted)? as *mut f32,
+                get_cuda_mut_ptr(&out)?,
+                get_cuda_ptr(state_kv)? as *const f32,
+                get_cuda_ptr(state_scores)? as *const f32,
+                bulk_rows as i32,
+                seq_len as i32,
+                chunk_start as i32,
+                head_dim as i32,
+                eps,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compressor_overlap_prefill_cont CUDA error: {}", ret);
+        }
+        Ok((weighted, out))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x,
+            wkv,
+            wgate,
+            ape,
+            norm,
+            state_kv,
+            state_scores,
+            seq_len,
+            chunk_start,
+            head_dim,
+            bulk_rows,
+            eps,
+        );
+        candle_core::bail!("compressor_overlap_prefill_cont requires cuda feature")
+    }
+}
+
+/// Continued-prefill non-overlap (ratio>4) compressor epilogue.
+pub fn compressor_nonoverlap_prefill_cont(
+    x: &Tensor,
+    wkv: &Tensor,
+    wgate: &Tensor,
+    ape: &Tensor,
+    norm: &Tensor,
+    state_kv: &Tensor,
+    state_scores: &Tensor,
+    seq_len: usize,
+    chunk_start: usize,
+    head_dim: usize,
+    ratio: usize,
+    bulk_rows: usize,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        let scores = compressor_bf16_linear_f32(x, wgate, seq_len, x.dim(1)?, head_dim)?;
+        let values = compressor_bf16_linear_f32(x, wkv, seq_len, x.dim(1)?, head_dim)?;
+        let weighted = Tensor::zeros((bulk_rows, head_dim), DType::F32, x.device())?;
+        let out = Tensor::zeros((bulk_rows, head_dim), DType::BF16, x.device())?;
+        let stream = get_cuda_stream(x.device())?;
+        let ret = unsafe {
+            kernels::ffi::ds_compressor_nonoverlap_prefill_cont_epilogue(
+                get_cuda_ptr(&scores)? as *const f32,
+                get_cuda_ptr(&values)? as *const f32,
+                get_cuda_ptr(ape)? as *const f32,
+                get_cuda_ptr(norm)?,
+                get_cuda_mut_ptr(&weighted)? as *mut f32,
+                get_cuda_mut_ptr(&out)?,
+                get_cuda_ptr(state_kv)? as *const f32,
+                get_cuda_ptr(state_scores)? as *const f32,
+                bulk_rows as i32,
+                seq_len as i32,
+                chunk_start as i32,
+                head_dim as i32,
+                ratio as i32,
+                eps,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("compressor_nonoverlap_prefill_cont CUDA error: {}", ret);
+        }
+        Ok((weighted, out))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x,
+            wkv,
+            wgate,
+            ape,
+            norm,
+            state_kv,
+            state_scores,
+            seq_len,
+            chunk_start,
+            head_dim,
+            ratio,
+            bulk_rows,
+            eps,
+        );
+        candle_core::bail!("compressor_nonoverlap_prefill_cont requires cuda feature")
     }
 }
 
