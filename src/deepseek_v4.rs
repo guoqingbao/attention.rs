@@ -2547,15 +2547,15 @@ pub fn concat_topk_indices(
 // Attention utility kernels
 // ============================================================================
 
-/// Returns true when `XINFER_DISABLE_FLASHMLA=1` (or `true`) is set.
-///
-/// Disables **both** FlashMLA (SM90) and FlashInfer SM120 sparse MLA fast
-/// paths; [`sparse_attention_into`] falls back to the custom BF16 kernel.
-/// Default is off — accelerated sparse is used when the arch/shape allow it.
+/// Returns whether **both** FlashMLA (SM90) and FlashInfer SM120 sparse MLA
+/// fast paths are disabled. The custom BF16 kernel is the default because it
+/// is the precision reference for V4's request-isolated state. Set
+/// `XINFER_ENABLE_FLASHMLA=1` (or `true`) to allow accelerated paths for
+/// supported shapes; leave it unset for the BF16 fallback.
 pub fn flash_sparse_mla_disabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("XINFER_DISABLE_FLASHMLA")
+        std::env::var("XINFER_ENABLE_FLASHMLA")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -2569,11 +2569,10 @@ pub fn flash_sparse_mla_disabled() -> bool {
 /// topk_idxs: [seq_len, topk] I32 (-1 = invalid/skip)
 /// Returns: [seq_len, num_heads, head_dim] BF16
 ///
-/// Prefers FlashMLA (SM90) / FlashInfer SM120 sparse paths with auto FP8
-/// paged KV packing when shapes are supported; falls back to the custom
-/// BF16 kernel otherwise. Decode workspaces are grow-only (eager-safe;
-/// optional [`prewarm_flashmla_decode`] for CUDA graphs).
-/// Set `XINFER_DISABLE_FLASHMLA=1` to force the BF16 path.
+/// Uses the precision-preserving custom BF16 kernel by default. FlashMLA
+/// (SM90) and FlashInfer SM120 can be explicitly opted into with
+/// `XINFER_ENABLE_FLASHMLA=1` when their workloads have been validated;
+/// unsupported shapes fall back to BF16.
 pub fn sparse_attention_into(
     q: &Tensor,
     kv: &Tensor,
@@ -2653,34 +2652,33 @@ pub fn sparse_attention_into(
             }
         }
 
-        // Fast path: FlashInfer SM120 sparse decode (FP8 FOOTER, page_block=64).
-        // Instantiated topk ∈ {128,512,1024}; pad shorter topk with -1 + topk_length.
-        if !flash_sparse_disabled && seq_len == 1 && head_dim == 512 {
+        // FlashInfer SM120 sparse decode.  The model-owned cache remains BF16;
+        // this path packs the active rows into the kernel's FP8 footer layout
+        // on-device and is only reachable when explicitly enabled.
+        if !flash_sparse_disabled
+            && seq_len == 1
+            && head_dim == 512
+            && topk > 0
+            && flashinfer_sm120_sparse_available(num_heads, topk)
+        {
             if let Some(kernel_topk) = flashinfer_sm120_kernel_topk(topk) {
-                if unsafe {
-                    kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(
-                        num_heads as i32,
-                        kernel_topk as i32,
-                    )
-                } != 0
-                {
-                    match sparse_attention_flashinfer_sm120_into(
-                        q,
-                        kv,
-                        attn_sink,
-                        topk_idxs,
-                        out,
-                        num_heads,
-                        kv_len,
-                        topk,
-                        kernel_topk,
-                        softmax_scale,
-                        stream,
-                    ) {
-                        Ok(()) => return Ok(()),
-                        Err(_) => {
-                            // Fall through to custom BF16 sparse kernel.
-                        }
+                match sparse_attention_flashinfer_sm120_into(
+                    q,
+                    kv,
+                    attn_sink,
+                    topk_idxs,
+                    out,
+                    num_heads,
+                    kv_len,
+                    topk,
+                    kernel_topk,
+                    softmax_scale,
+                    stream,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(_) => {
+                        // Unsupported/runtime-failing fast paths fall back to
+                        // the precision-preserving BF16 implementation below.
                     }
                 }
             }
