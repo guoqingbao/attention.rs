@@ -9,6 +9,7 @@ use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
+#[cfg(any(feature = "cuda", test))]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }
@@ -3601,4 +3602,32 @@ pub fn moe_gemm_w2(
         32,
         true,
     )
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn moe_gemm_w2(
+    input: &Tensor,
+    planes: &Tensor,
+    scale_planes: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    n: usize,
+    k: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let _ = (
+        input,
+        planes,
+        scale_planes,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+        n,
+        k,
+        is_prefill,
+    );
+    candle_core::bail!("moe_gemm_w2 requires cuda feature")
 }

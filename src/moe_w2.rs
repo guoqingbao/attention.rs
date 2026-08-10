@@ -78,6 +78,12 @@ pub fn moe_w2_swiglu_clamp_bf16(gate_up: &Tensor, hidden: usize, limit: f32) -> 
     Ok(output)
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn moe_w2_swiglu_clamp_bf16(gate_up: &Tensor, hidden: usize, limit: f32) -> Result<Tensor> {
+    let _ = (gate_up, hidden, limit);
+    candle_core::bail!("moe_w2_swiglu_clamp_bf16 requires cuda feature")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ZeroMode {
     #[default]
@@ -638,6 +644,17 @@ pub fn moe_w2_pack_from_mxfp4(
     }
     drop((ps, ss, os, sos));
     Ok((planes, scales_out))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn moe_w2_pack_from_mxfp4(
+    packed: &Tensor,
+    scales: &Tensor,
+    n: usize,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let _ = (packed, scales, n, k);
+    candle_core::bail!("moe_w2_pack_from_mxfp4 requires cuda feature")
 }
 
 /// Convenience: mxfp4 packed weights + UE8M0 scales → (plane, scales) for one expert.

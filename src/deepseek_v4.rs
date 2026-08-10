@@ -176,7 +176,7 @@ pub fn hc_expand(x: &Tensor, hc: usize) -> Result<Tensor> {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = hc;
+        let _ = (x, hc);
         candle_core::bail!("hc_expand requires cuda feature")
     }
 }
@@ -227,7 +227,7 @@ pub fn hc_mixes(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _, _, _) = (hc_fn, hc, dim, mix_hc, eps);
+        let (_, _, _, _, _, _) = (x, hc_fn, hc, dim, mix_hc, eps);
         candle_core::bail!("hc_mixes requires cuda feature")
     }
 }
@@ -278,7 +278,7 @@ pub fn hc_pre_from_mixes(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _, _, _, _, _) = (mixes, hc_scale, hc_base, hc, dim, sinkhorn_iters, eps);
+        let (_, _, _, _, _, _, _, _) = (x, mixes, hc_scale, hc_base, hc, dim, sinkhorn_iters, eps);
         candle_core::bail!("hc_pre_from_mixes requires cuda feature")
     }
 }
@@ -339,7 +339,8 @@ pub fn hc_pre_norm_from_mixes(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _, _, _, _, _, _, _) = (
+        let (_, _, _, _, _, _, _, _, _, _) = (
+            x,
             mixes,
             hc_scale,
             hc_base,
@@ -379,7 +380,7 @@ pub fn hc_pre_output(x: &Tensor, pre: &Tensor, hc: usize, dim: usize) -> Result<
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _) = (pre, hc, dim);
+        let (_, _, _, _) = (x, pre, hc, dim);
         candle_core::bail!("hc_pre_output requires cuda feature")
     }
 }
@@ -416,7 +417,7 @@ pub fn hc_head_pre(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _) = (hc_scale, hc_base, eps);
+        let (_, _, _, _, _) = (mixes, hc_scale, hc_base, hc, eps);
         candle_core::bail!("hc_head_pre requires cuda feature")
     }
 }
@@ -489,7 +490,7 @@ pub fn hc_post(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _, _) = (residual, post, comb, dim);
+        let (_, _, _, _, _, _) = (x, residual, post, comb, hc, dim);
         candle_core::bail!("hc_post requires cuda feature")
     }
 }
@@ -597,7 +598,7 @@ pub fn rms_norm_v4(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) -> Result<
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (weight, dim, eps);
+        let _ = (x, weight, dim, eps);
         candle_core::bail!("rms_norm_v4 requires cuda feature")
     }
 }
@@ -620,7 +621,7 @@ pub fn rms_norm_v4_inplace(x: &Tensor, weight: &Tensor, dim: usize, eps: f32) ->
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (weight, dim, eps);
+        let _ = (x, weight, dim, eps);
         candle_core::bail!("rms_norm_v4_inplace requires cuda feature")
     }
 }
@@ -676,7 +677,7 @@ pub fn head_rms_norm(x: &Tensor, num_heads: usize, head_dim: usize, eps: f32) ->
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let (_, _, _) = (num_heads, head_dim, eps);
+        let (_, _, _, _) = (x, num_heads, head_dim, eps);
         candle_core::bail!("head_rms_norm requires cuda feature")
     }
 }
@@ -685,6 +686,7 @@ pub fn head_rms_norm(x: &Tensor, num_heads: usize, head_dim: usize, eps: f32) ->
 // Compressor kernels
 // ============================================================================
 
+#[cfg(feature = "cuda")]
 fn rope_hidden_shape(x: &Tensor) -> Result<(usize, usize, usize)> {
     let dims = x.dims();
     if !(2..=3).contains(&dims.len()) {

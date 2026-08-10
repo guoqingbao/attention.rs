@@ -484,7 +484,7 @@ pub fn flash_tq_decode_k8v4_metal(
     block_tables: &Tensor,
     context_lens: &Tensor,
     output: &Tensor,
-    max_context_len: usize,
+    _max_context_len: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,

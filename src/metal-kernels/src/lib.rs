@@ -2285,7 +2285,7 @@ pub fn flash_attention_decode(
     scale: f32,
     softcapping: f32,
     block_size: i32,
-    max_context_len: i32,
+    _max_context_len: i32,
     num_seqs: i32,
     head_size: i32,
     max_num_blocks_per_seq: i32,
