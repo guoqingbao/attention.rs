@@ -267,6 +267,7 @@ __global__ void setup_moe_group_gemm_args(
   int64_t group_k = k / group_size;
   int64_t group_k_padded = ((group_k + 3) / 4) * 4;
   int64_t n_padded = ((n + row_align - 1) / row_align) * row_align;
+  int64_t swizzled_k = group_k_padded * group_size;
 
   a_offsets[expert_id] = a_base + expert_offset * half_k;
   b_offsets[expert_id] = b_base + expert_id * n * half_k;
@@ -286,10 +287,12 @@ __global__ void setup_moe_group_gemm_args(
 
   layout_sfa[expert_id] =
       ScaleConfig::tile_atom_to_shape_SFA(
-          cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1));
+          cute::make_shape(static_cast<int>(m), static_cast<int>(n_padded),
+                           static_cast<int>(swizzled_k), 1));
   layout_sfb[expert_id] =
       ScaleConfig::tile_atom_to_shape_SFB(
-          cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1));
+          cute::make_shape(static_cast<int>(m), static_cast<int>(n_padded),
+                           static_cast<int>(swizzled_k), 1));
 }
 
 // ============================================================================

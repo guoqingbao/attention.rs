@@ -3959,6 +3959,7 @@ extern "C" {
     ) -> c_int;
 
     // FlashInfer SM120 sparse MLA
+    pub fn flashinfer_dsv4_sparse_sm120_compiled() -> c_int;
     pub fn flashinfer_dsv4_sparse_sm120_supported(num_heads: c_int, topk: c_int) -> c_int;
     pub fn flashinfer_dsv4_sparse_decode_sm120(
         q_bf16: *const c_void,
@@ -4400,6 +4401,14 @@ extern "C" {
         compressed: c_int,
         offset: c_int,
         ratio: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn ds_sparse_indices_to_local(
+        input: *const c_void,
+        output: *mut c_void,
+        count: c_int,
+        offset: c_int,
         stream: i64,
     ) -> c_int;
 

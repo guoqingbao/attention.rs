@@ -2652,34 +2652,38 @@ pub fn sparse_attention_into(
             }
         }
 
-        // FlashInfer SM120 sparse decode.  The model-owned cache remains BF16;
+        // FlashInfer SM120 sparse decode. The model-owned cache remains BF16;
         // this path packs the active rows into the kernel's FP8 footer layout
-        // on-device and is only reachable when explicitly enabled.
+        // on-device and uses the fixed 128-entry SWA segment plus the
+        // optional compressed segment.
         if !flash_sparse_disabled
             && seq_len == 1
             && head_dim == 512
-            && topk > 0
-            && flashinfer_sm120_sparse_available(num_heads, topk)
+            && topk >= 128
+            // The CUDA wrapper owns the runtime SM12x check.  Keeping a
+            // second host-side capability probe here made a valid SM120
+            // build look unsupported when CUDA reported a different minor
+            // revision.  Only reject shapes for which this translation unit
+            // has no compiled specialization; a real launch error is kept
+            // below and reported to the caller.
+            && unsafe { kernels::ffi::flashinfer_dsv4_sparse_sm120_compiled() } != 0
         {
-            if let Some(kernel_topk) = flashinfer_sm120_kernel_topk(topk) {
-                match sparse_attention_flashinfer_sm120_into(
-                    q,
-                    kv,
-                    attn_sink,
-                    topk_idxs,
-                    out,
-                    num_heads,
-                    kv_len,
-                    topk,
-                    kernel_topk,
-                    softmax_scale,
-                    stream,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(_) => {
-                        // Unsupported/runtime-failing fast paths fall back to
-                        // the precision-preserving BF16 implementation below.
-                    }
+            match sparse_attention_flashinfer_sm120_into(
+                q,
+                kv,
+                attn_sink,
+                topk_idxs,
+                out,
+                num_heads,
+                kv_len,
+                topk,
+                128,
+                softmax_scale,
+                stream,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    // Fall back to the precision-preserving BF16 kernel.
                 }
             }
         }
@@ -2898,17 +2902,6 @@ pub fn prewarm_flashmla_decode(
     Ok(())
 }
 
-/// FlashInfer SM120 decode instantiates topk ∈ {128, 512, 1024}.
-#[cfg(feature = "cuda")]
-fn flashinfer_sm120_kernel_topk(topk: usize) -> Option<usize> {
-    for &k in &[128usize, 512, 1024] {
-        if topk <= k {
-            return Some(k);
-        }
-    }
-    None
-}
-
 #[cfg(feature = "cuda")]
 fn flashinfer_sm120_num_splits(kernel_topk: usize) -> usize {
     (kernel_topk + 63) / 64
@@ -2920,8 +2913,9 @@ struct FlashInferSm120Ws {
     mid_out: Option<Tensor>,
     mid_lse: Option<Tensor>,
     out_lse: Option<Tensor>,
-    topk_idxs_pad: Option<Tensor>,
     topk_length: Option<Tensor>,
+    extra_indices: Option<Tensor>,
+    extra_topk_length: Option<Tensor>,
     decode_kv_len: usize,
     decode_kernel_topk: usize,
     decode_num_heads: usize,
@@ -2948,9 +2942,13 @@ pub fn prewarm_flashinfer_sm120_decode(
     if flash_sparse_mla_disabled() {
         return Ok(());
     }
-    let Some(kernel_topk) = flashinfer_sm120_kernel_topk(topk.max(1)) else {
+    // SM120 DSV4 uses the official two-segment ABI: fixed 128-token SWA
+    // segment plus an optional compressed segment.  `topk` is the logical
+    // combined width used by the model.
+    if topk < 128 {
         return Ok(());
-    };
+    }
+    let kernel_topk = 128usize;
     if unsafe {
         kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, kernel_topk as i32)
     } == 0
@@ -2962,7 +2960,8 @@ pub fn prewarm_flashinfer_sm120_decode(
     let num_pages = (kv_len.max(1) + page_block_size - 1) / page_block_size;
     let bytes_per_token = unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() } as usize;
     let fp8_elems = num_pages * page_block_size * bytes_per_token;
-    let num_splits = flashinfer_sm120_num_splits(kernel_topk);
+    let num_splits =
+        flashinfer_sm120_num_splits(kernel_topk) + flashinfer_sm120_num_splits(topk - 128);
 
     let mut guard = flashinfer_sm120_ws();
     let ws = guard.get_or_insert_with(|| FlashInferSm120Ws {
@@ -2970,8 +2969,9 @@ pub fn prewarm_flashinfer_sm120_decode(
         mid_out: None,
         mid_lse: None,
         out_lse: None,
-        topk_idxs_pad: None,
         topk_length: None,
+        extra_indices: None,
+        extra_topk_length: None,
         decode_kv_len: 0,
         decode_kernel_topk: 0,
         decode_num_heads: 0,
@@ -3006,18 +3006,29 @@ pub fn prewarm_flashinfer_sm120_decode(
     if ws.out_lse.as_ref().map(|t| t.elem_count()).unwrap_or(0) < num_heads {
         ws.out_lse = Some(Tensor::zeros((1, num_heads), DType::F32, device)?);
     }
-    if ws
-        .topk_idxs_pad
-        .as_ref()
-        .map(|t| t.dim(1).unwrap_or(0))
-        .unwrap_or(0)
-        < kernel_topk
-    {
-        // u32::MAX bit-casts to i32 -1 (FlashInfer invalid index).
-        ws.topk_idxs_pad = Some(Tensor::full(u32::MAX, (1, kernel_topk), device)?);
-    }
     if ws.topk_length.as_ref().map(|t| t.elem_count()).unwrap_or(0) < 1 {
         ws.topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
+    }
+    let extra_topk = topk - 128;
+    if extra_topk > 0
+        && ws
+            .extra_indices
+            .as_ref()
+            .map(|t| t.dim(1).unwrap_or(0))
+            .unwrap_or(0)
+            < extra_topk
+    {
+        ws.extra_indices = Some(Tensor::zeros((1, extra_topk), DType::U32, device)?);
+    }
+    if extra_topk > 0
+        && ws
+            .extra_topk_length
+            .as_ref()
+            .map(|t| t.elem_count())
+            .unwrap_or(0)
+            < 1
+    {
+        ws.extra_topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
     }
 
     ws.decode_kv_len = kv_len.max(1);
@@ -3025,7 +3036,8 @@ pub fn prewarm_flashinfer_sm120_decode(
     ws.decode_num_heads = num_heads;
     if !ws.logged {
         eprintln!(
-            "[FlashInfer] SM120 sparse decode prewarmed (local_heads={num_heads}, kernel_topk={kernel_topk}, kv_len={})",
+            "[FlashInfer] SM120 sparse decode prewarmed (local_heads={num_heads}, swa_topk=128, extra_topk={}, kv_len={})",
+            extra_topk,
             ws.decode_kv_len
         );
         ws.logged = true;
@@ -3048,16 +3060,10 @@ pub fn prewarm_flashinfer_sm120_decode(
 pub fn flashinfer_sm120_sparse_available(num_heads: usize, topk: usize) -> bool {
     #[cfg(feature = "cuda")]
     {
-        if flash_sparse_mla_disabled() {
+        if flash_sparse_mla_disabled() || topk < 128 {
             return false;
         }
-        match flashinfer_sm120_kernel_topk(topk) {
-            Some(k) => unsafe {
-                kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, k as i32)
-                    != 0
-            },
-            None => false,
-        }
+        unsafe { kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, 128) != 0 }
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -3077,31 +3083,31 @@ fn sparse_attention_flashinfer_sm120_into(
     num_heads: usize,
     kv_len: usize,
     topk: usize,
-    kernel_topk: usize,
+    _kernel_topk: usize,
     softmax_scale: f32,
     stream: i64,
 ) -> Result<()> {
     let device = q.device();
-    let page_block_size = 64usize;
-    let num_pages = (kv_len.max(1) + page_block_size - 1) / page_block_size;
-    let bytes_per_token = unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() } as usize;
-    let fp8_elems = num_pages * page_block_size * bytes_per_token;
-
-    // Prefer the prewarmed (max) kernel topk so mid_* shapes stay stable across
-    // SWA (128) and CSA (640→1024) layers in the same forward.
-    let launch_topk = {
-        let guard = flashinfer_sm120_ws();
-        let warmed = guard.as_ref().map(|w| w.decode_kernel_topk).unwrap_or(0);
-        let t = warmed.max(kernel_topk);
-        flashinfer_sm120_kernel_topk(t).unwrap_or(kernel_topk)
-    };
-    if unsafe {
-        kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, launch_topk as i32)
-    } == 0
-    {
-        candle_core::bail!("flashinfer sm120 unsupported for heads={num_heads} topk={launch_topk}");
+    const SWA_TOPK: usize = 128;
+    if topk < SWA_TOPK {
+        candle_core::bail!("FlashInfer SM120 DSV4 requires at least {SWA_TOPK} sparse entries");
     }
-    let num_splits = flashinfer_sm120_num_splits(launch_topk);
+    let extra_topk = topk - SWA_TOPK;
+    // FlashInfer's fixed 64-token footer pages hold the packed BF16 cache and
+    // the compressed segment is a view into the same allocation.
+    let page_block_size = 64usize;
+    if page_block_size != 64 {
+        candle_core::bail!("FlashInfer SM120 FP8 cache page size must be 64");
+    }
+    let bytes_per_token = unsafe { kernels::ffi::ds_fp8_kv_bytes_per_token() } as usize;
+    let fp8_elems = kv_len.max(1).div_ceil(page_block_size) * page_block_size * bytes_per_token;
+
+    // Official FlashInfer SM120 DSV4 ABI: two independent streams, SWA and
+    // compressed.  Keep the fixed SWA specialization and let the launcher
+    // split the compressed stream into 64-entry chunks.
+    let launch_topk = SWA_TOPK;
+    let num_splits =
+        flashinfer_sm120_num_splits(SWA_TOPK) + flashinfer_sm120_num_splits(extra_topk);
 
     // Grow workspaces if needed (DSV4 CUDA graphs are disabled; still avoid per-step alloc churn).
     {
@@ -3111,8 +3117,9 @@ fn sparse_attention_flashinfer_sm120_into(
             mid_out: None,
             mid_lse: None,
             out_lse: None,
-            topk_idxs_pad: None,
             topk_length: None,
+            extra_indices: None,
+            extra_topk_length: None,
             decode_kv_len: 0,
             decode_kernel_topk: 0,
             decode_num_heads: 0,
@@ -3152,17 +3159,28 @@ fn sparse_attention_flashinfer_sm120_into(
         {
             ws.out_lse = Some(Tensor::zeros((1, num_heads), DType::F32, device)?);
         }
-        if ws
-            .topk_idxs_pad
-            .as_ref()
-            .map(|t| t.dim(1).unwrap_or(0))
-            .unwrap_or(0)
-            < launch_topk
-        {
-            ws.topk_idxs_pad = Some(Tensor::full(u32::MAX, (1, launch_topk), device)?);
-        }
         if ws.topk_length.as_ref().map(|t| t.elem_count()).unwrap_or(0) < 1 {
             ws.topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
+        }
+        if extra_topk > 0
+            && ws
+                .extra_indices
+                .as_ref()
+                .map(|t| t.dim(1).unwrap_or(0))
+                .unwrap_or(0)
+                < extra_topk
+        {
+            ws.extra_indices = Some(Tensor::zeros((1, extra_topk), DType::U32, device)?);
+        }
+        if extra_topk > 0
+            && ws
+                .extra_topk_length
+                .as_ref()
+                .map(|t| t.elem_count())
+                .unwrap_or(0)
+                < 1
+        {
+            ws.extra_topk_length = Some(Tensor::zeros((1,), DType::U32, device)?);
         }
         ws.decode_kv_len = ws.decode_kv_len.max(kv_len.max(1));
         ws.decode_kernel_topk = launch_topk;
@@ -3178,8 +3196,9 @@ fn sparse_attention_flashinfer_sm120_into(
     let mid_out = ws.mid_out.as_ref().unwrap();
     let mid_lse = ws.mid_lse.as_ref().unwrap();
     let out_lse = ws.out_lse.as_ref().unwrap();
-    let topk_idxs_pad = ws.topk_idxs_pad.as_ref().unwrap();
     let topk_length = ws.topk_length.as_ref().unwrap();
+    let extra_indices = ws.extra_indices.as_ref();
+    let extra_topk_length = ws.extra_topk_length.as_ref();
 
     // Pack BF16 KV into multi-page FOOTER layout (page_block_size=64).
     let kv_2d = kv.reshape((kv_len, 512))?.contiguous()?;
@@ -3197,26 +3216,66 @@ fn sparse_attention_flashinfer_sm120_into(
         candle_core::bail!("ds_fp8_kv_pack_footer error: {}", ret);
     }
 
-    // Indices: copy actual topk into a -1-padded launch_topk buffer.
-    let indices = if topk == launch_topk {
-        topk_idxs.reshape((1, launch_topk))?.contiguous()?
+    // The first 128 entries index the SWA region directly.  The compressed
+    // entries in the model's unified index row include the SWA base offset;
+    // convert only that small index vector to the local extra-cache ABI.  No
+    // KV bytes are copied or repacked.
+    let indices = topk_idxs.narrow(1, 0, launch_topk)?.contiguous()?;
+    let indices = if indices.dtype() == DType::U32 {
+        indices
     } else {
-        // Re-fill pad with -1 then overwrite the valid prefix.
-        let fill = Tensor::full(u32::MAX, (1, launch_topk), device)?;
-        copy_contiguous_into(topk_idxs_pad, &fill, 0)?;
-        let src = topk_idxs.reshape((topk,))?.contiguous()?;
+        indices.to_dtype(DType::U32)?
+    };
+    let extra_indices = if extra_topk > 0 {
+        let src = topk_idxs.narrow(1, launch_topk, extra_topk)?.contiguous()?;
         let src = if src.dtype() == DType::U32 {
             src
         } else {
             src.to_dtype(DType::U32)?
         };
-        copy_contiguous_into(topk_idxs_pad, &src, 0)?;
-        topk_idxs_pad.clone()
+        let dst = extra_indices.ok_or_else(|| {
+            candle_core::Error::Msg("FlashInfer SM120 extra-index workspace missing".into())
+        })?;
+        let ret = unsafe {
+            kernels::ffi::ds_sparse_indices_to_local(
+                get_cuda_ptr(&src)? as *const core::ffi::c_void,
+                get_cuda_mut_ptr(dst)? as *mut core::ffi::c_void,
+                extra_topk as i32,
+                launch_topk as i32,
+                stream,
+            )
+        };
+        if ret != 0 {
+            candle_core::bail!("ds_sparse_indices_to_local CUDA error: {ret}");
+        }
+        Some(dst)
+    } else {
+        None
     };
 
-    // topk_length[0] = actual topk (not launch_topk).
-    let tl = Tensor::full(topk as u32, (1,), device)?;
+    // Main and extra top-k lengths are separate in the SM120 ABI.
+    let tl = Tensor::full(launch_topk as u32, (1,), device)?;
     copy_contiguous_into(topk_length, &tl, 0)?;
+    if extra_topk > 0 {
+        let extra_tl = Tensor::full(extra_topk as u32, (1,), device)?;
+        copy_contiguous_into(
+            extra_topk_length.ok_or_else(|| {
+                candle_core::Error::Msg("FlashInfer SM120 extra-length workspace missing".into())
+            })?,
+            &extra_tl,
+            0,
+        )?;
+    }
+
+    // The compressed pool starts after the two 64-token SWA pages in the
+    // same native FP8 allocation.  This is a pointer view, not a cache copy.
+    let extra_kv = if extra_topk > 0 {
+        let base = get_cuda_ptr(&kv_fp8)? as *const u8;
+        let byte_offset = (launch_topk / page_block_size) * page_block_size * bytes_per_token;
+        Some(unsafe { base.add(byte_offset) as *const core::ffi::c_void })
+    } else {
+        None
+    };
 
     let q_in = q.reshape((1, num_heads, 512))?.contiguous()?;
     let sink = attn_sink
@@ -3236,16 +3295,22 @@ fn sparse_attention_flashinfer_sm120_into(
             get_cuda_mut_ptr(out_lse)? as *mut f32,
             get_cuda_mut_ptr(mid_out)?,
             get_cuda_mut_ptr(mid_lse)? as *mut f32,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
+            extra_kv.unwrap_or(std::ptr::null()),
+            extra_indices
+                .map(|t| get_cuda_ptr(t).map(|p| p as *const i32))
+                .transpose()?
+                .unwrap_or(std::ptr::null()),
+            extra_topk_length
+                .map(|t| get_cuda_ptr(t).map(|p| p as *const i32))
+                .transpose()?
+                .unwrap_or(std::ptr::null()),
             1, // num_tokens
             num_heads as i32,
             launch_topk as i32,
             num_splits as i32,
             page_block_size as i32,
-            0,  // extra_topk
-            0,  // extra_page_block_size
+            extra_topk as i32,
+            page_block_size as i32,
             -1, // chunks_per_block_override (auto)
             softmax_scale,
             stream,
