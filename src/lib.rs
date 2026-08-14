@@ -250,9 +250,8 @@ pub struct InputMetadata {
     pub mamba_slot_mapping: Option<Tensor>,
     pub slot_mapping: Tensor,
     pub block_tables: Option<Tensor>,
-    /// Host-side block tables prepared in `prepare_prefill` / `prepare_decode`
-    /// (no D2H). Used by DeepSeek V4 hybrid page addressing; CUDA-graph safe.
     pub block_tables_host: Option<Vec<Vec<u32>>>,
+    pub context_lens_host: Option<Vec<u32>>,
     pub context_lens: Option<Tensor>,
     pub cu_seqlens_q: Option<Tensor>,
     pub cu_seqlens_k: Option<Tensor>,
