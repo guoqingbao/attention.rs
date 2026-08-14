@@ -25,17 +25,21 @@
 #include <vector>
 
 // ============================================================================
-// SM100/SM103 path (Blackwell)
-// fp4_gemm_cutlass_template_sm103.h is the superset: it includes both
-// fp4_gemm_template_sm100.h and fp4_gemm_template_sm103.h, and provides
-// the CutlassFp4GemmRunner with dispatch to both SM100 and SM103 kernels.
+// SM100/SM103 path (Blackwell).
+// SM100 uses FlashInfer's native SM100 template.  The SM103 template adds a
+// Store256 dispatch which is only valid when its separately-instantiated
+// implementation is linked, so do not include that header for SM100 builds.
 // ============================================================================
 
 #if defined(ENABLE_FP4_SM100)
 
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 #include "flashinfer/gemm/fp4_gemm_cutlass.h"
+#if defined(ATTENTION_RS_FLASHINFER_SM103)
 #include "flashinfer/gemm/fp4_gemm_cutlass_template_sm103.h"
+#else
+#include "flashinfer/gemm/fp4_gemm_cutlass_template.h"
+#endif
 
 namespace flashinfer { namespace gemm {
 
@@ -65,8 +69,9 @@ INSTANTIATE_ALL_CLUSTERS(__nv_bfloat16, 128, 256, 256)
 
 #undef INSTANTIATE_ALL_CLUSTERS
 
-// SM103 "Ultra" tile configs: 128×128×768, 128×192×768, 128×256×768
+// SM103 "Ultra" tile configs: 128×128×768, 128×192×768, 128×256×768.
 // These use a different CUTLASS kernel path with enhanced register file.
+#if defined(ATTENTION_RS_FLASHINFER_SM103)
 
 #define INSTANTIATE_ALL_CLUSTERS_SM103(TYPE, CTA_M, CTA_N, CTA_K) \
   INSTANTIATE_FP4_ULTRA_GEMM_KERNEL_LAUNCHER(TYPE, CTA_M, CTA_N, CTA_K, 1, 1, 1, _1SM_sm103) \
@@ -88,6 +93,7 @@ INSTANTIATE_ALL_CLUSTERS_SM103(__nv_bfloat16, 128, 192, 768)
 INSTANTIATE_ALL_CLUSTERS_SM103(__nv_bfloat16, 128, 256, 768)
 
 #undef INSTANTIATE_ALL_CLUSTERS_SM103
+#endif // ATTENTION_RS_FLASHINFER_SM103
 
 template class CutlassFp4GemmRunner<half, FP4GemmType::W4A4_NVFP4_NVFP4>;
 template class CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4>;

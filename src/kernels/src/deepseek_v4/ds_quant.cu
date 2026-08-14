@@ -26,13 +26,44 @@ extern "C" int ds_copy_device_bytes(
 }
 
 static __device__ __forceinline__ float e8m0_to_float(unsigned char value) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   __nv_bfloat16_raw raw = __nv_cvt_e8m0_to_bf16raw(value);
   __nv_bfloat16 bf16_value(raw);
   return __bfloat162float(bf16_value);
+#else
+  // UE8M0 is an exponent-only format. CUDA's E8M0 intrinsics are not
+  // declared by older toolkits for SM70/75/80, but the representation is
+  // simple enough to decode without an architecture-specific instruction.
+  // Zero and 0xff are the UE8M0 minimum/subnormal and NaN encodings.
+  unsigned int bits = (value == 0)
+                          ? 0x00400000u       // 2^-127
+                          : (value == 0xff) ? 0x7fc00000u  // canonical NaN
+                                             : (static_cast<unsigned int>(value) << 23);
+  return __uint_as_float(bits);
+#endif
 }
 
 static __device__ __forceinline__ unsigned char float_to_e8m0(float value) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   return __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf);
+#else
+  // Match cudaRoundPosInf + __NV_SATFINITE: round the absolute value up to
+  // the next power of two and clamp finite overflow to the largest encoding.
+  unsigned int bits = __float_as_uint(value) & 0x7fffffffu;
+  if (bits > 0x7f800000u) return 0xff;  // NaN
+  if (bits == 0) return 0;              // zero maps to the minimum encoding
+  if (bits >= 0x7f800000u) return 0xfe; // +Inf/finite overflow -> max finite
+
+  unsigned int exponent = (bits >> 23) & 0xffu;
+  unsigned int mantissa = bits & 0x007fffffu;
+  if (exponent == 0) {
+    // 0x00400000 is the float encoding of 2^-127, the smallest UE8M0
+    // value. Values below it round up to that same encoding.
+    return bits <= 0x00400000u ? 0 : 1;
+  }
+  if (mantissa != 0) ++exponent;
+  return static_cast<unsigned char>(exponent >= 0xffu ? 0xfeu : exponent);
+#endif
 }
 
 static __device__ __forceinline__ float fp8_e4m3_to_float(unsigned char value) {

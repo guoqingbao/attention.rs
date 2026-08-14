@@ -390,7 +390,11 @@ pub fn configure_flashmla(
 ) -> Result<(KernelBuilder, bool)> {
     let mut link_flashmla = false;
 
-    if !(std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 90) {
+    // FlashMLA's DSV4 kernels target SM90 only. SM100/120/121 use the
+    // FlashInfer paths instead; cloning and compiling FlashMLA there is
+    // unnecessary and breaks on toolchains that do not accept its sparse
+    // checkout layout.
+    if !(std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap == 90) {
         return Ok((builder, link_flashmla));
     }
 
@@ -424,7 +428,6 @@ pub fn configure_flashmla(
             "csrc/sm90/prefill/sparse",
             "csrc/smxx/decode",
             "csrc/kerutils",
-            "csrc/params.h",
             "csrc/cutlass",
         ],
         true,

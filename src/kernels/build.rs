@@ -73,6 +73,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer_sm103.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/mlx_nvfp4_utils.cu");
@@ -177,6 +178,12 @@ fn main() -> Result<()> {
         }
         if (100..120).contains(&compute_cap) {
             builder = builder.arg("-DENABLE_FP4_SM100");
+            if compute_cap >= 103 {
+                // FlashInfer's SM103 header adds an optional Store256 path.
+                // Keep it out of SM100 builds, where that implementation and
+                // its symbols are not part of the SM100 kernel set.
+                builder = builder.arg("-DATTENTION_RS_FLASHINFER_SM103");
+            }
         }
         if compute_cap >= 120 {
             builder = builder.arg("-DENABLE_FP4_SM120");
