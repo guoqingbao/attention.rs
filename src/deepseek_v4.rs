@@ -2548,11 +2548,11 @@ pub fn concat_topk_indices(
 // ============================================================================
 
 /// Returns whether **both** FlashMLA (SM90) and FlashInfer SM120 sparse MLA
-/// fast paths are disabled. The custom BF16 kernel is the default because it
+/// fast paths are enabled. The custom BF16 kernel is the default because it
 /// is the precision reference for V4's request-isolated state. Set
 /// `XINFER_ENABLE_FLASHMLA=1` (or `true`) to allow accelerated paths for
 /// supported shapes; leave it unset for the BF16 fallback.
-pub fn flash_sparse_mla_disabled() -> bool {
+pub fn flash_sparse_mla_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("XINFER_ENABLE_FLASHMLA")
@@ -2589,13 +2589,13 @@ pub fn sparse_attention_into(
     #[cfg(feature = "cuda")]
     {
         let stream = get_cuda_stream(q.device())?;
-        let flash_sparse_disabled = flash_sparse_mla_disabled();
+        let flash_sparse_enabled = flash_sparse_mla_enabled();
 
         // Fast path: FlashMLA SM90 sparse (FP8 decode / BF16 prefill).
         // Prefill requires topk % 128 == 0; decode requires topk % 64 == 0.
         // Decode must not H2D/cat: only pass through when already aligned
         // (DSV4 decode topk = window + index_topk is typically 128+512=640).
-        if !flash_sparse_disabled
+        if flash_sparse_enabled
             && head_dim == 512
             && unsafe { kernels::ffi::flashmla_dsv4_supported(num_heads as i32) } != 0
         {
@@ -2656,7 +2656,7 @@ pub fn sparse_attention_into(
         // this path packs the active rows into the kernel's FP8 footer layout
         // on-device and uses the fixed 128-entry SWA segment plus the
         // optional compressed segment.
-        if !flash_sparse_disabled
+        if flash_sparse_enabled
             && seq_len == 1
             && head_dim == 512
             && topk >= 128
@@ -2761,6 +2761,7 @@ struct FlashMlaWs {
     decode_topk: usize,
     decode_pad_h: usize,
     logged: bool,
+    prefill_logged: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2781,7 +2782,7 @@ pub fn prewarm_flashmla_decode(
     topk: usize,
     kv_len: usize,
 ) -> Result<()> {
-    if flash_sparse_mla_disabled() {
+    if !flash_sparse_mla_enabled() {
         return Ok(());
     }
     let pad_h = flashmla_padded_heads(num_heads).ok_or_else(|| {
@@ -2832,6 +2833,7 @@ pub fn prewarm_flashmla_decode(
         decode_topk: 0,
         decode_pad_h: 0,
         logged: false,
+        prefill_logged: false,
     });
 
     if ws.q_pad.as_ref().map(|t| t.elem_count()).unwrap_or(0) < pad_h * 512 {
@@ -2882,7 +2884,7 @@ pub fn prewarm_flashmla_decode(
     ws.decode_topk = aligned_topk;
     ws.decode_pad_h = pad_h;
     if !ws.logged {
-        eprintln!(
+        tracing::info!(
             "[FlashMLA] SM90 sparse decode prewarmed (local_heads={num_heads}, pad_heads={pad_h}, topk={aligned_topk}, kv_len={})",
             ws.decode_kv_len
         );
@@ -2920,6 +2922,7 @@ struct FlashInferSm120Ws {
     decode_kernel_topk: usize,
     decode_num_heads: usize,
     logged: bool,
+    active_logged: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2939,7 +2942,7 @@ pub fn prewarm_flashinfer_sm120_decode(
     topk: usize,
     kv_len: usize,
 ) -> Result<()> {
-    if flash_sparse_mla_disabled() {
+    if !flash_sparse_mla_enabled() {
         return Ok(());
     }
     // SM120 DSV4 uses the official two-segment ABI: fixed 128-token SWA
@@ -2976,6 +2979,7 @@ pub fn prewarm_flashinfer_sm120_decode(
         decode_kernel_topk: 0,
         decode_num_heads: 0,
         logged: false,
+        active_logged: false,
     });
 
     if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
@@ -3035,7 +3039,7 @@ pub fn prewarm_flashinfer_sm120_decode(
     ws.decode_kernel_topk = kernel_topk;
     ws.decode_num_heads = num_heads;
     if !ws.logged {
-        eprintln!(
+        tracing::info!(
             "[FlashInfer] SM120 sparse decode prewarmed (local_heads={num_heads}, swa_topk=128, extra_topk={}, kv_len={})",
             extra_topk,
             ws.decode_kv_len
@@ -3060,7 +3064,7 @@ pub fn prewarm_flashinfer_sm120_decode(
 pub fn flashinfer_sm120_sparse_available(num_heads: usize, topk: usize) -> bool {
     #[cfg(feature = "cuda")]
     {
-        if flash_sparse_mla_disabled() || topk < 128 {
+        if !flash_sparse_mla_enabled() || topk < 128 {
             return false;
         }
         unsafe { kernels::ffi::flashinfer_dsv4_sparse_sm120_supported(num_heads as i32, 128) != 0 }
@@ -3124,6 +3128,7 @@ fn sparse_attention_flashinfer_sm120_into(
             decode_kernel_topk: 0,
             decode_num_heads: 0,
             logged: false,
+            active_logged: false,
         });
         if ws.kv_fp8.as_ref().map(|t| t.elem_count()).unwrap_or(0) < fp8_elems {
             ws.kv_fp8 = Some(Tensor::zeros((fp8_elems,), DType::U8, device)?);
@@ -3187,9 +3192,9 @@ fn sparse_attention_flashinfer_sm120_into(
         ws.decode_num_heads = num_heads;
     }
 
-    let guard = flashinfer_sm120_ws();
+    let mut guard = flashinfer_sm120_ws();
     let ws = guard
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| candle_core::Error::Msg("flashinfer sm120 workspace missing".into()))?;
 
     let kv_fp8 = ws.kv_fp8.as_ref().unwrap().narrow(0, 0, fp8_elems)?;
@@ -3319,6 +3324,12 @@ fn sparse_attention_flashinfer_sm120_into(
     if ret != 0 {
         candle_core::bail!("flashinfer sm120 sparse decode error: {}", ret);
     }
+    if !ws.active_logged {
+        tracing::info!(
+            "[FlashInfer] SM120 sparse decode active (local_heads={num_heads}, swa_topk=128, extra_topk={extra_topk}, kv_len={kv_len})"
+        );
+        ws.active_logged = true;
+    }
     Ok(())
 }
 
@@ -3363,6 +3374,7 @@ fn sparse_attention_flashmla_into(
         decode_topk: 0,
         decode_pad_h: 0,
         logged: false,
+        prefill_logged: false,
     });
 
     // Prefill is outside CUDA graphs — grow-only alloc allowed.
@@ -3496,6 +3508,12 @@ fn sparse_attention_flashmla_into(
         if ret != 0 {
             candle_core::bail!("flashmla sparse prefill error: {}", ret);
         }
+        if !ws.prefill_logged {
+            tracing::info!(
+                "[FlashMLA] SM90 sparse prefill active (seq_len={seq_len}, local_heads={num_heads}, pad_heads={pad_h}, topk={topk})"
+            );
+            ws.prefill_logged = true;
+        }
         if pad_h != num_heads {
             let out_view = out.reshape((seq_len, num_heads, 512))?;
             for s in 0..seq_len {
@@ -3572,7 +3590,7 @@ fn sparse_attention_flashmla_into(
         ws.o_accum = Some(Tensor::zeros((o_acc_elems,), DType::F32, device)?);
     }
     if !ws.logged {
-        eprintln!(
+        tracing::info!(
             "[FlashMLA] SM90 sparse decode active (local_heads={num_heads}, pad_heads={pad_h}, topk={topk})"
         );
         ws.logged = true;
@@ -3709,7 +3727,7 @@ pub fn sparse_attention(
 pub fn flashmla_dsv4_sparse_available(num_heads: usize) -> bool {
     #[cfg(feature = "cuda")]
     {
-        if flash_sparse_mla_disabled() {
+        if !flash_sparse_mla_enabled() {
             return false;
         }
         unsafe { kernels::ffi::flashmla_dsv4_supported(num_heads as i32) != 0 }
