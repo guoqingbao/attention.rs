@@ -730,6 +730,21 @@ __global__ void ds_compress_topk_indices_decode_from_pos_kernel(
   out[idx] = idx < valid ? offset + idx : -1;
 }
 
+// Convert the compressed half of a combined DeepSeek sparse-index row from
+// unified-cache coordinates to the local coordinates required by FlashInfer's
+// SM120 extra-cache segment.  Invalid entries stay -1 instead of wrapping when
+// the storage is passed through Candle as U32.
+__global__ void ds_sparse_indices_to_local_kernel(
+    int *__restrict__ out,
+    const int *__restrict__ in,
+    int count,
+    int offset) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) return;
+  const int value = in[idx];
+  out[idx] = value < 0 ? -1 : value - offset;
+}
+
 extern "C" {
 
 cudaError_t ds_hadamard_fp4_quant_bf16(
@@ -1019,6 +1034,23 @@ cudaError_t ds_compress_topk_indices_decode_from_pos(
   int blocks = (compressed + threads - 1) / threads;
   ds_compress_topk_indices_decode_from_pos_kernel<<<blocks, threads, 0, stream>>>(
       out, positions, compressed, offset, ratio);
+  return cudaGetLastError();
+}
+
+cudaError_t ds_sparse_indices_to_local(
+    const int *in,
+    int *out,
+    int count,
+    int offset,
+    cudaStream_t stream) {
+  if (in == nullptr || out == nullptr || count < 0 || offset < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (count == 0) return cudaSuccess;
+  constexpr int threads = 256;
+  int blocks = (count + threads - 1) / threads;
+  ds_sparse_indices_to_local_kernel<<<blocks, threads, 0, stream>>>(
+      out, in, count, offset);
   return cudaGetLastError();
 }
 

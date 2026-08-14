@@ -160,9 +160,9 @@ CutlassGemmConfig select_fp4_config(
 {
   if (configs.size() <= 1) return configs[0];
 
-  // For SM120 there's typically only one config; for SM100 we have many.
-  // Try each config and pick the one that can launch successfully with
-  // the best tile utilization for the given problem size.
+  // Try each config and pick the one with the best tile utilization for the
+  // given problem size.  The enum members are used below instead of raw
+  // integer IDs so this remains tied to FlashInfer's config definitions.
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> probe;
 
   int best_idx = 0;
@@ -176,35 +176,49 @@ CutlassGemmConfig select_fp4_config(
     }
 
     int cta_m = 128, cta_n = 128;
-    int tile_id = configs[i].getTileConfigAsInt();
-
     if (configs[i].sm_version >= 120) {
-      switch (tile_id) {
-        case 2: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x128B
-        case 3: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x64B
-        case 4: cta_m = 256; cta_n = 128; break;  // CtaShape256x128x64B
-        case 5: cta_m = 128; cta_n = 256; break;  // CtaShape128x256x64B
-        case 6: cta_m = 128; cta_n = 128; break;  // CtaShape128x128x256B
-        case 7: cta_m = 256; cta_n = 128; break;  // CtaShape256x128x128B
+      using TileConfig = flashinfer::gemm::CutlassTileConfigSM120;
+      switch (configs[i].tile_config_sm120) {
+        case TileConfig::CtaShape128x32x128B: cta_m = 128; cta_n = 32; break;
+        case TileConfig::CtaShape128x32x64B: cta_m = 128; cta_n = 32; break;
+        case TileConfig::CtaShape128x64x128B: cta_m = 128; cta_n = 64; break;
+        case TileConfig::CtaShape128x64x64B: cta_m = 128; cta_n = 64; break;
+        case TileConfig::CtaShape128x128x128B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape128x128x64B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape256x128x64B: cta_m = 256; cta_n = 128; break;
+        case TileConfig::CtaShape128x256x64B: cta_m = 128; cta_n = 256; break;
+        case TileConfig::CtaShape128x128x256B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape256x128x128B: cta_m = 256; cta_n = 128; break;
+        case TileConfig::CtaShape128x256x128B: cta_m = 128; cta_n = 256; break;
+        case TileConfig::Undefined:
+        case TileConfig::ChooseWithHeuristic:
+          break;
         default: break;
       }
     } else if (configs[i].sm_version >= 100) {
-      switch (tile_id) {
-        case 2: cta_m = 64;  cta_n = 32;  break;
-        case 3: cta_m = 64;  cta_n = 64;  break;
-        case 4: cta_m = 64;  cta_n = 128; break;
-        case 5: cta_m = 64;  cta_n = 256; break;
-        case 6: cta_m = 128; cta_n = 8;   break;
-        case 7: cta_m = 128; cta_n = 16;  break;
-        case 8: cta_m = 128; cta_n = 32;  break;
-        case 9: cta_m = 128; cta_n = 64;  break;
-        case 10: cta_m = 128; cta_n = 128; break;
-        case 11: cta_m = 128; cta_n = 256; break;
-        case 12: cta_m = 128; cta_n = 128; break;
-        case 13: cta_m = 128; cta_n = 256; break;
-        case 14: cta_m = 256; cta_n = 64;  break;
-        case 15: cta_m = 256; cta_n = 128; break;
-        case 16: cta_m = 256; cta_n = 256; break;
+      using TileConfig = flashinfer::gemm::CutlassTileConfigSM100;
+      switch (configs[i].tile_config_sm100) {
+        case TileConfig::CtaShape64x32x128B: cta_m = 64; cta_n = 32; break;
+        case TileConfig::CtaShape64x64x128B: cta_m = 64; cta_n = 64; break;
+        case TileConfig::CtaShape64x128x128B: cta_m = 64; cta_n = 128; break;
+        case TileConfig::CtaShape64x256x128B: cta_m = 64; cta_n = 256; break;
+        case TileConfig::CtaShape128x8x256B: cta_m = 128; cta_n = 8; break;
+        case TileConfig::CtaShape128x16x128B: cta_m = 128; cta_n = 16; break;
+        case TileConfig::CtaShape128x32x128B: cta_m = 128; cta_n = 32; break;
+        case TileConfig::CtaShape128x64x128B: cta_m = 128; cta_n = 64; break;
+        case TileConfig::CtaShape128x128x128B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape128x256x128B: cta_m = 128; cta_n = 256; break;
+        case TileConfig::CtaShape128x128x256B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape128x256x256B: cta_m = 128; cta_n = 256; break;
+        case TileConfig::CtaShape256x64x128B: cta_m = 256; cta_n = 64; break;
+        case TileConfig::CtaShape256x128x128B: cta_m = 256; cta_n = 128; break;
+        case TileConfig::CtaShape256x256x128B: cta_m = 256; cta_n = 256; break;
+        case TileConfig::CtaShape128x128x768B: cta_m = 128; cta_n = 128; break;
+        case TileConfig::CtaShape128x192x768B: cta_m = 128; cta_n = 192; break;
+        case TileConfig::CtaShape128x256x768B: cta_m = 128; cta_n = 256; break;
+        case TileConfig::Undefined:
+        case TileConfig::ChooseWithHeuristic:
+          break;
         default: break;
       }
     }

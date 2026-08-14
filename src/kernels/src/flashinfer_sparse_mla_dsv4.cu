@@ -26,18 +26,31 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk,
                                    size_t stride_kv_block, cudaStream_t stream);
 }
 
+static int flashinfer_dsv4_sm120_kernel_topk(int topk) {
+  if (topk <= 128) return 128;
+  if (topk <= 512) return 512;
+  if (topk <= 1024) return 1024;
+  return 0;
+}
+
 extern "C" int flashinfer_dsv4_sparse_sm120_supported(int num_heads, int topk) {
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) return 0;
   cudaDeviceProp prop{};
   if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
-  if (!(prop.major == 12 && (prop.minor == 0 || prop.minor == 1))) return 0;
+  // FlashInfer calls this the SM12x sparse backend.  Do not make the model
+  // dispatch depend on an exact minor number: CUDA 13.x and early SM120
+  // drivers have reported the same SM120 device through slightly different
+  // minor values.  The actual launch still returns the CUDA error if a
+  // future SM12x device is not executable by this cubin.
+  if (prop.major != 12) return 0;
   const int heads_ok =
       num_heads == 8 || num_heads == 16 || num_heads == 32 || num_heads == 64 ||
       num_heads == 128;
-  const int topk_ok = topk == 128 || topk == 512 || topk == 1024;
-  return heads_ok && topk_ok ? 1 : 0;
+  return heads_ok && flashinfer_dsv4_sm120_kernel_topk(topk) != 0 ? 1 : 0;
 }
+
+extern "C" int flashinfer_dsv4_sparse_sm120_compiled() { return 1; }
 
 extern "C" int flashinfer_dsv4_sparse_decode_sm120(
     const void* q_bf16, const void* kv_fp8, const int* indices, const int* topk_length,
@@ -46,7 +59,8 @@ extern "C" int flashinfer_dsv4_sparse_decode_sm120(
     const int* extra_topk_length, int num_tokens, int num_heads, int topk, int num_splits,
     int page_block_size, int extra_topk, int extra_page_block_size,
     int chunks_per_block_override, float sm_scale, cudaStream_t stream) {
-  if (!flashinfer_dsv4_sparse_sm120_supported(num_heads, topk)) {
+  const int dispatch_topk = flashinfer_dsv4_sm120_kernel_topk(topk);
+  if (dispatch_topk == 0 || !flashinfer_dsv4_sparse_sm120_supported(num_heads, topk)) {
     return static_cast<int>(cudaErrorNotSupported);
   }
   if (!q_bf16 || !kv_fp8 || !indices || !out_bf16 || !mid_out_bf16 || !mid_lse ||
@@ -63,7 +77,7 @@ extern "C" int flashinfer_dsv4_sparse_decode_sm120(
       extra_kv_fp8 ? static_cast<size_t>(extra_page_block_size) * kBytesPerToken : 0;
 
   bool ok = flashinfer::sparse_mla_sm120::launch_sparse_mla_decode_dsv4(
-      ModelType::DSV4, num_heads, topk, page_block_size, num_tokens, num_splits,
+      ModelType::DSV4, num_heads, dispatch_topk, page_block_size, num_tokens, num_splits,
       reinterpret_cast<const bf16*>(q_bf16), reinterpret_cast<const uint8_t*>(kv_fp8),
       indices, reinterpret_cast<bf16*>(mid_out_bf16), mid_lse,
       reinterpret_cast<bf16*>(out_bf16), out_lse, topk_length, attn_sink,
@@ -77,6 +91,8 @@ extern "C" int flashinfer_dsv4_sparse_decode_sm120(
 #else
 
 extern "C" int flashinfer_dsv4_sparse_sm120_supported(int, int) { return 0; }
+
+extern "C" int flashinfer_dsv4_sparse_sm120_compiled() { return 0; }
 
 extern "C" int flashinfer_dsv4_sparse_decode_sm120(
     const void*, const void*, const int*, const int*, const float*, void*, float*, void*,
