@@ -1742,6 +1742,28 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn nvfp4_moe_compute_online_scales_f16(
+        input: *const c_void,
+        expert_offsets: *const i32,
+        weight_global_scales: *const f32,
+        alphas: *mut f32,
+        input_scale_invs: *mut f32,
+        num_experts: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn nvfp4_moe_compute_online_scales_bf16(
+        input: *const c_void,
+        expert_offsets: *const i32,
+        weight_global_scales: *const f32,
+        alphas: *mut f32,
+        input_scale_invs: *mut f32,
+        num_experts: i32,
+        K: i32,
+        stream: i64,
+    );
+
     pub fn nvfp4_swizzle_weight_scales(
         linear_scales: *const c_void,
         swizzled_scales: *mut c_void,
