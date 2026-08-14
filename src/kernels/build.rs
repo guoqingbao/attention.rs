@@ -1,12 +1,25 @@
-mod trtllm_artifacts;
+mod others;
 
 use anyhow::Result;
 use cudaforge::KernelBuilder;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    // CUDA translation units use host-side C++ state/workspaces (including
+    // DeepSeek V4's persistent per-device scratch guards).  Consumers that
+    // do not otherwise pull in a C++ dependency, such as the library test
+    // binary, still need the C++ ABI and standard-library symbols.
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=trtllm_artifacts.rs");
+    println!("cargo:rerun-if-env-changed=CUDACXX");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-changed=others.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn_opt.cu");
@@ -18,6 +31,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mask.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm.cu");
     println!("cargo:rerun-if-changed=src/moe_gemv.cu");
+    println!("cargo:rerun-if-changed=src/moe_w2_unpack.cu");
+    println!("cargo:rerun-if-changed=src/moe_w2_pack.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/moe_gemm_gguf.cu");
     println!("cargo:rerun-if-changed=src/moe_gguf_small_m.cu");
@@ -36,6 +51,11 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_compressor.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_indexer.cu");
     println!("cargo:rerun-if-changed=src/deepseek_v4/ds_sparse_attn.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_quant.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_moe.cu");
+    println!("cargo:rerun-if-changed=src/deepseek_v4/ds_fp8_kv_pack.cu");
+    println!("cargo:rerun-if-changed=src/flashmla_sparse_mla.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_sparse_mla_dsv4.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_batched_gemm_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_runner.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_dev_kernel.cu");
@@ -148,7 +168,7 @@ fn main() -> Result<()> {
     {
         builder = builder
             .arg("-DUSE_CUTLASS")
-            .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
+            .with_cutlass(Some("b46b16d003484063bca4ed365e44095c4c6ed633"));
 
         if compute_cap >= 100 {
             builder = builder
@@ -196,16 +216,17 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_prefill_fp8_fa2.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
-        // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
-        // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support
+        // guoqingbao/flashinfer upstream branch: official DSV4 sparse MLA + GQA/FP8 patches
+        // Pin: github/upstream @ 0f06c230 (DSV4 sparse + GQA patches + fastdiv/flat compat)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "377611ceeb404b31768b17983ac00a2415b26942", // v0.6.7
+            "0f06c2305a276bcb704277705b32025575cb567f", // upstream + fastdiv/flat compat
             vec![
                 "include",
                 "include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export",
                 "include/flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+                "include/flashinfer/attention/sparse_mla_sm120",
                 "csrc/nv_internal",
                 "csrc/nv_internal/include",
                 "csrc/nv_internal/tensorrt_llm/cutlass_extensions/include",
@@ -213,6 +234,7 @@ fn main() -> Result<()> {
             vec![
                 "csrc/nv_internal/cpp/common",
                 "csrc/nv_internal/tensorrt_llm",
+                "csrc/sparse_mla_sm120_decode_dsv4.cu",
             ],
             false,
         );
@@ -251,90 +273,27 @@ fn main() -> Result<()> {
             );
         }
 
-        // TRT-LLM backend: download BMM/GEMM/FMHA artifacts from NVIDIA artifactory.
-        // Cubins are Blackwell-only (SM100+); fail the build on older architectures.
-        if trtllm_enabled && compute_cap < 100 {
-            panic!(
-                "trtllm feature requires SM100+ (Blackwell). Detected compute_cap={compute_cap}. \
-                 TRT-LLM fused MoE cubins are Blackwell-only. \
-                 Remove the trtllm feature to build for this GPU."
-            );
-        }
-        if trtllm_enabled && compute_cap >= 100 {
-            let trtllm_cache = build_dir.join("trtllm_artifacts");
-            std::fs::create_dir_all(&trtllm_cache)?;
+        builder = others::configure_trtllm(
+            builder,
+            &flashinfer_root,
+            &build_dir,
+            compute_cap,
+            trtllm_enabled,
+        )?;
+    }
 
-            // The bmm_export headers go into the FlashInfer include tree so that
-            // `#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"` resolves.
-            let bmm_dest = flashinfer_root.join("include/flashinfer/trtllm/batched_gemm");
-            std::fs::create_dir_all(&bmm_dest)?;
+    let (builder, link_flashmla) = others::configure_flashmla(builder, &build_dir, compute_cap)?;
+    let mut builder = builder;
 
-            // BMM metainfo goes into the artifact cache dir (included separately)
-            let bmm_include_dir = trtllm_cache.join("bmm_include");
-            std::fs::create_dir_all(&bmm_include_dir)?;
-
-            match trtllm_artifacts::download_bmm_headers(&trtllm_cache, &bmm_include_dir) {
-                Ok(()) => {
-                    // Symlink/copy the downloaded bmm_export into the FlashInfer tree
-                    let export_src = bmm_include_dir.join("trtllmGen_bmm_export");
-                    let export_dst = bmm_dest.join("trtllmGen_bmm_export");
-                    if export_src.exists() && !export_dst.exists() {
-                        #[cfg(unix)]
-                        std::os::unix::fs::symlink(&export_src, &export_dst).or_else(|_| {
-                            trtllm_artifacts::copy_dir_recursive(&export_src, &export_dst)
-                        })?;
-                        #[cfg(not(unix))]
-                        trtllm_artifacts::copy_dir_recursive(&export_src, &export_dst)?;
-                    }
-
-                    // GEMM metainfo
-                    let gemm_include_dir = trtllm_cache.join("gemm_include");
-                    let _ =
-                        trtllm_artifacts::download_gemm_metainfo(&trtllm_cache, &gemm_include_dir);
-
-                    // FMHA metainfo
-                    let fmha_include_dir = trtllm_cache.join("fmha_include");
-                    let fmha_meta_hash =
-                        trtllm_artifacts::download_fmha_metainfo(&trtllm_cache, &fmha_include_dir)
-                            .unwrap_or_default();
-
-                    builder = builder
-                        .arg("-DUSE_TRTLLM")
-                        .arg("-DTLLM_GEN_EXPORT_INTERFACE")
-                        .arg("-DTLLM_GEN_EXPORT_FLASHINFER")
-                        .arg("-DTLLM_ENABLE_CUDA")
-                        .arg(&format!(
-                            "-DTLLM_GEN_GEMM_CUBIN_PATH=\\\"{}\\\"",
-                            trtllm_artifacts::TRTLLM_GEN_BMM_PATH
-                        ))
-                        .arg(&format!(
-                            "-DTLLM_GEN_FMHA_CUBIN_PATH=\\\"{}\\\"",
-                            trtllm_artifacts::TRTLLM_GEN_FMHA_PATH
-                        ))
-                        .arg(&format!(
-                            "-DTLLM_GEN_FMHA_METAINFO_HASH=\\\"{fmha_meta_hash}\\\""
-                        ))
-                        .include_path(&bmm_include_dir)
-                        .include_path(bmm_include_dir.join("trtllmGen_bmm_export"));
-
-                    if gemm_include_dir.exists() {
-                        builder = builder.include_path(&gemm_include_dir);
-                    }
-                    if fmha_include_dir.exists() {
-                        builder = builder.include_path(&fmha_include_dir);
-                    }
-
-                    let csrc_path = PathBuf::from("src/trtllm/trtllm_cutlass_heuristic.cpp");
-                    if csrc_path.exists() {
-                        builder = builder.source_files(vec![csrc_path]);
-                    }
-
-                    println!("cargo:warning=TRT-LLM artifacts downloaded successfully");
-                }
-                Err(e) => {
-                    println!("cargo:warning=Failed to download TRT-LLM BMM artifacts: {e}");
-                    println!("cargo:warning=TRT-LLM fused MoE backend will be disabled");
-                }
+    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 120 {
+        if let Ok(flashinfer_root) = builder.fetch_git_dependency("flashinfer") {
+            let csrc_dir = flashinfer_root.join("csrc");
+            let dsv4_cu = csrc_dir.join("sparse_mla_sm120_decode_dsv4.cu");
+            if dsv4_cu.exists() {
+                builder = builder
+                    .arg("-DATTENTION_RS_USE_FLASHINFER_SPARSE_MLA_SM120")
+                    .source_files(vec![dsv4_cu]);
+                println!("cargo:warning=FlashInfer SM120 DSV4 sparse MLA enabled");
             }
         }
     }
@@ -363,6 +322,9 @@ fn main() -> Result<()> {
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
+    if link_flashmla {
+        println!("cargo:rustc-link-lib=static=flashmla_dsv4");
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 

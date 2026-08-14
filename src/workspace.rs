@@ -434,6 +434,8 @@ mod cuda {
             };
 
             if needs_realloc {
+                // Grow-only: CudaSlice Drop uses free_async on the device stream,
+                // and the subsequent alloc is also stream-ordered — no host sync.
                 let old = slot.take();
                 let (g_sz, ap_sz, as_sz, r_sz, m_sz) = if let Some(ref prev) = old {
                     (

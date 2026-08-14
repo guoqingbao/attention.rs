@@ -177,7 +177,7 @@ void flashinfer_prefill_ragged_wrapper(
             q_cu_seqlens_host, kv_cu_seqlens_host, total_num_rows,
             batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, 1,
             enable_cuda_graph, sizeof(DTypeOut),
-            -1, 0, false, 0, stream
+            -1, 0, false, 0, /*uniform_q_len=*/static_cast<int64_t>(0), stream
         );
         using ParamsType = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
         ParamsType params(
@@ -305,7 +305,7 @@ void flashinfer_prefill_plan_wrapper(
             batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
             enable_cuda_graph, (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
             window_left > 0 ? window_left : -1, 0, false, 0,
-            stream
+            /*uniform_q_len=*/static_cast<int64_t>(0), stream
         );
         if (!ValidatePrefillPlanInfoBounds(
                 plan_info, workspace_float_size, workspace_int_size)) {

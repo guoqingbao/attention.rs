@@ -8,6 +8,7 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
 
 pub mod moe;
+pub mod moe_w2;
 pub mod paged_attention;
 pub mod scale_update;
 #[cfg(feature = "cuda")]
@@ -249,6 +250,8 @@ pub struct InputMetadata {
     pub mamba_slot_mapping: Option<Tensor>,
     pub slot_mapping: Tensor,
     pub block_tables: Option<Tensor>,
+    pub block_tables_host: Option<Vec<Vec<u32>>>,
+    pub context_lens_host: Option<Vec<u32>>,
     pub context_lens: Option<Tensor>,
     pub cu_seqlens_q: Option<Tensor>,
     pub cu_seqlens_k: Option<Tensor>,

@@ -9,6 +9,7 @@ use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
+#[cfg(any(feature = "cuda", test))]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }
@@ -2701,7 +2702,6 @@ pub fn moe_gemm_mxfp4(
             }
 
             let has_bias = biases.is_some();
-            let use_fused = is_prefill;
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
@@ -2736,7 +2736,7 @@ pub fn moe_gemm_mxfp4(
                 unsafe {
                     match dtype {
                         DType::F16 => {
-                            if use_fused {
+                            if is_prefill {
                                 ffi::mxfp4_moe_grouped_gemm_wmma_f16(
                                     input_ptr,
                                     weights_ptr,
@@ -2774,7 +2774,7 @@ pub fn moe_gemm_mxfp4(
                             }
                         }
                         DType::BF16 => {
-                            if use_fused {
+                            if is_prefill {
                                 ffi::mxfp4_moe_grouped_gemm_wmma_bf16(
                                     input_ptr,
                                     weights_ptr,
@@ -2818,7 +2818,7 @@ pub fn moe_gemm_mxfp4(
                 }
             }
 
-            if !use_fused {
+            if !is_prefill {
                 if let Some(tw) = topk_weights {
                     let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
                     return Ok(output.broadcast_mul(&tw)?);
@@ -3511,4 +3511,121 @@ mod tests {
         };
         assert_metadata_eq(actual, expected);
     }
+}
+
+/// Moet-style 2-bit MoE GEMM: unpack W2 planes → e4m3 + F32 scales, then `moe_gemm_fp8`.
+/// Scale blocks are `(1, 32)` matching UE8M0 block-K.
+///
+/// Decode / small batches (`size_m < E`): unpack **only** the experts listed in
+/// `experts_ids` (on-the-fly dequant, Moet-style activation path), remap ids to
+/// local `[0..U)`, then FP8 GEMM. Prefill with large M falls back to full unpack.
+#[cfg(feature = "cuda")]
+pub fn moe_gemm_w2(
+    input: &Tensor,
+    planes: &Tensor,
+    scale_planes: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    n: usize,
+    k: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let input = if input.dtype() == candle_core::DType::BF16 {
+        input.clone()
+    } else {
+        input.to_dtype(candle_core::DType::BF16)?
+    };
+    let input = crate::moe_w2::moe_w2_quantize_dequantize_activation(&input)?;
+    let e = planes.dim(0)?;
+    let size_m = experts_ids.elem_count();
+
+    // Prefill (eager): host-side bounds check. Decode runs under CUDA graph
+    // capture — `to_vec1` is a D2H sync that invalidates stream capture.
+    if is_prefill {
+        let route_ids = experts_ids
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
+        for &expert in &route_ids {
+            if expert as usize >= e {
+                candle_core::bail!(
+                    "moe_gemm_w2: routed expert id {} is outside the {}-expert table",
+                    expert,
+                    e
+                );
+            }
+        }
+    }
+
+    // Decode: unpack one weight row per route assignment (duplicates allowed)
+    // and remap to local `[0..size_m)` with a device arange — no D2H/H2D.
+    // Prefill with large M uses full unpack. Host-side unique compaction used
+    // to D2H+H2D every decode step and broke CUDA graph capture.
+    let force_full = std::env::var("XINFER_W2_FULL_UNPACK").is_ok();
+    let (weights_u8, scales_f32, compact_route_ids) =
+        if !force_full && !is_prefill && size_m > 0 && size_m < e {
+            let route_ids_tensor = experts_ids
+                .to_dtype(candle_core::DType::U32)?
+                .contiguous()?;
+            let (w, s) = crate::moe_w2::moe_w2_unpack_by_ids_to_fp8(
+                planes,
+                scale_planes,
+                &route_ids_tensor,
+                n,
+                k,
+            )?;
+            let compact = Tensor::arange(0u32, size_m as u32, experts_ids.device())?
+                .reshape(experts_ids.dims())?;
+            (w, s, compact)
+        } else {
+            let (w, s) = crate::moe_w2::moe_w2_unpack_to_fp8(planes, scale_planes, n, k)?;
+            (w, s, experts_ids.clone())
+        };
+
+    // W2 uses block_size_n=1 / block_size_k=32 scales. The decode FP8 GEMV
+    // path has been observed to illegal-address with that layout on Hopper;
+    // prefill WMMA with the same scales is stable. Always take WMMA for W2.
+    moe_gemm_fp8(
+        &input,
+        &weights_u8,
+        &scales_f32,
+        topk_weights,
+        sorted_token_ids,
+        &compact_route_ids,
+        topk,
+        1,
+        32,
+        true,
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn moe_gemm_w2(
+    input: &Tensor,
+    planes: &Tensor,
+    scale_planes: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    n: usize,
+    k: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    let _ = (
+        input,
+        planes,
+        scale_planes,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+        n,
+        k,
+        is_prefill,
+    );
+    candle_core::bail!("moe_gemm_w2 requires cuda feature")
 }

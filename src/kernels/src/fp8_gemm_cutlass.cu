@@ -982,6 +982,41 @@ void sm120_fp8_blockwise_dispatch_shape(
 
 #endif
 
+#if !defined(USE_CUTLASS)
+// Rust always links these symbols (fp8_linear / moe / moe_w2). Provide stubs when
+// building without the cutlass feature so cuda,nccl-only targets still link.
+extern "C" void fp8_quantize_per_token_group_launch(
+    const void* /*input*/,
+    void* /*output_q*/,
+    float* /*output_s*/,
+    int /*num_groups*/,
+    int /*group_size*/,
+    int /*num_groups_per_row*/,
+    int /*scale_stride*/,
+    bool /*is_input_f16*/,
+    bool /*is_column_major_stats*/,
+    cudaStream_t /*stream*/) {
+  fprintf(stderr,
+          "fp8_quantize_per_token_group_launch requires the cutlass feature\n");
+}
+
+extern "C" void fp8_quantize_per_token_group_static_launch(
+    const void* /*input*/,
+    void* /*output_q*/,
+    float* /*output_s*/,
+    int /*num_groups*/,
+    int /*group_size*/,
+    int /*num_groups_per_row*/,
+    int /*scale_stride*/,
+    bool /*is_input_f16*/,
+    bool /*is_column_major_stats*/,
+    float /*input_scale*/,
+    cudaStream_t /*stream*/) {
+  fprintf(stderr,
+          "fp8_quantize_per_token_group_static_launch requires the cutlass feature\n");
+}
+#endif
+
 extern "C" void fp8_matmul_f16_cutlass(const uint8_t* input_q,
                                        const float* input_scale,
                                        const uint8_t* weight,
