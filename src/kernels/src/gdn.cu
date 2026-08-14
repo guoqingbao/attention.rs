@@ -681,7 +681,9 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     float* scalars = smem + 2 * BK;
 
     if (tid == 0) {
-        scalars[0] = expf(to_float(g[b * num_v_heads + v_head_idx]));
+        float decay_val = to_float(g[b * num_v_heads + v_head_idx]);
+        decay_val = fmaxf(fminf(decay_val, 100.0f), -100.0f);
+        scalars[0] = expf(decay_val);
         scalars[1] = to_float(beta[b * num_v_heads + v_head_idx]);
     }
 
@@ -1937,7 +1939,9 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
             }
         }
         if (tid == 0) {
-            scalars[0][0] = expf(to_float(g_base[0]));
+            float decay_val = to_float(g_base[0]);
+            decay_val = fmaxf(fminf(decay_val, 100.0f), -100.0f);
+            scalars[0][0] = expf(decay_val);
             scalars[0][1] = to_float(beta_base[0]);
         }
         __syncthreads();
@@ -1960,7 +1964,9 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
                 }
             }
             if (tid == 0) {
-                scalars[nxt][0] = expf(to_float(g_base[(t + 1) * token_stride_g]));
+                float decay_val = to_float(g_base[(t + 1) * token_stride_g]);
+                decay_val = fmaxf(fminf(decay_val, 100.0f), -100.0f);
+                scalars[nxt][0] = expf(decay_val);
                 scalars[nxt][1] = to_float(beta_base[(t + 1) * token_stride_g]);
             }
         }
