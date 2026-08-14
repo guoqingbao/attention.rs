@@ -2702,8 +2702,6 @@ pub fn moe_gemm_mxfp4(
             }
 
             let has_bias = biases.is_some();
-            let use_fused =
-                is_prefill && std::env::var_os("XINFER_DSV4_DISABLE_MXFP4_GROUPED").is_none();
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
@@ -2738,7 +2736,7 @@ pub fn moe_gemm_mxfp4(
                 unsafe {
                     match dtype {
                         DType::F16 => {
-                            if use_fused {
+                            if is_prefill {
                                 ffi::mxfp4_moe_grouped_gemm_wmma_f16(
                                     input_ptr,
                                     weights_ptr,
@@ -2776,7 +2774,7 @@ pub fn moe_gemm_mxfp4(
                             }
                         }
                         DType::BF16 => {
-                            if use_fused {
+                            if is_prefill {
                                 ffi::mxfp4_moe_grouped_gemm_wmma_bf16(
                                     input_ptr,
                                     weights_ptr,
@@ -2820,7 +2818,7 @@ pub fn moe_gemm_mxfp4(
                 }
             }
 
-            if !use_fused {
+            if !is_prefill {
                 if let Some(tw) = topk_weights {
                     let tw = tw.to_dtype(dtype)?.unsqueeze(candle_core::D::Minus1)?;
                     return Ok(output.broadcast_mul(&tw)?);

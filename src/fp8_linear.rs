@@ -810,10 +810,6 @@ fn fp8_matmul_cutlass_with_input_scale(
         _ => candle_core::bail!("fp8_matmul_cutlass only supports CUDA"),
     }
 
-    if std::env::var_os("XINFER_DSV4_SYNC_FP8").is_some() {
-        input.device().synchronize()?;
-    }
-
     if pad_len > 0 {
         output = output.narrow(0, 0, m)?.contiguous()?;
     }
@@ -1283,9 +1279,6 @@ pub fn fp8_grouped_gemm_fused(
     };
     if ret != 0 {
         candle_core::bail!("fp8_grouped_gemm_fused failed with code {}", ret);
-    }
-    if std::env::var_os("XINFER_DSV4_SYNC_FP8").is_some() {
-        input.device().synchronize()?;
     }
 
     Ok(output)

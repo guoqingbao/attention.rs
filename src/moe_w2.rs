@@ -5,18 +5,6 @@
 
 use candle_core::{Device, Result, Tensor};
 
-/// e2m1 nibble → 2-bit code (sign-symmetric).
-pub const NIBBLE_TO_CODE: [u8; 16] = [
-    2, 2, 2, 2, 2, 3, 3, 3, // +0,.5,1,1.5,2,3,4,6
-    1, 1, 1, 1, 1, 0, 0, 0, // negatives
-];
-
-/// 2-bit code → representative e2m1 nibble (for reverse remap).
-pub const CODE_TO_NIBBLE: [u8; 4] = [0x0E, 0x0A, 0x02, 0x06];
-
-/// Codebook levels in float.
-pub const CODE_LEVELS: [f32; 4] = [-4.0, -1.0, 1.0, 4.0];
-
 /// PRMT LUT word (LE bytes = e4m3 encodings of {-4,-1,+1,+4}).
 pub const PRMT_LUT_WORD: u32 = 0x4838_B8C8;
 
@@ -84,48 +72,9 @@ pub fn moe_w2_swiglu_clamp_bf16(gate_up: &Tensor, hidden: usize, limit: f32) -> 
     candle_core::bail!("moe_w2_swiglu_clamp_bf16 requires cuda feature")
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ZeroMode {
-    #[default]
-    Auto,
-    Sign,
-    Alt,
-}
-
-/// Packed mxfp4 / e2m1 nibbles `[N, K/2]` → codes `[N*K]` in `0..3`.
-pub fn mxfp4_to_codes(w_packed: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
-    if k % 2 != 0 {
-        candle_core::bail!("mxfp4_to_codes: K must be even, got {k}");
-    }
-    if w_packed.len() < n * (k / 2) {
-        candle_core::bail!("mxfp4_to_codes: packed len too small");
-    }
-    let mut codes = vec![0u8; n * k];
-    for row in 0..n {
-        for kb in 0..(k / 2) {
-            let byte = w_packed[row * (k / 2) + kb];
-            let lo = byte & 0x0F;
-            let hi = byte >> 4;
-            codes[row * k + 2 * kb] = NIBBLE_TO_CODE[lo as usize];
-            codes[row * k + 2 * kb + 1] = NIBBLE_TO_CODE[hi as usize];
-        }
-    }
-    Ok(codes)
-}
-
 /// e4m3 byte encodings for codebook levels (matches PRMT_LUT_WORD).
 fn code_to_e4m3(code: u8) -> u8 {
     ((PRMT_LUT_WORD >> (8 * (code as u32))) & 0xFF) as u8
-}
-
-fn ue8m0_from_amax(amax: f32) -> u8 {
-    if !amax.is_finite() || amax <= 0.0 {
-        return 0;
-    }
-    // Round to nearest power-of-two exponent in UE8M0 (bias 127).
-    let exp = amax.log2().ceil() as i32;
-    let e = (exp + 127).clamp(0, 255) as u8;
-    e
 }
 
 fn scale_from_ue8m0(s: u8) -> f32 {
@@ -135,132 +84,8 @@ fn scale_from_ue8m0(s: u8) -> f32 {
     2.0f32.powi(s as i32 - 127)
 }
 
-/// f32 weights `[N*K]` → (codes, UE8M0 scales `[N*(K/32)]`).
-pub fn f32_to_codes_scales(
-    w: &[f32],
-    n: usize,
-    k: usize,
-    zero_mode: ZeroMode,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    if k % W2_SCALE_BLOCK_K != 0 {
-        candle_core::bail!("f32_to_codes_scales: K must be multiple of 32");
-    }
-    if w.len() < n * k {
-        candle_core::bail!("f32_to_codes_scales: weight len too small");
-    }
-    let ks = k / W2_SCALE_BLOCK_K;
-    let mut scales = vec![0u8; n * ks];
-    let mut codes = vec![0u8; n * k];
-
-    for row in 0..n {
-        for b in 0..ks {
-            let base = row * k + b * W2_SCALE_BLOCK_K;
-            let mut amax = 0.0f32;
-            for t in 0..W2_SCALE_BLOCK_K {
-                amax = amax.max(w[base + t].abs());
-            }
-            let s = ue8m0_from_amax(amax);
-            scales[row * ks + b] = s;
-            let scale = scale_from_ue8m0(s).max(1e-12);
-            for t in 0..W2_SCALE_BLOCK_K {
-                let v = w[base + t] / scale;
-                // Snap to e2m1-ish grid then map via nibble table.
-                let mag = v.abs();
-                let level = if mag < 0.25 {
-                    0.0
-                } else if mag < 0.75 {
-                    0.5
-                } else if mag < 1.25 {
-                    1.0
-                } else if mag < 1.75 {
-                    1.5
-                } else if mag < 2.5 {
-                    2.0
-                } else if mag < 3.5 {
-                    3.0
-                } else if mag < 5.0 {
-                    4.0
-                } else {
-                    6.0
-                };
-                let signed = if v < 0.0 { -level } else { level };
-                let nibble = e2m1_to_nibble(signed);
-                let mut code = NIBBLE_TO_CODE[nibble as usize];
-                if level == 0.0 {
-                    code = match zero_mode {
-                        ZeroMode::Sign => {
-                            if v < 0.0 {
-                                1
-                            } else {
-                                2
-                            }
-                        }
-                        ZeroMode::Alt | ZeroMode::Auto => {
-                            if ((base + t) & 1) == 0 {
-                                2
-                            } else {
-                                1
-                            }
-                        }
-                    };
-                }
-                codes[base + t] = code;
-            }
-        }
-    }
-    Ok((codes, scales))
-}
-
-fn e2m1_to_nibble(v: f32) -> u8 {
-    // Map to FP4 e2m1 nibble indices used by Moet tables.
-    let neg = v < 0.0;
-    let mag = v.abs();
-    let idx = if mag == 0.0 {
-        0
-    } else if (mag - 0.5).abs() < 1e-6 {
-        1
-    } else if (mag - 1.0).abs() < 1e-6 {
-        2
-    } else if (mag - 1.5).abs() < 1e-6 {
-        3
-    } else if (mag - 2.0).abs() < 1e-6 {
-        4
-    } else if (mag - 3.0).abs() < 1e-6 {
-        5
-    } else if (mag - 4.0).abs() < 1e-6 {
-        6
-    } else {
-        7
-    };
-    if neg {
-        idx + 8
-    } else {
-        idx
-    }
-}
-
-/// Pack `[N,K]` codes (0..3) into row-major 2-bit plane `[N*K/4]` (4 codes/byte, little-endian).
-/// First cut uses **row-major** packing (not QMMA fragment-major) so unpack is trivial.
-pub fn pack_row_major(codes: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
-    if k % 4 != 0 {
-        candle_core::bail!("pack_row_major: K must be multiple of 4");
-    }
-    if codes.len() < n * k {
-        candle_core::bail!("pack_row_major: codes len too small");
-    }
-    let mut plane = vec![0u8; n * k / 4];
-    for i in 0..(n * k / 4) {
-        let b0 = codes[4 * i] & 3;
-        let b1 = codes[4 * i + 1] & 3;
-        let b2 = codes[4 * i + 2] & 3;
-        let b3 = codes[4 * i + 3] & 3;
-        plane[i] = b0 | (b1 << 2) | (b2 << 4) | (b3 << 6);
-    }
-    Ok(plane)
-}
-
-/// Decode row-major plane → e4m3 bytes `[N*K]` (host).
-pub fn unpack_row_major_to_e4m3(plane: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
+/// Decode row-major plane → e4m3 bytes `[N*K]` (host fallback for non-CUDA).
+fn unpack_row_major_to_e4m3(plane: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
     if plane.len() < n * k / 4 {
         candle_core::bail!("unpack_row_major_to_e4m3: plane too small");
     }
@@ -275,8 +100,8 @@ pub fn unpack_row_major_to_e4m3(plane: &[u8], n: usize, k: usize) -> Result<Vec<
     Ok(out)
 }
 
-/// UE8M0 scales `[N*(K/32)]` → F32 block scales.
-pub fn ue8m0_to_f32_scales(scales: &[u8]) -> Vec<f32> {
+/// UE8M0 scales `[N*(K/32)]` → F32 block scales (host fallback).
+fn ue8m0_to_f32_scales(scales: &[u8]) -> Vec<f32> {
     scales.iter().map(|&s| scale_from_ue8m0(s)).collect()
 }
 
@@ -657,31 +482,23 @@ pub fn moe_w2_pack_from_mxfp4(
     candle_core::bail!("moe_w2_pack_from_mxfp4 requires cuda feature")
 }
 
-/// Convenience: mxfp4 packed weights + UE8M0 scales → (plane, scales) for one expert.
-pub fn quantize_expert_mxfp4(
-    w_packed: &[u8],
-    scales_ue8m0: &[u8],
-    n: usize,
-    k: usize,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let codes = mxfp4_to_codes(w_packed, n, k)?;
-    let plane = pack_row_major(&codes, n, k)?;
-    Ok((plane, scales_ue8m0.to_vec()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn codebook_roundtrip_pack() {
+    fn codebook_host_unpack() {
         let n = 16;
         let k = 64;
-        let mut codes = vec![0u8; n * k];
-        for (i, c) in codes.iter_mut().enumerate() {
-            *c = (i % 4) as u8;
+        // Row-major packing: 4 codes per byte, little-endian nibbles of 2 bits.
+        let mut plane = vec![0u8; n * k / 4];
+        for i in 0..(n * k / 4) {
+            let b0 = ((4 * i) % 4) as u8;
+            let b1 = ((4 * i + 1) % 4) as u8;
+            let b2 = ((4 * i + 2) % 4) as u8;
+            let b3 = ((4 * i + 3) % 4) as u8;
+            plane[i] = b0 | (b1 << 2) | (b2 << 4) | (b3 << 6);
         }
-        let plane = pack_row_major(&codes, n, k).unwrap();
         let e4 = unpack_row_major_to_e4m3(&plane, n, k).unwrap();
         assert_eq!(e4.len(), n * k);
         assert_eq!(e4[0], code_to_e4m3(0));
@@ -691,12 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn nibble_map_symmetric() {
-        // +4 → code 3, -4 → code 0
-        assert_eq!(NIBBLE_TO_CODE[6], 3);
-        assert_eq!(NIBBLE_TO_CODE[14], 0);
-        // +1 → 2, -1 → 1
-        assert_eq!(NIBBLE_TO_CODE[2], 2);
-        assert_eq!(NIBBLE_TO_CODE[10], 1);
+    fn prmt_lut_codebook_bytes() {
+        // {-4,-1,+1,+4} as e4m3 bytes in PRMT_LUT_WORD little-endian order.
+        assert_eq!(code_to_e4m3(0), 0xC8);
+        assert_eq!(code_to_e4m3(1), 0xB8);
+        assert_eq!(code_to_e4m3(2), 0x38);
+        assert_eq!(code_to_e4m3(3), 0x48);
     }
 }
