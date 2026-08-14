@@ -1,4 +1,4 @@
-mod trtllm_artifacts;
+mod others;
 
 use anyhow::Result;
 use cudaforge::KernelBuilder;
@@ -16,7 +16,10 @@ fn main() -> Result<()> {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=trtllm_artifacts.rs");
+    println!("cargo:rerun-if-env-changed=CUDACXX");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-changed=others.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn_opt.cu");
@@ -270,231 +273,17 @@ fn main() -> Result<()> {
             );
         }
 
-        // TRT-LLM backend: download BMM/GEMM/FMHA artifacts from NVIDIA artifactory.
-        // Cubins are Blackwell-only (SM100+); fail the build on older architectures.
-        if trtllm_enabled && compute_cap < 100 {
-            panic!(
-                "trtllm feature requires SM100+ (Blackwell). Detected compute_cap={compute_cap}. \
-                 TRT-LLM fused MoE cubins are Blackwell-only. \
-                 Remove the trtllm feature to build for this GPU."
-            );
-        }
-        if trtllm_enabled && compute_cap >= 100 {
-            let trtllm_cache = build_dir.join("trtllm_artifacts");
-            std::fs::create_dir_all(&trtllm_cache)?;
-
-            // The bmm_export headers go into the FlashInfer include tree so that
-            // `#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"` resolves.
-            let bmm_dest = flashinfer_root.join("include/flashinfer/trtllm/batched_gemm");
-            std::fs::create_dir_all(&bmm_dest)?;
-
-            // BMM metainfo goes into the artifact cache dir (included separately)
-            let bmm_include_dir = trtllm_cache.join("bmm_include");
-            std::fs::create_dir_all(&bmm_include_dir)?;
-
-            match trtllm_artifacts::download_bmm_headers(&trtllm_cache, &bmm_include_dir) {
-                Ok(()) => {
-                    // Symlink/copy the downloaded bmm_export into the FlashInfer tree
-                    let export_src = bmm_include_dir.join("trtllmGen_bmm_export");
-                    let export_dst = bmm_dest.join("trtllmGen_bmm_export");
-                    if export_src.exists() && !export_dst.exists() {
-                        #[cfg(unix)]
-                        std::os::unix::fs::symlink(&export_src, &export_dst).or_else(|_| {
-                            trtllm_artifacts::copy_dir_recursive(&export_src, &export_dst)
-                        })?;
-                        #[cfg(not(unix))]
-                        trtllm_artifacts::copy_dir_recursive(&export_src, &export_dst)?;
-                    }
-
-                    // GEMM metainfo
-                    let gemm_include_dir = trtllm_cache.join("gemm_include");
-                    let _ =
-                        trtllm_artifacts::download_gemm_metainfo(&trtllm_cache, &gemm_include_dir);
-
-                    // FMHA metainfo
-                    let fmha_include_dir = trtllm_cache.join("fmha_include");
-                    let fmha_meta_hash =
-                        trtllm_artifacts::download_fmha_metainfo(&trtllm_cache, &fmha_include_dir)
-                            .unwrap_or_default();
-
-                    builder = builder
-                        .arg("-DUSE_TRTLLM")
-                        .arg("-DTLLM_GEN_EXPORT_INTERFACE")
-                        .arg("-DTLLM_GEN_EXPORT_FLASHINFER")
-                        .arg("-DTLLM_ENABLE_CUDA")
-                        .arg(&format!(
-                            "-DTLLM_GEN_GEMM_CUBIN_PATH=\\\"{}\\\"",
-                            trtllm_artifacts::TRTLLM_GEN_BMM_PATH
-                        ))
-                        .arg(&format!(
-                            "-DTLLM_GEN_FMHA_CUBIN_PATH=\\\"{}\\\"",
-                            trtllm_artifacts::TRTLLM_GEN_FMHA_PATH
-                        ))
-                        .arg(&format!(
-                            "-DTLLM_GEN_FMHA_METAINFO_HASH=\\\"{fmha_meta_hash}\\\""
-                        ))
-                        .include_path(&bmm_include_dir)
-                        .include_path(bmm_include_dir.join("trtllmGen_bmm_export"));
-
-                    if gemm_include_dir.exists() {
-                        builder = builder.include_path(&gemm_include_dir);
-                    }
-                    if fmha_include_dir.exists() {
-                        builder = builder.include_path(&fmha_include_dir);
-                    }
-
-                    let csrc_path = PathBuf::from("src/trtllm/trtllm_cutlass_heuristic.cpp");
-                    if csrc_path.exists() {
-                        builder = builder.source_files(vec![csrc_path]);
-                    }
-
-                    println!("cargo:warning=TRT-LLM artifacts downloaded successfully");
-                }
-                Err(e) => {
-                    println!("cargo:warning=Failed to download TRT-LLM BMM artifacts: {e}");
-                    println!("cargo:warning=TRT-LLM fused MoE backend will be disabled");
-                }
-            }
-        }
+        builder = others::configure_trtllm(
+            builder,
+            &flashinfer_root,
+            &build_dir,
+            compute_cap,
+            trtllm_enabled,
+        )?;
     }
 
-    // FlashMLA (SM90 DeepSeek V4 sparse). Built as a separate static library with
-    // FlashMLA's own CUTLASS pin so it does not clash with attention.rs CUTLASS.
-    let mut link_flashmla = false;
-    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 90 {
-        // cudaforge only treats a checkout as cached when <root>/include exists.
-        // FlashMLA has no top-level include/, so without this marker every build
-        // re-runs `git fetch` (and hangs when GitHub is slow/unreachable).
-        let fm_commit = "05e26647fe840b8baedae486c2d86d5ce4efeb7c";
-        if let Some(cache) = std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h).join(format!(
-                ".cudaforge/git/checkouts/flashmla-{}",
-                &fm_commit[..16]
-            ))
-        }) {
-            if cache.exists() {
-                let _ = std::fs::create_dir_all(cache.join("include"));
-            }
-        }
-        builder = builder.with_git_dependency(
-            "flashmla",
-            "https://github.com/sgl-project/FlashMLA.git",
-            fm_commit,
-            vec![
-                "csrc",
-                "csrc/kerutils/include",
-                "csrc/sm90",
-                "csrc/cutlass/include",
-                "csrc/cutlass/tools/util/include",
-            ],
-            vec![
-                "csrc/sm90/decode/sparse_fp8",
-                "csrc/sm90/prefill/sparse",
-                "csrc/smxx/decode",
-                "csrc/kerutils",
-                "csrc/params.h",
-                "csrc/cutlass",
-            ],
-            true,
-        );
-        let flashmla_root = builder.fetch_git_dependency("flashmla")?;
-        let fm_csrc = flashmla_root.join("csrc");
-        let fm_cutlass_hdr = fm_csrc.join("cutlass/include/cutlass/bfloat16.h");
-        if !fm_cutlass_hdr.exists() {
-            let _ = std::process::Command::new("git")
-                .args([
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--depth",
-                    "1",
-                    "csrc/cutlass",
-                ])
-                .current_dir(&flashmla_root)
-                .status();
-        }
-        if fm_csrc.join("cutlass/include/cutlass/bfloat16.h").exists() {
-            let fm_out = build_dir.join("flashmla_objs");
-            std::fs::create_dir_all(&fm_out)?;
-            let nvcc = std::env::var("CUDACXX").unwrap_or_else(|_| "nvcc".into());
-            let sources = [
-                fm_csrc.join("sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu"),
-                fm_csrc.join("sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu"),
-                fm_csrc.join("sm90/prefill/sparse/instantiations/phase1_k512.cu"),
-                fm_csrc.join("sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu"),
-                fm_csrc.join("smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu"),
-                fm_csrc.join("smxx/decode/combine/combine.cu"),
-                PathBuf::from("src/flashmla_sparse_mla.cu"),
-            ];
-            let mut objs = Vec::new();
-            let mut ok = true;
-            for src in &sources {
-                let obj = fm_out.join(format!(
-                    "{}.o",
-                    src.file_stem().and_then(|s| s.to_str()).unwrap_or("obj")
-                ));
-                let mut cmd = std::process::Command::new(&nvcc);
-                cmd.arg("-c")
-                    .arg(src)
-                    .arg("-o")
-                    .arg(&obj)
-                    .arg("-std=c++20")
-                    .arg("-O3")
-                    .arg("--expt-relaxed-constexpr")
-                    .arg("--expt-extended-lambda")
-                    .arg("--use_fast_math")
-                    .arg("-Xcompiler")
-                    .arg("-fPIC")
-                    .arg("-DATTENTION_RS_USE_FLASHMLA")
-                    .arg(format!("-I{}", fm_csrc.display()))
-                    .arg(format!("-I{}", fm_csrc.join("kerutils/include").display()))
-                    .arg(format!("-I{}", fm_csrc.join("sm90").display()))
-                    .arg(format!("-I{}", fm_csrc.join("cutlass/include").display()))
-                    .arg(format!(
-                        "-I{}",
-                        fm_csrc.join("cutlass/tools/util/include").display()
-                    ))
-                    .arg("-gencode=arch=compute_90a,code=sm_90a");
-                let status = cmd.status();
-                match status {
-                    Ok(st) if st.success() => objs.push(obj),
-                    Ok(st) => {
-                        println!(
-                            "cargo:warning=FlashMLA nvcc failed for {}: status={}",
-                            src.display(),
-                            st
-                        );
-                        ok = false;
-                        break;
-                    }
-                    Err(e) => {
-                        println!("cargo:warning=FlashMLA nvcc spawn failed: {e}");
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok && !objs.is_empty() {
-                let lib = build_dir.join("libflashmla_dsv4.a");
-                let _ = std::fs::remove_file(&lib);
-                let mut ar = std::process::Command::new("ar");
-                ar.arg("rcs").arg(&lib);
-                for o in &objs {
-                    ar.arg(o);
-                }
-                if ar.status().map(|s| s.success()).unwrap_or(false) {
-                    link_flashmla = true;
-                    // Exclude the in-tree wrapper from the main lib (compiled into flashmla lib).
-                    builder = builder.exclude(&["flashmla_sparse_mla.cu"]);
-                    println!("cargo:warning=FlashMLA DSV4 sparse static lib built");
-                } else {
-                    println!("cargo:warning=Failed to archive FlashMLA objects");
-                }
-            }
-        } else {
-            println!("cargo:warning=FlashMLA CUTLASS missing; sparse FlashMLA stub only");
-        }
-    }
+    let (builder, link_flashmla) = others::configure_flashmla(builder, &build_dir, compute_cap)?;
+    let mut builder = builder;
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 120 {
         if let Ok(flashinfer_root) = builder.fetch_git_dependency("flashinfer") {
