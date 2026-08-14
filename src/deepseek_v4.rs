@@ -2573,6 +2573,16 @@ pub fn flash_sparse_mla_enabled() -> bool {
 /// (SM90) and FlashInfer SM120 can be explicitly opted into with
 /// `XINFER_ENABLE_FLASHMLA=1` when their workloads have been validated;
 /// unsupported shapes fall back to BF16.
+#[derive(Clone, Copy, Debug)]
+pub struct FlashInferSm120Layout {
+    /// Number of rows in the main SWA segment.
+    pub window_len: usize,
+    /// Unified-cache offset of the compressed segment. `None` is valid only
+    /// when there is no compressed segment; the caller must still explicitly
+    /// opt into the SM120 decode ABI.
+    pub compressed_offset: Option<usize>,
+}
+
 pub fn sparse_attention_into(
     q: &Tensor,
     kv: &Tensor,
@@ -2585,6 +2595,42 @@ pub fn sparse_attention_into(
     kv_len: usize,
     topk: usize,
     softmax_scale: f32,
+) -> Result<()> {
+    sparse_attention_into_with_sm120_layout(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        seq_len,
+        num_heads,
+        head_dim,
+        kv_len,
+        topk,
+        softmax_scale,
+        None,
+    )
+}
+
+/// Sparse indexed attention with explicit permission and layout metadata for
+/// the FlashInfer SM120 decode ABI.
+///
+/// SM120 is decode-only and expects a canonical `[128-row SWA | compressed]`
+/// layout. Passing `None` keeps that path disabled while leaving the SM90
+/// FlashMLA and BF16 paths unchanged.
+pub fn sparse_attention_into_with_sm120_layout(
+    q: &Tensor,
+    kv: &Tensor,
+    attn_sink: &Tensor,
+    topk_idxs: &Tensor,
+    out: &Tensor,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    topk: usize,
+    softmax_scale: f32,
+    sm120_layout: Option<FlashInferSm120Layout>,
 ) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
@@ -2656,7 +2702,14 @@ pub fn sparse_attention_into(
         // this path packs the active rows into the kernel's FP8 footer layout
         // on-device and uses the fixed 128-entry SWA segment plus the
         // optional compressed segment.
+        let sm120_layout_ok = sm120_layout.is_some_and(|layout| {
+            layout.window_len == 128
+                && layout
+                    .compressed_offset
+                    .map_or(true, |compressed_offset| compressed_offset == 128)
+        });
         if flash_sparse_enabled
+            && sm120_layout_ok
             && seq_len == 1
             && head_dim == 512
             && topk >= 128
@@ -2723,6 +2776,7 @@ pub fn sparse_attention_into(
             kv_len,
             topk,
             softmax_scale,
+            sm120_layout,
         );
         candle_core::bail!("sparse_attention requires cuda feature")
     }
