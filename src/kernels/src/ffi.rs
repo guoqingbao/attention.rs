@@ -1089,6 +1089,17 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn fp8_matmul_f16_channelwise(
+        input: *const c_void,     // [M, K]
+        weight: *const u8,        // [N, K]
+        weight_scale: *const f32, // [N, 1], one scale per output row
+        output: *mut c_void,      // [M, N]
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
     pub fn fp8_matmul_f16_cutlass(
         input_q: *const u8,
         input_scale: *const f32,
@@ -1119,6 +1130,17 @@ extern "C" {
         block_size_y: c_int,
         block_size_x: c_int,
         scale_dtype: c_int, // 0=f32, 1=e8m0
+        stream: i64,
+    );
+
+    pub fn fp8_matmul_bf16_channelwise(
+        input: *const c_void,     // [M, K]
+        weight: *const u8,        // [N, K]
+        weight_scale: *const f32, // [N, 1], one scale per output row
+        output: *mut c_void,      // [M, N]
+        m: c_int,
+        n: c_int,
+        k: c_int,
         stream: i64,
     );
 

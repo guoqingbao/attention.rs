@@ -373,6 +373,33 @@ __global__ void fp8_wmma_matmul(
     }
 }
 
+// Channel-wise compressed-tensors FP8 uses one F32 scale for every output
+// row: scale[n] applies to all K values of weight[n, :].  The WMMA path above
+// first converts each dequantized weight to T in shared memory.  That is a
+// precision loss for this format (especially when T is BF16), and it is
+// needlessly repeated for every K tile.  Keep this path on the FP32
+// dequantizing kernel, whose accumulator already stays in FP32, and only
+// round once when writing the requested output dtype.
+template <typename T>
+static void fp8_matmul_channelwise_impl(
+    const T *input, const uint8_t *weight, const float *weight_scale,
+    T *output, int M, int N, int K, cudaStream_t stream) {
+  constexpr int BM = 8;
+  constexpr int BN = 64;
+  constexpr int BK_S = 32;
+  dim3 block(BN, BM);
+  dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+  fp8_matmul_kernel<T, float, BM, BN, BK_S>
+      <<<grid, block, 0, stream>>>(input, weight, weight_scale, output, M, N, K,
+                                   1, 1, K);
+}
+
+extern "C" void fp8_matmul_f16_channelwise(
+    const __half *input, const uint8_t *weight, const float *weight_scale,
+    __half *output, int M, int N, int K, cudaStream_t stream) {
+  fp8_matmul_channelwise_impl(input, weight, weight_scale, output, M, N, K, stream);
+}
+
 extern "C" void fp8_matmul_f16(const __half *input, const uint8_t *weight,
                         const void *weight_scale, __half *output, int M,
                         int N, int K, int scale_row_stride, int block_size_y,
@@ -468,5 +495,13 @@ extern "C" void fp8_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weigh
                                     scale_row_stride, block_size_y, block_size_x);
     }
   }
+#endif
+}
+
+extern "C" void fp8_matmul_bf16_channelwise(
+    const __nv_bfloat16 *input, const uint8_t *weight, const float *weight_scale,
+    __nv_bfloat16 *output, int M, int N, int K, cudaStream_t stream) {
+#ifndef NO_BF16_KERNEL
+  fp8_matmul_channelwise_impl(input, weight, weight_scale, output, M, N, K, stream);
 #endif
 }

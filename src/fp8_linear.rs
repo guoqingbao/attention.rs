@@ -130,6 +130,26 @@ pub fn fp8_matmul_with_input_scale(
         input.contiguous()?
     };
 
+    // Qwen3.8 and other compressed-tensors channel-wise FP8 checkpoints use
+    // [N, 1] scales with block geometry [1, K].  The generic CUDA fallback
+    // switches to WMMA for M > 32, where dequantized weights are rounded to
+    // BF16/F16 in shared memory before the FP32 MMA.  Use the FP32
+    // dequantizing channel-wise kernel instead; this is the reference path
+    // for this format and rounds only at the output.
+    #[cfg(feature = "cuda")]
+    {
+        let (n, k_w) = weight.dims2()?;
+        let (scale_n, scale_k) = weight_scale.dims2()?;
+        let (_, k) = input.dims2()?;
+        if weight_scale.dtype() == DType::F32
+            && block_size == [1, k_w]
+            && k == k_w
+            && (scale_n, scale_k) == (n, 1)
+        {
+            return fp8_matmul_channelwise(&input, weight, weight_scale);
+        }
+    }
+
     #[cfg(feature = "cuda")]
     let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
         crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
@@ -181,6 +201,101 @@ pub fn fp8_matmul_with_input_scale(
     }
 
     fp8_matmul_fallback(&input, weight, weight_scale, block_size)
+}
+
+/// FP8 W8A16 matrix multiplication for one scale per output channel.
+///
+/// This deliberately uses the FP32 dequantizing CUDA kernel for every M,
+/// including large prefill matrices.  The regular fallback's WMMA path
+/// stores dequantized weights in the output dtype before the MMA, which is
+/// materially less accurate for BF16 channel-wise scales.
+#[cfg(feature = "cuda")]
+fn fp8_matmul_channelwise(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+) -> Result<Tensor> {
+    let (m, k) = input.dims2()?;
+    let (n, k_w) = weight.dims2()?;
+    if k != k_w {
+        candle_core::bail!(
+            "Shape mismatch in channel-wise fp8_matmul: input [{}, {}], weight [{}, {}]",
+            m,
+            k,
+            n,
+            k_w
+        );
+    }
+    if weight_scale.dims2()? != (n, 1) {
+        candle_core::bail!(
+            "Channel-wise FP8 scales must have shape [{}, 1], got {:?}",
+            n,
+            weight_scale.dims()
+        );
+    }
+    if weight_scale.dtype() != DType::F32 {
+        candle_core::bail!(
+            "Channel-wise FP8 scales must be F32, got {:?}",
+            weight_scale.dtype()
+        );
+    }
+
+    let weight = if weight.is_contiguous() {
+        weight.clone()
+    } else {
+        weight.contiguous()?
+    };
+    let weight_scale = if weight_scale.is_contiguous() {
+        weight_scale.clone()
+    } else {
+        weight_scale.contiguous()?
+    };
+    let output = unsafe { Tensor::empty_((m, n), input.dtype(), input.device())? };
+    let input_ptr = match input.dtype() {
+        DType::F16 => get_cuda_slice::<half::f16>(input)?,
+        DType::BF16 => get_cuda_slice::<half::bf16>(input)?,
+        dtype => {
+            candle_core::bail!("Channel-wise FP8 matmul requires F16 or BF16 input, got {dtype:?}")
+        }
+    };
+    let weight_ptr = get_cuda_slice::<u8>(&weight)?;
+    let scale_ptr = get_cuda_slice::<f32>(&weight_scale)?;
+    let output_ptr = match input.dtype() {
+        DType::F16 => get_cuda_slice::<half::f16>(&output)?,
+        DType::BF16 => get_cuda_slice::<half::bf16>(&output)?,
+        dtype => {
+            candle_core::bail!("Channel-wise FP8 matmul requires F16 or BF16 input, got {dtype:?}")
+        }
+    };
+    let stream = *input.device().as_cuda_device()?.cu_stream() as i64;
+
+    unsafe {
+        match input.dtype() {
+            DType::F16 => ffi::fp8_matmul_f16_channelwise(
+                input_ptr as *const core::ffi::c_void,
+                weight_ptr as *const u8,
+                scale_ptr as *const f32,
+                output_ptr as *mut core::ffi::c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                stream,
+            ),
+            DType::BF16 => ffi::fp8_matmul_bf16_channelwise(
+                input_ptr as *const core::ffi::c_void,
+                weight_ptr as *const u8,
+                scale_ptr as *const f32,
+                output_ptr as *mut core::ffi::c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                stream,
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(output)
 }
 
 /// FP8 matrix multiplication for checkpoints whose activation scales use
