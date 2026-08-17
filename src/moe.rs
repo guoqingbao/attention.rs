@@ -3146,7 +3146,9 @@ pub fn moe_gemm_gguf(
         );
         let dev = input.device().as_cuda_device()?;
 
-        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5, IQ2_XXS: 6, IQ2_XS: 7, IQ3_XXS: 8, IQ4_XS: 9
+        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3K: 3, Q5K: 4, Q6K: 5,
+        // IQ2_XXS: 6, IQ2_XS: 7, IQ3_XXS: 8, IQ4_XS: 9,
+        // IQ1_S: 10, IQ4_NL: 11, IQ3_S: 12, IQ2_S: 13, IQ1_M: 14.
         let gguf_dtype = match weights.dtype() {
             GgmlDType::Q8_0 => 0,
             GgmlDType::Q4K => 1,
@@ -3158,9 +3160,15 @@ pub fn moe_gemm_gguf(
             GgmlDType::IQ2_XS => 7,
             GgmlDType::IQ3_XXS => 8,
             GgmlDType::IQ4_XS => 9,
+            GgmlDType::IQ1_S => 10,
+            GgmlDType::IQ4_NL => 11,
+            GgmlDType::IQ3_S => 12,
+            GgmlDType::IQ2_S => 13,
+            GgmlDType::IQ1_M => 14,
             _ => {
                 candle_core::bail!(
-                    "moe_gemm_gguf `ISQ` only accept q2k, q3k, q4k, q5k, q6k, q8_0, iq2_xxs, iq2_xs, iq3_xxs, or iq4_xs weights!"
+                    "moe_gemm_gguf `ISQ` does not support {:?} weights",
+                    weights.dtype()
                 )
             }
         };

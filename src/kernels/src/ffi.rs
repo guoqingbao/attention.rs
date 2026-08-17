@@ -547,6 +547,19 @@ extern "C" {
         stream: i64,
     );
 
+    // Dense GEMM for ordinary GGUF tensors. The weights remain in their
+    // original Q/K/IQ block format; only the activation is quantized to Q8_1.
+    pub fn gguf_gemm(
+        input: *const f32,
+        weights: *const c_void,
+        output: *mut f32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        gguf_dtype: i32,
+        stream: i64,
+    );
+
     // Optimized kernel for small M (batch size 1-8) with input caching
     pub fn moe_gemm_gguf_small_m(
         input: *const f32,      // input [size_m, size_k]
