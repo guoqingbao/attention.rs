@@ -396,6 +396,107 @@ template <typename T>
                 }
                 break;
             }
+            case 10: { // IQ1_S — 256 elements per block
+                for (int i = int(simd_lane_id); i < qk; i += MOE_WARP_SIZE) {
+                int k = k_base + i;
+                if (k >= size_k) continue;
+                device const block_iq1_s *blk = reinterpret_cast<device const block_iq1_s *>(block_ptr);
+                int ib32 = i / 32;
+                int il = i % 32;
+                int j = il % 8;
+                int group = il / 8;
+                uint16_t h = blk->qh[ib32];
+                device const uint8_t *qs = blk->qs + 4 * ib32;
+                int grid_shift = group == 0 ? 8 : (group == 1 ? 5 : (group == 2 ? 2 : -1));
+                int grid_index = group == 3 ? int(qs[group]) | ((int(h) >> 1) & 0x700)
+                                            : int(qs[group]) | ((int(h) << grid_shift) & 0x700);
+                uint8_t grid_byte = uint8_t((iq1s_grid_gpu[grid_index] >> (8 * (j / 2))) & 0xff);
+                int q = (j & 1) ? (int(grid_byte) >> 4) : (int(grid_byte) & 0xf);
+                float dl = float(blk->d) * float(2 * ((h >> 12) & 7) + 1);
+                float ml = dl * ((h & 0x8000) ? -1.125f : -0.875f);
+                sum_f += float(x_ptr[k]) * (dl * float(q) + ml);
+                }
+                break;
+            }
+            case 11: { // IQ4_NL — 32 elements per block
+                for (int i = int(simd_lane_id); i < qk; i += MOE_WARP_SIZE) {
+                int k = k_base + i;
+                if (k >= size_k) continue;
+                device const block_iq4_nl *blk = reinterpret_cast<device const block_iq4_nl *>(block_ptr);
+                int q = (i & 1) ? (int(blk->qs[i / 2]) >> 4) : (int(blk->qs[i / 2]) & 0xf);
+                sum_f += float(x_ptr[k]) * float(blk->d) * float(kvalues_iq4nl[q]);
+                }
+                break;
+            }
+            case 12: { // IQ3_S — 256 elements per block
+                for (int i = int(simd_lane_id); i < qk; i += MOE_WARP_SIZE) {
+                int k = k_base + i;
+                if (k >= size_k) continue;
+                device const block_iq3_s *blk = reinterpret_cast<device const block_iq3_s *>(block_ptr);
+                int ib32 = i / 32;
+                int il = i % 32;
+                int l = il / 8;
+                int j = il % 8;
+                device const uint8_t *qs = blk->qs + 8 * ib32;
+                uint8_t qh = blk->qh[ib32];
+                int qidx = int(qs[2 * l + (j >= 4)]) | ((qh & kmask_iq2xs[2 * l + (j >= 4)]) ? 256 : 0);
+                uint32_t grid = iq3s_grid[qidx];
+                uint8_t gv = uint8_t((grid >> (8 * (j % 4))) & 0xff);
+                int sign = blk->signs[4 * ib32 + l] & kmask_iq2xs[j] ? -1 : 1;
+                float d = float(blk->d) * float(1 + 2 * ((blk->scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf));
+                sum_f += float(x_ptr[k]) * d * float(gv) * float(sign);
+                }
+                break;
+            }
+            case 13: { // IQ2_S — 256 elements per block
+                for (int i = int(simd_lane_id); i < qk; i += MOE_WARP_SIZE) {
+                int k = k_base + i;
+                if (k >= size_k) continue;
+                device const block_iq2_s *blk = reinterpret_cast<device const block_iq2_s *>(block_ptr);
+                int ib32 = i / 32;
+                int il = i % 32;
+                int l = il / 8;
+                int j = il % 8;
+                device const uint8_t *qs = blk->qs + 4 * ib32;
+                uint8_t qh = blk->qh[ib32];
+                int group = il >= 16 ? 1 : 0;
+                int qidx = group == 0
+                    ? int(qs[l]) | ((int(qh) << (8 - 2 * l)) & 0x300)
+                    : int(qs[l + 2]) | ((int(qh) << (4 - 2 * l)) & 0x300);
+                uint64_t grid = iq2s_grid[qidx];
+                uint8_t gv = uint8_t((grid >> (8 * j)) & 0xff);
+                uint8_t signs = blk->qs[QK_K / 8 + 4 * ib32 + (group == 0 ? l : l + 2)];
+                float d = float(blk->d) * (0.5f + float(group == 0 ? (blk->scales[ib32] & 0xf) : (blk->scales[ib32] >> 4))) * 0.25f;
+                int sign = signs & kmask_iq2xs[j] ? -1 : 1;
+                sum_f += float(x_ptr[k]) * d * float(gv) * float(sign);
+                }
+                break;
+            }
+            case 14: { // IQ1_M — 256 elements per block
+                for (int i = int(simd_lane_id); i < qk; i += MOE_WARP_SIZE) {
+                int k = k_base + i;
+                if (k >= size_k) continue;
+                device const block_iq1_m *blk = reinterpret_cast<device const block_iq1_m *>(block_ptr);
+                int ib32 = i / 32;
+                int il = i % 32;
+                int j = il % 8;
+                int group = il / 8;
+                device const uint8_t *qs = blk->qs + 4 * ib32;
+                uint8_t qh = blk->qh[2 * ib32 + group / 2];
+                int grid_index = int(qs[group]) | ((int(qh) << (group % 2 == 0 ? 8 : 4)) & 0x700);
+                uint8_t grid_byte = uint8_t((iq1s_grid_gpu[grid_index] >> (8 * (j / 2))) & 0xff);
+                int q = (j & 1) ? (int(grid_byte) >> 4) : (int(grid_byte) & 0xf);
+                device const uint16_t *sc = reinterpret_cast<device const uint16_t *>(blk->scales);
+                uint16_t scale_bits = uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+                float scale = float(as_type<half>(scale_bits));
+                int scale_shift = 6 * (ib32 % 2) + (il >= 16 ? 3 : 0);
+                float dl = scale * float(2 * ((sc[ib32 / 2] >> scale_shift) & 7) + 1);
+                bool negative = (group & 1) ? (qh & 0x80) : (qh & 0x08);
+                float ml = dl * (negative ? -1.125f : -0.875f);
+                sum_f += float(x_ptr[k]) * (dl * float(q) + ml);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -678,6 +779,79 @@ template <typename T>
                                     } else {
                                         dq_val = db * float(kvalues_iq4nl[q4[4 * il + (j_in - 4)] >> 4]);
                                     }
+                                    break;
+                                }
+                                case 10: { // IQ1_S
+                                    device const block_iq1_s *blk = reinterpret_cast<device const block_iq1_s *>(w_block);
+                                    int ib32 = elem_in_block / 32;
+                                    int il = elem_in_block % 32;
+                                    int j = il % 8;
+                                    int group = il / 8;
+                                    uint16_t h = blk->qh[ib32];
+                                    device const uint8_t *qs = blk->qs + 4 * ib32;
+                                    int grid_index = group == 3 ? int(qs[group]) | ((int(h) >> 1) & 0x700) : int(qs[group]) | ((int(h) << (group == 0 ? 8 : (group == 1 ? 5 : 2))) & 0x700);
+                                    uint8_t grid_byte = uint8_t((iq1s_grid_gpu[grid_index] >> (8 * (j / 2))) & 0xff);
+                                    int q = (j & 1) ? (int(grid_byte) >> 4) : (int(grid_byte) & 0xf);
+                                    float dl = float(blk->d) * float(2 * ((h >> 12) & 7) + 1);
+                                    float ml = dl * ((h & 0x8000) ? -1.125f : -0.875f);
+                                    dq_val = dl * float(q) + ml;
+                                    break;
+                                }
+                                case 11: { // IQ4_NL
+                                    device const block_iq4_nl *blk = reinterpret_cast<device const block_iq4_nl *>(w_block);
+                                    int q = (elem_in_block & 1) ? (int(blk->qs[elem_in_block / 2]) >> 4) : (int(blk->qs[elem_in_block / 2]) & 0xf);
+                                    dq_val = float(blk->d) * float(kvalues_iq4nl[q]);
+                                    break;
+                                }
+                                case 12: { // IQ3_S
+                                    device const block_iq3_s *blk = reinterpret_cast<device const block_iq3_s *>(w_block);
+                                    int ib32 = elem_in_block / 32;
+                                    int il = elem_in_block % 32;
+                                    int l = il / 8;
+                                    int j = il % 8;
+                                    device const uint8_t *qs = blk->qs + 8 * ib32;
+                                    uint8_t qh = blk->qh[ib32];
+                                    int qidx = int(qs[2 * l + (j >= 4)]) | ((qh & kmask_iq2xs[2 * l + (j >= 4)]) ? 256 : 0);
+                                    uint8_t gv = uint8_t((iq3s_grid[qidx] >> (8 * (j % 4))) & 0xff);
+                                    int sign = blk->signs[4 * ib32 + l] & kmask_iq2xs[j] ? -1 : 1;
+                                    float d = float(blk->d) * float(1 + 2 * ((blk->scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf));
+                                    dq_val = d * float(gv) * float(sign);
+                                    break;
+                                }
+                                case 13: { // IQ2_S
+                                    device const block_iq2_s *blk = reinterpret_cast<device const block_iq2_s *>(w_block);
+                                    int ib32 = elem_in_block / 32;
+                                    int il = elem_in_block % 32;
+                                    int l = il / 8;
+                                    int j = il % 8;
+                                    device const uint8_t *qs = blk->qs + 4 * ib32;
+                                    uint8_t qh = blk->qh[ib32];
+                                    int group = il >= 16 ? 1 : 0;
+                                    int qidx = group == 0 ? int(qs[l]) | ((int(qh) << (8 - 2 * l)) & 0x300) : int(qs[l + 2]) | ((int(qh) << (4 - 2 * l)) & 0x300);
+                                    uint8_t gv = uint8_t((iq2s_grid[qidx] >> (8 * j)) & 0xff);
+                                    uint8_t signs = blk->qs[QK_K / 8 + 4 * ib32 + (group == 0 ? l : l + 2)];
+                                    float d = float(blk->d) * (0.5f + float(group == 0 ? (blk->scales[ib32] & 0xf) : (blk->scales[ib32] >> 4))) * 0.25f;
+                                    dq_val = d * float(gv) * float(signs & kmask_iq2xs[j] ? -1 : 1);
+                                    break;
+                                }
+                                case 14: { // IQ1_M
+                                    device const block_iq1_m *blk = reinterpret_cast<device const block_iq1_m *>(w_block);
+                                    int ib32 = elem_in_block / 32;
+                                    int il = elem_in_block % 32;
+                                    int j = il % 8;
+                                    int group = il / 8;
+                                    device const uint8_t *qs = blk->qs + 4 * ib32;
+                                    uint8_t qh = blk->qh[2 * ib32 + group / 2];
+                                    int grid_index = int(qs[group]) | ((int(qh) << (group % 2 == 0 ? 8 : 4)) & 0x700);
+                                    uint8_t grid_byte = uint8_t((iq1s_grid_gpu[grid_index] >> (8 * (j / 2))) & 0xff);
+                                    int q = (j & 1) ? (int(grid_byte) >> 4) : (int(grid_byte) & 0xf);
+                                    device const uint16_t *sc = reinterpret_cast<device const uint16_t *>(blk->scales);
+                                    uint16_t scale_bits = uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+                                    float scale = float(as_type<half>(scale_bits));
+                                    int scale_shift = 6 * (ib32 % 2) + (il >= 16 ? 3 : 0);
+                                    float dl = scale * float(2 * ((sc[ib32 / 2] >> scale_shift) & 7) + 1);
+                                    bool negative = (group & 1) ? (qh & 0x80) : (qh & 0x08);
+                                    dq_val = dl * float(q) + dl * (negative ? -1.125f : -0.875f);
                                     break;
                                 }
                                 default:

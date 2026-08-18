@@ -3339,6 +3339,11 @@ pub fn moe_gemm_gguf(
         GgmlDType::IQ2_XS => 7,
         GgmlDType::IQ3_XXS => 8,
         GgmlDType::IQ4_XS => 9,
+        GgmlDType::IQ1_S => 10,
+        GgmlDType::IQ4_NL => 11,
+        GgmlDType::IQ3_S => 12,
+        GgmlDType::IQ2_S => 13,
+        GgmlDType::IQ1_M => 14,
         _ => {
             candle_core::bail!(
                 "moe_gemm_gguf Metal does not support {:?} weights!",
@@ -3358,6 +3363,11 @@ pub fn moe_gemm_gguf(
         GgmlDType::IQ2_XS => (74, 256),
         GgmlDType::IQ3_XXS => (98, 256),
         GgmlDType::IQ4_XS => (136, 256),
+        GgmlDType::IQ1_S => (50, 256),
+        GgmlDType::IQ4_NL => (18, 32),
+        GgmlDType::IQ3_S => (110, 256),
+        GgmlDType::IQ2_S => (82, 256),
+        GgmlDType::IQ1_M => (56, 256),
         _ => unreachable!(),
     };
 
