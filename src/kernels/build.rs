@@ -77,6 +77,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer_sm103.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_quant_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/mlx_nvfp4_utils.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_quant.cu");
@@ -296,6 +297,15 @@ fn main() -> Result<()> {
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() && compute_cap >= 120 {
         if let Ok(flashinfer_root) = builder.fetch_git_dependency("flashinfer") {
             let csrc_dir = flashinfer_root.join("csrc");
+            let quant_cu = csrc_dir.join("nv_internal/cpp/kernels/quantization.cu");
+            if quant_cu.exists() {
+                builder = builder
+                    .arg("-DATTENTION_RS_USE_FLASHINFER_FP4_QUANT")
+                    .source_files(vec![quant_cu]);
+                println!(
+                    "cargo:warning=FlashInfer SM120 NVFP4 quant (invokeFP4Quantization) enabled"
+                );
+            }
             let dsv4_cu = csrc_dir.join("sparse_mla_sm120_decode_dsv4.cu");
             if dsv4_cu.exists() {
                 builder = builder

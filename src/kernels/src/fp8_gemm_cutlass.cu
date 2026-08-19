@@ -671,26 +671,18 @@ void fp8_gemm_launcher_sm90(
                      void* workspace, size_t workspace_bytes,
                      cudaStream_t stream)
 {
-    // SM90 cooperative kernel requires TileSize M >= 128, so we use 128x128x128 tile
-    // StreamK scheduler for K-heavy problems, Persistent scheduler for balanced problems
-    if (K > 3 * N) {
-        cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::StreamKScheduler, T_Out, 1, 128, 128>>(
-            output_ptr,
-            reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-            reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
-            const_cast<float*>(a_scales),
-            const_cast<float*>(b_scales),
-            M, N, K, workspace, workspace_bytes, stream);
-    } else {
-        cutlass_gemm_caller_blockwise<
-            cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, T_Out, 1, 128, 128>>(
-            output_ptr,
-            reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
-            reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
-            const_cast<float*>(a_scales),
-            const_cast<float*>(b_scales),
-            M, N, K, workspace, workspace_bytes, stream);
-    }
+    // SM90 cooperative kernel requires TileSize M >= 128, so we use 128x128x128 tile.
+    // Always Persistent: StreamK + Nondeterministic reduction disagrees with
+    // SGLang's SM90 DeepGEMM/Triton path on K-heavy Qwen3.8 layers (down_proj
+    // K=17408 N=5120, and k/v_proj K=5120 N=1024).
+    cutlass_gemm_caller_blockwise<
+        cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, T_Out, 1, 128, 128>>(
+        output_ptr,
+        reinterpret_cast<const cutlass::float_e4m3_t*>(a_fp8),
+        reinterpret_cast<const cutlass::float_e4m3_t*>(b_fp8),
+        const_cast<float*>(a_scales),
+        const_cast<float*>(b_scales),
+        M, N, K, workspace, workspace_bytes, stream);
 }
 
 template <

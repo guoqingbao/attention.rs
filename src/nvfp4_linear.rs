@@ -76,6 +76,7 @@ fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
     }
     if let Ok(cuda_dev) = dev.as_cuda_device() {
         let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        // SM100+ hardware NVFP4, including SM120/SM121 tensor-core FP4.
         sm >= 100
     } else {
         false
@@ -83,7 +84,7 @@ fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
 }
 
 /// Check if FlashInfer-ported FP4 CUTLASS path is available.
-/// Requires SM100+ and the flashinfer feature (which implies cutlass).
+/// Requires SM100+ (including SM120/SM121) and the flashinfer feature.
 #[cfg(feature = "cuda")]
 fn is_flashinfer_fp4_available(dev: &candle_core::Device) -> bool {
     if !cfg!(feature = "flashinfer") {
@@ -199,9 +200,11 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor) -> Result<Tensor> {
 /// * `weight_scale_swizzled` - Optional pre-swizzled weight scales from
 ///   [`swizzle_nvfp4_weight_scales`]. When provided, skips per-call swizzling.
 ///
-/// On Blackwell (SM100+) with cutlass feature: uses hardware FP4 tensor cores
-/// via CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly).
-/// On older GPUs: uses software dequant path (LUT-based FP4 decode + FMA/WMMA).
+/// On SM100+ with cutlass/flashinfer: hardware FP4 tensor cores via
+/// CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly),
+/// used for every M to match SGLang. SM120/SM121 uses FlashInfer
+/// `fp4_quantize` + `mm_fp4` (cutlass). On Hopper and below: software
+/// dequant (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [M, N] in same dtype as input
 
@@ -278,16 +281,19 @@ pub fn nvfp4_matmul(
                 }
             }
 
+            // SGLang uses flashinfer.mm_fp4 for every M on SM100+. Restricting
+            // hardware GEMM to prefill mixed a different kernel into decode.
+            let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
-                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
+            // SM120/SM121: FlashInfer fp4_quantize (SWIZZLED_128x4, e4m3Max=448).
+            let use_flashinfer_quant = use_flashinfer_fp4 && sm >= 120;
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
 
@@ -341,6 +347,7 @@ pub fn nvfp4_matmul(
                     };
                     let alpha = hw_input_scale * weight_global_scale;
                     let alpha_tensor = Tensor::new(&[alpha], dev)?;
+                    let sf_scale_tensor = Tensor::new(&[hw_input_scale_inv], dev)?;
 
                     {
                         let (input_s, _) = input.storage_and_layout();
@@ -376,36 +383,66 @@ pub fn nvfp4_matmul(
                         let (alpha_s, _) = alpha_tensor.storage_and_layout();
                         let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
 
+                        let (sf_s, _) = sf_scale_tensor.storage_and_layout();
+                        let sf_scale_ptr = cuda_ptr(&sf_s, DType::F32)? as *const f32;
+
                         unsafe {
-                            match dtype {
-                                DType::F16 => ffi::nvfp4_quantize_activation_f16(
-                                    input_ptr,
-                                    act_packed_ptr,
-                                    act_scales_ptr,
-                                    act_scales_sw_ptr,
-                                    hw_input_scale_inv,
-                                    m as i32,
-                                    k as i32,
-                                    m_padded as i32,
-                                    k_scale_padded as i32,
-                                    stream,
-                                ),
-                                DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
-                                    input_ptr,
-                                    act_packed_ptr,
-                                    act_scales_ptr,
-                                    act_scales_sw_ptr,
-                                    hw_input_scale_inv,
-                                    m as i32,
-                                    k as i32,
-                                    m_padded as i32,
-                                    k_scale_padded as i32,
-                                    stream,
-                                ),
-                                _ => candle_core::bail!(
-                                    "nvfp4_matmul: unsupported dtype {:?}",
-                                    dtype
-                                ),
+                            if use_flashinfer_quant {
+                                match dtype {
+                                    DType::F16 => ffi::flashinfer_nvfp4_quantize_activation_f16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_sw_ptr,
+                                        sf_scale_ptr,
+                                        m as i32,
+                                        k as i32,
+                                        stream,
+                                    ),
+                                    DType::BF16 => ffi::flashinfer_nvfp4_quantize_activation_bf16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_sw_ptr,
+                                        sf_scale_ptr,
+                                        m as i32,
+                                        k as i32,
+                                        stream,
+                                    ),
+                                    _ => candle_core::bail!(
+                                        "nvfp4_matmul: unsupported dtype {:?}",
+                                        dtype
+                                    ),
+                                }
+                            } else {
+                                match dtype {
+                                    DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_ptr,
+                                        act_scales_sw_ptr,
+                                        hw_input_scale_inv,
+                                        m as i32,
+                                        k as i32,
+                                        m_padded as i32,
+                                        k_scale_padded as i32,
+                                        stream,
+                                    ),
+                                    DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_ptr,
+                                        act_scales_sw_ptr,
+                                        hw_input_scale_inv,
+                                        m as i32,
+                                        k as i32,
+                                        m_padded as i32,
+                                        k_scale_padded as i32,
+                                        stream,
+                                    ),
+                                    _ => candle_core::bail!(
+                                        "nvfp4_matmul: unsupported dtype {:?}",
+                                        dtype
+                                    ),
+                                }
                             }
 
                             if weight_scale_swizzled.is_none() {

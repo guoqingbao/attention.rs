@@ -36,6 +36,7 @@ pub mod cuda_utils;
 pub mod deepseek_v4;
 pub mod fp8_linear;
 pub mod gdn;
+pub mod gguf_linear;
 pub mod mamba_cache;
 pub mod mla;
 pub mod mxfp4_linear;

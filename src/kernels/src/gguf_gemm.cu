@@ -21,6 +21,68 @@ constexpr int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
 
+static __device__ __forceinline__ void gguf_cp_async_16(void *smem, const void *glob) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    unsigned smem_ptr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_ptr), "l"(glob));
+#else
+    *reinterpret_cast<int4 *>(smem) = __ldg(reinterpret_cast<const int4 *>(glob));
+#endif
+}
+
+static __device__ __forceinline__ void gguf_cp_async_4(void *smem, const void *glob) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    unsigned smem_ptr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(smem_ptr), "l"(glob));
+#else
+    *reinterpret_cast<int *>(smem) = __ldg(reinterpret_cast<const int *>(glob));
+#endif
+}
+
+static __device__ __forceinline__ void gguf_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+static __device__ __forceinline__ void gguf_cp_async_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+template <int n>
+static __device__ __forceinline__ void gguf_cp_async_wait_group() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+#endif
+}
+
+template <typename block_q_t>
+static __device__ __forceinline__ void gguf_copy_block_async(
+    unsigned char *dst, const block_q_t *src, int lane, int nlanes)
+{
+    const unsigned char *s = reinterpret_cast<const unsigned char *>(src);
+    constexpr int nbytes = (int)sizeof(block_q_t);
+    if (((uintptr_t)src & 15) == 0) {
+        constexpr int nvec = nbytes / 16;
+        for (int v = lane; v < nvec; v += nlanes) {
+            gguf_cp_async_16(dst + 16 * v, s + 16 * v);
+        }
+        for (int b = 16 * nvec + lane; b < nbytes; b += nlanes) {
+            dst[b] = s[b];
+        }
+    } else {
+        constexpr int n4 = nbytes / 4;
+        for (int v = lane; v < n4; v += nlanes) {
+            gguf_cp_async_4(dst + 4 * v, s + 4 * v);
+        }
+        for (int b = 4 * n4 + lane; b < nbytes; b += nlanes) {
+            dst[b] = s[b];
+        }
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __global__ void gguf_gemm_kernel(
     const void * __restrict__ weights, // [N, K] in GGUF block layout
@@ -66,12 +128,11 @@ __global__ void gguf_gemm_kernel(
     }
 }
 
-// Prefill is a matrix-matrix operation.  The original kernel above is
-// intentionally a GEMV-shaped kernel: one block handles one token and four
-// output rows.  That is reasonable for decode, but it makes a long prefill
-// launch millions of small blocks and rereads the same compressed weight row
-// for every token.  This tile keeps the weights compressed, but reuses one
-// weight row for eight input tokens.
+// Prefill tile: same vec_dot as decode, but each warp reuses its GGUF blocks
+// across an M-tile.  SM80+ copies those blocks with cp.async + double buffering.
+//
+// Lanes in a warp own different k_block indices (MMVQ).  Each k_block gets its
+// own 256-byte shared slot so the copy cannot mix Q4_K/Q6_K superblocks.
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __global__ void gguf_gemm_prefill_kernel(
     const void * __restrict__ weights,
@@ -84,10 +145,15 @@ __global__ void gguf_gemm_prefill_kernel(
 ) {
     constexpr int n_warps = 8;
     constexpr int m_tile = 8;
+    constexpr int k_slots = vdr * WARP_SIZE / qi;
+    constexpr int blk_align = 256;
+    constexpr int nlanes_slot = qi / vdr;
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
     const int row = blockIdx.x * n_warps + warp_id;
     const int m_base = blockIdx.y * m_tile;
+    const int slot = lane_id / nlanes_slot;
+    const int lane_in_slot = lane_id % nlanes_slot;
 
     if (row >= size_n) {
         return;
@@ -101,43 +167,53 @@ __global__ void gguf_gemm_prefill_kernel(
     const block_q8_1 * __restrict__ input_base =
         reinterpret_cast<const block_q8_1 *>(inputs);
 
-    // Each warp owns one row-sized shared-memory slice.  The largest GGUF
-    // block used here is well below 256 bytes, and every slice is aligned by
-    // the 256-byte stride below.  The bytes are copied once per K block and
-    // then consumed by all m_tile accumulators in this warp.
     extern __shared__ unsigned char shared_weights[];
-    constexpr int shared_stride = 256;
-    block_q_t * __restrict__ shared_row = reinterpret_cast<block_q_t *>(
-        shared_weights + warp_id * shared_stride);
+    const int slot_off = (warp_id * k_slots + slot) * blk_align;
+    const int stage_stride = n_warps * k_slots * blk_align;
 
     float acc[m_tile] = {0.0f};
-    const int blocks_per_iter = vdr * WARP_SIZE / qi;
-    const int first_k_block = lane_id / (qi / vdr);
+    int stage = 0;
 
-    for (int k_block = first_k_block;
-         k_block < weight_blocks_per_row;
-         k_block += blocks_per_iter) {
-        const unsigned char * __restrict__ src =
-            reinterpret_cast<const unsigned char *>(&weight_row[k_block]);
-        unsigned char * __restrict__ dst =
-            reinterpret_cast<unsigned char *>(shared_row);
-        for (int byte = lane_id; byte < (int)sizeof(block_q_t); byte += WARP_SIZE) {
-            dst[byte] = src[byte];
+    if (slot < weight_blocks_per_row) {
+        gguf_copy_block_async(
+            shared_weights + slot_off, &weight_row[slot],
+            lane_in_slot, nlanes_slot);
+        gguf_cp_async_commit();
+    }
+
+    for (int k_base = 0; k_base < weight_blocks_per_row; k_base += k_slots) {
+        const int k_block = k_base + slot;
+        const int k_next = k_block + k_slots;
+        unsigned char * cur = shared_weights + stage * stage_stride + slot_off;
+        if (k_base + k_slots < weight_blocks_per_row) {
+            if (k_next < weight_blocks_per_row) {
+                gguf_copy_block_async(
+                    shared_weights + (1 - stage) * stage_stride + slot_off,
+                    &weight_row[k_next], lane_in_slot, nlanes_slot);
+            }
+            gguf_cp_async_commit();
+            gguf_cp_async_wait_group<1>();
+        } else {
+            gguf_cp_async_wait();
         }
         __syncwarp();
 
-        const int input_block = k_block * (qk / QK8_1);
-        const int quant_index = vdr * (lane_id % (qi / vdr));
-        #pragma unroll
-        for (int mi = 0; mi < m_tile; ++mi) {
-            const int m = m_base + mi;
-            if (m < size_m) {
-                const block_q8_1 * __restrict__ input_row =
-                    input_base + (size_t)m * input_blocks_per_row;
-                acc[mi] += vec_dot_q_cuda(
-                    shared_row, &input_row[input_block], quant_index);
+        if (k_block < weight_blocks_per_row) {
+            const block_q_t * __restrict__ wblk =
+                reinterpret_cast<const block_q_t *>(cur);
+            const int input_block = k_block * (qk / QK8_1);
+            const int quant_index = vdr * lane_in_slot;
+            #pragma unroll
+            for (int mi = 0; mi < m_tile; ++mi) {
+                const int m = m_base + mi;
+                if (m < size_m) {
+                    const block_q8_1 * __restrict__ input_row =
+                        input_base + (size_t)m * input_blocks_per_row;
+                    acc[mi] += vec_dot_q_cuda(wblk, &input_row[input_block], quant_index);
+                }
             }
         }
+        stage = 1 - stage;
         __syncwarp();
     }
 
@@ -180,16 +256,11 @@ __global__ void gguf_gemm_prefill_kernel(
 #define IQ4_NL_BUF_BYTES    (IQ4_NL_BUF_W_INT8 + IQ4_NL_BUF_W_SCALE + IQ4_NL_BUF_X_INT8 + IQ4_NL_BUF_X_SCALE)
 #define IQ4_NL_SHMEM_BYTES  (2 * IQ4_NL_BUF_BYTES)
 
-static __device__ __forceinline__ void iq4nl_load_stage(
+static __device__ __forceinline__ void iq4nl_load_weights(
     const block_iq4_nl * __restrict__ all_w,
-    const block_q8_1   * __restrict__ all_x,
     int8_t * __restrict__ smem_w, float * __restrict__ smem_d,
-    int8_t * __restrict__ smem_x, float * __restrict__ smem_s,
-    const int n_base, const int m_base,
-    const int k_block_start,
-    const int wbpr, const int ibpr,
-    const int size_n, const int size_m,
-    const int tid
+    const int n_base, const int k_block_start,
+    const int wbpr, const int size_n, const int tid
 ) {
     #pragma unroll 4
     for (int blk = tid; blk < IQ4_NL_N_TILE * IQ4_NL_K_BLOCKS; blk += 256) {
@@ -217,7 +288,14 @@ static __device__ __forceinline__ void iq4nl_load_stage(
         }
         smem_d[local_n * IQ4_NL_K_BLOCKS + local_kb] = d_val;
     }
+}
 
+static __device__ __forceinline__ void iq4nl_load_acts_async(
+    const block_q8_1 * __restrict__ all_x,
+    int8_t * __restrict__ smem_x, float * __restrict__ smem_s,
+    const int m_base, const int k_block_start,
+    const int ibpr, const int size_m, const int tid
+) {
     #pragma unroll 4
     for (int blk = tid; blk < IQ4_NL_M_TILE * IQ4_NL_K_BLOCKS; blk += 256) {
         const int local_m  = blk / IQ4_NL_K_BLOCKS;
@@ -233,7 +311,9 @@ static __device__ __forceinline__ void iq4nl_load_stage(
             const int* qs_i = reinterpret_cast<const int*>(bx->qs);
             int* dst_i = reinterpret_cast<int*>(&smem_x[x_off]);
             #pragma unroll
-            for (int j = 0; j < QK8_1 / 4; ++j) dst_i[j] = __ldg(&qs_i[j]);
+            for (int j = 0; j < QK8_1 / 4; ++j) {
+                gguf_cp_async_4(&dst_i[j], &qs_i[j]);
+            }
         } else {
             #pragma unroll
             for (int i = 0; i < QK8_1; ++i) smem_x[x_off + i] = 0;
@@ -282,8 +362,12 @@ __global__ void gguf_gemm_iq4_nl_prefill(
     const int n_warp_base = warp_id * N_PER_WARP;
 
     if (wbpr > 0) {
-        iq4nl_load_stage(all_w, all_x, smem_wA, smem_dA, smem_xA, smem_sA,
-                         n_base, m_base, 0, wbpr, ibpr, size_n, size_m, tid);
+        iq4nl_load_acts_async(all_x, smem_xA, smem_sA,
+                              m_base, 0, ibpr, size_m, tid);
+        gguf_cp_async_commit();
+        iq4nl_load_weights(all_w, smem_wA, smem_dA,
+                           n_base, 0, wbpr, size_n, tid);
+        gguf_cp_async_wait();
     }
     __syncthreads();
 
@@ -298,6 +382,15 @@ __global__ void gguf_gemm_iq4_nl_prefill(
         int8_t * x_nxt = use_a ? smem_xB : smem_xA;
         float  * s_nxt = use_a ? smem_sB : smem_sA;
 
+        const int next_start = kb_start + K_BLOCKS;
+        if (next_start < wbpr) {
+            iq4nl_load_acts_async(all_x, x_nxt, s_nxt,
+                                  m_base, next_start, ibpr, size_m, tid);
+            gguf_cp_async_commit();
+            iq4nl_load_weights(all_w, w_nxt, d_nxt,
+                               n_base, next_start, wbpr, size_n, tid);
+        }
+
         #pragma unroll
         for (int kb = 0; kb < K_BLOCKS; ++kb) {
             #pragma unroll
@@ -311,10 +404,14 @@ __global__ void gguf_gemm_iq4_nl_prefill(
                     const float d_x = s_cur[m_local * K_BLOCKS + kb];
                     int dot = 0;
                     #pragma unroll
-                    for (int k4 = 0; k4 < QK_IQ4_NL / 4; ++k4) {
+                    for (int i = 0; i < QI_IQ4_NL; ++i) {
                         dot = ggml_cuda_dp4a(
-                            *reinterpret_cast<const int *>(w_row + 4 * k4),
-                            *reinterpret_cast<const int *>(x_row + 4 * k4),
+                            *reinterpret_cast<const int *>(w_row + 4 * i),
+                            *reinterpret_cast<const int *>(x_row + 4 * i),
+                            dot);
+                        dot = ggml_cuda_dp4a(
+                            *reinterpret_cast<const int *>(w_row + 16 + 4 * i),
+                            *reinterpret_cast<const int *>(x_row + 16 + 4 * i),
                             dot);
                     }
                     acc[ni][mi] += d_w * d_x * (float)dot;
@@ -322,10 +419,8 @@ __global__ void gguf_gemm_iq4_nl_prefill(
             }
         }
 
-        const int next_start = kb_start + K_BLOCKS;
         if (next_start < wbpr) {
-            iq4nl_load_stage(all_w, all_x, w_nxt, d_nxt, x_nxt, s_nxt,
-                             n_base, m_base, next_start, wbpr, ibpr, size_n, size_m, tid);
+            gguf_cp_async_wait();
         }
         __syncthreads();
     }
@@ -414,7 +509,8 @@ __global__ void gguf_gemm_iq4_nl_decode(
 
 #define LAUNCH_GGUF_GEMM_PREFILL(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
     gguf_gemm_prefill_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda> \
-        <<<prefill_grid, prefill_block, 8 * 256, stream>>>( \
+        <<<prefill_grid, prefill_block, \
+            (2 * 8 * ((vdr) * WARP_SIZE / (qi)) * 256), stream>>>( \
             weights, input_q8_1, outputs, size_m, size_n, size_k, k_padded)
 
 #define LAUNCH_GGUF_IQ4_NL_PREFILL() \

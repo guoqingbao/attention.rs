@@ -22,9 +22,8 @@
 #include <cmath>
 
 static constexpr int NVFP4_BLOCK_SIZE = 16;
-// SM120 CUTLASS FP4 kernels produce NaN when E4M3 block scale hits uint8 127
-// (max finite = 448.0). Clamp to 126 (= 416.0, <2% precision loss).
-// See: sgl-project/sglang#22927
+// Custom SM100 quant path: clamp E4M3 block scale to 126. SM120/SM121 uses
+// FlashInfer invokeFP4Quantization (e4m3Max=448) instead of this kernel.
 static constexpr uint8_t NVFP4_E4M3_SCALE_MAX = 126;
 
 __device__ __forceinline__ uint8_t clamp_nvfp4_e4m3_scale(uint8_t bits) {
