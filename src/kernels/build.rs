@@ -2,7 +2,11 @@ mod others;
 
 use anyhow::Result;
 use cudaforge::KernelBuilder;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn unix_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
 
 fn main() -> Result<()> {
     // CUDA translation units use host-side C++ state/workspaces (including
@@ -300,14 +304,23 @@ fn main() -> Result<()> {
             let csrc_dir = flashinfer_root.join("csrc");
             let quant_cu = csrc_dir.join("nv_internal/cpp/kernels/quantization.cu");
             if quant_cu.exists() {
-                let cccl_compat = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("src/flashinfer_cccl_compat.h");
-                let cccl_compat = cccl_compat.to_string_lossy().into_owned();
+                // Do not use global nvcc `-include`: extra_args apply to every
+                // kernel. A `cuda::maximum` polyfill would then redeclare CCCL
+                // types on CUDA 13. Wrap only this translation unit.
+                let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+                let compat = manifest.join("src/flashinfer_cccl_compat.h");
+                let wrap = build_dir.join("flashinfer_quantization_sm120.cu");
+                std::fs::write(
+                    &wrap,
+                    format!(
+                        "#include \"{}\"\n#include \"{}\"\n",
+                        unix_path(&compat),
+                        unix_path(&quant_cu)
+                    ),
+                )?;
                 builder = builder
-                    .arg("-include")
-                    .arg(&cccl_compat)
                     .arg("-DATTENTION_RS_USE_FLASHINFER_FP4_QUANT")
-                    .source_files(vec![quant_cu]);
+                    .source_files(vec![wrap]);
                 println!(
                     "cargo:warning=FlashInfer SM120 NVFP4 quant (invokeFP4Quantization) enabled"
                 );
