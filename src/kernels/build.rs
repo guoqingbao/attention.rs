@@ -78,6 +78,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant_flashinfer.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_cccl_compat.h");
     println!("cargo:rerun-if-changed=src/mlx_nvfp4_utils.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_quant.cu");
@@ -299,7 +300,11 @@ fn main() -> Result<()> {
             let csrc_dir = flashinfer_root.join("csrc");
             let quant_cu = csrc_dir.join("nv_internal/cpp/kernels/quantization.cu");
             if quant_cu.exists() {
+                let cccl_compat = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("src/flashinfer_cccl_compat.h");
                 builder = builder
+                    .arg("-include")
+                    .arg(cccl_compat.to_string_lossy().into_owned())
                     .arg("-DATTENTION_RS_USE_FLASHINFER_FP4_QUANT")
                     .source_files(vec![quant_cu]);
                 println!(
