@@ -302,9 +302,10 @@ fn main() -> Result<()> {
             if quant_cu.exists() {
                 let cccl_compat = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("src/flashinfer_cccl_compat.h");
+                let cccl_compat = cccl_compat.to_string_lossy().into_owned();
                 builder = builder
                     .arg("-include")
-                    .arg(cccl_compat.to_string_lossy().into_owned())
+                    .arg(&cccl_compat)
                     .arg("-DATTENTION_RS_USE_FLASHINFER_FP4_QUANT")
                     .source_files(vec![quant_cu]);
                 println!(
