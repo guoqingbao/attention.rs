@@ -200,11 +200,12 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor) -> Result<Tensor> {
 /// * `weight_scale_swizzled` - Optional pre-swizzled weight scales from
 ///   [`swizzle_nvfp4_weight_scales`]. When provided, skips per-call swizzling.
 ///
-/// On SM100+ with cutlass/flashinfer: hardware FP4 tensor cores via
-/// CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly),
-/// used for every M to match SGLang. SM120/SM121 uses FlashInfer
-/// `fp4_quantize` + `mm_fp4` (cutlass). On Hopper and below: software
-/// dequant (LUT-based FP4 decode + FMA/WMMA).
+/// On SM100+ with cutlass/flashinfer: prefill uses hardware FP4 tensor cores
+/// via CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly).
+/// SM120/SM121 prefill uses FlashInfer `fp4_quantize` + `mm_fp4`. Decode uses
+/// the same hardware W4A4 path by default (`XINFER_NVFP4_HW_DECODE=1`);
+/// set `XINFER_NVFP4_HW_DECODE=0` for software small-M GEMV.
+/// On Hopper and below: software dequant (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [M, N] in same dtype as input
 
@@ -281,17 +282,19 @@ pub fn nvfp4_matmul(
                 }
             }
 
-            // SGLang uses flashinfer.mm_fp4 for every M on SM100+. Restricting
-            // hardware GEMM to prefill mixed a different kernel into decode.
+            // Hardware W4A4 for prefill; decode too unless XINFER_NVFP4_HW_DECODE=0.
             let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
-            let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
+            let use_hw_gemm = is_prefill || crate::nvfp4_hw_decode();
+            let use_flashinfer_fp4 = use_hw_gemm
+                && cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
                 && n % 32 == 0
                 && k % 32 == 0;
             // SM120/SM121: FlashInfer fp4_quantize (SWIZZLED_128x4, e4m3Max=448).
             let use_flashinfer_quant = use_flashinfer_fp4 && sm >= 120;
 
-            let use_hardware_fp4 = !use_flashinfer_fp4
+            let use_hardware_fp4 = use_hw_gemm
+                && !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
                 && n % 32 == 0

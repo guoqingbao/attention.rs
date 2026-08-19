@@ -197,16 +197,27 @@ pub mod trtllm_cubin_loader;
 
 static NVFP4_FORCE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static NVFP4_ONLINE_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static NVFP4_HW_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn env_flag_enabled_or(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Ok(_) | Err(_) => default,
+    }
+}
 
 /// Returns true if `XINFER_NVFP4_FORCE_LUT=1` is set, forcing the software
 /// GEMM decode path to use the higher-precision LUT-based dequantization
 /// instead of hardware FP4 intrinsics on Blackwell (SM100+).
 pub fn nvfp4_force_lut() -> bool {
-    *NVFP4_FORCE_LUT.get_or_init(|| {
-        std::env::var("XINFER_NVFP4_FORCE_LUT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *NVFP4_FORCE_LUT.get_or_init(|| env_flag_enabled("XINFER_NVFP4_FORCE_LUT"))
 }
 
 /// Returns true if `XINFER_NVFP4_ONLINE_SCALE=1` is set.
@@ -218,11 +229,16 @@ pub fn nvfp4_force_lut() -> bool {
 /// when activations exceed calibration. Opt-in only — affects all hardware
 /// NVFP4 paths (pure and mixed).
 pub fn nvfp4_online_scale() -> bool {
-    *NVFP4_ONLINE_SCALE.get_or_init(|| {
-        std::env::var("XINFER_NVFP4_ONLINE_SCALE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *NVFP4_ONLINE_SCALE.get_or_init(|| env_flag_enabled("XINFER_NVFP4_ONLINE_SCALE"))
+}
+
+/// Hardware W4A4 decode is **on** by default (`XINFER_NVFP4_HW_DECODE=1`).
+///
+/// Prefill always uses hardware W4A4 (CUTLASS / FlashInfer) on SM100+.
+/// Set `XINFER_NVFP4_HW_DECODE=0` to use the software NVFP4 GEMV
+/// (`nvfp4_matmul_smallm`) for decode, which is faster on SM120.
+pub fn nvfp4_hw_decode() -> bool {
+    *NVFP4_HW_DECODE.get_or_init(|| env_flag_enabled_or("XINFER_NVFP4_HW_DECODE", true))
 }
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
