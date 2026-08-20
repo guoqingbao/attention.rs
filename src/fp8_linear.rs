@@ -69,8 +69,8 @@ fn get_cuda_slice<
 /// Dispatches to the best available kernel based on hardware capability,
 /// feature flags, and `is_prefill`:
 ///
-/// 1. **FlashInfer** (sm90, BF16, 128x128 blocks, decode with m<=64)
-/// 2. **CUTLASS** (sm90+, 128x128 blocks)
+/// 1. **FlashInfer** (sm90, BF16, 128x128 blocks, decode with 1 <= M < 32)
+/// 2. **CUTLASS** (sm90+, 128x128 blocks, Persistent scheduler)
 /// 3. **Fallback** (any CUDA or Metal)
 ///
 /// # Arguments
@@ -160,9 +160,11 @@ pub fn fp8_matmul_with_input_scale(
     #[cfg(all(feature = "cuda", feature = "flashinfer"))]
     {
         let (m, _) = input.dims2()?;
-        // Enable only for decode phase (small M <= 64) on SM90 with BF16 and 128x128 block scales
+        // Match FlashInferFp8DeepGEMMDynamicBlockScaledKernel bound:
+        // fp8_blockscale_gemm_sm90's M >= 32 half is the non-swapAB kernel,
+        // which SGLang documents as less accurate on some checkpoints.
         let use_flashinfer = !is_prefill
-            && m <= 64
+            && (1..32).contains(&m)
             && (90..100).contains(&sm_version)
             && DType::BF16 == input.dtype()
             && block_size == [128, 128];
@@ -629,23 +631,45 @@ fn fp8_matmul_flashinfer_with_input_scale(
 
     let cu_dev = dev.as_cuda_device()?;
     let stream = *cu_dev.cu_stream() as i64;
-    let m_padded = (m + 4 - 1) / 4 * 4;
     let out = unsafe { Tensor::empty_((m, n), DType::BF16, dev)? };
-    let k_over_128 = k / 128;
-    // FlashInfer/DeepGEMM expects scales_a to use an M-aligned leading stride.
-    // Keep both asynchronous inputs in the per-device pool: call-local tensors
-    // can be reclaimed as soon as this function returns, before the GEMM has
-    // finished reading them.
-    let input_q_bytes = m * k;
-    let input_scales_bytes = k_over_128 * m_padded * std::mem::size_of::<f32>();
-    let (q_ptr, s_ptr) = get_grouped_gemm_scratch(cu_dev, input_q_bytes, input_scales_bytes)?;
-    let s_ptr = s_ptr as *mut f32;
-    let scale_stride = m_padded as i32;
+    let weight_ptr = get_cuda_slice::<u8>(weight)? as *const std::ffi::c_void;
+    let weight_scale_ptr = get_cuda_slice::<f32>(weight_scale)? as *const f32;
+    let out_ptr = get_cuda_slice::<half::bf16>(&out)? as *mut std::ffi::c_void;
     let inp_ptr = get_cuda_slice::<half::bf16>(input)? as *const std::ffi::c_void;
 
-    unsafe {
+    // Dynamic W8A8: match SGLang fp8_blockscale_gemm_sm90, which
+    // takes BF16 activations and quantizes inside FlashInfer (fp8CS1x128).
+    // Static ModelOpt scales still need the external per-group quant path.
+    let status = if input_scale.is_none() {
+        let required_ws = unsafe {
+            ffi::flashinfer_fp8_blockscale_workspace_size_bf16(m as i32, n as i32, k as i32)
+        };
+        let (workspace_ptr, workspace_size) =
+            get_or_init_flashinfer_fp8_workspace(cu_dev, required_ws)?;
+        unsafe {
+            ffi::flashinfer_fp8_blockscale_bf16(
+                inp_ptr,
+                weight_ptr,
+                weight_scale_ptr,
+                out_ptr,
+                m as i32,
+                n as i32,
+                k as i32,
+                workspace_ptr,
+                workspace_size,
+                stream,
+            )
+        }
+    } else {
+        let m_padded = (m + 4 - 1) / 4 * 4;
+        let k_over_128 = k / 128;
+        let input_q_bytes = m * k;
+        let input_scales_bytes = k_over_128 * m_padded * std::mem::size_of::<f32>();
+        let (q_ptr, s_ptr) = get_grouped_gemm_scratch(cu_dev, input_q_bytes, input_scales_bytes)?;
+        let s_ptr = s_ptr as *mut f32;
+        let scale_stride = m_padded as i32;
         let num_groups = m * k_over_128;
-        if let Some(input_scale) = input_scale {
+        unsafe {
             ffi::fp8_quantize_per_token_group_static_launch(
                 inp_ptr,
                 q_ptr,
@@ -656,48 +680,30 @@ fn fp8_matmul_flashinfer_with_input_scale(
                 scale_stride,
                 false,
                 true,
-                input_scale,
-                stream,
-            );
-        } else {
-            ffi::fp8_quantize_per_token_group_launch(
-                inp_ptr,
-                q_ptr,
-                s_ptr,
-                num_groups as i32,
-                128,
-                k_over_128 as i32,
-                scale_stride,
-                false,
-                true,
+                input_scale.unwrap(),
                 stream,
             );
         }
-    }
-
-    let required_ws =
-        unsafe { ffi::flashinfer_fp8_blockscale_workspace_size_fp8(m as i32, n as i32, k as i32) };
-    let (workspace_ptr, workspace_size) =
-        get_or_init_flashinfer_fp8_workspace(cu_dev, required_ws)?;
-
-    let weight_ptr = get_cuda_slice::<u8>(weight)? as *const std::ffi::c_void;
-    let weight_scale_ptr = get_cuda_slice::<f32>(weight_scale)? as *const f32;
-    let out_ptr = get_cuda_slice::<half::bf16>(&out)? as *mut std::ffi::c_void;
-
-    let status = unsafe {
-        ffi::flashinfer_fp8_blockscale_fp8(
-            q_ptr as *const std::ffi::c_void,
-            s_ptr as *const f32,
-            weight_ptr,
-            weight_scale_ptr,
-            out_ptr,
-            m as i32,
-            n as i32,
-            k as i32,
-            workspace_ptr,
-            workspace_size,
-            stream,
-        )
+        let required_ws = unsafe {
+            ffi::flashinfer_fp8_blockscale_workspace_size_fp8(m as i32, n as i32, k as i32)
+        };
+        let (workspace_ptr, workspace_size) =
+            get_or_init_flashinfer_fp8_workspace(cu_dev, required_ws)?;
+        unsafe {
+            ffi::flashinfer_fp8_blockscale_fp8(
+                q_ptr as *const std::ffi::c_void,
+                s_ptr as *const f32,
+                weight_ptr,
+                weight_scale_ptr,
+                out_ptr,
+                m as i32,
+                n as i32,
+                k as i32,
+                workspace_ptr,
+                workspace_size,
+                stream,
+            )
+        }
     };
     if status != 0 {
         candle_core::bail!("flashinfer fp8 blockscale gemm failed with status {status}");

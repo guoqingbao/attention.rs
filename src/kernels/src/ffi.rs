@@ -1788,6 +1788,27 @@ extern "C" {
         stream: i64,
     );
 
+    // FlashInfer invokeFP4Quantization (SM120/SM121; writes packed FP4 + SWIZZLED_128x4 SF)
+    pub fn flashinfer_nvfp4_quantize_activation_f16(
+        input: *const c_void,
+        output_packed: *mut c_void,
+        output_sf_swizzled: *mut c_void,
+        global_scale: *const f32,
+        M: i32,
+        K: i32,
+        stream: i64,
+    );
+
+    pub fn flashinfer_nvfp4_quantize_activation_bf16(
+        input: *const c_void,
+        output_packed: *mut c_void,
+        output_sf_swizzled: *mut c_void,
+        global_scale: *const f32,
+        M: i32,
+        K: i32,
+        stream: i64,
+    );
+
     pub fn nvfp4_quantize_activation_grouped_f16(
         input: *const c_void,
         output: *mut c_void,
