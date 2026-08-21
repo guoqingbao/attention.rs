@@ -285,6 +285,7 @@ pub fn nvfp4_matmul(
     bias: Option<&Tensor>,
     is_prefill: bool,
     weight_scale_swizzled: Option<&Tensor>,
+    weight_row_scales: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -622,6 +623,14 @@ pub fn nvfp4_matmul(
                     std::ptr::null()
                 };
 
+                let row_scales_ptr: *const f32 = match weight_row_scales {
+                    Some(rs) => {
+                        let (rs_s, _) = rs.storage_and_layout();
+                        cuda_ptr(&rs_s, rs.dtype())? as *const f32
+                    }
+                    None => std::ptr::null(),
+                };
+
                 let stream = *cuda_dev.cu_stream() as i64;
                 let force_lut = crate::nvfp4_force_lut();
 
@@ -634,6 +643,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -650,6 +660,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -673,6 +684,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -689,6 +701,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,

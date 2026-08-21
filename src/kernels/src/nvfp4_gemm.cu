@@ -219,6 +219,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
                                     const uint8_t *__restrict__ weight,
                                     const uint8_t *__restrict__ weight_scale,
                                     float weight_global_scale,
+                                    const float *__restrict__ weight_row_scales,
                                     const T *__restrict__ bias,
                                     T *__restrict__ output, int M, int N,
                                     int K, bool has_bias, bool force_lut) {
@@ -283,6 +284,8 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 
   const uint8_t *w_row = weight + (size_t)n_idx * weight_row_stride;
   const uint8_t *w_scale_row = weight_scale + (size_t)n_idx * scale_stride;
+  const float gscale =
+      weight_row_scales ? weight_row_scales[n_idx] : weight_global_scale;
 
   float acc = 0.0f;
 
@@ -296,7 +299,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       {
         float block_scale =
             fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
+            gscale;
         uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
         const float *in = s_input + (k + (k / WARP_SIZE));
         acc += hw_dot_16(w_vec, block_scale, in);
@@ -306,7 +309,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       if (k2 < K) {
         float block_scale2 =
             fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
+            gscale;
         uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
         const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
         acc += hw_dot_16(w_vec2, block_scale2, in2);
@@ -317,7 +320,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       // --- LUT path: FP4→int8 table lookup, FP32 accumulation ---
       float block_scale =
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
-          weight_global_scale * 0.5f;
+          gscale * 0.5f;
 
       uint2 w_vec = load_uint2_safe(w_row + k / 2);
       const float *in = s_input + (k + (k / WARP_SIZE));
@@ -348,7 +351,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       if (k2 < K) {
         float block_scale2 =
             dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale * 0.5f;
+            gscale * 0.5f;
 
         uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
         const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
@@ -405,6 +408,7 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
                                    const uint8_t *__restrict__ weight,
                                    const uint8_t *__restrict__ weight_scale,
                                    float weight_global_scale,
+                                   const float *__restrict__ weight_row_scales,
                                    const T *__restrict__ bias,
                                    T *__restrict__ output, int M, int N, int K,
                                    bool has_bias, bool force_lut) {
@@ -452,10 +456,13 @@ __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
     for (int ln = tid; ln < BLOCK_N; ln += NUM_THREADS) {
       const int gn = bx * BLOCK_N + ln;
       if (gn < N) {
+        const float row_gscale = weight_row_scales
+            ? weight_row_scales[gn]
+            : weight_global_scale;
         float raw_scale =
             fp8_scale_to_float(__ldg(&weight_scale[(size_t)gn * scale_stride +
                                                    k_tile / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
+            row_gscale;
 
         uint2 w_vec = load_uint2_safe(
             &weight[(size_t)gn * (K / 2) + k_tile / 2]);
@@ -534,6 +541,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
                         const uint8_t *__restrict__ weights,
                         const uint8_t *__restrict__ weight_scales,
                         const float *__restrict__ weight_global_scales,
+                        const float *__restrict__ weight_half_scales,
                         const T *__restrict__ biases,
                         const uint32_t *__restrict__ indices,
                         const float *__restrict__ topk_weights,
@@ -621,7 +629,9 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
     const uint32_t expert_idx = __ldg(&indices[token_idx * topk + expert_slot]);
     if (expert_idx >= (uint32_t)num_experts) continue;
 
-    const float global_scale = weight_global_scales[expert_idx];
+    const float global_scale = weight_half_scales
+        ? weight_half_scales[expert_idx * 2 + ((n_idx >= N / 2) ? 1 : 0)]
+        : weight_global_scales[expert_idx];
 
     const uint8_t *w_row = weights +
                            (size_t)expert_idx * N * weight_row_stride +
@@ -776,6 +786,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
     const uint8_t *__restrict__ weight,
     const uint8_t *__restrict__ weight_scale,
     float weight_global_scale,
+    const float *__restrict__ weight_row_scales,
     const T *__restrict__ bias,
     T *__restrict__ output,
     int M, int N, int K, bool has_bias, bool force_lut) {
@@ -825,9 +836,12 @@ __global__ void nvfp4_wmma_matmul_kernel(
       int gn = bx * BN + row;
 
       if (row < BN && gn < N && k_step < K) {
+        const float row_gscale = weight_row_scales
+            ? weight_row_scales[gn]
+            : weight_global_scale;
         float raw_scale = fp8_scale_to_float(
             __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
-            * weight_global_scale;
+            * row_gscale;
 
         uint2 w_vec = load_uint2_safe(
             &weight[(size_t)gn * half_k + k_step / 2]);
@@ -932,6 +946,7 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
                                          const uint8_t *weight,
                                          const uint8_t *weight_scale,
                                          float weight_global_scale,
+                                         const float *weight_row_scales,
                                          const __half *bias, __half *output,
                                          int M, int N, int K, bool has_bias,
                                          bool force_lut, cudaStream_t stream) {
@@ -943,7 +958,8 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                        weight_global_scale, bias, output, M, N,
+                                        weight_global_scale, weight_row_scales,
+                                        bias, output, M, N,
                                         K, has_bias, force_lut);
 }
 
@@ -952,6 +968,7 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           const uint8_t *weight,
                                           const uint8_t *weight_scale,
                                           float weight_global_scale,
+                                          const float *weight_row_scales,
                                           const __nv_bfloat16 *bias,
                                           __nv_bfloat16 *output,
                                           int M, int N, int K, bool has_bias,
@@ -964,12 +981,14 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                        weight_global_scale, bias, output, M, N,
+                                        weight_global_scale, weight_row_scales,
+                                        bias, output, M, N,
                                         K, has_bias, force_lut);
 }
 #else
 extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
-                                          const uint8_t *, float, const void *,
+                                          const uint8_t *, float, const float *,
+                                          const void *,
                                           void *, int, int, int, bool, bool,
                                           cudaStream_t) {}
 #endif
@@ -977,6 +996,7 @@ extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
 extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                   const uint8_t *weight_scale,
                                   float weight_global_scale,
+                                  const float *weight_row_scales,
                                   const __half *bias, __half *output, int M,
                                   int N, int K, bool has_bias, bool force_lut,
                                   cudaStream_t stream) {
@@ -986,7 +1006,8 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
   nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, bias, output, M, N, K,
+                                   weight_global_scale, weight_row_scales,
+                                   bias, output, M, N, K,
                                    has_bias, force_lut);
 #else
   constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
@@ -996,7 +1017,8 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
   nvfp4_gemm::nvfp4_matmul_tiled<half, BM, BN, BK, TM, TN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, bias, output, M, N, K,
+                                   weight_global_scale, weight_row_scales,
+                                   bias, output, M, N, K,
                                    has_bias, force_lut);
 #endif
 }
@@ -1006,6 +1028,7 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
                                    const uint8_t *weight,
                                    const uint8_t *weight_scale,
                                    float weight_global_scale,
+                                   const float *weight_row_scales,
                                    const __nv_bfloat16 *bias,
                                    __nv_bfloat16 *output, int M, int N, int K,
                                    bool has_bias, bool force_lut,
@@ -1015,19 +1038,22 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
   nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, bias, output, M, N, K,
+                                   weight_global_scale, weight_row_scales,
+                                   bias, output, M, N, K,
                                    has_bias, force_lut);
 }
 #else
 extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,
-                                   const uint8_t *, float, const void *,
+                                   const uint8_t *, float, const float *,
+                                   const void *,
                                    void *, int, int, int, bool, bool,
                                    cudaStream_t) {}
 #endif
 
 extern "C" void nvfp4_indexed_moe_gemm_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
-    const float *weight_global_scales, const __half *biases,
+    const float *weight_global_scales, const float *weight_half_scales,
+    const __half *biases,
     const uint32_t *indices, const float *topk_weights, __half *output,
     int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
@@ -1042,7 +1068,8 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
   auto kernel = nvfp4_gemm::nvfp4_moe_gemm<half>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
-      input, weights, weight_scales, weight_global_scales, biases, indices,
+      input, weights, weight_scales, weight_global_scales, weight_half_scales,
+      biases, indices,
       topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
@@ -1051,6 +1078,7 @@ extern "C" void nvfp4_indexed_moe_gemm_f16(
 extern "C" void nvfp4_indexed_moe_gemm_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const float *weight_global_scales,
+    const float *weight_half_scales,
     const __nv_bfloat16 *biases, const uint32_t *indices,
     const float *topk_weights, __nv_bfloat16 *output, int num_tokens, int topk,
     int num_experts, int N,
@@ -1066,14 +1094,16 @@ extern "C" void nvfp4_indexed_moe_gemm_bf16(
   auto kernel = nvfp4_gemm::nvfp4_moe_gemm<__nv_bfloat16>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
   kernel<<<grid, block, shared_mem_size, stream>>>(
-      input, weights, weight_scales, weight_global_scales, biases, indices,
+      input, weights, weight_scales, weight_global_scales, weight_half_scales,
+      biases, indices,
       topk_weights, output, num_tokens, topk, num_experts, N, K, has_bias,
       input_has_topk_dim, force_lut);
 }
 #else
 extern "C" void nvfp4_indexed_moe_gemm_bf16(const void *, const uint8_t *,
                                              const uint8_t *, const float *,
-                                             const void *, const uint32_t *,
+                                             const float *, const void *,
+                                             const uint32_t *,
                                              const float *, void *, int, int,
                                              int, int, int, bool, bool, bool,
                                              cudaStream_t) {}
@@ -1103,6 +1133,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
     const uint8_t* __restrict__ weights,       // [E, N, K/2] packed FP4
     const uint8_t* __restrict__ weight_scales,  // [E, N, K/16] FP8 E4M3
     const float* __restrict__ weight_global_scales, // [E]
+    const float* __restrict__ weight_half_scales,   // [E, 2] optional per-half
     const int32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
@@ -1176,10 +1207,13 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
                 int sub = i & 1;
                 int gn = n_base + row;
                 if (gn < size_n && k_base < size_k) {
+                    const float row_scale = weight_half_scales
+                        ? weight_half_scales[expert_id * 2 + (gn >= size_n / 2)]
+                        : global_scale;
                     float raw_scale = fp8_scale_to_float(
                         __ldg(&weight_scales[(size_t)expert_id * size_n * scale_stride +
                                              (size_t)gn * scale_stride + k_base / NVFP4_BLOCK_SIZE]))
-                        * global_scale;
+                        * row_scale;
 
                     uint2 w_vec = load_uint2_safe(
                         &weights[(size_t)expert_id * size_n * half_k + (size_t)gn * half_k + k_base / 2]);
@@ -1269,7 +1303,7 @@ __global__ void nvfp4_moe_gemm_wmma_kernel(
 // C API for NVFP4 MoE WMMA grouped GEMM
 extern "C" void nvfp4_moe_gemm_wmma_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
-    const float *weight_global_scales,
+    const float *weight_global_scales, const float *weight_half_scales,
     const int32_t *sorted_token_ids, const int32_t *expert_offsets,
     const float *topk_weights,
     __half *output,
@@ -1283,7 +1317,7 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
               + MOE_N_BLK * (MOE_WMMA_K + 8) * sizeof(__half)
               + MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__half><<<grid, block, smem, stream>>>(
-      input, weights, weight_scales, weight_global_scales,
+      input, weights, weight_scales, weight_global_scales, weight_half_scales,
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
       input_has_topk_dim, force_lut);
@@ -1292,7 +1326,7 @@ extern "C" void nvfp4_moe_gemm_wmma_f16(
 #ifndef NO_BF16_KERNEL
 extern "C" void nvfp4_moe_gemm_wmma_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights, const uint8_t *weight_scales,
-    const float *weight_global_scales,
+    const float *weight_global_scales, const float *weight_half_scales,
     const int32_t *sorted_token_ids, const int32_t *expert_offsets,
     const float *topk_weights,
     __nv_bfloat16 *output,
@@ -1306,7 +1340,7 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
               + MOE_N_BLK * (MOE_WMMA_K + 8) * sizeof(__nv_bfloat16)
               + MOE_M_BLK * MOE_N_BLK * sizeof(float);
   nvfp4_moe_gemm_wmma_kernel<__nv_bfloat16><<<grid, block, smem, stream>>>(
-      input, weights, weight_scales, weight_global_scales,
+      input, weights, weight_scales, weight_global_scales, weight_half_scales,
       sorted_token_ids, expert_offsets, topk_weights,
       output, num_experts, topk, size_m, size_n, size_k,
       input_has_topk_dim, force_lut);
@@ -1314,6 +1348,6 @@ extern "C" void nvfp4_moe_gemm_wmma_bf16(
 #else
 extern "C" void nvfp4_moe_gemm_wmma_bf16(
     const void *, const uint8_t *, const uint8_t *, const float *,
-    const int32_t *, const int32_t *, const float *,
+    const float *, const int32_t *, const int32_t *, const float *,
     void *, int, int, int, int, int, bool, bool, cudaStream_t) {}
 #endif
