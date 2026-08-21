@@ -1761,13 +1761,22 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn nvfp4_resolve_online_scales(
+        online: *const f32,
+        calibrated_scale: f32,
+        weight_global_scale: f32,
+        alpha_out: *mut f32,
+        sf_inv_out: *mut f32,
+        stream: i64,
+    );
+
     // NVFP4 activation quantization (SM100+ / Blackwell)
     pub fn nvfp4_quantize_activation_f16(
         input: *const c_void,
         output: *mut c_void,
         scales: *mut c_void,
         swizzled_scales: *mut c_void,
-        input_scale_inv: f32,
+        input_scale_inv: *const f32,
         M: i32,
         K: i32,
         M_padded: i32,
@@ -1780,7 +1789,7 @@ extern "C" {
         output: *mut c_void,
         scales: *mut c_void,
         swizzled_scales: *mut c_void,
-        input_scale_inv: f32,
+        input_scale_inv: *const f32,
         M: i32,
         K: i32,
         M_padded: i32,
