@@ -92,6 +92,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
     println!("cargo:rerun-if-changed=src/mla_sparse_attention.cu");
     println!("cargo:rerun-if-changed=src/fast_topk.cu");
+    println!("cargo:rerun-if-changed=src/minimax_m3_indexer.cu");
+    println!("cargo:rerun-if-changed=src/minimax_m3_sparse_attention.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_instantiate.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_decode.cu");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged.cuh");

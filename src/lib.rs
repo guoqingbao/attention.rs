@@ -18,7 +18,7 @@ use candle_core::DType;
 use candle_core::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use paged_attention::convert_to_fp8;
-use paged_attention::{paged_attention, reshape_and_cache};
+pub use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
 pub mod fused_rope;
 pub mod mask;
@@ -38,7 +38,9 @@ pub mod fp8_linear;
 pub mod gdn;
 pub mod gguf_linear;
 pub mod mamba_cache;
+pub mod minimax_m3;
 pub mod mla;
+pub use minimax_m3::{minimax_m3_indexer_prefill, minimax_m3_sparse_attention_prefill};
 pub mod mxfp4_linear;
 pub mod nvfp4_linear;
 pub mod ops;
@@ -276,6 +278,7 @@ pub struct InputMetadata {
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
     pub seqlens: Option<Vec<u32>>,
+    pub kv_seqlens: Option<Vec<u32>>,
     pub flashinfer_metadata: Option<FlashInferMetadata>,
     pub is_mtp_verify: bool,
 }
