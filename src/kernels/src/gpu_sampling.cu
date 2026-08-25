@@ -108,6 +108,7 @@ static __device__ __forceinline__ void merge_topk_desc_safe(
 template<int K, int BLOCK_THREADS, int ITEMS_PER_THREAD, typename T>
 __global__ void stageA_local_topk(
     const T* __restrict__ logits, // [B,V]
+    const float* __restrict__ mask, // [B,V] 1.0=legal / 0.0=illegal, or nullptr
     int B, int V,
     float temperature,
     int tiles_per_row,                // number of tiles along vocab
@@ -122,6 +123,7 @@ __global__ void stageA_local_topk(
   int base = tile * CHUNK;
 
   const T* row = logits + (size_t)b * (size_t)V;
+  const float* mrow = mask ? (mask + (size_t)b * (size_t)V) : nullptr;
 
   float invT = (temperature > 1e-6f) ? (1.0f / temperature) : 1e6f;
 
@@ -132,7 +134,12 @@ __global__ void stageA_local_topk(
   for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
     int idx = base + threadIdx.x + it * BLOCK_THREADS;
     if (idx < V) {
-      v[it] = to_float(row[idx]) * invT;
+      float scaled = to_float(row[idx]) * invT;
+      // Grammar gate: a disallowed vocab entry is dropped from the top-k (and thus
+      // from sampling) by forcing its score to -inf.
+      if (mrow != nullptr && mrow[idx] == 0.0f)
+        scaled = -CUDART_INF_F;
+      v[it] = scaled;
       i[it] = idx;
     } else {
       v[it] = -CUDART_INF_F;
@@ -278,6 +285,7 @@ __global__ void stageB_reduce_and_sample(
 template<int K, typename T>
 void gpu_topk_topp_sample(
     const T* logits_d,
+    const float* mask_d,   // [B,V] 1.0=legal / 0.0=illegal, or nullptr
     int* out_tokens_d,
     const SamplerParams& p,
     cudaStream_t stream
@@ -309,7 +317,7 @@ void gpu_topk_topp_sample(
   dim3 blockA(BLOCK_THREADS, 1, 1);
   stageA_local_topk<K, BLOCK_THREADS, ITEMS_PER_THREAD, T>
       <<<gridA, blockA, 0, stream>>>(
-          logits_d, p.B, p.V, p.temperature, tiles, tile_vals_d, tile_idx_d);
+          logits_d, mask_d, p.B, p.V, p.temperature, tiles, tile_vals_d, tile_idx_d);
 
   // Stage B: one block per batch element
   dim3 gridB(p.B, 1, 1);
@@ -325,23 +333,23 @@ void gpu_topk_topp_sample(
 }
 
 // Explicit instantiations for float
-template void gpu_topk_topp_sample<32, float>(const float*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<64, float>(const float*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<128, float>(const float*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<256, float>(const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<32, float>(const float*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<64, float>(const float*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<128, float>(const float*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<256, float>(const float*, const float*, int*, const SamplerParams&, cudaStream_t);
 
 // Explicit instantiations for __half (f16)
-template void gpu_topk_topp_sample<32, __half>(const __half*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<64, __half>(const __half*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<128, __half>(const __half*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<256, __half>(const __half*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<32, __half>(const __half*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<64, __half>(const __half*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<128, __half>(const __half*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<256, __half>(const __half*, const float*, int*, const SamplerParams&, cudaStream_t);
 
 // Explicit instantiations for __nv_bfloat16 (bf16) - requires sm_80+
 #ifndef NO_BF16_KERNEL
-template void gpu_topk_topp_sample<32, __nv_bfloat16>(const __nv_bfloat16*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<64, __nv_bfloat16>(const __nv_bfloat16*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<128, __nv_bfloat16>(const __nv_bfloat16*, int*, const SamplerParams&, cudaStream_t);
-template void gpu_topk_topp_sample<256, __nv_bfloat16>(const __nv_bfloat16*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<32, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<64, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<128, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample<256, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
 #endif
 
 
@@ -373,13 +381,52 @@ extern "C" void sampling_f32(
     cudaStream_t stream = (cudaStream_t)stream_ptr;
 
     if (k_eff <= 32) {
-        gpu_topk_topp_sample<32, float>(logits_d, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<32, float>(logits_d, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 64) {
-        gpu_topk_topp_sample<64, float>(logits_d, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<64, float>(logits_d, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 128) {
-        gpu_topk_topp_sample<128, float>(logits_d, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<128, float>(logits_d, nullptr, out_tokens_d, p, stream);
     } else {
-        gpu_topk_topp_sample<256, float>(logits_d, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<256, float>(logits_d, nullptr, out_tokens_d, p, stream);
+    }
+}
+
+extern "C" void sampling_masked_f32(
+    const float* logits_d,
+    const float* mask_d,   // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int* out_tokens_d,
+    int B,
+    int V,
+    int K,
+    float temperature,
+    float top_p,
+    uint64_t seed,
+    uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B;
+    p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample<32, float>(logits_d, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample<64, float>(logits_d, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample<128, float>(logits_d, mask_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample<256, float>(logits_d, mask_d, out_tokens_d, p, stream);
     }
 }
 
@@ -412,13 +459,53 @@ extern "C" void sampling_f16(
     const __half* logits = reinterpret_cast<const __half*>(logits_d);
 
     if (k_eff <= 32) {
-        gpu_topk_topp_sample<32, __half>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<32, __half>(logits, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 64) {
-        gpu_topk_topp_sample<64, __half>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<64, __half>(logits, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 128) {
-        gpu_topk_topp_sample<128, __half>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<128, __half>(logits, nullptr, out_tokens_d, p, stream);
     } else {
-        gpu_topk_topp_sample<256, __half>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<256, __half>(logits, nullptr, out_tokens_d, p, stream);
+    }
+}
+
+extern "C" void sampling_masked_f16(
+    const void* logits_d,
+    const float* mask_d,   // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int* out_tokens_d,
+    int B,
+    int V,
+    int K,
+    float temperature,
+    float top_p,
+    uint64_t seed,
+    uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B;
+    p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const __half* logits = reinterpret_cast<const __half*>(logits_d);
+
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample<32, __half>(logits, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample<64, __half>(logits, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample<128, __half>(logits, mask_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample<256, __half>(logits, mask_d, out_tokens_d, p, stream);
     }
 }
 
@@ -452,13 +539,55 @@ extern "C" void sampling_bf16(
     const __nv_bfloat16* logits = reinterpret_cast<const __nv_bfloat16*>(logits_d);
 
     if (k_eff <= 32) {
-        gpu_topk_topp_sample<32, __nv_bfloat16>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<32, __nv_bfloat16>(logits, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 64) {
-        gpu_topk_topp_sample<64, __nv_bfloat16>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<64, __nv_bfloat16>(logits, nullptr, out_tokens_d, p, stream);
     } else if (k_eff <= 128) {
-        gpu_topk_topp_sample<128, __nv_bfloat16>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<128, __nv_bfloat16>(logits, nullptr, out_tokens_d, p, stream);
     } else {
-        gpu_topk_topp_sample<256, __nv_bfloat16>(logits, out_tokens_d, p, stream);
+        gpu_topk_topp_sample<256, __nv_bfloat16>(logits, nullptr, out_tokens_d, p, stream);
+    }
+  #endif
+}
+
+extern "C" void sampling_masked_bf16(
+    const void* logits_d,
+    const float* mask_d,   // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int* out_tokens_d,
+    int B,
+    int V,
+    int K,
+    float temperature,
+    float top_p,
+    uint64_t seed,
+    uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B;
+    p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+  #ifndef NO_BF16_KERNEL
+    const __nv_bfloat16* logits = reinterpret_cast<const __nv_bfloat16*>(logits_d);
+
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample<32, __nv_bfloat16>(logits, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample<64, __nv_bfloat16>(logits, mask_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample<128, __nv_bfloat16>(logits, mask_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample<256, __nv_bfloat16>(logits, mask_d, out_tokens_d, p, stream);
     }
   #endif
 }
