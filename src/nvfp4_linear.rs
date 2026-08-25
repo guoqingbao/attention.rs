@@ -13,12 +13,12 @@ use candle_core::{Result, Tensor};
 pub const NVFP4_BLOCK_SIZE: usize = 16;
 
 /// Compute online input scale from the activation tensor's max absolute value.
-/// Returns (input_scale, input_scale_inv) where input_scale = amax(|x|) / 6.0.
-/// This replaces static checkpoint-calibrated input_scale with a dynamic per-batch
-/// value, improving precision for long contexts where activation distributions
-/// shift beyond what the calibration captured.
+///
+/// Device-only variant: returns a CUDA `[2]` tensor
+/// (`[input_scale, input_scale_inv]` where `input_scale = amax(|x|) / 6.0`).
+/// Safe under CUDA graph capture — no host sync.
 #[cfg(feature = "cuda")]
-pub fn compute_online_input_scale(input: &Tensor) -> Result<(f32, f32)> {
+pub fn compute_online_input_scale_device(input: &Tensor) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
     let dev = input.device();
@@ -62,9 +62,73 @@ pub fn compute_online_input_scale(input: &Tensor) -> Result<(f32, f32)> {
             _ => candle_core::bail!("unsupported dtype {:?}", dtype),
         }
     }
+    drop(result_s);
+    drop(input_s);
 
+    Ok(result_tensor)
+}
+
+/// Compute online input scale from the activation tensor's max absolute value.
+/// Returns (input_scale, input_scale_inv) where input_scale = amax(|x|) / 6.0.
+///
+/// Performs a D2H sync — **not** safe under CUDA graph capture. Prefer
+/// [`compute_online_input_scale_device`] + [`resolve_online_hw_scales`] inside
+/// graph-captured forwards.
+#[cfg(feature = "cuda")]
+pub fn compute_online_input_scale(input: &Tensor) -> Result<(f32, f32)> {
+    let result_tensor = compute_online_input_scale_device(input)?;
     let result_vec = result_tensor.to_vec1::<f32>()?;
     Ok((result_vec[0], result_vec[1]))
+}
+
+/// Build device `alpha` and `sf_inv` scalars from an online `[scale, inv]`
+/// tensor and the checkpoint-calibrated scale. Graph-capture safe (no D2H).
+#[cfg(feature = "cuda")]
+pub fn resolve_online_hw_scales(
+    online: &Tensor,
+    calibrated_input_scale: f32,
+    weight_global_scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    use candle_core::{DType, Storage};
+
+    let dev = online.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let alpha_tensor = Tensor::zeros((1,), DType::F32, dev)?;
+    let sf_scale_tensor = Tensor::zeros((1,), DType::F32, dev)?;
+
+    let (online_s, _) = online.storage_and_layout();
+    let online_ptr = match &*online_s {
+        Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+        _ => candle_core::bail!("online scales must be on CUDA"),
+    };
+    let (alpha_s, _) = alpha_tensor.storage_and_layout();
+    let alpha_ptr = match &*alpha_s {
+        Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+        _ => candle_core::bail!("alpha must be on CUDA"),
+    };
+    let (sf_s, _) = sf_scale_tensor.storage_and_layout();
+    let sf_ptr = match &*sf_s {
+        Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+        _ => candle_core::bail!("sf_inv must be on CUDA"),
+    };
+
+    unsafe {
+        ffi::nvfp4_resolve_online_scales(
+            online_ptr as *const f32,
+            calibrated_input_scale,
+            weight_global_scale,
+            alpha_ptr as *mut f32,
+            sf_ptr as *mut f32,
+            stream,
+        );
+    }
+    drop(online_s);
+    drop(alpha_s);
+    drop(sf_s);
+
+    Ok((alpha_tensor, sf_scale_tensor))
 }
 
 /// Check if hardware FP4 (CUTLASS block-scaled tensor ops) is available.
@@ -221,6 +285,7 @@ pub fn nvfp4_matmul(
     bias: Option<&Tensor>,
     is_prefill: bool,
     weight_scale_swizzled: Option<&Tensor>,
+    weight_row_scales: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -330,27 +395,23 @@ pub fn nvfp4_matmul(
                     // Default: checkpoint-calibrated input_scale (ModelOpt joint
                     // PTQ). Optional XINFER_NVFP4_ONLINE_SCALE=1 raises the scale
                     // to max(online_amax/6, calibrated) to avoid FP4 clipping.
-                    let (hw_input_scale, hw_input_scale_inv) = if crate::nvfp4_online_scale() {
-                        let (online_scale, online_inv) = compute_online_input_scale(&input)?;
-                        if input_scale > 1e-12 {
-                            if online_scale > input_scale {
-                                (online_scale, online_inv)
-                            } else {
-                                (input_scale, 1.0 / input_scale)
-                            }
-                        } else if online_scale > 1e-12 {
-                            (online_scale, online_inv)
+                    // Online path stays fully on-device (no to_vec1) so CUDA graph
+                    // capture/replay remain valid.
+                    let (alpha_tensor, sf_scale_tensor) = if crate::nvfp4_online_scale() {
+                        let online = compute_online_input_scale_device(&input)?;
+                        resolve_online_hw_scales(&online, input_scale, weight_global_scale)?
+                    } else {
+                        let (hw_input_scale, hw_input_scale_inv) = if input_scale > 1e-12 {
+                            (input_scale, 1.0 / input_scale)
                         } else {
                             (1.0, 1.0)
-                        }
-                    } else if input_scale > 1e-12 {
-                        (input_scale, 1.0 / input_scale)
-                    } else {
-                        (1.0, 1.0)
+                        };
+                        let alpha = hw_input_scale * weight_global_scale;
+                        (
+                            Tensor::new(&[alpha], dev)?,
+                            Tensor::new(&[hw_input_scale_inv], dev)?,
+                        )
                     };
-                    let alpha = hw_input_scale * weight_global_scale;
-                    let alpha_tensor = Tensor::new(&[alpha], dev)?;
-                    let sf_scale_tensor = Tensor::new(&[hw_input_scale_inv], dev)?;
 
                     {
                         let (input_s, _) = input.storage_and_layout();
@@ -422,7 +483,7 @@ pub fn nvfp4_matmul(
                                         act_packed_ptr,
                                         act_scales_ptr,
                                         act_scales_sw_ptr,
-                                        hw_input_scale_inv,
+                                        sf_scale_ptr,
                                         m as i32,
                                         k as i32,
                                         m_padded as i32,
@@ -434,7 +495,7 @@ pub fn nvfp4_matmul(
                                         act_packed_ptr,
                                         act_scales_ptr,
                                         act_scales_sw_ptr,
-                                        hw_input_scale_inv,
+                                        sf_scale_ptr,
                                         m as i32,
                                         k as i32,
                                         m_padded as i32,
@@ -562,6 +623,14 @@ pub fn nvfp4_matmul(
                     std::ptr::null()
                 };
 
+                let row_scales_ptr: *const f32 = match weight_row_scales {
+                    Some(rs) => {
+                        let (rs_s, _) = rs.storage_and_layout();
+                        cuda_ptr(&rs_s, rs.dtype())? as *const f32
+                    }
+                    None => std::ptr::null(),
+                };
+
                 let stream = *cuda_dev.cu_stream() as i64;
                 let force_lut = crate::nvfp4_force_lut();
 
@@ -574,6 +643,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -590,6 +660,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -613,6 +684,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,
@@ -629,6 +701,7 @@ pub fn nvfp4_matmul(
                                     weight_ptr,
                                     scale_ptr,
                                     weight_global_scale,
+                                    row_scales_ptr,
                                     bias_ptr,
                                     output_ptr,
                                     m as i32,

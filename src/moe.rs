@@ -1610,6 +1610,7 @@ pub fn moe_gemm_nvfp4(
     is_prefill: bool,
     topk_weights: Option<&Tensor>,
     weight_scales_swizzled: Option<&Tensor>,
+    weight_half_scales: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1721,6 +1722,16 @@ pub fn moe_gemm_nvfp4(
     let dev = input.device();
     let cuda_dev = dev.as_cuda_device()?;
 
+    // Optional per-half (gate/up) weight global scales, shape [E, 2]. Null when
+    // the caller uses a single per-expert scale.
+    let half_scales_ptr: *const f32 = match weight_half_scales {
+        Some(hs) => {
+            let (hs_s, _) = hs.storage_and_layout();
+            cuda_ptr(&hs_s, DType::F32)? as *const f32
+        }
+        None => std::ptr::null(),
+    };
+
     // During prefill, sort by expert and dispatch to grouped kernels:
     // hardware FP4 (SM100+) or software WMMA (SM80+).
     // Prefill never uses CUDA graphs, so thrust-based expert offset is safe.
@@ -1817,6 +1828,7 @@ pub fn moe_gemm_nvfp4(
                         cuda_ptr(&weights_s, DType::U8)? as *const u8,
                         cuda_ptr(&scales_s, DType::U8)? as *const u8,
                         cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                        half_scales_ptr,
                         cuda_ptr(&stids_s, DType::U32)? as *const i32,
                         cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
                         topk_w_ptr,
@@ -1835,6 +1847,7 @@ pub fn moe_gemm_nvfp4(
                         cuda_ptr(&weights_s, DType::U8)? as *const u8,
                         cuda_ptr(&scales_s, DType::U8)? as *const u8,
                         cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                        half_scales_ptr,
                         cuda_ptr(&stids_s, DType::U32)? as *const i32,
                         cuda_ptr(&eoffs_s, DType::U32)? as *const i32,
                         topk_w_ptr,
@@ -1889,6 +1902,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&weights_s, DType::U8)? as *const u8,
                     cuda_ptr(&scales_s, DType::U8)? as *const u8,
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                    half_scales_ptr,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
                     topk_w_ptr,
@@ -1908,6 +1922,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&weights_s, DType::U8)? as *const u8,
                     cuda_ptr(&scales_s, DType::U8)? as *const u8,
                     cuda_ptr(&gscales_s, DType::F32)? as *const f32,
+                    half_scales_ptr,
                     biases_ptr,
                     cuda_ptr(&indices_s, DType::U32)? as *const u32,
                     topk_w_ptr,
@@ -1944,6 +1959,7 @@ pub fn moe_gemm_nvfp4(
     _is_prefill: bool,
     topk_weights: Option<&Tensor>,
     _weight_scales_swizzled: Option<&Tensor>,
+    _weight_half_scales: Option<&Tensor>,
 ) -> Result<Tensor> {
     use candle_core::DType;
 

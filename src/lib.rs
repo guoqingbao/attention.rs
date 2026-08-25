@@ -227,7 +227,8 @@ pub fn nvfp4_force_lut() -> bool {
 /// regressed). When enabled, the runtime raises the effective scale to
 /// `max(online_amax/6, calibrated)` so deep/long-context runs do not clip
 /// when activations exceed calibration. Opt-in only — affects all hardware
-/// NVFP4 paths (pure and mixed).
+/// NVFP4 paths (pure and mixed). The online path is CUDA-graph safe (scales
+/// stay on-device; no D2H sync during capture/replay).
 pub fn nvfp4_online_scale() -> bool {
     *NVFP4_ONLINE_SCALE.get_or_init(|| env_flag_enabled("XINFER_NVFP4_ONLINE_SCALE"))
 }

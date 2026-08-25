@@ -9,78 +9,24 @@
  * On SM100+ (Blackwell): uses hardware PTX cvt.rn.satfinite.e2m1x2.f32 for
  * precise FP4 conversion and __nv_fp8_e4m3 for scale factor encoding.
  * On older GPUs: uses software fallback with LUT-based conversion.
+ *
+ * Online input-scale helpers (amax / resolve) do not need FP4 HW and are
+ * compiled for all CUDA arches so CUDA-graph-safe paths can be tested on
+ * Hopper/Ampere too.
  */
-
-#ifdef ENABLE_FP4
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
 
-static constexpr int NVFP4_BLOCK_SIZE = 16;
-// Custom SM100 quant path: clamp E4M3 block scale to 126. SM120/SM121 uses
-// FlashInfer invokeFP4Quantization (e4m3Max=448) instead of this kernel.
-static constexpr uint8_t NVFP4_E4M3_SCALE_MAX = 126;
-
-__device__ __forceinline__ uint8_t clamp_nvfp4_e4m3_scale(uint8_t bits) {
-  return bits > NVFP4_E4M3_SCALE_MAX ? NVFP4_E4M3_SCALE_MAX : bits;
-}
-
 // ============================================================================
 // Online input scale: compute per-tensor amax(|x|) / 6.0 for dynamic
-// activation quantization. This replaces the static checkpoint input_scale
-// to adapt to activation distributions that change with sequence length.
-// Returns input_scale in output[0] and 1/input_scale in output[1].
+// activation quantization. Graph-capture safe (device-only; no D2H).
 // ============================================================================
 
-template <typename T>
-__global__ void nvfp4_compute_online_input_scale_kernel(
-    const T* __restrict__ input,
-    float* __restrict__ output,   // [2]: output[0] = input_scale, output[1] = 1/input_scale
-    int num_elements)
-{
-  __shared__ float s_max[1024];
-  int tid = threadIdx.x;
-  int block_size = blockDim.x;
-
-  float local_max = 0.0f;
-  for (int i = blockIdx.x * block_size + tid; i < num_elements; i += gridDim.x * block_size) {
-    float v;
-    if constexpr (std::is_same_v<T, half>) {
-      v = fabsf(__half2float(input[i]));
-    } else {
-      v = fabsf(__bfloat162float(input[i]));
-    }
-    local_max = fmaxf(local_max, v);
-  }
-
-  s_max[tid] = local_max;
-  __syncthreads();
-
-  for (int stride = block_size / 2; stride > 0; stride /= 2) {
-    if (tid < stride) {
-      s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    atomicMax(reinterpret_cast<int*>(output), __float_as_int(s_max[0]));
-  }
-
-  __threadfence();
-
-  if (tid == 0 && blockIdx.x == 0) {
-    // Spin until all blocks have written
-    // Use a simple approach: launch with gridDim.x=1 for correctness
-  }
-}
-
-// Single-block version for simplicity and correctness
 template <typename T>
 __global__ void nvfp4_compute_online_input_scale_single_block_kernel(
     const T* __restrict__ input,
@@ -122,6 +68,39 @@ __global__ void nvfp4_compute_online_input_scale_single_block_kernel(
   }
 }
 
+// Resolve effective HW scales entirely on-device so CUDA graph capture never
+// needs a D2H sync of the online amax. Matches the host-side logic in
+// nvfp4_linear::nvfp4_matmul: max(online, calibrated) then alpha = scale * wgs.
+__global__ void nvfp4_resolve_online_scales_kernel(
+    const float* __restrict__ online,  // [2]: scale, inv
+    float calibrated_scale,
+    float weight_global_scale,
+    float* __restrict__ alpha_out,     // [1]
+    float* __restrict__ sf_inv_out)    // [1]
+{
+  float online_scale = online[0];
+  float online_inv = online[1];
+  float scale;
+  float inv;
+  if (calibrated_scale > 1e-12f) {
+    if (online_scale > calibrated_scale) {
+      scale = online_scale;
+      inv = online_inv;
+    } else {
+      scale = calibrated_scale;
+      inv = __fdiv_rn(1.0f, calibrated_scale);
+    }
+  } else if (online_scale > 1e-12f) {
+    scale = online_scale;
+    inv = online_inv;
+  } else {
+    scale = 1.0f;
+    inv = 1.0f;
+  }
+  alpha_out[0] = scale * weight_global_scale;
+  sf_inv_out[0] = inv;
+}
+
 extern "C" {
 
 void nvfp4_compute_online_input_scale_f16(
@@ -140,7 +119,32 @@ void nvfp4_compute_online_input_scale_bf16(
       static_cast<const nv_bfloat16*>(input), output, num_elements);
 }
 
+void nvfp4_resolve_online_scales(
+    const float* online,
+    float calibrated_scale,
+    float weight_global_scale,
+    float* alpha_out,
+    float* sf_inv_out,
+    int64_t stream)
+{
+  nvfp4_resolve_online_scales_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      online, calibrated_scale, weight_global_scale, alpha_out, sf_inv_out);
+}
+
 }  // extern "C"
+
+#ifdef ENABLE_FP4
+
+#include <cuda_fp8.h>
+
+static constexpr int NVFP4_BLOCK_SIZE = 16;
+// Custom SM100 quant path: clamp E4M3 block scale to 126. SM120/SM121 uses
+// FlashInfer invokeFP4Quantization (e4m3Max=448) instead of this kernel.
+static constexpr uint8_t NVFP4_E4M3_SCALE_MAX = 126;
+
+__device__ __forceinline__ uint8_t clamp_nvfp4_e4m3_scale(uint8_t bits) {
+  return bits > NVFP4_E4M3_SCALE_MAX ? NVFP4_E4M3_SCALE_MAX : bits;
+}
 
 // ============================================================================
 // Hardware FP4 conversion (SM100+ / Blackwell)
@@ -220,11 +224,13 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
     const InType* __restrict__ input,   // [M, K]
     uint8_t* __restrict__ output,       // [M, K/2] packed FP4
     uint8_t* __restrict__ scales,       // [M_padded, K/16] FP8 E4M3 block scales
-    float SFScaleVal,                   // 1/input_scale
+    const float* __restrict__ SFScaleVal_ptr,  // device 1/input_scale (graph-safe)
     int M, int K, int M_padded)
 {
   int row = blockIdx.x;
   int num_blocks = K / NVFP4_BLOCK_SIZE;
+  // Load once per block; pointer form keeps online scale graph-capturable.
+  float SFScaleVal = *SFScaleVal_ptr;
 
   if (row >= M) return;
 
@@ -405,7 +411,7 @@ void nvfp4_quantize_activation_f16(
     void* output,           // [M, K/2] packed FP4 uint8
     void* scales,           // [M_padded, K/16] FP8 block scales
     void* swizzled_scales,  // [M_padded, K_scale_padded] swizzled scales for CUTLASS
-    float input_scale_inv,  // SFScaleVal = 1.0 / input_scale (from checkpoint, default 1.0)
+    const float* input_scale_inv,  // device SFScaleVal = 1.0 / input_scale
     int M, int K,
     int M_padded, int K_scale_padded,
     int64_t stream)
@@ -436,7 +442,7 @@ void nvfp4_quantize_activation_bf16(
     void* output,
     void* scales,
     void* swizzled_scales,
-    float input_scale_inv,
+    const float* input_scale_inv,
     int M, int K,
     int M_padded, int K_scale_padded,
     int64_t stream)
@@ -954,17 +960,11 @@ void nvfp4_moe_scatter_bf16(
 
 extern "C" {
 
-void nvfp4_compute_online_input_scale_f16(
-    const void*, float*, int, int64_t) {}
-
-void nvfp4_compute_online_input_scale_bf16(
-    const void*, float*, int, int64_t) {}
-
 void nvfp4_quantize_activation_f16(
-    const void*, void*, void*, void*, float, int, int, int, int, int64_t) {}
+    const void*, void*, void*, void*, const float*, int, int, int, int, int64_t) {}
 
 void nvfp4_quantize_activation_bf16(
-    const void*, void*, void*, void*, float, int, int, int, int, int64_t) {}
+    const void*, void*, void*, void*, const float*, int, int, int, int, int64_t) {}
 
 void nvfp4_quantize_activation_grouped_f16(
     const void*, void*, void*, const float*, const int32_t*, const int32_t*, int, int, int, int, int64_t) {}
