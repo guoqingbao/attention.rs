@@ -289,10 +289,12 @@ __global__ void dflash_select_candidates_kernel(
     const float* __restrict__ predecessor_codebook,
     const float* __restrict__ successor_codebook,
     const uint32_t* __restrict__ anchor_token,
+    const float* __restrict__ allow,
     uint32_t* __restrict__ selected_tokens,
     const int sequence_len,
     const int rank,
-    const int topk) {
+    const int topk,
+    const int vocab_size) {
 
     // DFlash2 checkpoints use topk=16 and rank=256. Mapping one group of
     // threads to each candidate keeps the whole K-way edge score in one
@@ -335,6 +337,13 @@ __global__ void dflash_select_candidates_kernel(
                     edge += partial_dots[candidate * blockDim.x + lane];
                 const float score =
                     unary_logits[position * topk + candidate] + edge;
+                // Grammar gate: a candidate disallowed at this position by the
+                // per-position VOB allow matrix ([sequence_len, vocab_size],
+                // 1.0 = legal) is scored -inf so the walk never selects it.
+                if (allow != nullptr &&
+                    allow[(int64_t)position * vocab_size +
+                         candidate_ids[position * topk + candidate]] == 0.0f)
+                    continue;
                 if (score > best_score) {
                     best_score = score;
                     best_candidate = candidate;
@@ -349,17 +358,19 @@ __global__ void dflash_select_candidates_kernel(
     }
 }
 
-cudaError_t dflash_select_candidates(
+cudaError_t dflash_select_candidates_masked(
     const float* hidden,                // [sequence_len, rank]
     const float* unary_logits,          // [sequence_len, topk]
     const uint32_t* candidate_ids,      // [sequence_len, topk]
     const float* predecessor_codebook,  // [vocab_size, rank]
     const float* successor_codebook,    // [vocab_size, rank]
     const uint32_t* anchor_token,
-    uint32_t* selected_tokens,          // [sequence_len]
+    const float* allow,                // [sequence_len, vocab_size] or nullptr
+    uint32_t* selected_tokens,         // [sequence_len]
     int sequence_len,
     int rank,
     int topk,
+    int vocab_size,
     int64_t stream_) {
 
     if (hidden == nullptr || unary_logits == nullptr || candidate_ids == nullptr ||
@@ -367,6 +378,8 @@ cudaError_t dflash_select_candidates(
         anchor_token == nullptr || selected_tokens == nullptr ||
         sequence_len <= 0 || rank <= 0 || topk <= 0 || topk > 32 ||
         topk > 256)
+        return cudaErrorInvalidValue;
+    if (allow != nullptr && vocab_size <= 0)
         return cudaErrorInvalidValue;
 
     const int lanes_per_candidate = 256 / topk;
@@ -382,11 +395,31 @@ cudaError_t dflash_select_candidates(
         predecessor_codebook,
         successor_codebook,
         anchor_token,
+        allow,
         selected_tokens,
         sequence_len,
         rank,
-        topk);
+        topk,
+        vocab_size);
     return cudaGetLastError();
+}
+
+cudaError_t dflash_select_candidates(
+    const float* hidden,
+    const float* unary_logits,
+    const uint32_t* candidate_ids,
+    const float* predecessor_codebook,
+    const float* successor_codebook,
+    const uint32_t* anchor_token,
+    uint32_t* selected_tokens,
+    int sequence_len,
+    int rank,
+    int topk,
+    int64_t stream_) {
+    return dflash_select_candidates_masked(
+        hidden, unary_logits, candidate_ids, predecessor_codebook,
+        successor_codebook, anchor_token, nullptr, selected_tokens,
+        sequence_len, rank, topk, 0, stream_);
 }
 
 }  // extern "C"

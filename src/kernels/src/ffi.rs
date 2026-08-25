@@ -4574,6 +4574,22 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn dflash_select_candidates_masked(
+        hidden: *const c_void,
+        unary_logits: *const f32,
+        candidate_ids: *const u32,
+        predecessor_codebook: *const f32,
+        successor_codebook: *const f32,
+        anchor_token: *const u32,
+        allow: *const f32,
+        selected_tokens: *mut u32,
+        sequence_len: c_int,
+        rank: c_int,
+        topk: c_int,
+        vocab_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn dflash_grouped_conv_bf16(
         hidden: *const c_void,
         delta: *const c_void,

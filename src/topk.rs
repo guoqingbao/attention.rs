@@ -304,6 +304,138 @@ pub fn dflash_select_candidates(
     )
 }
 
+/// Grammar-gated DFlash2 candidate-path selection.
+///
+/// Same device walk as `dflash_select_candidates`, plus an optional per-position
+/// allow matrix `allow: [sequence_len, vocab_size]` F32 (1.0 = legal, 0.0 = illegal).
+/// A candidate whose token is disallowed at its position is scored -inf, so the
+/// greedy walk never selects a grammar-illegal token. Pass `None` for the
+/// unmasked path (identical behavior to `dflash_select_candidates`).
+#[cfg(feature = "cuda")]
+pub fn dflash_select_candidates_masked(
+    hidden: &Tensor,
+    unary_logits: &Tensor,
+    candidate_ids: &Tensor,
+    predecessor_codebook: &Tensor,
+    successor_codebook: &Tensor,
+    anchor_token: &Tensor,
+    allow: Option<&Tensor>,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::WrapErr;
+
+    let (sequence_len, rank) = hidden.dims2()?;
+    let (candidate_rows, topk) = unary_logits.dims2()?;
+    if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
+        candle::bail!("DFlash2 candidate selector input shape mismatch");
+    }
+    if predecessor_codebook.dims2()?.1 != rank || successor_codebook.dims2()?.1 != rank {
+        candle::bail!("DFlash2 codebook rank does not match hidden projection");
+    }
+    if anchor_token.dims1()? != 1 {
+        candle::bail!("DFlash2 anchor token must have shape [1]");
+    }
+
+    let dev = hidden.device().as_cuda_device()?;
+    let hidden = if hidden.dtype() == DType::F32 {
+        hidden.contiguous()?
+    } else {
+        hidden.to_dtype(DType::F32)?.contiguous()?
+    };
+    let unary_logits = if unary_logits.dtype() == DType::F32 {
+        unary_logits.contiguous()?
+    } else {
+        unary_logits.to_dtype(DType::F32)?.contiguous()?
+    };
+    let candidate_ids = if candidate_ids.dtype() == DType::U32 {
+        candidate_ids.contiguous()?
+    } else {
+        candidate_ids.to_dtype(DType::U32)?.contiguous()?
+    };
+    let predecessor_codebook = if predecessor_codebook.dtype() == DType::F32 {
+        predecessor_codebook.contiguous()?
+    } else {
+        predecessor_codebook.to_dtype(DType::F32)?.contiguous()?
+    };
+    let successor_codebook = if successor_codebook.dtype() == DType::F32 {
+        successor_codebook.contiguous()?
+    } else {
+        successor_codebook.to_dtype(DType::F32)?.contiguous()?
+    };
+    let anchor_token = if anchor_token.dtype() == DType::U32 {
+        anchor_token.contiguous()?
+    } else {
+        anchor_token.to_dtype(DType::U32)?.contiguous()?
+    };
+
+    let (allow_tensor, vocab_size) = match allow {
+        Some(a) => {
+            if a.dims() != &[sequence_len as i64, a.dim(1)?] {
+                candle::bail!("DFlash2 allow matrix must have shape [sequence_len, vocab_size]");
+            }
+            let vocab_size = a.dim(1)?;
+            let a = if a.dtype() == DType::F32 {
+                a.contiguous()?
+            } else {
+                a.to_dtype(DType::F32)?.contiguous()?
+            };
+            (Some(a), vocab_size)
+        }
+        None => (None, 0),
+    };
+
+    let f32_ptr = |tensor: &Tensor| -> Result<*const f32> {
+        let (storage, _) = tensor.storage_and_layout();
+        match &*storage {
+            candle::Storage::Cuda(storage) => {
+                Ok(*storage.as_cuda_slice::<f32>()?.device_ptr() as *const f32)
+            }
+            _ => candle::bail!("DFlash2 selector tensors must be CUDA tensors"),
+        }
+    };
+    let u32_ptr = |tensor: &Tensor| -> Result<*const u32> {
+        let (storage, _) = tensor.storage_and_layout();
+        match &*storage {
+            candle::Storage::Cuda(storage) => {
+                Ok(*storage.as_cuda_slice::<u32>()?.device_ptr() as *const u32)
+            }
+            _ => candle::bail!("DFlash2 selector tensors must be CUDA tensors"),
+        }
+    };
+
+    let selected_tokens = unsafe { dev.alloc::<u32>(sequence_len) }.w()?;
+    let stream = *dev.cu_stream() as i64;
+    let allow_ptr = match &allow_tensor {
+        Some(a) => f32_ptr(a)?,
+        None => std::ptr::null(),
+    };
+    unsafe {
+        let status = ffi::dflash_select_candidates_masked(
+            f32_ptr(&hidden)? as *const std::ffi::c_void,
+            f32_ptr(&unary_logits)?,
+            u32_ptr(&candidate_ids)?,
+            f32_ptr(&predecessor_codebook)?,
+            f32_ptr(&successor_codebook)?,
+            u32_ptr(&anchor_token)?,
+            allow_ptr,
+            *selected_tokens.device_ptr() as *mut u32,
+            sequence_len as i32,
+            rank as i32,
+            topk as i32,
+            vocab_size as i32,
+            stream,
+        );
+        if status != 0 {
+            candle::bail!("DFlash2 masked candidate selector kernel failed with CUDA error {status}");
+        }
+    }
+    let selected_tokens = candle::CudaStorage::wrap_cuda_slice(selected_tokens, dev.clone());
+    Tensor::from_storage(
+        candle::Storage::Cuda(selected_tokens),
+        candle::Shape::from(sequence_len),
+    )
+}
+
 /// Fused BF16 grouped dynamic depthwise convolution used by DFlash2.
 #[cfg(feature = "cuda")]
 pub fn dflash_grouped_conv_bf16(
