@@ -209,12 +209,13 @@ pub fn dflash_select_candidates(
     candidate_ids: &Tensor,
     predecessor_codebook: &Tensor,
     successor_codebook: &Tensor,
-    anchor_token: &Tensor,
-) -> Result<Tensor> {
+anchor_token: &Tensor,
+    ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::WrapErr;
 
     let (sequence_len, rank) = hidden.dims2()?;
+    tracing::info!("[dflash-kernel] dflash_select_candidates (unmasked): seq={} rank={}", sequence_len, rank);
     let (candidate_rows, topk) = unary_logits.dims2()?;
     if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
         candle::bail!("DFlash2 candidate selector input shape mismatch");
@@ -326,6 +327,13 @@ pub fn dflash_select_candidates_masked(
 
     let (sequence_len, rank) = hidden.dims2()?;
     let (candidate_rows, topk) = unary_logits.dims2()?;
+    tracing::info!(
+        "[dflash-kernel] dflash_select_candidates_masked: seq={} rank={} topk={} allow={}",
+        sequence_len,
+        rank,
+        topk,
+        allow.is_some()
+    );
     if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
         candle::bail!("DFlash2 candidate selector input shape mismatch");
     }
@@ -370,16 +378,16 @@ pub fn dflash_select_candidates_masked(
 
     let (allow_tensor, vocab_size) = match allow {
         Some(a) => {
-            if a.dims() != &[sequence_len as i64, a.dim(1)?] {
+            let a_vocab = a.dim(1)?;
+            if a.dims() != &[sequence_len, a_vocab] {
                 candle::bail!("DFlash2 allow matrix must have shape [sequence_len, vocab_size]");
             }
-            let vocab_size = a.dim(1)?;
             let a = if a.dtype() == DType::F32 {
                 a.contiguous()?
             } else {
                 a.to_dtype(DType::F32)?.contiguous()?
             };
-            (Some(a), vocab_size)
+            (Some(a), a_vocab)
         }
         None => (None, 0),
     };
@@ -585,6 +593,13 @@ pub fn dflash_grouped_conv(
     block_size: usize,
     side: usize,
 ) -> Result<Tensor> {
+    tracing::info!(
+        "[dflash-kernel] dflash_grouped_conv: dtype={:?} seq={} block={} side={}",
+        hidden.dtype(),
+        hidden.dim(0)?,
+        block_size,
+        side
+    );
     match hidden.dtype() {
         DType::BF16 => dflash_grouped_conv_bf16(hidden, delta, base_kernel, block_size, side),
         DType::F16 => dflash_grouped_conv_f16(hidden, delta, base_kernel, block_size, side),

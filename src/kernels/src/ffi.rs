@@ -843,6 +843,51 @@ extern "C" {
         stream: i64,
     );
 
+    // Masked sampling: `mask_d` is a [B,V] F32 grammar allow-matrix (1.0 = legal,
+    // 0.0 = illegal) applied in the top-k stage so disallowed tokens are never
+    // sampled. Pass null() for unmasked sampling (identical to the plain entries).
+    pub fn sampling_masked_f32(
+        logits_d: *const f32,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_masked_f16(
+        logits_d: *const c_void,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_masked_bf16(
+        logits_d: *const c_void,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
     // Fused Rotary Position Embedding (RoPE) kernels - with position selection
     // Non-interleaved versions - support GQA, fuses index_select
     pub fn fused_rope_f32(
