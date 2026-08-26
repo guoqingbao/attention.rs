@@ -215,7 +215,6 @@ anchor_token: &Tensor,
     use candle_core::cuda_backend::WrapErr;
 
     let (sequence_len, rank) = hidden.dims2()?;
-    tracing::info!("[dflash-kernel] dflash_select_candidates (unmasked): seq={} rank={}", sequence_len, rank);
     let (candidate_rows, topk) = unary_logits.dims2()?;
     if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
         candle::bail!("DFlash2 candidate selector input shape mismatch");
@@ -327,13 +326,6 @@ pub fn dflash_select_candidates_masked(
 
     let (sequence_len, rank) = hidden.dims2()?;
     let (candidate_rows, topk) = unary_logits.dims2()?;
-    tracing::info!(
-        "[dflash-kernel] dflash_select_candidates_masked: seq={} rank={} topk={} allow={}",
-        sequence_len,
-        rank,
-        topk,
-        allow.is_some()
-    );
     if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
         candle::bail!("DFlash2 candidate selector input shape mismatch");
     }
@@ -593,13 +585,6 @@ pub fn dflash_grouped_conv(
     block_size: usize,
     side: usize,
 ) -> Result<Tensor> {
-    tracing::info!(
-        "[dflash-kernel] dflash_grouped_conv: dtype={:?} seq={} block={} side={}",
-        hidden.dtype(),
-        hidden.dim(0)?,
-        block_size,
-        side
-    );
     match hidden.dtype() {
         DType::BF16 => dflash_grouped_conv_bf16(hidden, delta, base_kernel, block_size, side),
         DType::F16 => dflash_grouped_conv_f16(hidden, delta, base_kernel, block_size, side),
