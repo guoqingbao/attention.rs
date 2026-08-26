@@ -1056,14 +1056,14 @@ impl MambaCache {
             Ok(cpu_snapshot) => {
                 self.cpu_prefix_states.insert(hash, cpu_snapshot);
                 self.touch_cpu_prefix_state(hash);
-                tracing::info!(
+                /* tracing::info!(
                     "MambaCache: spilled prefix snapshot {} to CPU (device snapshots {}/{}, cpu snapshots {}/{})",
                     hash,
                     self.prefix_states.len(),
                     self.prefix_cache_capacity,
                     self.cpu_prefix_states.len(),
                     self.cpu_prefix_cache_capacity
-                );
+                ); */
                 true
             }
             Err(err) => {
