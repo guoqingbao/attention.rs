@@ -854,6 +854,10 @@ pub fn prefill_plan(
             if !crate::has_flashinfer_fp8_e4m3() {
                 candle::bail!("FP8 KvCache prefill requires SM90+ or env ENABLE_FLASHINFER_SOFTWARE_FP8=1 during build!");
             }
+            // Must forward enable_cuda_graph into PrefillPlan. Hardcoding false
+            // made MTP/DFlash verify CUDA graphs bake non-graph plan pointers
+            // (null total_num_rows / no block_valid_mask); replay with a shorter
+            // context then hits CUDA_ERROR_ILLEGAL_ADDRESS on SM100+/multi-rank.
             kernels::ffi::flashinfer_prefill_plan_fp8_fa2(
                 q_cu_seqlens_host.as_ptr() as *const i32,
                 indptr_host.as_ptr() as *const i32,
@@ -864,7 +868,7 @@ pub fn prefill_plan(
                 num_kv_heads as i32,
                 head_dim as i32,
                 page_size as i32,
-                false,
+                enable_cuda_graph,
                 window_left.unwrap_or(-1),
                 out_data_type,
                 ws_float_ptr,
@@ -887,7 +891,7 @@ pub fn prefill_plan(
                 num_kv_heads as i32,
                 head_dim as i32,
                 page_size as i32,
-                false,
+                enable_cuda_graph,
                 window_left.unwrap_or(-1),
                 out_data_type,
                 ws_float_ptr,
