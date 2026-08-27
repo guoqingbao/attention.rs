@@ -371,6 +371,8 @@ pub fn nvfp4_matmul(
             if use_flashinfer_fp4 || use_hardware_fp4 {
                 #[cfg(feature = "cutlass")]
                 {
+                    use crate::workspace::get_nvfp4_hw_scratch;
+
                     let stream = *cuda_dev.cu_stream() as i64;
 
                     let m_padded = pad_to(m, 128);
@@ -378,56 +380,97 @@ pub fn nvfp4_matmul(
                     let k_scale_padded = pad_to(k_scale_cols, 4);
                     let n_padded = pad_to(n, 128);
 
-                    let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
-                    let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
-                    let act_scales_swizzled =
-                        Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
-
-                    let wscale_sw_owned;
-                    let wscale_sw_ref = if let Some(preswizzled) = weight_scale_swizzled {
-                        preswizzled
+                    let act_packed_bytes = m * (k / 2);
+                    let act_scales_bytes = m_padded * k_scale_cols;
+                    let act_scales_swizzled_bytes = m_padded * k_scale_padded;
+                    let wscale_bytes = if weight_scale_swizzled.is_some() {
+                        0
                     } else {
-                        wscale_sw_owned =
-                            Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
-                        &wscale_sw_owned
+                        n_padded * k_scale_padded
                     };
+                    let scratch = get_nvfp4_hw_scratch(
+                        cuda_dev,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        act_scales_swizzled_bytes,
+                        wscale_bytes,
+                    )?;
+
+                    let act_packed_ptr = scratch.act_packed;
+                    let act_scales_ptr = scratch.act_scales;
+                    let act_scales_sw_ptr = scratch.act_scales_swizzled;
 
                     // Default: checkpoint-calibrated input_scale (ModelOpt joint
                     // PTQ). Optional XINFER_NVFP4_ONLINE_SCALE=1 raises the scale
                     // to max(online_amax/6, calibrated) to avoid FP4 clipping.
                     // Online path stays fully on-device (no to_vec1) so CUDA graph
                     // capture/replay remain valid.
-                    let (alpha_tensor, sf_scale_tensor) = if crate::nvfp4_online_scale() {
-                        let online = compute_online_input_scale_device(&input)?;
-                        resolve_online_hw_scales(&online, input_scale, weight_global_scale)?
+                    let (alpha_ptr, sf_scale_ptr) = if crate::nvfp4_online_scale() {
+                        // Compute online amax/6 directly into domain-stable scratch
+                        // (avoids ephemeral Tensor::zeros under CUDA graph capture).
+                        let (input_s, _) = input.storage_and_layout();
+                        let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+                        let num_elements = input.elem_count();
+                        unsafe {
+                            match dtype {
+                                DType::F16 => ffi::nvfp4_compute_online_input_scale_f16(
+                                    input_ptr,
+                                    scratch.online_scale,
+                                    num_elements as i32,
+                                    stream,
+                                ),
+                                DType::BF16 => ffi::nvfp4_compute_online_input_scale_bf16(
+                                    input_ptr,
+                                    scratch.online_scale,
+                                    num_elements as i32,
+                                    stream,
+                                ),
+                                _ => candle_core::bail!(
+                                    "nvfp4 online scale: unsupported dtype {:?}",
+                                    dtype
+                                ),
+                            }
+                            ffi::nvfp4_resolve_online_scales(
+                                scratch.online_scale,
+                                input_scale,
+                                weight_global_scale,
+                                scratch.alpha,
+                                scratch.sf_scale,
+                                stream,
+                            );
+                        }
+                        drop(input_s);
+                        (scratch.alpha as *const f32, scratch.sf_scale as *const f32)
                     } else {
+                        use candle_core::cuda_backend::cudarc::driver::result;
                         let (hw_input_scale, hw_input_scale_inv) = if input_scale > 1e-12 {
                             (input_scale, 1.0 / input_scale)
                         } else {
                             (1.0, 1.0)
                         };
                         let alpha = hw_input_scale * weight_global_scale;
-                        (
-                            Tensor::new(&[alpha], dev)?,
-                            Tensor::new(&[hw_input_scale_inv], dev)?,
-                        )
+                        // Host→device scalar writes are graph-capture safe and keep
+                        // alpha/sf addresses in the domain-scoped scratch pool.
+                        unsafe {
+                            result::memcpy_htod_async(
+                                scratch.alpha as u64,
+                                &[alpha],
+                                *cuda_dev.cu_stream(),
+                            )
+                            .map_err(candle_core::Error::wrap)?;
+                            result::memcpy_htod_async(
+                                scratch.sf_scale as u64,
+                                &[hw_input_scale_inv],
+                                *cuda_dev.cu_stream(),
+                            )
+                            .map_err(candle_core::Error::wrap)?;
+                        }
+                        (scratch.alpha as *const f32, scratch.sf_scale as *const f32)
                     };
 
                     {
                         let (input_s, _) = input.storage_and_layout();
                         let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
-
-                        let (act_packed_s, _) = act_packed.storage_and_layout();
-                        let act_packed_ptr =
-                            cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
-
-                        let (act_scales_s, _) = act_scales.storage_and_layout();
-                        let act_scales_ptr =
-                            cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
-
-                        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
-                        let act_scales_sw_ptr =
-                            cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
 
                         let (weight_s, _) = weight.storage_and_layout();
                         let weight_ptr =
@@ -437,18 +480,17 @@ pub fn nvfp4_matmul(
                         let scale_ptr =
                             cuda_ptr(&scale_s, scale.dtype())? as *const std::ffi::c_void;
 
-                        let (wscale_sw_s, _) = wscale_sw_ref.storage_and_layout();
-                        let wscale_sw_ptr =
-                            cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+                        let wscale_sw_ptr = if let Some(preswizzled) = weight_scale_swizzled {
+                            let (wscale_sw_s, _) = preswizzled.storage_and_layout();
+                            let ptr = cuda_ptr(&wscale_sw_s, DType::U8)? as *mut std::ffi::c_void;
+                            drop(wscale_sw_s);
+                            ptr
+                        } else {
+                            scratch.wscale_swizzled
+                        };
 
                         let (output_s, _) = output.storage_and_layout();
                         let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
-
-                        let (alpha_s, _) = alpha_tensor.storage_and_layout();
-                        let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
-
-                        let (sf_s, _) = sf_scale_tensor.storage_and_layout();
-                        let sf_scale_ptr = cuda_ptr(&sf_s, DType::F32)? as *const f32;
 
                         unsafe {
                             if use_flashinfer_quant {
@@ -603,6 +645,11 @@ pub fn nvfp4_matmul(
                     if let Some(b) = bias {
                         return Ok(output.broadcast_add(b)?);
                     }
+                }
+                #[cfg(not(feature = "cutlass"))]
+                {
+                    let _ = (use_flashinfer_fp4, use_hardware_fp4, use_flashinfer_quant);
+                    candle_core::bail!("nvfp4 hardware path requires the cutlass feature");
                 }
             } else {
                 // Software dequant path (existing kernels)
