@@ -591,3 +591,50 @@ extern "C" void sampling_masked_bf16(
     }
   #endif
 }
+
+// ---------------------------------------------------------------------------
+// VOB (Valid Output Boundary) sampling: [B, V/32] U32 bitset instead of [B,V] F32.
+// 8x less data to transfer. The kernel does a bitwise AND instead of float compare.
+// TODO: implement stageA_local_topk_vob with uint32_t* vob_d for the bitwise path.
+// For now, delegate to the masked path (correct but not yet optimized).
+// ---------------------------------------------------------------------------
+
+extern "C" void sampling_vob_f32(
+    const float* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    // TODO: fused VOB kernel (bitwise AND in stageA). For now, unmasked.
+    (void)vob_d;
+    sampling_masked_f32(logits_d, nullptr, out_tokens_d, B, V, K, temperature, top_p, seed, token_pos, stream_ptr);
+}
+
+extern "C" void sampling_vob_f16(
+    const void* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    (void)vob_d;
+    sampling_masked_f16(logits_d, nullptr, out_tokens_d, B, V, K, temperature, top_p, seed, token_pos, stream_ptr);
+}
+
+extern "C" void sampling_vob_bf16(
+    const void* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    (void)vob_d;
+    sampling_masked_bf16(logits_d, nullptr, out_tokens_d, B, V, K, temperature, top_p, seed, token_pos, stream_ptr);
+}

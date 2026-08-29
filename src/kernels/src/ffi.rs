@@ -888,6 +888,50 @@ extern "C" {
         stream: i64,
     );
 
+    // VOB (Valid Output Boundary) sampling: `vob_d` is a [B, V/32] U32 bitset
+    // (bit i set = token allowed). 8x less data than the F32 mask path.
+    pub fn sampling_vob_f32(
+        logits_d: *const f32,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_f16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_bf16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
     // Fused Rotary Position Embedding (RoPE) kernels - with position selection
     // Non-interleaved versions - support GQA, fuses index_select
     pub fn fused_rope_f32(

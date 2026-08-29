@@ -1,0 +1,111 @@
+diff --git i/src/flashinfer.rs w/src/flashinfer.rs
+index f62990a..6d5fb28 100644
+--- i/src/flashinfer.rs
++++ w/src/flashinfer.rs
+@@ -963,6 +963,7 @@ pub fn prefill_with_plan(
+     logits_soft_cap: Option<f32>,
+     plan_info: &[i64],
+     enable_cuda_graph: bool,
++    custom_mask: Option<&Tensor>,
+ ) -> Result<Tensor> {
+     let op = FlashInferPrefillWithPlan {
+         key_cache: key_cache.clone(),
+@@ -983,6 +984,7 @@ pub fn prefill_with_plan(
+         logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
+         plan_info: plan_info.to_vec(),
+         enable_cuda_graph,
++        custom_mask: custom_mask.cloned(),
+     };
+     q.apply_op1(op)
+ }
+@@ -1006,6 +1008,7 @@ struct FlashInferPrefillWithPlan {
+     pub logits_soft_cap: f32,
+     pub plan_info: Vec<i64>,
+     pub enable_cuda_graph: bool,
++    pub custom_mask: Option<Tensor>,
+ }
+ 
+ impl candle::CustomOp1 for FlashInferPrefillWithPlan {
+@@ -1097,6 +1100,24 @@ impl FlashInferPrefillWithPlan {
+             (std::ptr::null(), std::ptr::null())
+         };
+ 
++        // topk>1 tree verify: the custom ancestor mask ([q_len, kv_len] F32 bias, 0 = attend,
++        // -inf = masked), passed to the flashinfer kernel (sglang's custom_mask_buf mechanism).
++        let (custom_mask_ptr, custom_mask_q_len, custom_mask_kv_len) = match &self.custom_mask {
++            Some(cm) => {
++                let (cm_s, cm_l) = cm.storage_and_layout();
++                let ptr = match &*cm_s {
++                    Storage::Cuda(c) => c
++                        .as_cuda_slice::<f32>()?
++                        .slice(cm_l.start_offset()..)
++                        .device_ptr(),
++                    _ => std::ptr::null(),
++                };
++                let (q_len, kv_len) = cm.dims2()?;
++                (*ptr as *const std::ffi::c_void, q_len as i32, kv_len as i32)
++            }
++            None => (std::ptr::null(), 0, 0),
++        };
++
+         unsafe {
+             kernels::ffi::flashinfer_prefill_run_wrapper(
+                 out_ptr,
+@@ -1125,6 +1146,9 @@ impl FlashInferPrefillWithPlan {
+                 data_type,
+                 out_data_type,
+                 self.plan_info.as_ptr(),
++                custom_mask_ptr,
++                custom_mask_q_len,
++                custom_mask_kv_len,
+                 *dev.cu_stream() as i64,
+             );
+         }
+diff --git i/src/kernels/src/ffi.rs w/src/kernels/src/ffi.rs
+index 4f1ee2b..ff1be72 100644
+--- i/src/kernels/src/ffi.rs
++++ w/src/kernels/src/ffi.rs
+@@ -1613,6 +1613,9 @@ extern "C" {
+         data_type: i32,
+         out_data_type: i32,
+         plan_info_vec: *const i64,
++        custom_mask_ptr: *const c_void,
++        custom_mask_q_len: i32,
++        custom_mask_kv_len: i32,
+         stream: i64,
+     );
+ 
+diff --git i/src/lib.rs w/src/lib.rs
+index b208a91..0a05964 100644
+--- i/src/lib.rs
++++ w/src/lib.rs
+@@ -279,6 +279,11 @@ pub struct InputMetadata {
+     pub seqlens: Option<Vec<u32>>,
+     pub flashinfer_metadata: Option<FlashInferMetadata>,
+     pub is_mtp_verify: bool,
++    /// Optional custom attention mask `[q_len, kv_len]` (bool, true = attend) applied on top of
++    /// the standard causal/sliding mask. Used by topk>1 tree verification (each tree node attends
++    /// only to its ancestors + itself). `None` = no custom mask.
++    #[cfg_attr(feature = "cuda", allow(unused))]
++    pub custom_attn_mask: Option<Tensor>,
+ }
+ 
+ #[allow(dead_code)]
+@@ -574,6 +579,17 @@ impl PagedAttention {
+                     att = att.broadcast_add(&q_chunk_mask)?;
+                 }
+ 
++                // topk>1 tree verify: apply the custom ancestor mask (each tree node attends to
++                // its ancestors + itself). `custom_attn_mask` is [q_len, kv_len] (0 = attend,
++                // -inf = masked); narrow to this query chunk and broadcast over heads.
++                if let Some(custom_mask) = &input_metadata.custom_attn_mask {
++                    let cm = custom_mask
++                        .narrow(0, offset, len)?
++                        .unsqueeze(0)?
++                        .unsqueeze(0)?;
++                    att = att.broadcast_add(&cm)?;
++                }
++
+                 att = candle_nn::ops::softmax_last_dim(&att.to_dtype(candle_core::DType::F32)?)?
+                     .to_dtype(att.dtype())?;
+ 
