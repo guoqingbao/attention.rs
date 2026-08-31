@@ -12,42 +12,6 @@ use crate::workspace::get_or_init_flashinfer_fp8_workspace;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Device, Result, Tensor};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fp8ExecutionDomain {
-    Eager,
-    DecodeGraph,
-    MtpGraph,
-}
-
-thread_local! {
-    static FP8_EXECUTION_DOMAIN: std::cell::Cell<Fp8ExecutionDomain> =
-        const { std::cell::Cell::new(Fp8ExecutionDomain::Eager) };
-}
-
-pub struct Fp8ExecutionGuard {
-    previous: Fp8ExecutionDomain,
-}
-
-impl Drop for Fp8ExecutionGuard {
-    fn drop(&mut self) {
-        FP8_EXECUTION_DOMAIN.with(|domain| domain.set(self.previous));
-    }
-}
-
-pub fn set_fp8_execution_domain(domain: Fp8ExecutionDomain) -> Fp8ExecutionGuard {
-    let previous = FP8_EXECUTION_DOMAIN.with(|current| {
-        let previous = current.get();
-        current.set(domain);
-        previous
-    });
-    Fp8ExecutionGuard { previous }
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn fp8_execution_domain() -> Fp8ExecutionDomain {
-    FP8_EXECUTION_DOMAIN.with(|domain| domain.get())
-}
-
 #[cfg(feature = "cuda")]
 fn get_cuda_slice<
     T: candle_core::cuda_backend::cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType,
@@ -1478,13 +1442,13 @@ mod grouped_gemm_pool {
         input_q_bytes: usize,
         input_scales_bytes: usize,
     ) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-        match crate::fp8_linear::fp8_execution_domain() {
-            crate::fp8_linear::Fp8ExecutionDomain::Eager => {
+        match crate::graph_workspace::graph_workspace_domain() {
+            crate::graph_workspace::GraphWorkspaceDomain::Eager => {
                 POOL_EAGER.with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes))
             }
-            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => POOL_DECODE_GRAPH
+            crate::graph_workspace::GraphWorkspaceDomain::DecodeGraph => POOL_DECODE_GRAPH
                 .with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes)),
-            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => POOL_MTP_GRAPH
+            crate::graph_workspace::GraphWorkspaceDomain::MtpGraph => POOL_MTP_GRAPH
                 .with(|cell| get_from_pool(cell, dev, input_q_bytes, input_scales_bytes)),
         }
     }

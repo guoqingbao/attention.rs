@@ -367,12 +367,14 @@ mod cuda {
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
-        match crate::fp8_linear::fp8_execution_domain() {
-            crate::fp8_linear::Fp8ExecutionDomain::Eager => CUTLASS_WORKSPACE_EAGER
+        match crate::graph_workspace::graph_workspace_domain() {
+            crate::graph_workspace::GraphWorkspaceDomain::Eager => CUTLASS_WORKSPACE_EAGER
                 .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
-            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => CUTLASS_WORKSPACE_DECODE_GRAPH
-                .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
-            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => CUTLASS_WORKSPACE_MTP_GRAPH
+            crate::graph_workspace::GraphWorkspaceDomain::DecodeGraph => {
+                CUTLASS_WORKSPACE_DECODE_GRAPH
+                    .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size))
+            }
+            crate::graph_workspace::GraphWorkspaceDomain::MtpGraph => CUTLASS_WORKSPACE_MTP_GRAPH
                 .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
         }
     }
@@ -504,30 +506,9 @@ mod cuda {
         act_scales_swizzled_bytes: usize,
         wscale_swizzled_bytes: usize,
     ) -> Result<Nvfp4HwScratchPtrs> {
-        match crate::fp8_linear::fp8_execution_domain() {
-            crate::fp8_linear::Fp8ExecutionDomain::Eager => NVFP4_HW_SCRATCH_EAGER.with(|cell| {
-                get_nvfp4_hw_scratch_from_pool(
-                    cell,
-                    dev,
-                    act_packed_bytes,
-                    act_scales_bytes,
-                    act_scales_swizzled_bytes,
-                    wscale_swizzled_bytes,
-                )
-            }),
-            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => NVFP4_HW_SCRATCH_DECODE_GRAPH
-                .with(|cell| {
-                    get_nvfp4_hw_scratch_from_pool(
-                        cell,
-                        dev,
-                        act_packed_bytes,
-                        act_scales_bytes,
-                        act_scales_swizzled_bytes,
-                        wscale_swizzled_bytes,
-                    )
-                }),
-            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
-                NVFP4_HW_SCRATCH_MTP_GRAPH.with(|cell| {
+        match crate::graph_workspace::graph_workspace_domain() {
+            crate::graph_workspace::GraphWorkspaceDomain::Eager => {
+                NVFP4_HW_SCRATCH_EAGER.with(|cell| {
                     get_nvfp4_hw_scratch_from_pool(
                         cell,
                         dev,
@@ -538,6 +519,29 @@ mod cuda {
                     )
                 })
             }
+            crate::graph_workspace::GraphWorkspaceDomain::DecodeGraph => {
+                NVFP4_HW_SCRATCH_DECODE_GRAPH.with(|cell| {
+                    get_nvfp4_hw_scratch_from_pool(
+                        cell,
+                        dev,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        act_scales_swizzled_bytes,
+                        wscale_swizzled_bytes,
+                    )
+                })
+            }
+            crate::graph_workspace::GraphWorkspaceDomain::MtpGraph => NVFP4_HW_SCRATCH_MTP_GRAPH
+                .with(|cell| {
+                    get_nvfp4_hw_scratch_from_pool(
+                        cell,
+                        dev,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        act_scales_swizzled_bytes,
+                        wscale_swizzled_bytes,
+                    )
+                }),
         }
     }
 
@@ -690,14 +694,14 @@ mod cuda {
             Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
         };
 
-        match crate::fp8_linear::fp8_execution_domain() {
-            crate::fp8_linear::Fp8ExecutionDomain::Eager => {
+        match crate::graph_workspace::graph_workspace_domain() {
+            crate::graph_workspace::GraphWorkspaceDomain::Eager => {
                 FLASHINFER_FP8_WORKSPACE_EAGER.with(init)
             }
-            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => {
+            crate::graph_workspace::GraphWorkspaceDomain::DecodeGraph => {
                 FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH.with(init)
             }
-            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
+            crate::graph_workspace::GraphWorkspaceDomain::MtpGraph => {
                 FLASHINFER_FP8_WORKSPACE_MTP_GRAPH.with(init)
             }
         }
@@ -804,12 +808,14 @@ mod cuda {
             })
         };
 
-        match crate::fp8_linear::fp8_execution_domain() {
-            crate::fp8_linear::Fp8ExecutionDomain::Eager => MLA_DECODE_WORKSPACE_EAGER.with(init),
-            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => {
+        match crate::graph_workspace::graph_workspace_domain() {
+            crate::graph_workspace::GraphWorkspaceDomain::Eager => {
+                MLA_DECODE_WORKSPACE_EAGER.with(init)
+            }
+            crate::graph_workspace::GraphWorkspaceDomain::DecodeGraph => {
                 MLA_DECODE_WORKSPACE_DECODE_GRAPH.with(init)
             }
-            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
+            crate::graph_workspace::GraphWorkspaceDomain::MtpGraph => {
                 MLA_DECODE_WORKSPACE_MTP_GRAPH.with(init)
             }
         }

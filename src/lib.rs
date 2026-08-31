@@ -7,10 +7,14 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 #[cfg(all(feature = "flashinfer", feature = "flashattn"))]
 compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
 
+#[cfg(feature = "cuda")]
+pub mod graph_workspace;
 pub mod moe;
 pub mod moe_w2;
 pub mod paged_attention;
 pub mod scale_update;
+#[cfg(feature = "cuda")]
+pub use graph_workspace::{set_graph_workspace_domain, GraphWorkspaceDomain, GraphWorkspaceGuard};
 #[cfg(feature = "cuda")]
 pub mod workspace;
 #[cfg(feature = "metal-flash")]
