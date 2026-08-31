@@ -4560,6 +4560,50 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn dflash_select_candidates(
+        hidden: *const c_void,
+        unary_logits: *const f32,
+        candidate_ids: *const u32,
+        predecessor_codebook: *const f32,
+        successor_codebook: *const f32,
+        anchor_token: *const u32,
+        selected_tokens: *mut u32,
+        sequence_len: c_int,
+        rank: c_int,
+        topk: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn dflash_grouped_conv_bf16(
+        hidden: *const c_void,
+        delta: *const c_void,
+        base_kernel: *const c_void,
+        output: *mut c_void,
+        sequence_len: c_int,
+        hidden_size: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        taps: c_int,
+        block_size: c_int,
+        side: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn dflash_grouped_conv_f16(
+        hidden: *const c_void,
+        delta: *const c_void,
+        base_kernel: *const c_void,
+        output: *mut c_void,
+        sequence_len: c_int,
+        hidden_size: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        taps: c_int,
+        block_size: c_int,
+        side: c_int,
+        stream: i64,
+    ) -> c_int;
+
     /// DeepSeek V4 fused hash-gate: tid2eid lookup + expert-row dots +
     /// sqrt(softplus) + L1 normalize * route_scale.
     /// x/gate_weight: BF16; tid2eid: I64 [vocab, topk]; token_ids: U32 [seq];

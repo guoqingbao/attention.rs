@@ -26,6 +26,8 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <float.h>
 #include <stdint.h>
 
@@ -278,6 +280,278 @@ cudaError_t fast_topk_select(
     }
 
     return cudaGetLastError();
+}
+
+__global__ void dflash_select_candidates_kernel(
+    const float* __restrict__ hidden,
+    const float* __restrict__ unary_logits,
+    const uint32_t* __restrict__ candidate_ids,
+    const float* __restrict__ predecessor_codebook,
+    const float* __restrict__ successor_codebook,
+    const uint32_t* __restrict__ anchor_token,
+    uint32_t* __restrict__ selected_tokens,
+    const int sequence_len,
+    const int rank,
+    const int topk) {
+
+    // DFlash2 checkpoints use topk=16 and rank=256. Mapping one group of
+    // threads to each candidate keeps the whole K-way edge score in one
+    // launch while retaining enough lanes to reduce the rank dimension.
+    const int tid = threadIdx.x;
+    const int lanes_per_candidate = blockDim.x / topk;
+    if (topk <= 0 || topk > 32 || lanes_per_candidate <= 0)
+        return;
+
+    extern __shared__ float partial_dots[];
+    __shared__ uint32_t previous_token;
+    if (tid == 0)
+        previous_token = anchor_token[0];
+    __syncthreads();
+
+    for (int position = 0; position < sequence_len; ++position) {
+        const int candidate = tid % topk;
+        const int lane = tid / topk;
+        if (candidate < topk) {
+            const uint32_t previous = previous_token;
+            const uint32_t candidate_token =
+                candidate_ids[position * topk + candidate];
+            const float* h = hidden + (int64_t)position * rank;
+            const float* p = predecessor_codebook + (int64_t)previous * rank;
+            const float* s = successor_codebook + (int64_t)candidate_token * rank;
+
+            float dot = 0.0f;
+            for (int r = lane; r < rank; r += lanes_per_candidate)
+                dot += h[r] * p[r] * s[r];
+            partial_dots[candidate * blockDim.x + lane] = dot;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float best_score = -FLT_MAX;
+            int best_candidate = 0;
+            for (int candidate = 0; candidate < topk; ++candidate) {
+                float edge = 0.0f;
+                for (int lane = 0; lane < lanes_per_candidate; ++lane)
+                    edge += partial_dots[candidate * blockDim.x + lane];
+                const float score =
+                    unary_logits[position * topk + candidate] + edge;
+                if (score > best_score) {
+                    best_score = score;
+                    best_candidate = candidate;
+                }
+            }
+            const uint32_t selected =
+                candidate_ids[position * topk + best_candidate];
+            selected_tokens[position] = selected;
+            previous_token = selected;
+        }
+        __syncthreads();
+    }
+}
+
+cudaError_t dflash_select_candidates(
+    const float* hidden,                // [sequence_len, rank]
+    const float* unary_logits,          // [sequence_len, topk]
+    const uint32_t* candidate_ids,      // [sequence_len, topk]
+    const float* predecessor_codebook,  // [vocab_size, rank]
+    const float* successor_codebook,    // [vocab_size, rank]
+    const uint32_t* anchor_token,
+    uint32_t* selected_tokens,          // [sequence_len]
+    int sequence_len,
+    int rank,
+    int topk,
+    int64_t stream_) {
+
+    if (hidden == nullptr || unary_logits == nullptr || candidate_ids == nullptr ||
+        predecessor_codebook == nullptr || successor_codebook == nullptr ||
+        anchor_token == nullptr || selected_tokens == nullptr ||
+        sequence_len <= 0 || rank <= 0 || topk <= 0 || topk > 32 ||
+        topk > 256)
+        return cudaErrorInvalidValue;
+
+    const int lanes_per_candidate = 256 / topk;
+    if (lanes_per_candidate <= 0)
+        return cudaErrorInvalidValue;
+
+    const cudaStream_t stream = (cudaStream_t)stream_;
+    const size_t shared_bytes = (size_t)topk * 256 * sizeof(float);
+    dflash_select_candidates_kernel<<<1, 256, shared_bytes, stream>>>(
+        hidden,
+        unary_logits,
+        candidate_ids,
+        predecessor_codebook,
+        successor_codebook,
+        anchor_token,
+        selected_tokens,
+        sequence_len,
+        rank,
+        topk);
+    return cudaGetLastError();
+}
+
+}  // extern "C"
+
+template <typename scalar_t>
+__device__ __forceinline__ float dflash_to_float(scalar_t value);
+
+#ifndef NO_BF16_KERNEL
+template <>
+__device__ __forceinline__ float dflash_to_float<__nv_bfloat16>(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+#endif
+
+template <>
+__device__ __forceinline__ float dflash_to_float<__half>(__half value) {
+    return __half2float(value);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t dflash_from_float(float value);
+
+#ifndef NO_BF16_KERNEL
+template <>
+__device__ __forceinline__ __nv_bfloat16 dflash_from_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16(value);
+}
+#endif
+
+template <>
+__device__ __forceinline__ __half dflash_from_float<__half>(float value) {
+    return __float2half(value);
+}
+
+template <typename scalar_t>
+__global__ void dflash_grouped_conv_kernel(
+    const scalar_t* __restrict__ hidden,
+    const scalar_t* __restrict__ delta,
+    const scalar_t* __restrict__ base_kernel,
+    scalar_t* __restrict__ output,
+    int sequence_len,
+    int hidden_size,
+    int num_groups,
+    int group_size,
+    int taps,
+    int block_size,
+    int side) {
+
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = sequence_len * hidden_size;
+    if (index >= total)
+        return;
+
+    const int position = index / hidden_size;
+    const int channel = index % hidden_size;
+    const int group = channel / group_size;
+    const int local_position = position % block_size;
+    float value = 0.0f;
+
+    for (int tap = 0; tap < taps; ++tap) {
+        const float base = dflash_to_float(
+            base_kernel[((side * taps + tap) * hidden_size) + channel]);
+        const float dynamic = dflash_to_float(
+            delta[(position * taps + tap) * num_groups + group]);
+        if (tap == 0 || local_position >= tap) {
+            const int source_position = position - tap;
+            value += (base + dynamic) *
+                dflash_to_float(hidden[source_position * hidden_size + channel]);
+        }
+    }
+    output[index] = dflash_from_float<scalar_t>(value);
+}
+
+template <typename scalar_t>
+cudaError_t dflash_grouped_conv_launch(
+    const void* hidden,
+    const void* delta,
+    const void* base_kernel,
+    void* output,
+    int sequence_len,
+    int hidden_size,
+    int num_groups,
+    int group_size,
+    int taps,
+    int block_size,
+    int side,
+    int64_t stream_) {
+
+    if (hidden == nullptr || delta == nullptr || base_kernel == nullptr ||
+        output == nullptr || sequence_len <= 0 || hidden_size <= 0 ||
+        num_groups <= 0 || group_size <= 0 || taps <= 0 || block_size <= 0 ||
+        side < 0 || side > 1 || num_groups * group_size != hidden_size)
+        return cudaErrorInvalidValue;
+
+    const int threads = 256;
+    const int blocks = (sequence_len * hidden_size + threads - 1) / threads;
+    dflash_grouped_conv_kernel<scalar_t><<<blocks, threads, 0, (cudaStream_t)stream_>>>(
+        (const scalar_t*)hidden,
+        (const scalar_t*)delta,
+        (const scalar_t*)base_kernel,
+        (scalar_t*)output,
+        sequence_len,
+        hidden_size,
+        num_groups,
+        group_size,
+        taps,
+        block_size,
+        side);
+    return cudaGetLastError();
+}
+
+extern "C" {
+
+#ifndef NO_BF16_KERNEL
+cudaError_t dflash_grouped_conv_bf16(
+    const void* hidden,
+    const void* delta,
+    const void* base_kernel,
+    void* output,
+    int sequence_len,
+    int hidden_size,
+    int num_groups,
+    int group_size,
+    int taps,
+    int block_size,
+    int side,
+    int64_t stream_) {
+    return dflash_grouped_conv_launch<__nv_bfloat16>(
+        hidden, delta, base_kernel, output, sequence_len, hidden_size,
+        num_groups, group_size, taps, block_size, side, stream_);
+}
+#else
+cudaError_t dflash_grouped_conv_bf16(
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int64_t) {
+    return cudaErrorNotSupported;
+}
+#endif
+
+cudaError_t dflash_grouped_conv_f16(
+    const void* hidden,
+    const void* delta,
+    const void* base_kernel,
+    void* output,
+    int sequence_len,
+    int hidden_size,
+    int num_groups,
+    int group_size,
+    int taps,
+    int block_size,
+    int side,
+    int64_t stream_) {
+    return dflash_grouped_conv_launch<__half>(
+        hidden, delta, base_kernel, output, sequence_len, hidden_size,
+        num_groups, group_size, taps, block_size, side, stream_);
 }
 
 }  // extern "C"

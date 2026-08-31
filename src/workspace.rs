@@ -216,9 +216,17 @@ mod cuda {
         #[cfg(feature = "flashinfer")]
         pub static WORKSPACE_GRAPH: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
 
-        /// Dedicated CUTLASS workspace.
+        /// Dedicated CUTLASS workspaces, split by execution domain so decode-graph
+        /// and MTP/DFlash-verify-graph captures never alias the same device pointer.
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
-        pub static CUTLASS_WORKSPACE: std::cell::RefCell<Option<CutlassWorkspace>> = const { std::cell::RefCell::new(None) };
+        pub static CUTLASS_WORKSPACE_EAGER: std::cell::RefCell<Option<CutlassWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+        #[cfg(all(feature = "cuda", feature = "cutlass"))]
+        pub static CUTLASS_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<CutlassWorkspace>> =
+            const { std::cell::RefCell::new(None) };
+        #[cfg(all(feature = "cuda", feature = "cutlass"))]
+        pub static CUTLASS_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<CutlassWorkspace>> =
+            const { std::cell::RefCell::new(None) };
 
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
@@ -323,43 +331,50 @@ mod cuda {
     }
 
     #[cfg(all(feature = "cuda", feature = "cutlass"))]
-    fn get_or_init_cutlass_workspace(
+    fn get_or_init_cutlass_workspace_slot(
+        cell: &std::cell::RefCell<Option<CutlassWorkspace>>,
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
-        CUTLASS_WORKSPACE.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let ordinal = dev.ordinal();
-            let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
-            let needs_init = match slot.as_ref() {
-                None => true,
-                Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
-            };
+        let mut slot = cell.borrow_mut();
+        let ordinal = dev.ordinal();
+        let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
+        let needs_init = match slot.as_ref() {
+            None => true,
+            Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
+        };
 
-            if needs_init {
-                let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-                *slot = Some(CutlassWorkspace {
-                    buffer,
-                    size: alloc_size,
-                    device_ordinal: ordinal,
-                });
-            }
+        if needs_init {
+            let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
+            *slot = Some(CutlassWorkspace {
+                buffer,
+                size: alloc_size,
+                device_ordinal: ordinal,
+            });
+        }
 
-            let ws = slot.as_ref().unwrap();
-            Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
-        })
+        let ws = slot.as_ref().unwrap();
+        Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
     }
 
-    /// Returns the dedicated CUTLASS workspace.
+    /// Returns the dedicated CUTLASS workspace for the current FP8/NVFP4 execution domain.
     ///
     /// Even when `flashinfer` is enabled, CUTLASS does not alias the FlashInfer
     /// float buffer because that shared path is not stable for the FP8 CUTLASS GEMM kernels.
+    /// Domain splitting keeps decode-graph and MTP-verify-graph captured addresses stable.
     #[cfg(all(feature = "cuda", feature = "cutlass"))]
     pub fn get_cutlass_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
-        get_or_init_cutlass_workspace(dev, required_size)
+        match crate::fp8_linear::fp8_execution_domain() {
+            crate::fp8_linear::Fp8ExecutionDomain::Eager => CUTLASS_WORKSPACE_EAGER
+                .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
+            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => CUTLASS_WORKSPACE_DECODE_GRAPH
+                .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
+            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => CUTLASS_WORKSPACE_MTP_GRAPH
+                .with(|cell| get_or_init_cutlass_workspace_slot(cell, dev, required_size)),
+        }
     }
 
     /// Alias for CUTLASS workspace in MoE context.
@@ -369,6 +384,161 @@ mod cuda {
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
         get_cutlass_workspace(dev, required_size)
+    }
+
+    /// Grow-only scratch for dense NVFP4 hardware W4A4 (quantize + CUTLASS GEMM).
+    ///
+    /// Per-call `Tensor::zeros` for act_packed/scales/alpha is not CUDA-graph safe:
+    /// those addresses are baked into the captured graph and must come from a
+    /// stable, domain-scoped pool (same pattern as FP8 grouped-GEMM scratch).
+    #[cfg(feature = "cutlass")]
+    pub struct Nvfp4HwScratchPool {
+        pub act_packed: CudaSlice<u8>,
+        pub act_packed_bytes: usize,
+        pub act_scales: CudaSlice<u8>,
+        pub act_scales_bytes: usize,
+        pub act_scales_swizzled: CudaSlice<u8>,
+        pub act_scales_swizzled_bytes: usize,
+        pub wscale_swizzled: CudaSlice<u8>,
+        pub wscale_swizzled_bytes: usize,
+        pub alpha: CudaSlice<u8>,
+        pub sf_scale: CudaSlice<u8>,
+        pub online_scale: CudaSlice<u8>,
+        pub device_ordinal: usize,
+    }
+
+    #[cfg(feature = "cutlass")]
+    thread_local! {
+        static NVFP4_HW_SCRATCH_EAGER: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(None) };
+        static NVFP4_HW_SCRATCH_DECODE_GRAPH: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(None) };
+        static NVFP4_HW_SCRATCH_MTP_GRAPH: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(feature = "cutlass")]
+    pub struct Nvfp4HwScratchPtrs {
+        pub act_packed: *mut std::ffi::c_void,
+        pub act_scales: *mut std::ffi::c_void,
+        pub act_scales_swizzled: *mut std::ffi::c_void,
+        pub wscale_swizzled: *mut std::ffi::c_void,
+        pub alpha: *mut f32,
+        pub sf_scale: *mut f32,
+        pub online_scale: *mut f32,
+    }
+
+    #[cfg(feature = "cutlass")]
+    fn get_nvfp4_hw_scratch_from_pool(
+        cell: &std::cell::RefCell<Option<Nvfp4HwScratchPool>>,
+        dev: &candle_core::cuda_backend::CudaDevice,
+        act_packed_bytes: usize,
+        act_scales_bytes: usize,
+        act_scales_swizzled_bytes: usize,
+        wscale_swizzled_bytes: usize,
+    ) -> Result<Nvfp4HwScratchPtrs> {
+        let mut slot = cell.borrow_mut();
+        let ordinal = dev.ordinal();
+        let needs_realloc = match slot.as_ref() {
+            None => true,
+            Some(p) => {
+                p.device_ordinal != ordinal
+                    || p.act_packed_bytes < act_packed_bytes
+                    || p.act_scales_bytes < act_scales_bytes
+                    || p.act_scales_swizzled_bytes < act_scales_swizzled_bytes
+                    || p.wscale_swizzled_bytes < wscale_swizzled_bytes
+            }
+        };
+
+        if needs_realloc {
+            let old = slot.take();
+            let (ap, as_, asw, ws) = if let Some(ref prev) = old {
+                (
+                    act_packed_bytes.max(prev.act_packed_bytes),
+                    act_scales_bytes.max(prev.act_scales_bytes),
+                    act_scales_swizzled_bytes.max(prev.act_scales_swizzled_bytes),
+                    wscale_swizzled_bytes.max(prev.wscale_swizzled_bytes),
+                )
+            } else {
+                (
+                    act_packed_bytes,
+                    act_scales_bytes,
+                    act_scales_swizzled_bytes,
+                    wscale_swizzled_bytes,
+                )
+            };
+            drop(old);
+            *slot = Some(Nvfp4HwScratchPool {
+                act_packed: unsafe { dev.alloc::<u8>(ap.max(1)) }.w()?,
+                act_packed_bytes: ap,
+                act_scales: unsafe { dev.alloc::<u8>(as_.max(1)) }.w()?,
+                act_scales_bytes: as_,
+                act_scales_swizzled: unsafe { dev.alloc::<u8>(asw.max(1)) }.w()?,
+                act_scales_swizzled_bytes: asw,
+                wscale_swizzled: unsafe { dev.alloc::<u8>(ws.max(1)) }.w()?,
+                wscale_swizzled_bytes: ws,
+                alpha: unsafe { dev.alloc::<u8>(4) }.w()?,
+                sf_scale: unsafe { dev.alloc::<u8>(4) }.w()?,
+                online_scale: unsafe { dev.alloc::<u8>(8) }.w()?,
+                device_ordinal: ordinal,
+            });
+        }
+
+        let pool = slot.as_ref().unwrap();
+        Ok(Nvfp4HwScratchPtrs {
+            act_packed: *pool.act_packed.device_ptr() as *mut std::ffi::c_void,
+            act_scales: *pool.act_scales.device_ptr() as *mut std::ffi::c_void,
+            act_scales_swizzled: *pool.act_scales_swizzled.device_ptr() as *mut std::ffi::c_void,
+            wscale_swizzled: *pool.wscale_swizzled.device_ptr() as *mut std::ffi::c_void,
+            alpha: *pool.alpha.device_ptr() as *mut f32,
+            sf_scale: *pool.sf_scale.device_ptr() as *mut f32,
+            online_scale: *pool.online_scale.device_ptr() as *mut f32,
+        })
+    }
+
+    #[cfg(feature = "cutlass")]
+    pub fn get_nvfp4_hw_scratch(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        act_packed_bytes: usize,
+        act_scales_bytes: usize,
+        act_scales_swizzled_bytes: usize,
+        wscale_swizzled_bytes: usize,
+    ) -> Result<Nvfp4HwScratchPtrs> {
+        match crate::fp8_linear::fp8_execution_domain() {
+            crate::fp8_linear::Fp8ExecutionDomain::Eager => NVFP4_HW_SCRATCH_EAGER.with(|cell| {
+                get_nvfp4_hw_scratch_from_pool(
+                    cell,
+                    dev,
+                    act_packed_bytes,
+                    act_scales_bytes,
+                    act_scales_swizzled_bytes,
+                    wscale_swizzled_bytes,
+                )
+            }),
+            crate::fp8_linear::Fp8ExecutionDomain::DecodeGraph => NVFP4_HW_SCRATCH_DECODE_GRAPH
+                .with(|cell| {
+                    get_nvfp4_hw_scratch_from_pool(
+                        cell,
+                        dev,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        act_scales_swizzled_bytes,
+                        wscale_swizzled_bytes,
+                    )
+                }),
+            crate::fp8_linear::Fp8ExecutionDomain::MtpGraph => {
+                NVFP4_HW_SCRATCH_MTP_GRAPH.with(|cell| {
+                    get_nvfp4_hw_scratch_from_pool(
+                        cell,
+                        dev,
+                        act_packed_bytes,
+                        act_scales_bytes,
+                        act_scales_swizzled_bytes,
+                        wscale_swizzled_bytes,
+                    )
+                })
+            }
+        }
     }
 
     /// Thread-local pool for MoE NVFP4 hardware activation buffers.
