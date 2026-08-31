@@ -454,7 +454,20 @@ pub fn dflash_grouped_conv(
     side: usize,
 ) -> Result<Tensor> {
     match hidden.dtype() {
-        DType::BF16 => dflash_grouped_conv_bf16(hidden, delta, base_kernel, block_size, side),
+        DType::BF16 => {
+            let sm = hidden
+                .device()
+                .as_cuda_device()
+                .ok()
+                .and_then(|d| crate::cuda_utils::sm_version(d))
+                .unwrap_or(0);
+            if sm < 80 {
+                candle::bail!(
+                    "DFlash2 grouped convolution BF16 requires SM80+ (got SM{sm}); use F16 on SM70/SM75"
+                );
+            }
+            dflash_grouped_conv_bf16(hidden, delta, base_kernel, block_size, side)
+        }
         DType::F16 => dflash_grouped_conv_f16(hidden, delta, base_kernel, block_size, side),
         dtype => candle::bail!("DFlash2 grouped convolution does not support {dtype:?}"),
     }

@@ -394,10 +394,12 @@ cudaError_t dflash_select_candidates(
 template <typename scalar_t>
 __device__ __forceinline__ float dflash_to_float(scalar_t value);
 
+#ifndef NO_BF16_KERNEL
 template <>
 __device__ __forceinline__ float dflash_to_float<__nv_bfloat16>(__nv_bfloat16 value) {
     return __bfloat162float(value);
 }
+#endif
 
 template <>
 __device__ __forceinline__ float dflash_to_float<__half>(__half value) {
@@ -407,10 +409,12 @@ __device__ __forceinline__ float dflash_to_float<__half>(__half value) {
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t dflash_from_float(float value);
 
+#ifndef NO_BF16_KERNEL
 template <>
 __device__ __forceinline__ __nv_bfloat16 dflash_from_float<__nv_bfloat16>(float value) {
     return __float2bfloat16(value);
 }
+#endif
 
 template <>
 __device__ __forceinline__ __half dflash_from_float<__half>(float value) {
@@ -496,6 +500,7 @@ cudaError_t dflash_grouped_conv_launch(
 
 extern "C" {
 
+#ifndef NO_BF16_KERNEL
 cudaError_t dflash_grouped_conv_bf16(
     const void* hidden,
     const void* delta,
@@ -513,6 +518,23 @@ cudaError_t dflash_grouped_conv_bf16(
         hidden, delta, base_kernel, output, sequence_len, hidden_size,
         num_groups, group_size, taps, block_size, side, stream_);
 }
+#else
+cudaError_t dflash_grouped_conv_bf16(
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int64_t) {
+    return cudaErrorNotSupported;
+}
+#endif
 
 cudaError_t dflash_grouped_conv_f16(
     const void* hidden,
