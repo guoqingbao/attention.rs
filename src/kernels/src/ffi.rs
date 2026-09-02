@@ -4498,6 +4498,56 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn qwen4_hc_read(
+        hyper_input: *const c_void,
+        hc_norm_weight: *const c_void,
+        mix_down_weight: *const c_void,
+        mix_up_weight: *const c_void,
+        inject_weight: *const c_void,
+        mixed_out: *mut c_void,
+        inject_out: *mut c_void,
+        normed_scratch: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        hidden: c_int,
+        lowrank: c_int,
+        eps: f32,
+        use_combine: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn qwen4_hc_write(
+        hyper_input: *const c_void,
+        block_out: *const c_void,
+        inject_weights: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        hidden: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn qwen4_qsa_indexer_mask(
+        q: *const c_void,
+        raw_keys: *const c_void,
+        q_norm_weight: *const c_void,
+        k_norm_weight: *const c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        mask_out: *mut c_void,
+        seq_len: c_int,
+        kv_len: c_int,
+        n_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        compress_ratio: c_int,
+        block_topk: c_int,
+        score_scale: f32,
+        mask_min: f32,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
     // =========================================================================
     // FP8 grouped/strided GEMM (flashinfer + cutlass features)
     // =========================================================================

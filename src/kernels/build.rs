@@ -71,6 +71,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_llama4.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_fused_moe_routing_common.cu");
     println!("cargo:rerun-if-changed=src/trtllm/trtllm_cutlass_heuristic.cpp");
+    println!("cargo:rerun-if-changed=src/qwen4/qwen4_hc.cu");
+    println!("cargo:rerun-if-changed=src/qwen4/qwen4_qsa.cu");
     println!("cargo:rerun-if-changed=src/gdn.cu");
     println!("cargo:rerun-if-changed=src/gdn_flashinfer_prefill.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
