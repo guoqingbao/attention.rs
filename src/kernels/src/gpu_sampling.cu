@@ -166,6 +166,66 @@ __global__ void stageA_local_topk(
   }
 }
 
+// VOB variant: [B, V/32] U32 bitset instead of [B,V] F32 mask.
+// Bit i set = token allowed. 8x less data, bitwise AND instead of float compare.
+template<int K, int BLOCK_THREADS, int ITEMS_PER_THREAD, typename T>
+__global__ void stageA_local_topk_vob(
+    const T* __restrict__ logits, // [B,V]
+    const uint32_t* __restrict__ vob, // [B, V/32] bitset, or nullptr
+    int B, int V,
+    float temperature,
+    int tiles_per_row,
+    float* __restrict__ out_vals,
+    int* __restrict__ out_idx
+) {
+  int b = blockIdx.x;
+  int tile = blockIdx.y;
+  if (b >= B) return;
+
+  constexpr int CHUNK = BLOCK_THREADS * ITEMS_PER_THREAD;
+  int base = tile * CHUNK;
+
+  const T* row = logits + (size_t)b * (size_t)V;
+  const uint32_t* vobrow = vob ? (vob + (size_t)b * ((V + 31) / 32)) : nullptr;
+
+  float invT = (temperature > 1e-6f) ? (1.0f / temperature) : 1e6f;
+
+  float v[ITEMS_PER_THREAD];
+  int   i[ITEMS_PER_THREAD];
+
+  #pragma unroll
+  for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+    int idx = base + threadIdx.x + it * BLOCK_THREADS;
+    if (idx < V) {
+      float scaled = to_float(row[idx]) * invT;
+      // VOB gate: bit not set = disallowed -> -inf
+      if (vobrow != nullptr && ((vobrow[idx >> 5] >> (idx & 31)) & 1u) == 0u)
+        scaled = -CUDART_INF_F;
+      v[it] = scaled;
+      i[it] = idx;
+    } else {
+      v[it] = -CUDART_INF_F;
+      i[it] = -1;
+    }
+  }
+
+  using BlockSort = cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+  __shared__ typename BlockSort::TempStorage temp;
+  BlockSort(temp).SortDescending(v, i);
+  __syncthreads();
+
+  int out_base = (b * tiles_per_row + tile) * K;
+
+  #pragma unroll
+  for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+    int rank = threadIdx.x + it * BLOCK_THREADS;
+    if (rank < K) {
+      out_vals[out_base + rank] = v[it];
+      out_idx[out_base + rank]  = i[it];
+    }
+  }
+}
+
 // ---------------- Stage B: reduce tiles -> global topK -> softmax -> top-p -> sample ----------------
 //
 // One block per batch element.
@@ -350,6 +410,64 @@ template void gpu_topk_topp_sample<32, __nv_bfloat16>(const __nv_bfloat16*, cons
 template void gpu_topk_topp_sample<64, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
 template void gpu_topk_topp_sample<128, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
 template void gpu_topk_topp_sample<256, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
+#endif
+
+// ---------------------------------------------------------------------------
+// VOB variant: uses [B, V/32] U32 bitset instead of [B,V] F32 mask.
+// 8x less data, bitwise AND instead of float compare in stageA.
+// ---------------------------------------------------------------------------
+template<int K, typename T>
+void gpu_topk_topp_sample_vob(
+    const T* logits_d,
+    const uint32_t* vob_d,  // [B, V/32] bitset, or nullptr
+    int* out_tokens_d,
+    const SamplerParams& p,
+    cudaStream_t stream
+) {
+  constexpr int BLOCK_THREADS = 256;
+  constexpr int ITEMS_PER_THREAD = 4;
+  constexpr int CHUNK = BLOCK_THREADS * ITEMS_PER_THREAD;
+
+  int tiles = (p.V + CHUNK - 1) / CHUNK;
+
+  float* tile_vals_d = nullptr;
+  int*   tile_idx_d  = nullptr;
+  size_t vals_bytes = (size_t)p.B * (size_t)tiles * (size_t)K * sizeof(float);
+  size_t idx_bytes  = (size_t)p.B * (size_t)tiles * (size_t)K * sizeof(int);
+  CUDA_CHECK(cudaMallocAsync(&tile_vals_d, vals_bytes, stream));
+  CUDA_CHECK(cudaMallocAsync(&tile_idx_d,  idx_bytes,  stream));
+
+  dim3 gridA(p.B, tiles, 1);
+  dim3 blockA(BLOCK_THREADS, 1, 1);
+  stageA_local_topk_vob<K, BLOCK_THREADS, ITEMS_PER_THREAD, T>
+      <<<gridA, blockA, 0, stream>>>(
+          logits_d, vob_d, p.B, p.V, p.temperature, tiles, tile_vals_d, tile_idx_d);
+
+  dim3 gridB(p.B, 1, 1);
+  dim3 blockB(256, 1, 1);
+  stageB_reduce_and_sample<K, 256>
+      <<<gridB, blockB, 0, stream>>>(
+          p.B, tiles, tile_vals_d, tile_idx_d, p.top_p, p.top_k, p.seed, p.token_pos, out_tokens_d);
+
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaFreeAsync(tile_vals_d, stream));
+  CUDA_CHECK(cudaFreeAsync(tile_idx_d,  stream));
+}
+
+// Explicit VOB instantiations
+template void gpu_topk_topp_sample_vob<32, float>(const float*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<64, float>(const float*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<128, float>(const float*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<256, float>(const float*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<32, __half>(const __half*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<64, __half>(const __half*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<128, __half>(const __half*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<256, __half>(const __half*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+#ifndef NO_BF16_KERNEL
+template void gpu_topk_topp_sample_vob<32, __nv_bfloat16>(const __nv_bfloat16*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<64, __nv_bfloat16>(const __nv_bfloat16*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<128, __nv_bfloat16>(const __nv_bfloat16*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
+template void gpu_topk_topp_sample_vob<256, __nv_bfloat16>(const __nv_bfloat16*, const uint32_t*, int*, const SamplerParams&, cudaStream_t);
 #endif
 
 
@@ -590,4 +708,113 @@ extern "C" void sampling_masked_bf16(
         gpu_topk_topp_sample<256, __nv_bfloat16>(logits, mask_d, out_tokens_d, p, stream);
     }
   #endif
+}
+
+// ---------------------------------------------------------------------------
+// VOB (Valid Output Boundary) sampling: [B, V/32] U32 bitset instead of [B,V] F32.
+// 8x less data to transfer. The kernel does a bitwise AND instead of float compare.
+// TODO: implement stageA_local_topk_vob with uint32_t* vob_d for the bitwise path.
+// For now, delegate to the masked path (correct but not yet optimized).
+// ---------------------------------------------------------------------------
+
+extern "C" void sampling_vob_f32(
+    const float* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B; p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample_vob<32, float>(logits_d, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample_vob<64, float>(logits_d, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample_vob<128, float>(logits_d, vob_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample_vob<256, float>(logits_d, vob_d, out_tokens_d, p, stream);
+    }
+}
+
+extern "C" void sampling_vob_f16(
+    const void* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B; p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const __half* logits = reinterpret_cast<const __half*>(logits_d);
+
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample_vob<32, __half>(logits, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample_vob<64, __half>(logits, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample_vob<128, __half>(logits, vob_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample_vob<256, __half>(logits, vob_d, out_tokens_d, p, stream);
+    }
+}
+
+extern "C" void sampling_vob_bf16(
+    const void* logits_d,
+    const uint32_t* vob_d,
+    int* out_tokens_d,
+    int B, int V, int K,
+    float temperature, float top_p,
+    uint64_t seed, uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParams p;
+    p.B = B; p.V = V;
+    p.temperature = temperature;
+    p.top_p = top_p;
+    int k_eff = K <= 0 ? V : K;
+    if (k_eff > V) k_eff = V;
+    if (k_eff < 1) k_eff = 1;
+    if (k_eff > 256) k_eff = 256;
+    p.top_k = k_eff;
+    p.seed = seed;
+    p.token_pos = token_pos;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+#ifndef NO_BF16_KERNEL
+    const __nv_bfloat16* logits = reinterpret_cast<const __nv_bfloat16*>(logits_d);
+    if (k_eff <= 32) {
+        gpu_topk_topp_sample_vob<32, __nv_bfloat16>(logits, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 64) {
+        gpu_topk_topp_sample_vob<64, __nv_bfloat16>(logits, vob_d, out_tokens_d, p, stream);
+    } else if (k_eff <= 128) {
+        gpu_topk_topp_sample_vob<128, __nv_bfloat16>(logits, vob_d, out_tokens_d, p, stream);
+    } else {
+        gpu_topk_topp_sample_vob<256, __nv_bfloat16>(logits, vob_d, out_tokens_d, p, stream);
+    }
+#endif
 }
