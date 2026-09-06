@@ -888,6 +888,50 @@ extern "C" {
         stream: i64,
     );
 
+    // VOB (Valid Output Boundary) sampling: `vob_d` is a [B, V/32] U32 bitset
+    // (bit i set = token allowed). 8x less data than the F32 mask path.
+    pub fn sampling_vob_f32(
+        logits_d: *const f32,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_f16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_bf16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
     // Fused Rotary Position Embedding (RoPE) kernels - with position selection
     // Non-interleaved versions - support GQA, fuses index_select
     pub fn fused_rope_f32(
@@ -4685,4 +4729,75 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    // The pushdown-rs fused PDA kernels.
+    // One kernel launch does mask + sample + advance (the Pre3 fusion).
+    // The PDA dispatch is optional: if ctrl/stack/sp are null, the kernel
+    // runs plain sampling with zero PDA overhead.
+    pub fn pda_fused_sample_f32(
+        logits: *const f32,
+        ctrl: *const u32,
+        stack: *const u32,
+        sp: *const u32,
+        out_ctrl: *mut u32,
+        out_sp: *mut u32,
+        out_tokens: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        words_per_vob: u32,
+        batch: i32,
+        vocab: i32,
+        top_k: i32,
+        temperature: f32,
+        top_p: f32,
+        d: i32,
+        stream: i64,
+    );
+
+    pub fn pda_fused_sample_bf16(
+        logits: *const core::ffi::c_void,
+        ctrl: *const u32,
+        stack: *const u32,
+        sp: *const u32,
+        out_ctrl: *mut u32,
+        out_sp: *mut u32,
+        out_tokens: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        words_per_vob: u32,
+        batch: i32,
+        vocab: i32,
+        top_k: i32,
+        temperature: f32,
+        top_p: f32,
+        d: i32,
+        stream: i64,
+    );
+
+    // The fused projection for drafting (MTP/DFlash): K+1 VOB masks in one launch.
+    pub fn pda_fused_project_masks(
+        ctrl: *const u32,
+        stack: *const u32,
+        sp: *const u32,
+        drafts: *const u32,
+        out_masks: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        words_per_vob: u32,
+        batch: i32,
+        k: i32,
+        d: i32,
+        stream: i64,
+    );
 }

@@ -21,6 +21,7 @@ tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.6.8", optional = true}
+pushdown-rs = { git = "https://github.com/sempervictus/pushdown-rs" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.2.6", optional = true}
 flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "762a0ce", optional = true }
