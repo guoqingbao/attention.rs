@@ -258,6 +258,123 @@ impl Sampler {
         Ok(host_out.into_iter().map(|x| x as u32).collect())
     }
 
+    /// Like `sample_cuda_masked`, but takes a precomputed VOB bitset (`[b, v/32]` u32
+    /// words) instead of a full F32 mask tensor. 8x less data to transfer.
+    /// Each u32 word covers 32 vocab entries: bit i set = token allowed.
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_vob(
+        &self,
+        logits: &Tensor,
+        k: usize,
+        p: f32,
+        temperature: f32,
+        seed: u64,
+        vob: Option<&Tensor>, // [b, v/32] U32
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+        use candle_core::DType;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+        let dtype = logits.dtype();
+
+        let logits = if !logits.is_contiguous() {
+            logits.contiguous()?
+        } else {
+            logits.clone()
+        };
+        let storage = logits.storage_and_layout().0;
+        let cuda_storage = match &*storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Sampler expects CUDA tensor"),
+        };
+
+        let vob_ptr: *const u32 = match vob {
+            Some(vob_tensor) => {
+                let (vb, vw) = vob_tensor.dims2()?;
+                if vb != b || vw != v.div_ceil(32) {
+                    candle_core::bail!(
+                        "VOB shape [{}x{}] does not match logits [{}x{}] (expected [{}x{}])",
+                        vb, vw, b, v, b, v.div_ceil(32)
+                    );
+                }
+                let vob_tensor = if vob_tensor.dtype() == DType::U32 {
+                    vob_tensor.contiguous()?
+                } else {
+                    vob_tensor.to_dtype(DType::U32)?.contiguous()?
+                };
+                let (vstorage, _) = vob_tensor.storage_and_layout();
+                match &*vstorage {
+                    candle_core::Storage::Cuda(s) => {
+                        let slice = match &s.slice {
+                            CudaStorageSlice::U32(inp) => inp,
+                            _ => candle_core::bail!("VOB must be U32 storage"),
+                        };
+                        *slice.device_ptr() as *const u32
+                    }
+                    _ => candle_core::bail!("VOB must be a CUDA tensor"),
+                }
+            }
+            None => std::ptr::null(),
+        };
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        match dtype {
+            DType::F32 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F32(inp) => *inp.device_ptr() as *const f32,
+                    _ => candle_core::bail!("Dtype mismatch: expected F32 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_f32(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::F16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected F16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_f16(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected BF16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_bf16(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            _ => candle_core::bail!(
+                "Sampler only supports F32, F16, and BF16 dtypes, got {:?}",
+                dtype
+            ),
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
     #[cfg(feature = "metal")]
     pub fn sample(&self, _: &Tensor, _: usize, _: f32, _: f32, _: u64) -> Result<Vec<u32>> {
         candle_core::bail!("Sampler requires CUDA or Metal device")
