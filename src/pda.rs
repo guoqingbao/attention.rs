@@ -211,6 +211,8 @@ impl PdaPushdownTable {
         stack: &Tensor,
         sp: &Tensor,
         sampling: &PdaSampling,
+        forbid: Option<&Tensor>,
+        seed: u64,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let dev = logits.device();
         let (batch, vocab) = logits.dims2()?;
@@ -232,6 +234,8 @@ impl PdaPushdownTable {
         let out_ctrl = Tensor::zeros((batch,), DType::U32, &dev)?;
         let out_sp = Tensor::zeros((batch,), DType::U32, &dev)?;
         let out_tokens = Tensor::zeros((batch,), DType::U32, &dev)?;
+        // The full-VOB buffer (the batch x words_per_vob, covering the full input range).
+        let vob_buf = Tensor::zeros((batch * words as usize,), DType::U32, &dev)?;
 
         let p_ctrl = Self::ptr_u32(ctrl)?;
         let p_stack = Self::ptr_u32(stack)?;
@@ -239,6 +243,13 @@ impl PdaPushdownTable {
         let p_out_ctrl = Self::ptr_u32_mut(&out_ctrl)?;
         let p_out_sp = Self::ptr_u32_mut(&out_sp)?;
         let p_out_tokens = Self::ptr_u32_mut(&out_tokens)?;
+        let p_vob_buf = Self::ptr_u32_mut(&vob_buf)?;
+        // The optional anti-loop kick (the per-seq forbid token, the UINT32_MAX
+        // sentinel = no-kick). Null when absent (the kernel skips the kick).
+        let p_forbid: *const u32 = match forbid {
+            Some(f) => Self::ptr_u32(f)?,
+            None => std::ptr::null(),
+        };
         let p_trans = Self::ptr_u32(&self.transitions)?;
         let p_accept = Self::ptr_u32(&self.accepting)?;
         let p_ctrl_offsets = Self::ptr_u32(&self.ctrl_offsets)?;
@@ -251,10 +262,10 @@ impl PdaPushdownTable {
                     ffi::pda_fused_sample_f32(
                         p_logits, p_ctrl, p_stack, p_sp,
                         p_out_ctrl, p_out_sp, p_out_tokens,
-                        p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts,
-                        self.num_states, self.num_stack_syms,
+                        p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts, p_vob_buf, p_forbid,
+                        self.num_states, self.num_stack_syms, self.num_inputs,
                         words, batch as i32, vocab as i32,
-                        k, temp, topp, d as i32, stream,
+                        k, temp, topp, seed, d as i32, stream,
                     );
                 }
                 DType::BF16 => {
@@ -262,10 +273,10 @@ impl PdaPushdownTable {
                     ffi::pda_fused_sample_bf16(
                         p_logits, p_ctrl, p_stack, p_sp,
                         p_out_ctrl, p_out_sp, p_out_tokens,
-                        p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts,
-                        self.num_states, self.num_stack_syms,
+                        p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts, p_vob_buf, p_forbid,
+                        self.num_states, self.num_stack_syms, self.num_inputs,
                         words, batch as i32, vocab as i32,
-                        k, temp, topp, d as i32, stream,
+                        k, temp, topp, seed, d as i32, stream,
                     );
                 }
                 _ => {
@@ -293,6 +304,7 @@ impl PdaPushdownTable {
         stack: &Tensor,
         sp: &Tensor,
         draft: &Tensor,
+        forbid: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dev = ctrl.device();
         let batch = ctrl.dim(0)?;
@@ -310,12 +322,18 @@ impl PdaPushdownTable {
         let p_accept = Self::ptr_u32(&self.accepting)?;
         let p_ctrl_offsets = Self::ptr_u32(&self.ctrl_offsets)?;
         let p_ctrl_counts = Self::ptr_u32(&self.ctrl_counts)?;
+        // The optional anti-loop kick (the anchor-only forbid, the UINT32_MAX
+        // sentinel = no-kick). Null when absent.
+        let p_forbid: *const u32 = match forbid {
+            Some(f) => Self::ptr_u32(f)?,
+            None => std::ptr::null(),
+        };
 
         unsafe {
             ffi::pda_fused_project_masks(
                 p_ctrl, p_stack, p_sp, p_draft, p_out,
-                p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts,
-                self.num_states, self.num_stack_syms,
+                p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts, p_forbid,
+                self.num_states, self.num_stack_syms, self.num_inputs,
                 self.words_per_vob, batch as i32, k as i32, d as i32, stream,
             );
         }
@@ -395,23 +413,28 @@ mod tests {
         ).unwrap();
 
         // CPU reference: from ctrl=0, stack=[0], sp=1.
-        //   Input 1 is allowed (record 0 matches). Greedy picks 1.
-        //   Advance: ctrl 0->1, push 1, sp 1->2.
+        //   The PDA has num_inputs=1, so a=1 is the EPSILON (the a=0 is the only
+        //   terminal). Record 0 is the epsilon move (q=0 --ε--> q=1, push [1]);
+        //   record 1 is the terminal move (q=1 --0--> q=1, push []).
+        //   The epsilon-closure mask at (q=0, top=0): the BFS reaches (q=1, top=1)
+        //   ( the epsilon, where the terminal 0 is allowed. So the mask = {0}.
+        //   Greedy picks token 0 (the only allowed input). Advance: (q=0, [0]) --ε-->
+        //   (q=1, [1]) --0--> (q=1, []) (the pop 1, the push nothing). So sp 1 -> 0.
         let logits = Tensor::from_vec(vec![0.0f32, 5.0, 1.0, 0.0], (1, vocab), &dev).unwrap();
         let ctrl = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
         let stack = Tensor::from_vec(vec![0u32, 0], (1, 2), &dev).unwrap();
         let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
 
         let (out_ctrl, out_sp, out_tok) = table.fused_sample(&
-            &logits, &ctrl, &stack, &sp, &PdaSampling::Greedy,
+            &logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, None, 0,
         ).unwrap();
         let oc = out_ctrl.flatten_all().unwrap().to_vec1::<u32>().unwrap();
         let os = out_sp.flatten_all().unwrap().to_vec1::<u32>().unwrap();
         let ot = out_tok.flatten_all().unwrap().to_vec1::<u32>().unwrap();
 
-        assert_eq!(ot[0], 1, "greedy should pick token 1 (highest allowed logit)");
-        assert_eq!(oc[0], 1, "shift moves ctrl 0 -> 1");
-        assert_eq!(os[0], 1, "push_len=1: pop 1, push 1, sp stays at 1");
+        assert_eq!(ot[0], 0, "greedy picks token 0 (the only allowed input, the mask is bit 0)");
+        assert_eq!(oc[0], 1, "the advance moves ctrl 0 -> 1 (the epsilon + the terminal)");
+        assert_eq!(os[0], 0, "push_len=0: pop 1, push nothing, sp 1 -> 0");
         println!("PDA fused_sample matches CPU reference: tok={} ctrl={} sp={}", ot[0], oc[0], os[0]);
     }
 
@@ -444,10 +467,74 @@ mod tests {
         let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
         let draft = Tensor::from_vec(vec![1u32, 2], (1, 2), &dev).unwrap();
 
-        let out = table.fused_project(&ctrl, &stack, &sp, &draft).unwrap();
+        let out = table.fused_project(&ctrl, &stack, &sp, &draft, None).unwrap();
         let flat = out.flatten_all().unwrap().to_vec1::<u32>().unwrap();
         // K+1 = 3 masks, 1 word each: pos0=ctrl0{1}=2, pos1=ctrl1{2}=4, pos2=ctrl2{}=0
         assert_eq!(flat, vec![2u32, 4, 0], "projected masks must match the per-position control masks");
         println!("PDA fused_project: {:?} (3 positions for a 2-token draft)", flat);
+    }
+
+    /// The anti-loop kick (the optional forbid): the mask {0,1} with the forbid 0
+    /// becomes {1} (the greedy picks 1). The safety floor (the popcount > 1) means
+    /// a single-token mask is NOT kicked (the no dead-end).
+    #[test]
+    fn pda_fused_sample_forbid_kick() {
+        let dev = Device::new_cuda(0).unwrap();
+        let vocab = 4;
+        // the 2-state PDA: the state 0 has two terminal moves (the input 0, the
+        // input 1), both to the state 1 (the accepting). The mask at (0, 0) = {0, 1}.
+        let transitions = vec![
+            0, 0, 0, 1, 0, // record 0: (q=0, a=0, top=0, next=1, push_len=0)
+            0, 1, 0, 1, 0, // record 1: (q=0, a=1, top=0, next=1, push_len=0)
+        ];
+        let table = PdaPushdownTable::upload(
+            transitions, vec![1], 2, 2, 1, 2, 0, 0, 1, &dev,
+        ).unwrap();
+        // the token 0 has the highest logit (the greedy picks 0 without the kick).
+        let logits = Tensor::from_vec(vec![5.0f32, 1.0, 0.0, 0.0], (1, vocab), &dev).unwrap();
+        let ctrl = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
+        let stack = Tensor::from_vec(vec![0u32], (1, 1), &dev).unwrap();
+        let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
+
+        // the no kick (the None): the greedy picks token 0 (the highest allowed logit).
+        let (_, _, tok_none) = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, None, 0).unwrap();
+        assert_eq!(tok_none.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 0, "no kick: the greedy picks token 0");
+
+        // the kick (the forbid token 0): the mask {0,1} -> {1}, the greedy picks token 1.
+        let forbid = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
+        let (_, _, tok_kick) = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, Some(&forbid), 0).unwrap();
+        assert_eq!(tok_kick.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 1, "the kick forbids token 0, the greedy picks token 1");
+
+        // the safety floor: a single-token mask is NOT kicked (the no dead-end).
+        // the PDA with one terminal move (the mask {0}, the popcount 1).
+        let transitions1 = vec![0, 0, 0, 1, 0]; // the record 0: (q=0, a=0, top=0, next=1, push_len=0)
+        let table1 = PdaPushdownTable::upload(
+            transitions1, vec![1], 2, 2, 1, 1, 0, 0, 1, &dev,
+        ).unwrap();
+        let (_, _, tok_floor) = table1.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, Some(&forbid), 0).unwrap();
+        assert_eq!(tok_floor.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 0, "the safety floor: a single-token mask is not kicked (the no dead-end)");
+    }
+
+    // The M1 top-k sampling: the token must be in the masked set (the no illegal
+    // token). The 2-state PDA's mask at (0, 0) is {0, 1}.
+    #[test]
+    fn pda_fused_sample_topk_sampling() {
+        let dev = Device::new_cuda(0).unwrap();
+        let vocab = 4;
+        let transitions = vec![
+            0, 0, 0, 1, 0, // record 0: (q=0, a=0, top=0, next=1, push_len=0)
+            0, 1, 0, 1, 0, // record 1: (q=0, a=1, top=0, next=1, push_len=0)
+        ];
+        let table = PdaPushdownTable::upload(
+            transitions, vec![1], 2, 2, 1, 2, 0, 0, 1, &dev,
+        ).unwrap();
+        let logits = Tensor::from_vec(vec![5.0f32, 1.0, 0.0, 0.0], (1, vocab), &dev).unwrap();
+        let ctrl = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
+        let stack = Tensor::from_vec(vec![0u32], (1, 1), &dev).unwrap();
+        let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
+        let sampling = PdaSampling::TopKTopP { temperature: 1.0, top_k: 2, top_p: 1.0 };
+        let (_, _, tok) = table.fused_sample(&logits, &ctrl, &stack, &sp, &sampling, None, 42).unwrap();
+        let t = tok.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0];
+        assert!(t == 0 || t == 1, "the top-k sample must be in the masked set (0 or 1), got {t}");
     }
 }
