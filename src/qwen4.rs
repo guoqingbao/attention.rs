@@ -15,6 +15,10 @@ fn get_cuda_ptr(t: &Tensor) -> Result<*const std::ffi::c_void> {
             .as_cuda_slice::<half::bf16>()?
             .slice(l.start_offset()..)
             .device_ptr() as *const std::ffi::c_void),
+        (Storage::Cuda(c), DType::F16) => Ok(*c
+            .as_cuda_slice::<half::f16>()?
+            .slice(l.start_offset()..)
+            .device_ptr() as *const std::ffi::c_void),
         (Storage::Cuda(c), DType::F32) => Ok(*c
             .as_cuda_slice::<f32>()?
             .slice(l.start_offset()..)
@@ -25,6 +29,31 @@ fn get_cuda_ptr(t: &Tensor) -> Result<*const std::ffi::c_void> {
             t.device()
         ),
     }
+}
+
+/// Kernel dtype selector: 0 = BF16, 1 = F16, 2 = F32 (matches the extern "C" ABI).
+#[cfg(feature = "cuda")]
+fn dtype_code(dtype: DType) -> Result<i32> {
+    match dtype {
+        DType::BF16 => Ok(0),
+        DType::F16 => Ok(1),
+        DType::F32 => Ok(2),
+        other => candle_core::bail!("qwen4 kernels: unsupported dtype {other:?}"),
+    }
+}
+
+/// All kernel data operands must share one dtype (weights + activations).
+#[cfg(feature = "cuda")]
+fn check_same_dtype(op: &str, dtype: DType, tensors: &[&Tensor]) -> Result<()> {
+    for t in tensors {
+        if t.dtype() != dtype {
+            candle_core::bail!(
+                "qwen4 {op}: dtype mismatch, expected {dtype:?}, got {:?}",
+                t.dtype()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -62,15 +91,24 @@ pub fn hc_read(
         );
     }
     let device = hyper_input.device();
-    let mixed = Tensor::zeros((seq_len, hidden), DType::BF16, device)?;
-    let normed_scratch = Tensor::zeros((seq_len, hc_hidden), DType::BF16, device)?;
+    let dtype = hyper_input.dtype();
+    check_same_dtype(
+        "hc_read",
+        dtype,
+        &[hc_norm_weight, mix_down_weight, mix_up_weight],
+    )?;
+    if let Some(iw) = inject_weight {
+        check_same_dtype("hc_read", dtype, &[iw])?;
+    }
+    let dcode = dtype_code(dtype)?;
+    let mixed = Tensor::zeros((seq_len, hidden), dtype, device)?;
+    let normed_scratch = Tensor::zeros((seq_len, hc_hidden), dtype, device)?;
     let inject = if inject_weight.is_some() {
-        Some(Tensor::zeros((seq_len, hc), DType::BF16, device)?)
+        Some(Tensor::zeros((seq_len, hc), dtype, device)?)
     } else {
         None
     };
     let stream = get_cuda_stream(device)?;
-    let use_combine = if inject_weight.is_some() { 1 } else { 0 };
     let ret = unsafe {
         crate::kernels::ffi::qwen4_hc_read(
             get_cuda_ptr(hyper_input)?,
@@ -93,7 +131,7 @@ pub fn hc_read(
             hidden as i32,
             lowrank as i32,
             eps,
-            use_combine,
+            dcode,
             stream,
         )
     };
@@ -120,7 +158,17 @@ pub fn hc_write(
             hc_hidden
         );
     }
-    let out = Tensor::zeros((seq_len, hc_hidden), DType::BF16, hyper_input.device())?;
+    let out = Tensor::zeros(
+        (seq_len, hc_hidden),
+        hyper_input.dtype(),
+        hyper_input.device(),
+    )?;
+    check_same_dtype(
+        "hc_write",
+        hyper_input.dtype(),
+        &[block_out, inject_weights],
+    )?;
+    let dcode = dtype_code(hyper_input.dtype())?;
     let stream = get_cuda_stream(hyper_input.device())?;
     let ret = unsafe {
         crate::kernels::ffi::qwen4_hc_write(
@@ -131,6 +179,7 @@ pub fn hc_write(
             seq_len as i32,
             hc as i32,
             hidden as i32,
+            dcode,
             stream,
         )
     };
@@ -158,8 +207,28 @@ pub fn qsa_indexer_mask(
 ) -> Result<Tensor> {
     let seq_len = q.dim(0)?;
     let kv_len = raw_keys.dim(0)?;
+    // Kernel scores at most 512 complete blocks (stack-buffer limit), i.e.
+    // 512 * compress_ratio visible tokens (2048 for the reference config) — the
+    // exact token budget of Qwen3.8-Flash-Next. Longer contexts truncate block
+    // scoring to the first 512 blocks (mask application is not wired up yet).
+    if kv_len > 512 * compress_ratio {
+        tracing::warn!(
+            kv_len,
+            max_supported = 512 * compress_ratio,
+            "qwen4 qsa_indexer_mask: context exceeds exact block-scoring range"
+        );
+    }
     let device = q.device();
-    let mask = Tensor::full(f32::NEG_INFINITY, (seq_len, kv_len), device)?;
+    check_same_dtype(
+        "qsa_indexer_mask",
+        q.dtype(),
+        &[raw_keys, q_norm_weight, k_norm_weight],
+    )?;
+    let dcode = dtype_code(q.dtype())?;
+    // NOTE: must be a real dense allocation — `Tensor::full` is a zero-copy
+    // broadcast view over a single scalar, so passing its pointer to the kernel
+    // would write out of bounds. The kernel overwrites every element anyway.
+    let mask = Tensor::zeros((seq_len, kv_len), DType::F32, device)?;
     let score_scale = 1.0 / (head_dim as f32).sqrt();
     let cos_f32 = cos_table.to_dtype(DType::F32)?;
     let sin_f32 = sin_table.to_dtype(DType::F32)?;
@@ -183,6 +252,7 @@ pub fn qsa_indexer_mask(
             score_scale,
             f32::NEG_INFINITY,
             eps,
+            dcode,
             stream,
         )
     };

@@ -2395,6 +2395,76 @@ extern "C" {
         has_bias: bool,
         s: i64,
     );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f32(
+        x: *const f32,
+        z: *const f32,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut f32,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f16(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_bf16(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_bf16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
 
     // Fused L2 norm (last dim)
     pub fn l2_norm_last_dim_f32(
@@ -4512,7 +4582,7 @@ extern "C" {
         hidden: c_int,
         lowrank: c_int,
         eps: f32,
-        use_combine: c_int,
+        dtype: c_int,
         stream: i64,
     ) -> c_int;
 
@@ -4524,6 +4594,7 @@ extern "C" {
         seq_len: c_int,
         hc: c_int,
         hidden: c_int,
+        dtype: c_int,
         stream: i64,
     ) -> c_int;
 
@@ -4545,6 +4616,7 @@ extern "C" {
         score_scale: f32,
         mask_min: f32,
         eps: f32,
+        dtype: c_int,
         stream: i64,
     ) -> c_int;
 

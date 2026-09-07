@@ -1,15 +1,22 @@
 // Qwen4 QSA (Qwen Sparse Attention) indexer mask builder.
 // Reference: Qwen4ExpTextQSAIndexer in HuggingFace modeling_qwen4_exp.py
+//
+// Dtype-generic: BF16 (SM80+), F16 (SM70/75 fallback), F32. All math is
+// done in FP32 after conversion; only the load/store types differ, so no
+// architecture-specific intrinsics are required.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 
 namespace {
 
-__device__ __forceinline__ float bf16_to_f32(__nv_bfloat16 x) {
+__device__ __forceinline__ float qsa_to_f32(__nv_bfloat16 x) {
   return __bfloat162float(x);
 }
+__device__ __forceinline__ float qsa_to_f32(__half x) { return __half2float(x); }
+__device__ __forceinline__ float qsa_to_f32(float x) { return x; }
 
 __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
@@ -29,22 +36,24 @@ __device__ void apply_rope_partial(
   }
 }
 
-__device__ void rms_norm_vec(float* vec, const __nv_bfloat16* weight, int dim, float eps) {
+template <typename T>
+__device__ void rms_norm_vec(float* vec, const T* weight, int dim, float eps) {
   float sum_sq = 0.0f;
   for (int i = 0; i < dim; ++i) sum_sq += vec[i] * vec[i];
   float rms = rsqrtf(sum_sq / (float)dim + eps);
   for (int i = 0; i < dim; ++i) {
-    float w = 1.0f + bf16_to_f32(weight[i]);
+    float w = 1.0f + qsa_to_f32(weight[i]);
     vec[i] = w * vec[i] * rms;
   }
 }
 
 // One block per query position.
+template <typename T>
 __global__ void qwen4_qsa_indexer_mask_kernel(
-    const __nv_bfloat16* q,
-    const __nv_bfloat16* raw_keys,
-    const __nv_bfloat16* q_norm_weight,
-    const __nv_bfloat16* k_norm_weight,
+    const T* q,
+    const T* raw_keys,
+    const T* q_norm_weight,
+    const T* k_norm_weight,
     const float* cos_table,
     const float* sin_table,
     float* mask_out,
@@ -70,7 +79,7 @@ __global__ void qwen4_qsa_indexer_mask_kernel(
   float q_heads[4][128];
   for (int h = 0; h < n_heads; ++h) {
     for (int d = 0; d < head_dim; ++d) {
-      q_heads[h][d] = bf16_to_f32(q[(q_idx * n_heads + h) * head_dim + d]);
+      q_heads[h][d] = qsa_to_f32(q[(q_idx * n_heads + h) * head_dim + d]);
     }
     rms_norm_vec(q_heads[h], q_norm_weight, head_dim, eps);
     apply_rope_partial(q_heads[h], head_dim, rotary_dim,
@@ -88,7 +97,7 @@ __global__ void qwen4_qsa_indexer_mask_kernel(
     for (int t = 0; t < compress_ratio; ++t) {
       int pos = b * compress_ratio + t;
       for (int d = 0; d < head_dim; ++d) {
-        pooled[d] += bf16_to_f32(raw_keys[pos * head_dim + d]);
+        pooled[d] += qsa_to_f32(raw_keys[pos * head_dim + d]);
       }
     }
     for (int d = 0; d < head_dim; ++d) pooled[d] /= (float)compress_ratio;
@@ -147,6 +156,7 @@ __global__ void qwen4_qsa_indexer_mask_kernel(
 
 }  // namespace
 
+// dtype: 0 = BF16, 1 = F16, 2 = F32
 extern "C" int qwen4_qsa_indexer_mask(
     const void* q,
     const void* raw_keys,
@@ -165,18 +175,44 @@ extern "C" int qwen4_qsa_indexer_mask(
     float score_scale,
     float mask_min,
     float eps,
+    int dtype,
     int64_t stream_) {
   if (n_heads > 4 || head_dim > 128 || block_topk > 512) return -2;
+  if (rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim & 1) != 0) return -3;
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_);
-  qwen4_qsa_indexer_mask_kernel<<<seq_len, 1, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(q),
-      static_cast<const __nv_bfloat16*>(raw_keys),
-      static_cast<const __nv_bfloat16*>(q_norm_weight),
-      static_cast<const __nv_bfloat16*>(k_norm_weight),
-      static_cast<const float*>(cos_table),
-      static_cast<const float*>(sin_table),
-      static_cast<float*>(mask_out),
-      seq_len, kv_len, n_heads, head_dim, rotary_dim,
-      compress_ratio, block_topk, score_scale, mask_min, eps);
+  if (dtype == 1) {
+    qwen4_qsa_indexer_mask_kernel<__half><<<seq_len, 1, 0, stream>>>(
+        static_cast<const __half*>(q),
+        static_cast<const __half*>(raw_keys),
+        static_cast<const __half*>(q_norm_weight),
+        static_cast<const __half*>(k_norm_weight),
+        static_cast<const float*>(cos_table),
+        static_cast<const float*>(sin_table),
+        static_cast<float*>(mask_out),
+        seq_len, kv_len, n_heads, head_dim, rotary_dim,
+        compress_ratio, block_topk, score_scale, mask_min, eps);
+  } else if (dtype == 2) {
+    qwen4_qsa_indexer_mask_kernel<float><<<seq_len, 1, 0, stream>>>(
+        static_cast<const float*>(q),
+        static_cast<const float*>(raw_keys),
+        static_cast<const float*>(q_norm_weight),
+        static_cast<const float*>(k_norm_weight),
+        static_cast<const float*>(cos_table),
+        static_cast<const float*>(sin_table),
+        static_cast<float*>(mask_out),
+        seq_len, kv_len, n_heads, head_dim, rotary_dim,
+        compress_ratio, block_topk, score_scale, mask_min, eps);
+  } else {
+    qwen4_qsa_indexer_mask_kernel<__nv_bfloat16><<<seq_len, 1, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q),
+        static_cast<const __nv_bfloat16*>(raw_keys),
+        static_cast<const __nv_bfloat16*>(q_norm_weight),
+        static_cast<const __nv_bfloat16*>(k_norm_weight),
+        static_cast<const float*>(cos_table),
+        static_cast<const float*>(sin_table),
+        static_cast<float*>(mask_out),
+        seq_len, kv_len, n_heads, head_dim, rotary_dim,
+        compress_ratio, block_topk, score_scale, mask_min, eps);
+  }
   return static_cast<int>(cudaGetLastError());
 }
