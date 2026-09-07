@@ -54,7 +54,7 @@ fn main() {
 
     // Warmup.
     for _ in 0..10 {
-        let _ = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy).unwrap();
+        let _ = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, None, 0).unwrap();
     }
     dev.as_cuda_device().unwrap().synchronize().unwrap();
 
@@ -62,7 +62,7 @@ fn main() {
     let iters = 1000;
     let start = Instant::now();
     for _ in 0..iters {
-        let _ = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy).unwrap();
+        let _ = table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, None, 0).unwrap();
     }
     dev.as_cuda_device().unwrap().synchronize().unwrap();
     let elapsed = start.elapsed();
@@ -76,12 +76,12 @@ fn main() {
     let k = 16;
     let drafts = Tensor::zeros((batch, k), DType::U32, &dev).unwrap();
     for _ in 0..10 {
-        let _ = table.fused_project(&ctrl, &stack, &sp, &drafts).unwrap();
+        let _ = table.fused_project(&ctrl, &stack, &sp, &drafts, None).unwrap();
     }
     dev.as_cuda_device().unwrap().synchronize().unwrap();
     let start = Instant::now();
     for _ in 0..iters {
-        let _ = table.fused_project(&ctrl, &stack, &sp, &drafts).unwrap();
+        let _ = table.fused_project(&ctrl, &stack, &sp, &drafts, None).unwrap();
     }
     dev.as_cuda_device().unwrap().synchronize().unwrap();
     let elapsed = start.elapsed();
