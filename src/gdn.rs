@@ -587,6 +587,61 @@ pub fn gated_rmsnorm_silu_mul(
     Ok(out)
 }
 
+/// Sigmoid-gated variant (Qwen4 `output_gate_type = "sigmoid"`).
+/// Metal fallback implemented with Candle ops: rmsnorm(x) * gamma * sigmoid(z).
+#[cfg(feature = "metal")]
+pub fn gated_rmsnorm_sigmoid_mul(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+) -> Result<Tensor> {
+    let x_c = ensure_contiguous(x)?;
+    let (rows, value_dim) = x_c.dims2()?;
+    if group_size == 0 || value_dim % group_size != 0 {
+        candle_core::bail!(
+            "metal gated_rmsnorm_sigmoid_mul invalid group_size={} for value_dim={}",
+            group_size,
+            value_dim
+        );
+    }
+    let num_groups = value_dim / group_size;
+    let xg = x_c
+        .to_dtype(DType::F32)?
+        .reshape((rows, num_groups, group_size))?;
+    let sumsq = xg.sqr()?.sum_keepdim(D::Minus1)?;
+    let inv_rms = (sumsq / group_size as f64 + eps)?.sqrt()?;
+    let normed = xg.broadcast_div(&inv_rms)?;
+    let weight_len = norm_weight.dim(0)?;
+    let normed = if weight_len == group_size {
+        normed.broadcast_mul(&norm_weight.to_dtype(DType::F32)?)?
+    } else {
+        let w = norm_weight
+            .to_dtype(DType::F32)?
+            .reshape((1, num_groups, group_size))?;
+        normed.broadcast_mul(&w)?
+    };
+    let normed = if let Some(b) = norm_bias {
+        if b.dim(0)? == group_size {
+            normed.broadcast_add(&b.to_dtype(DType::F32)?)?
+        } else {
+            let b = b
+                .to_dtype(DType::F32)?
+                .reshape((1, num_groups, group_size))?;
+            normed.broadcast_add(&b)?
+        }
+    } else {
+        normed
+    };
+    let gate = candle_nn::ops::sigmoid(&z.to_dtype(DType::F32)?)?
+        .reshape((rows, num_groups, group_size))?;
+    (normed * gate)?
+        .reshape((rows, value_dim))?
+        .to_dtype(x_c.dtype())
+}
+
 #[cfg(feature = "metal")]
 pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
     let input_c = ensure_contiguous(input)?;
@@ -1450,6 +1505,33 @@ pub fn gated_rmsnorm_silu_mul(
     eps: f64,
     group_size: usize,
 ) -> Result<Tensor> {
+    gated_rmsnorm_gate_mul_impl(x, z, norm_weight, norm_bias, eps, group_size, 0)
+}
+
+/// Sigmoid-gated variant (Qwen4 `output_gate_type = "sigmoid"`):
+/// `out = rmsnorm(x) * gamma * sigmoid(z)`.
+#[cfg(feature = "cuda")]
+pub fn gated_rmsnorm_sigmoid_mul(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+) -> Result<Tensor> {
+    gated_rmsnorm_gate_mul_impl(x, z, norm_weight, norm_bias, eps, group_size, 1)
+}
+
+#[cfg(feature = "cuda")]
+fn gated_rmsnorm_gate_mul_impl(
+    x: &Tensor,
+    z: &Tensor,
+    norm_weight: &Tensor,
+    norm_bias: Option<&Tensor>,
+    eps: f64,
+    group_size: usize,
+    act: i32,
+) -> Result<Tensor> {
     match (x.device(), x.dtype()) {
         (Device::Cuda(dev), DType::F16 | DType::BF16 | DType::F32) => {
             let x_c = x.contiguous()?;
@@ -1519,8 +1601,88 @@ pub fn gated_rmsnorm_silu_mul(
             let eps = eps as f32;
 
             unsafe {
-                match x.dtype() {
-                    DType::F16 => {
+                match (x.dtype(), act) {
+                    (DType::F16, 1) => {
+                        if norm_weight.dtype() == DType::F32 {
+                            ffi::gdn_gated_rmsnorm_sigmoid_mul_f16_wf32(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr as *const f32,
+                                b_ptr as *const f32,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        } else {
+                            ffi::gdn_gated_rmsnorm_sigmoid_mul_f16(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr,
+                                b_ptr,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        }
+                    }
+                    (DType::BF16, 1) => {
+                        if norm_weight.dtype() == DType::F32 {
+                            ffi::gdn_gated_rmsnorm_sigmoid_mul_bf16_wf32(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr as *const f32,
+                                b_ptr as *const f32,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        } else {
+                            ffi::gdn_gated_rmsnorm_sigmoid_mul_bf16(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr,
+                                b_ptr,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        }
+                    }
+                    (DType::F32, 1) => ffi::gdn_gated_rmsnorm_sigmoid_mul_f32(
+                        x_ptr as *const f32,
+                        z_ptr as *const f32,
+                        w_ptr as *const f32,
+                        b_ptr as *const f32,
+                        out_ptr as *mut f32,
+                        rows as c_int,
+                        value_dim as c_int,
+                        group_size as c_int,
+                        eps,
+                        per_group_weights,
+                        bias.is_some(),
+                        stream,
+                    ),
+                    (DType::F16, _) => {
                         if norm_weight.dtype() == DType::F32 {
                             ffi::gdn_gated_rmsnorm_silu_mul_f16_wf32(
                                 x_ptr,
@@ -1553,7 +1715,7 @@ pub fn gated_rmsnorm_silu_mul(
                             )
                         }
                     }
-                    DType::BF16 => {
+                    (DType::BF16, _) => {
                         if norm_weight.dtype() == DType::F32 {
                             ffi::gdn_gated_rmsnorm_silu_mul_bf16_wf32(
                                 x_ptr,
@@ -1586,7 +1748,7 @@ pub fn gated_rmsnorm_silu_mul(
                             )
                         }
                     }
-                    DType::F32 => ffi::gdn_gated_rmsnorm_silu_mul_f32(
+                    (DType::F32, _) => ffi::gdn_gated_rmsnorm_silu_mul_f32(
                         x_ptr as *const f32,
                         z_ptr as *const f32,
                         w_ptr as *const f32,

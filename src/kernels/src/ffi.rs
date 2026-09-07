@@ -2395,6 +2395,76 @@ extern "C" {
         has_bias: bool,
         s: i64,
     );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f32(
+        x: *const f32,
+        z: *const f32,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut f32,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f16(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_bf16(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_f16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_sigmoid_mul_bf16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
 
     // Fused L2 norm (last dim)
     pub fn l2_norm_last_dim_f32(
@@ -4495,6 +4565,58 @@ extern "C" {
         head_dim: c_int,
         compressed_len: c_int,
         score_scale: f32,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn qwen4_hc_read(
+        hyper_input: *const c_void,
+        hc_norm_weight: *const c_void,
+        mix_down_weight: *const c_void,
+        mix_up_weight: *const c_void,
+        inject_weight: *const c_void,
+        mixed_out: *mut c_void,
+        inject_out: *mut c_void,
+        normed_scratch: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        hidden: c_int,
+        lowrank: c_int,
+        eps: f32,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn qwen4_hc_write(
+        hyper_input: *const c_void,
+        block_out: *const c_void,
+        inject_weights: *const c_void,
+        out: *mut c_void,
+        seq_len: c_int,
+        hc: c_int,
+        hidden: c_int,
+        dtype: c_int,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn qwen4_qsa_indexer_mask(
+        q: *const c_void,
+        raw_keys: *const c_void,
+        q_norm_weight: *const c_void,
+        k_norm_weight: *const c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        mask_out: *mut c_void,
+        seq_len: c_int,
+        kv_len: c_int,
+        n_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        compress_ratio: c_int,
+        block_topk: c_int,
+        score_scale: f32,
+        mask_min: f32,
+        eps: f32,
+        dtype: c_int,
         stream: i64,
     ) -> c_int;
 

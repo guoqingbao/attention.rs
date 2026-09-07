@@ -1321,7 +1321,8 @@ __global__ void gated_rmsnorm_silu_mul_kernel(
     int group_size,
     float eps,
     bool per_group_weights,
-    bool has_bias) {
+    bool has_bias,
+    int act) {
     const int row_group = blockIdx.x;
     const int num_groups = value_dim / group_size;
     const int row = row_group / num_groups;
@@ -1383,7 +1384,9 @@ __global__ void gated_rmsnorm_silu_mul_kernel(
         if (has_bias) {
             y += to_float(bias[wb_idx]);
         }
-        float gate = silu_float(to_float(z_group[i]));
+        float zv = to_float(z_group[i]);
+        // act: 0 = silu (Qwen3.5), 1 = sigmoid (Qwen4 output_gate_type=sigmoid)
+        float gate = (act == 1) ? (1.0f / (1.0f + expf(-zv))) : silu_float(zv);
         out_group[i] = from_float<T>(y * gate);
     }
 }
@@ -1401,14 +1404,15 @@ void launch_gated_rmsnorm_silu_mul(
     float eps,
     bool per_group_weights,
     bool has_bias,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int act = 0) {
     if (rows <= 0 || value_dim <= 0 || group_size <= 0 || value_dim % group_size != 0) return;
     constexpr int THREADS = 256;
     const int num_groups = value_dim / group_size;
     dim3 grid(rows * num_groups);
     dim3 block(THREADS);
     gated_rmsnorm_silu_mul_kernel<T, W, THREADS><<<grid, block, 0, stream>>>(
-        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias);
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, act);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -1495,6 +1499,92 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_bf16_wf32(
     cudaStream_t stream) {
     launch_gated_rmsnorm_silu_mul<__nv_bfloat16, float>(
         x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
+}
+
+// Sigmoid-gated variants (Qwen4 output_gate_type=sigmoid)
+extern "C" void gdn_gated_rmsnorm_sigmoid_mul_f32(
+    const float* x,
+    const float* z,
+    const float* gamma,
+    const float* bias,
+    float* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<float, float>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream, 1);
+}
+
+extern "C" void gdn_gated_rmsnorm_sigmoid_mul_f16(
+    const half* x,
+    const half* z,
+    const half* gamma,
+    const half* bias,
+    half* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<half, half>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream, 1);
+}
+
+extern "C" void gdn_gated_rmsnorm_sigmoid_mul_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* z,
+    const __nv_bfloat16* gamma,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<__nv_bfloat16, __nv_bfloat16>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream, 1);
+}
+
+extern "C" void gdn_gated_rmsnorm_sigmoid_mul_f16_wf32(
+    const half* x,
+    const half* z,
+    const float* gamma,
+    const float* bias,
+    half* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<half, float>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream, 1);
+}
+
+extern "C" void gdn_gated_rmsnorm_sigmoid_mul_bf16_wf32(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* z,
+    const float* gamma,
+    const float* bias,
+    __nv_bfloat16* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<__nv_bfloat16, float>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream, 1);
 }
 
 // =============================================================================

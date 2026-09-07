@@ -46,6 +46,7 @@ pub mod mla;
 pub mod mxfp4_linear;
 pub mod nvfp4_linear;
 pub mod ops;
+pub mod qwen4;
 pub mod silu_and_mul;
 pub mod swiglu;
 
