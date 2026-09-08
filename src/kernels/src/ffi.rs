@@ -4858,7 +4858,7 @@ extern "C" {
     pub fn pda_fused_sample_f32(
         logits: *const f32,
         ctrl: *const u32,
-        stack: *const u32,
+        stack: *mut u32,
         sp: *const u32,
         out_ctrl: *mut u32,
         out_sp: *mut u32,
@@ -4886,7 +4886,7 @@ extern "C" {
     pub fn pda_fused_sample_bf16(
         logits: *const core::ffi::c_void,
         ctrl: *const u32,
-        stack: *const u32,
+        stack: *mut u32,
         sp: *const u32,
         out_ctrl: *mut u32,
         out_sp: *mut u32,

@@ -99,11 +99,13 @@ __device__ void advance_pda(
     uint32_t* out_ctrl,
     uint32_t* out_top,
     uint32_t* out_push_len,
+    const uint32_t** out_push_base,
     uint32_t* out_moved)
 {
     *out_ctrl = ctrl;
     *out_top = top;
     *out_push_len = 0;
+    if (out_push_base) *out_push_base = nullptr;
     if (out_moved) *out_moved = 0;
     // the BFS over the (state, top) configs (the epsilon closure).
     const int MAXF = 64;
@@ -125,6 +127,7 @@ __device__ void advance_pda(
                     *out_ctrl = next_q;
                     *out_push_len = push_len;
                     *out_top = (push_len > 0) ? transitions[idx + 5] : ctop;
+                    if (out_push_base) *out_push_base = (push_len > 0) ? (transitions + idx + 5) : nullptr;
                     if (out_moved) *out_moved = 1;
                     return;
                 } else if (a == num_inputs) {
@@ -153,7 +156,7 @@ template <typename T>
 __global__ void pda_fused_sample_kernel(
     const T* __restrict__ logits,
     const uint32_t* __restrict__ ctrl,
-    const uint32_t* __restrict__ stack,
+    uint32_t* __restrict__ stack,
     const uint32_t* __restrict__ sp,
     uint32_t* __restrict__ out_ctrl,
     uint32_t* __restrict__ out_sp,
@@ -284,13 +287,22 @@ __global__ void pda_fused_sample_kernel(
     // the advance (the PDA, the no PDA, the no advance).
     if (ctrl != nullptr) {
         uint32_t next_ctrl, next_top, push_len;
-        advance_pda(transitions, ctrl_u32_offsets, ctrl_counts, num_inputs, c, top, (uint32_t)max_idx, &next_ctrl, &next_top, &push_len, nullptr);
+        const uint32_t* push_base = nullptr;
+        advance_pda(transitions, ctrl_u32_offsets, ctrl_counts, num_inputs, c, top, (uint32_t)max_idx, &next_ctrl, &next_top, &push_len, &push_base, nullptr);
         out_ctrl[seq] = next_ctrl;
         if (out_sp != nullptr) {
             // the stack update: pop 1 (the old top), push push_len (the new symbols).
             uint32_t new_sp = s;
             if (new_sp > 0) new_sp--;
             new_sp += push_len;
+            // write the pushed symbols into the bounded stack buffer (in-place), so
+            // the next step reads the correct top (the no desync).
+            if (stack != nullptr && push_base != nullptr) {
+                uint32_t base_pos = (s > 0) ? s - 1 : 0;
+                for (uint32_t j = 0; j < push_len && base_pos + j < (uint32_t)d; j++) {
+                    stack[(size_t)seq * d + base_pos + j] = push_base[j];
+                }
+            }
             out_sp[seq] = new_sp;
         }
     }
@@ -356,7 +368,7 @@ __global__ void pda_fused_project_kernel(
         // terminal move, matching the CPU project_batch).
         uint32_t tok = draft_row[pos];
         uint32_t next_c, next_top, next_push_len, moved;
-        advance_pda(transitions, ctrl_u32_offsets, ctrl_counts, num_inputs, c, top, tok, &next_c, &next_top, &next_push_len, &moved);
+        advance_pda(transitions, ctrl_u32_offsets, ctrl_counts, num_inputs, c, top, tok, &next_c, &next_top, &next_push_len, nullptr, &moved);
         if (!moved) break; // the draft diverged (the no transition)
         c = next_c;
         top = next_top;
@@ -367,7 +379,7 @@ extern "C" {
 
 void pda_fused_sample_f32(
     const float* logits,
-    const uint32_t* ctrl, const uint32_t* stack, const uint32_t* sp,
+    const uint32_t* ctrl, uint32_t* stack, const uint32_t* sp,
     uint32_t* out_ctrl, uint32_t* out_sp, uint32_t* out_tokens,
     const uint32_t* transitions, const uint32_t* accepting,
     const uint32_t* ctrl_u32_offsets, const uint32_t* ctrl_counts,
@@ -393,7 +405,7 @@ void pda_fused_sample_f32(
 
 void pda_fused_sample_bf16(
     const void* logits,
-    const uint32_t* ctrl, const uint32_t* stack, const uint32_t* sp,
+    const uint32_t* ctrl, uint32_t* stack, const uint32_t* sp,
     uint32_t* out_ctrl, uint32_t* out_sp, uint32_t* out_tokens,
     const uint32_t* transitions, const uint32_t* accepting,
     const uint32_t* ctrl_u32_offsets, const uint32_t* ctrl_counts,
