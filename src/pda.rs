@@ -238,7 +238,7 @@ impl PdaPushdownTable {
         let vob_buf = Tensor::zeros((batch * words as usize,), DType::U32, &dev)?;
 
         let p_ctrl = Self::ptr_u32(ctrl)?;
-        let p_stack = Self::ptr_u32(stack)?;
+        let p_stack = Self::ptr_u32_mut(stack)?;
         let p_sp = Self::ptr_u32(sp)?;
         let p_out_ctrl = Self::ptr_u32_mut(&out_ctrl)?;
         let p_out_sp = Self::ptr_u32_mut(&out_sp)?;
@@ -536,5 +536,58 @@ mod tests {
         let (_, _, tok) = table.fused_sample(&logits, &ctrl, &stack, &sp, &sampling, None, 42).unwrap();
         let t = tok.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0];
         assert!(t == 0 || t == 1, "the top-k sample must be in the masked set (0 or 1), got {t}");
+    }
+
+    /// Cross-step stack sync: the PDA's first move PUSHES a symbol (push_len=1).
+    /// The kernel must write it into the bounded stack buffer in-place, so the
+    /// NEXT step reads the correct top. Without the fix, step 2 reads a stale top
+    /// (0), its mask is empty, and greedy falls back to token 0 (the desync).
+    #[test]
+    fn pda_fused_sample_cross_step_stack_sync() {
+        let dev = Device::new_cuda(0).unwrap();
+        let vocab = 2;
+        //   record 0: (q=0, a=1, top=0, next=1, push_len=1, push=[7])  -> pushes 7
+        //   record 1: (q=1, a=1, top=7, next=1, push_len=0)          -> pop only
+        let transitions = vec![
+            0, 1, 0, 1, 1, 7, // record 0
+            1, 1, 7, 1, 0,    // record 1
+        ];
+        let table = PdaPushdownTable::upload(
+            transitions,
+            vec![1], // accepting
+            2,       // num_states
+            2,       // num_inputs
+            8,       // num_stack_syms (7 is a valid stack symbol)
+            2,       // num_transitions
+            0,       // start_state
+            0,       // start_stack
+            4,       // max_stack_depth
+            &dev,
+        ).unwrap();
+
+        let logits = Tensor::from_vec(vec![0.0f32, 5.0], (1, vocab), &dev).unwrap(); // greedy -> 1
+        let ctrl = Tensor::from_vec(vec![0u32], (1,), &dev).unwrap();
+        let stack = Tensor::from_vec(vec![0u32, 0, 0, 0], (1, 4), &dev).unwrap();
+        let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
+
+        // Step 1: (ctrl=0, top=stack[0]=0) --input 1--> push [7]. sp 1 -> 1, stack[0] = 7.
+        let (out_ctrl, out_sp, out_tok) =
+            table.fused_sample(&logits, &ctrl, &stack, &sp, &PdaSampling::Greedy, None, 0).unwrap();
+        assert_eq!(out_tok.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 1, "step 1 greedy picks input 1");
+        assert_eq!(out_ctrl.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 1, "step 1 ctrl 0 -> 1");
+        assert_eq!(out_sp.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 1, "step 1 sp stays 1 (pop 1, push 1)");
+        // THE SYNC ASSERTION: the kernel wrote push[0]=7 into stack[0] (the new top).
+        let stack_after1 = stack.to_device(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(stack_after1[0], 7, "stack[0] must hold the pushed symbol 7 (the no desync)");
+
+        // Step 2: (ctrl=1, top=stack[0]=7) --input 1--> pop (push_len 0). sp 1 -> 0.
+        // If step 1 had NOT synced the stack, top would read 0, the mask at (1, top=0)
+        // is empty, and greedy would fall back to token 0 (the desync symptom).
+        let (out_ctrl2, out_sp2, out_tok2) =
+            table.fused_sample(&logits, &out_ctrl, &stack, &out_sp, &PdaSampling::Greedy, None, 0).unwrap();
+        assert_eq!(out_tok2.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 1, "step 2 reads the synced top=7 and picks input 1");
+        assert_eq!(out_sp2.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 0, "step 2 sp 1 -> 0 (pop, no push)");
+        let _ = out_ctrl2;
+        println!("PDA fused_sample cross-step stack sync OK");
     }
 }
