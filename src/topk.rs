@@ -5,6 +5,27 @@ use candle_core::backend::BackendStorage;
 use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
+#[cfg(feature = "metal")]
+use metal_kernels;
+
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+struct MetalTensorSlice {
+    storage: candle_core::MetalStorage,
+    offset_in_bytes: usize,
+}
+
+#[cfg(feature = "metal")]
+fn get_metal_slice(tensor: &Tensor) -> Result<MetalTensorSlice> {
+    let (storage, layout) = tensor.storage_and_layout();
+    match &*storage {
+        candle::Storage::Metal(storage) => Ok(MetalTensorSlice {
+            storage: storage.clone(),
+            offset_in_bytes: layout.start_offset() * tensor.dtype().size_in_bytes(),
+        }),
+        _ => candle::bail!("expected a Metal tensor"),
+    }
+}
 
 #[cfg(feature = "cuda")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
@@ -197,6 +218,43 @@ pub fn topk_select(scores: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     Ok((topk_weights, topk_indices))
 }
 
+#[cfg(feature = "metal")]
+pub fn topk_select(scores: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
+    let (num_tokens, num_experts) = scores.dims2()?;
+    if scores.dtype() != DType::F32 {
+        candle::bail!("topk_select only accepts f32 inputs");
+    }
+    if num_tokens == 0 || num_experts == 0 || topk == 0 || topk > num_experts || topk > 32 {
+        candle::bail!(
+            "Metal DFlash2 topk_select requires 1 <= topk <= min(num_experts, 32), got topk={} and num_experts={}",
+            topk,
+            num_experts
+        );
+    }
+
+    let scores = scores.contiguous()?;
+    let topk_weights = Tensor::zeros((num_tokens, topk), DType::F32, scores.device())?;
+    let topk_indices = Tensor::zeros((num_tokens, topk), DType::U32, scores.device())?;
+    let scores_m = get_metal_slice(&scores)?;
+    let weights_m = get_metal_slice(&topk_weights)?;
+    let indices_m = get_metal_slice(&topk_indices)?;
+    let dev = scores_m.storage.device();
+    let command_buffer = dev.command_buffer()?;
+    command_buffer.set_label("dflash-topk-select");
+    metal_kernels::call_dflash_topk_select(
+        dev.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        (scores_m.storage.buffer(), scores_m.offset_in_bytes),
+        weights_m.storage.buffer(),
+        indices_m.storage.buffer(),
+        num_tokens as u32,
+        num_experts as u32,
+        topk as u32,
+    )?;
+    Ok((topk_weights, topk_indices))
+}
+
 /// Fused DFlash2 candidate-path selection.
 ///
 /// Scores and walks the K-way candidate lattice on device. The selected path
@@ -302,6 +360,69 @@ pub fn dflash_select_candidates(
         candle::Storage::Cuda(selected_tokens),
         candle::Shape::from(sequence_len),
     )
+}
+
+#[cfg(feature = "metal")]
+pub fn dflash_select_candidates(
+    hidden: &Tensor,
+    unary_logits: &Tensor,
+    candidate_ids: &Tensor,
+    predecessor_codebook: &Tensor,
+    successor_codebook: &Tensor,
+    anchor_token: &Tensor,
+) -> Result<Tensor> {
+    let (sequence_len, rank) = hidden.dims2()?;
+    let (candidate_rows, topk) = unary_logits.dims2()?;
+    if candidate_rows != sequence_len || candidate_ids.dims2()? != (sequence_len, topk) {
+        candle::bail!("DFlash2 candidate selector input shape mismatch");
+    }
+    if predecessor_codebook.dims2()?.1 != rank || successor_codebook.dims2()?.1 != rank {
+        candle::bail!("DFlash2 codebook rank does not match hidden projection");
+    }
+    if anchor_token.dims1()? != 1 {
+        candle::bail!("DFlash2 anchor token must have shape [1]");
+    }
+    if sequence_len == 0 || rank == 0 || topk == 0 || topk > 32 {
+        candle::bail!("Metal DFlash2 candidate selector requires 1 <= topk <= 32");
+    }
+
+    let hidden = hidden.to_dtype(DType::F32)?.contiguous()?;
+    let unary_logits = unary_logits.to_dtype(DType::F32)?.contiguous()?;
+    let candidate_ids = candidate_ids.to_dtype(DType::U32)?.contiguous()?;
+    let predecessor_codebook = predecessor_codebook.to_dtype(DType::F32)?.contiguous()?;
+    let successor_codebook = successor_codebook.to_dtype(DType::F32)?.contiguous()?;
+    let anchor_token = anchor_token.to_dtype(DType::U32)?.contiguous()?;
+    let selected_tokens = Tensor::zeros(sequence_len, DType::U32, hidden.device())?;
+
+    let hidden_m = get_metal_slice(&hidden)?;
+    let unary_m = get_metal_slice(&unary_logits)?;
+    let ids_m = get_metal_slice(&candidate_ids)?;
+    let predecessor_m = get_metal_slice(&predecessor_codebook)?;
+    let successor_m = get_metal_slice(&successor_codebook)?;
+    let anchor_m = get_metal_slice(&anchor_token)?;
+    let selected_m = get_metal_slice(&selected_tokens)?;
+    let dev = hidden_m.storage.device();
+    let command_buffer = dev.command_buffer()?;
+    command_buffer.set_label("dflash-select-candidates");
+    metal_kernels::call_dflash_select_candidates(
+        dev.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        (hidden_m.storage.buffer(), hidden_m.offset_in_bytes),
+        (unary_m.storage.buffer(), unary_m.offset_in_bytes),
+        (ids_m.storage.buffer(), ids_m.offset_in_bytes),
+        (
+            predecessor_m.storage.buffer(),
+            predecessor_m.offset_in_bytes,
+        ),
+        (successor_m.storage.buffer(), successor_m.offset_in_bytes),
+        (anchor_m.storage.buffer(), anchor_m.offset_in_bytes),
+        selected_m.storage.buffer(),
+        sequence_len as u32,
+        rank as u32,
+        topk as u32,
+    )?;
+    Ok(selected_tokens)
 }
 
 /// Fused BF16 grouped dynamic depthwise convolution used by DFlash2.
@@ -444,6 +565,89 @@ pub fn dflash_grouped_conv_f16(
     )
 }
 
+#[cfg(feature = "metal")]
+fn dflash_grouped_conv_metal(
+    hidden: &Tensor,
+    delta: &Tensor,
+    base_kernel: &Tensor,
+    block_size: usize,
+    side: usize,
+    expected_dtype: DType,
+) -> Result<Tensor> {
+    let (sequence_len, hidden_size) = hidden.dims2()?;
+    let (delta_len, taps, num_groups) = delta.dims3()?;
+    let (base_sides, base_taps, base_hidden) = base_kernel.dims3()?;
+    if hidden.dtype() != expected_dtype
+        || delta.dtype() != expected_dtype
+        || base_kernel.dtype() != expected_dtype
+        || delta_len != sequence_len
+        || base_sides != 2
+        || base_taps != taps
+        || base_hidden != hidden_size
+        || side > 1
+        || num_groups == 0
+        || sequence_len == 0
+        || hidden_size == 0
+        || taps == 0
+        || hidden_size % num_groups != 0
+        || block_size == 0
+    {
+        candle::bail!("invalid Metal DFlash2 grouped convolution shapes or dtypes");
+    }
+
+    let hidden = hidden.contiguous()?;
+    let delta = delta.contiguous()?;
+    let base_kernel = base_kernel.contiguous()?;
+    let output = Tensor::zeros((sequence_len, hidden_size), expected_dtype, hidden.device())?;
+    let hidden_m = get_metal_slice(&hidden)?;
+    let delta_m = get_metal_slice(&delta)?;
+    let base_m = get_metal_slice(&base_kernel)?;
+    let output_m = get_metal_slice(&output)?;
+    let dev = hidden_m.storage.device();
+    let command_buffer = dev.command_buffer()?;
+    command_buffer.set_label("dflash-grouped-conv");
+    metal_kernels::call_dflash_grouped_conv(
+        dev.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        expected_dtype,
+        (hidden_m.storage.buffer(), hidden_m.offset_in_bytes),
+        (delta_m.storage.buffer(), delta_m.offset_in_bytes),
+        (base_m.storage.buffer(), base_m.offset_in_bytes),
+        output_m.storage.buffer(),
+        sequence_len as u32,
+        hidden_size as u32,
+        num_groups as u32,
+        (hidden_size / num_groups) as u32,
+        taps as u32,
+        block_size as u32,
+        side as u32,
+    )?;
+    Ok(output)
+}
+
+#[cfg(feature = "metal")]
+pub fn dflash_grouped_conv_bf16(
+    hidden: &Tensor,
+    delta: &Tensor,
+    base_kernel: &Tensor,
+    block_size: usize,
+    side: usize,
+) -> Result<Tensor> {
+    dflash_grouped_conv_metal(hidden, delta, base_kernel, block_size, side, DType::BF16)
+}
+
+#[cfg(feature = "metal")]
+pub fn dflash_grouped_conv_f16(
+    hidden: &Tensor,
+    delta: &Tensor,
+    base_kernel: &Tensor,
+    block_size: usize,
+    side: usize,
+) -> Result<Tensor> {
+    dflash_grouped_conv_metal(hidden, delta, base_kernel, block_size, side, DType::F16)
+}
+
 /// Dispatch fused DFlash2 grouped convolution by the input tensor dtype.
 #[cfg(feature = "cuda")]
 pub fn dflash_grouped_conv(
@@ -473,6 +677,21 @@ pub fn dflash_grouped_conv(
     }
 }
 
+#[cfg(feature = "metal")]
+pub fn dflash_grouped_conv(
+    hidden: &Tensor,
+    delta: &Tensor,
+    base_kernel: &Tensor,
+    block_size: usize,
+    side: usize,
+) -> Result<Tensor> {
+    match hidden.dtype() {
+        DType::BF16 => dflash_grouped_conv_bf16(hidden, delta, base_kernel, block_size, side),
+        DType::F16 => dflash_grouped_conv_f16(hidden, delta, base_kernel, block_size, side),
+        dtype => candle::bail!("DFlash2 grouped convolution does not support {dtype:?}"),
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     let routing_weights = candle_nn::ops::softmax_last_dim(&logits)?;
@@ -483,4 +702,86 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
 
     let scores = routing_weights.gather(&indices, candle::D::Minus1)?;
     Ok((scores, indices))
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn dflash_topk_select_orders_scores_and_ties() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let scores = Tensor::from_slice(
+            &[1.0f32, 3.0, 2.0, 4.0, 5.0, 5.0, 1.0, 0.0],
+            (2, 4),
+            &device,
+        )?;
+        let (weights, indices) = topk_select(&scores, 2)?;
+        assert_eq!(
+            weights.to_vec2::<f32>()?,
+            vec![vec![4.0, 3.0], vec![5.0, 5.0]]
+        );
+        assert_eq!(indices.to_vec2::<u32>()?, vec![vec![3, 1], vec![0, 1]]);
+        Ok(())
+    }
+
+    #[test]
+    fn dflash_candidate_selection_walks_previous_tokens() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let hidden = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0], (2, 2), &device)?;
+        let unary = Tensor::zeros((2, 2), DType::F32, &device)?;
+        let candidate_ids = Tensor::from_slice(&[1u32, 2, 2, 3], (2, 2), &device)?;
+        let predecessor = Tensor::from_slice(
+            &[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            (4, 2),
+            &device,
+        )?;
+        let successor = Tensor::from_slice(
+            &[0.0f32, 0.0, 2.0, 0.0, 1.0, 3.0, 1.0, 2.0],
+            (4, 2),
+            &device,
+        )?;
+        let anchor = Tensor::from_slice(&[0u32], 1, &device)?;
+        let selected = dflash_select_candidates(
+            &hidden,
+            &unary,
+            &candidate_ids,
+            &predecessor,
+            &successor,
+            &anchor,
+        )?;
+        assert_eq!(selected.to_vec1::<u32>()?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn dflash_grouped_conv_respects_block_boundaries() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let hidden = Tensor::from_slice(
+            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            (4, 2),
+            &device,
+        )?
+        .to_dtype(DType::F16)?;
+        let delta = Tensor::zeros((4, 2, 1), DType::F16, &device)?;
+        let base_kernel = Tensor::from_slice(
+            &[1.0f32, 1.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0],
+            (2, 2, 2),
+            &device,
+        )?
+        .to_dtype(DType::F16)?;
+        let output =
+            dflash_grouped_conv(&hidden, &delta, &base_kernel, 2, 0)?.to_dtype(DType::F32)?;
+        assert_eq!(
+            output.to_vec2::<f32>()?,
+            vec![
+                vec![1.0, 2.0],
+                vec![5.0, 8.0],
+                vec![5.0, 6.0],
+                vec![17.0, 20.0]
+            ]
+        );
+        Ok(())
+    }
 }

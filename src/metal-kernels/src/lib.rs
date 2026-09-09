@@ -4347,3 +4347,159 @@ pub fn call_mlx_nvfp4_dequant_embedding(
     encoder.dispatch_thread_groups(gc, tg);
     Ok(())
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_dflash_topk_select(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    scores: (&Buffer, usize),
+    topk_weights: &Buffer,
+    topk_indices: &Buffer,
+    num_rows: u32,
+    num_experts: u32,
+    topk: u32,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, "dflash_topk_select_float".to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            scores,
+            topk_weights,
+            topk_indices,
+            num_rows,
+            num_experts,
+            topk
+        )
+    );
+
+    let thread_groups_count = MTLSize {
+        width: num_rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_dflash_select_candidates(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    hidden: (&Buffer, usize),
+    unary_logits: (&Buffer, usize),
+    candidate_ids: (&Buffer, usize),
+    predecessor_codebook: (&Buffer, usize),
+    successor_codebook: (&Buffer, usize),
+    anchor_token: (&Buffer, usize),
+    selected_tokens: &Buffer,
+    sequence_len: u32,
+    rank: u32,
+    topk: u32,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, "dflash_select_candidates_float".to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            hidden,
+            unary_logits,
+            candidate_ids,
+            predecessor_codebook,
+            successor_codebook,
+            anchor_token,
+            selected_tokens,
+            sequence_len,
+            rank,
+            topk
+        )
+    );
+
+    let thread_groups_count = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_dflash_grouped_conv(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    hidden: (&Buffer, usize),
+    delta: (&Buffer, usize),
+    base_kernel: (&Buffer, usize),
+    output: &Buffer,
+    sequence_len: u32,
+    hidden_size: u32,
+    num_groups: u32,
+    group_size: u32,
+    taps: u32,
+    block_size: u32,
+    side: u32,
+) -> Result<(), MetalKernelError> {
+    let name = match ty {
+        DType::F16 => "dflash_grouped_conv_half",
+        DType::BF16 => "dflash_grouped_conv_bfloat16_t",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, name.to_string())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            hidden,
+            delta,
+            base_kernel,
+            output,
+            sequence_len,
+            hidden_size,
+            num_groups,
+            group_size,
+            taps,
+            block_size,
+            side
+        )
+    );
+
+    let total = sequence_len as u64 * hidden_size as u64;
+    let thread_group_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: (total + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
+    Ok(())
+}
