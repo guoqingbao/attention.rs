@@ -611,7 +611,7 @@ pub fn gated_rmsnorm_sigmoid_mul(
     let xg = x_c
         .to_dtype(DType::F32)?
         .reshape((rows, num_groups, group_size))?;
-    let sumsq = xg.sqr()?.sum_keepdim(D::Minus1)?;
+    let sumsq = xg.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
     let inv_rms = (sumsq / group_size as f64 + eps)?.sqrt()?;
     let normed = xg.broadcast_div(&inv_rms)?;
     let weight_len = norm_weight.dim(0)?;
