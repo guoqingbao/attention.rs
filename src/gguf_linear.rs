@@ -5,7 +5,9 @@
 //! numeric contract than Q8_1 `vec_dot`. This module keeps IQ weights packed
 //! and calls the native `gguf_gemm` kernel.
 use candle_core::quantized::{GgmlDType, QTensor};
-use candle_core::{DType, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::DType;
+use candle_core::{Result, Tensor};
 
 /// IQ GGUF dtypes that should use [`gguf_iq_matmul`] instead of Candle `QMatMul`.
 pub fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
@@ -23,6 +25,7 @@ pub fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
     )
 }
 
+#[cfg(feature = "cuda")]
 fn iq_gguf_dtype_code(dtype: GgmlDType) -> Result<i32> {
     Ok(match dtype {
         GgmlDType::IQ2_XXS => 6,

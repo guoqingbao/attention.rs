@@ -1,6 +1,8 @@
 //! Qwen4-Exp kernels: Gated Residual (Hyper-Connection) and QSA indexer.
 
-use candle_core::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::{DType, Device};
+use candle_core::{Result, Tensor};
 
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;

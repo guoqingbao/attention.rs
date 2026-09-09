@@ -251,7 +251,8 @@ pub fn topk_select(scores: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         num_tokens as u32,
         num_experts as u32,
         topk as u32,
-    )?;
+    )
+    .map_err(candle_core::Error::wrap)?;
     Ok((topk_weights, topk_indices))
 }
 
@@ -421,7 +422,8 @@ pub fn dflash_select_candidates(
         sequence_len as u32,
         rank as u32,
         topk as u32,
-    )?;
+    )
+    .map_err(candle_core::Error::wrap)?;
     Ok(selected_tokens)
 }
 
@@ -622,7 +624,8 @@ fn dflash_grouped_conv_metal(
         taps as u32,
         block_size as u32,
         side as u32,
-    )?;
+    )
+    .map_err(candle_core::Error::wrap)?;
     Ok(output)
 }
 

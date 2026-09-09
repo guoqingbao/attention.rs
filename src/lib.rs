@@ -385,7 +385,7 @@ impl PagedAttention {
         feature = "flash",
         feature = "flashattn",
         feature = "flashinfer",
-        feature = "metal"
+        feature = "metal-flash"
     ))]
     fn packed_qkv(
         query: &Tensor,

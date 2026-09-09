@@ -3,7 +3,9 @@
 //! Codebook `{−4,−1,+1,+4}` (codes 0..3). Packers match vLLM-Moet; device
 //! unpack emits row-major e4m3 + F32 UE8M0 block-32 scales for `moe_gemm_fp8`.
 
-use candle_core::{Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::Device;
+use candle_core::{Result, Tensor};
 
 /// PRMT LUT word (LE bytes = e4m3 encodings of {-4,-1,+1,+4}).
 pub const PRMT_LUT_WORD: u32 = 0x4838_B8C8;
