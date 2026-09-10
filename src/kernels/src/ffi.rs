@@ -932,6 +932,36 @@ extern "C" {
         stream: i64,
     );
 
+    // Per-sequence sampling (the additive path, the QoS-gated): the temperature / top_p /
+    // top_k are per-batch-row device tensors (the [B]), so each sequence samples with its
+    // own strategy. The existing single-strategy entries are unchanged.
+    pub fn sampling_perseq_f32(
+        logits_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        temperature_d: *const f32, // [B]
+        top_p_d: *const f32,       // [B]
+        top_k_d: *const u32,       // [B]
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_perseq_masked_f32(
+        logits_d: *const f32,
+        mask_d: *const f32, // [B,V] 1.0=legal 0.0=illegal, or null
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        temperature_d: *const f32, // [B]
+        top_p_d: *const f32,       // [B]
+        top_k_d: *const u32,       // [B]
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
     // Fused Rotary Position Embedding (RoPE) kernels - with position selection
     // Non-interleaved versions - support GQA, fuses index_select
     pub fn fused_rope_f32(

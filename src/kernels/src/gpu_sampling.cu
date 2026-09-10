@@ -166,6 +166,68 @@ __global__ void stageA_local_topk(
   }
 }
 
+// Per-sequence variant (the additive path, the QoS-gated): the temperature is a
+// per-batch-row tensor (the temperature_d[b]), so each sequence samples with its
+// own temperature. The existing stageA_local_topk (the single shared temperature)
+// is unchanged.
+template<int K, int BLOCK_THREADS, int ITEMS_PER_THREAD, typename T>
+__global__ void stageA_local_topk_perseq(
+    const T* __restrict__ logits, // [B,V]
+    const float* __restrict__ mask, // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int B, int V,
+    const float* __restrict__ temperature_d, // [B] per-seq temperature
+    int tiles_per_row,
+    float* __restrict__ out_vals,      // [B, tiles, K]
+    int* __restrict__ out_idx          // [B, tiles, K]
+) {
+  int b = blockIdx.x;
+  int tile = blockIdx.y;
+  if (b >= B) return;
+
+  constexpr int CHUNK = BLOCK_THREADS * ITEMS_PER_THREAD;
+  int base = tile * CHUNK;
+
+  const T* row = logits + (size_t)b * (size_t)V;
+  const float* mrow = mask ? (mask + (size_t)b * (size_t)V) : nullptr;
+
+  float temperature = temperature_d[b];
+  float invT = (temperature > 1e-6f) ? (1.0f / temperature) : 1e6f;
+
+  float v[ITEMS_PER_THREAD];
+  int   i[ITEMS_PER_THREAD];
+
+  #pragma unroll
+  for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+    int idx = base + threadIdx.x + it * BLOCK_THREADS;
+    if (idx < V) {
+      float scaled = to_float(row[idx]) * invT;
+      if (mrow != nullptr && mrow[idx] == 0.0f)
+        scaled = -CUDART_INF_F;
+      v[it] = scaled;
+      i[it] = idx;
+    } else {
+      v[it] = -CUDART_INF_F;
+      i[it] = -1;
+    }
+  }
+
+  using BlockSort = cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+  __shared__ typename BlockSort::TempStorage temp;
+  BlockSort(temp).SortDescending(v, i);
+  __syncthreads();
+
+  int out_base = (b * tiles_per_row + tile) * K;
+
+  #pragma unroll
+  for (int it = 0; it < ITEMS_PER_THREAD; ++it) {
+    int rank = threadIdx.x + it * BLOCK_THREADS;
+    if (rank < K) {
+      out_vals[out_base + rank] = v[it];
+      out_idx[out_base + rank]  = i[it];
+    }
+  }
+}
+
 // VOB variant: [B, V/32] U32 bitset instead of [B,V] F32 mask.
 // Bit i set = token allowed. 8x less data, bitwise AND instead of float compare.
 template<int K, int BLOCK_THREADS, int ITEMS_PER_THREAD, typename T>
@@ -342,6 +404,114 @@ __global__ void stageB_reduce_and_sample(
   }
 }
 
+// Per-sequence variant (the additive path, the QoS-gated): the top_p and top_k are
+// per-batch-row tensors (the top_p_d[b], the top_k_d[b]), so each sequence samples
+// with its own top-p / top-k. The existing stageB_reduce_and_sample (the single
+// shared top_p / top_k) is unchanged.
+template<int K, int BLOCK_THREADS>
+__global__ void stageB_reduce_and_sample_perseq(
+    int B,
+    int tiles_per_row,
+    const float* __restrict__ tile_vals, // [B, tiles, K] sorted desc per tile
+    const int* __restrict__ tile_idx,    // [B, tiles, K]
+    const float* __restrict__ top_p_d,   // [B] per-seq top_p
+    const unsigned int* __restrict__ top_k_d, // [B] per-seq top_k
+    uint64_t seed,
+    uint64_t token_pos,
+    int* __restrict__ out_tokens         // [B]
+) {
+  int b = blockIdx.x;
+  if (b >= B) return;
+  int tid = threadIdx.x;
+
+  __shared__ float topv[K];
+  __shared__ int   topi[K];
+  __shared__ float tmpv[K];
+  __shared__ int   tmpi[K];
+
+  for (int t = tid; t < K; t += BLOCK_THREADS) {
+    topv[t] = -CUDART_INF_F;
+    topi[t] = -1;
+  }
+  __syncthreads();
+
+  for (int tile = 0; tile < tiles_per_row; ++tile) {
+    const int base = (b * tiles_per_row + tile) * K;
+    for (int t = tid; t < K; t += BLOCK_THREADS) {
+      tmpv[t] = tile_vals[base + t];
+      tmpi[t] = tile_idx [base + t];
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float outV[K];
+      int   outI[K];
+      merge_topk_desc_safe<K>(topv, topi, tmpv, tmpi, outV, outI);
+      #pragma unroll
+      for (int t = 0; t < K; ++t) { topv[t] = outV[t]; topi[t] = outI[t]; }
+    }
+    __syncthreads();
+  }
+
+  int top_k = top_k_d[b];
+  float top_p = top_p_d[b];
+  int k_eff = top_k > 0 ? (top_k < K ? top_k : K) : K;
+  if (k_eff < 1) k_eff = 1;
+
+  __shared__ float probs[K];
+  if (tid == 0) {
+    float mx = topv[0];
+    #pragma unroll
+    for (int t = 1; t < K; ++t) {
+      if (t < k_eff) {
+        mx = fmaxf(mx, topv[t]);
+      }
+    }
+
+    double sum_d = 0.0;
+    #pragma unroll
+    for (int t = 0; t < K; ++t) {
+      if (t < k_eff) {
+        float e = expf(topv[t] - mx);
+        probs[t] = e;
+        sum_d += (double)e;
+      } else {
+        probs[t] = 0.0f;
+      }
+    }
+    float sum = fmaxf((float)sum_d, 1e-20f);
+    #pragma unroll
+    for (int t = 0; t < K; ++t) probs[t] /= sum;
+
+    int cutoff = k_eff;
+    if (top_p > 0.0f && top_p < 1.0f) {
+      double cum = 0.0;
+      for (int t = 0; t < K; ++t) {
+        cum += (double)probs[t];
+        if (cum >= (double)top_p) { cutoff = t + 1; break; }
+      }
+    }
+
+    float psum = 0.0f;
+    for (int t = 0; t < cutoff; ++t) psum += probs[t];
+    psum = fmaxf(psum, 1e-20f);
+
+    uint2 key = make_uint2((uint32_t)(seed ^ (0x9E3779B97f4A7C15ULL + (uint64_t)b)),
+                           (uint32_t)((seed >> 32) + 0xD1B54A32D192ED03ULL));
+    uint4 ctr = make_uint4((uint32_t)token_pos, (uint32_t)(token_pos >> 32),
+                           (uint32_t)b, 0x12345678u);
+    uint4 r = philox4x32_10(key, ctr);
+    float u = u01_from_u32(r.x);
+
+    float acc = 0.0f;
+    int picked = topi[0];
+    for (int t = 0; t < cutoff; ++t) {
+      acc += probs[t] / psum;
+      if (u <= acc) { picked = topi[t]; break; }
+    }
+    out_tokens[b] = picked;
+  }
+}
+
 template<int K, typename T>
 void gpu_topk_topp_sample(
     const T* logits_d,
@@ -410,6 +580,50 @@ template void gpu_topk_topp_sample<32, __nv_bfloat16>(const __nv_bfloat16*, cons
 template void gpu_topk_topp_sample<64, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
 template void gpu_topk_topp_sample<128, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
 template void gpu_topk_topp_sample<256, __nv_bfloat16>(const __nv_bfloat16*, const float*, int*, const SamplerParams&, cudaStream_t);
+#endif
+
+ // Per-sequence launcher (the additive path, the QoS-gated): the temperature / top_p /
+// top_k are per-batch-row tensors (the SamplerParamsPerSeq), so each sequence samples
+// with its own strategy. The existing gpu_topk_topp_sample (the single shared strategy)
+// is unchanged.
+template<int K, typename T>
+void gpu_topk_topp_sample_perseq(
+    const T* logits_d,
+    const float* mask_d,   // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int* out_tokens_d,
+    const SamplerParamsPerSeq& p,
+    cudaStream_t stream
+) {
+  constexpr int BLOCK_THREADS = 256;
+  constexpr int ITEMS_PER_THREAD = 4;
+  constexpr int CHUNK = BLOCK_THREADS * ITEMS_PER_THREAD;
+  int tiles = (p.V + CHUNK - 1) / CHUNK;
+  float* tile_vals_d = nullptr;
+  int*   tile_idx_d  = nullptr;
+  size_t vals_bytes = (size_t)p.B * (size_t)tiles * (size_t)K * sizeof(float);
+  size_t idx_bytes  = (size_t)p.B * (size_t)tiles * (size_t)K * sizeof(int);
+  CUDA_CHECK(cudaMallocAsync(&tile_vals_d, vals_bytes, stream));
+  CUDA_CHECK(cudaMallocAsync(&tile_idx_d,  idx_bytes,  stream));
+  dim3 gridA(p.B, tiles, 1);
+  dim3 blockA(BLOCK_THREADS, 1, 1);
+  stageA_local_topk_perseq<K, BLOCK_THREADS, ITEMS_PER_THREAD, T>
+      <<<gridA, blockA, 0, stream>>>(
+          logits_d, mask_d, p.B, p.V, p.temperature_d, tiles, tile_vals_d, tile_idx_d);
+  dim3 gridB(p.B, 1, 1);
+  dim3 blockB(256, 1, 1);
+  stageB_reduce_and_sample_perseq<K, 256>
+      <<<gridB, blockB, 0, stream>>>(
+          p.B, tiles, tile_vals_d, tile_idx_d, p.top_p_d, p.top_k_d, p.seed, p.token_pos, out_tokens_d);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaFreeAsync(tile_vals_d, stream));
+  CUDA_CHECK(cudaFreeAsync(tile_idx_d,  stream));
+}
+
+#ifdef __CUDA_FP16_SUPPORT__
+template void gpu_topk_topp_sample_perseq<32, float>(const float*, const float*, int*, const SamplerParamsPerSeq&, cudaStream_t);
+template void gpu_topk_topp_sample_perseq<64, float>(const float*, const float*, int*, const SamplerParamsPerSeq&, cudaStream_t);
+template void gpu_topk_topp_sample_perseq<128, float>(const float*, const float*, int*, const SamplerParamsPerSeq&, cudaStream_t);
+template void gpu_topk_topp_sample_perseq<256, float>(const float*, const float*, int*, const SamplerParamsPerSeq&, cudaStream_t);
 #endif
 
 // ---------------------------------------------------------------------------
@@ -817,4 +1031,57 @@ extern "C" void sampling_vob_bf16(
         gpu_topk_topp_sample_vob<256, __nv_bfloat16>(logits, vob_d, out_tokens_d, p, stream);
     }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Per-sequence FFI entries (the additive path, the QoS-gated): the temperature /
+// top_p / top_k are per-batch-row device tensors (the [B] so each sequence
+// samples with its own strategy. The existing single-strategy FFI entries are
+// unchanged.
+// ---------------------------------------------------------------------------
+extern "C" void sampling_perseq_f32(
+    const float* logits_d,
+    int* out_tokens_d,
+    int B,
+    int V,
+    const float* temperature_d, // [B]
+    const float* top_p_d,       // [B]
+    const unsigned int*   top_k_d,       // [B]
+    uint64_t seed,
+    uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParamsPerSeq p;
+    p.B = B; p.V = V;
+    p.temperature_d = temperature_d;
+    p.top_p_d = top_p_d;
+    p.top_k_d = top_k_d;
+    p.seed = seed;
+    p.token_pos = token_pos;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    gpu_topk_topp_sample_perseq<256, float>(logits_d, nullptr, out_tokens_d, p, stream);
+}
+
+extern "C" void sampling_perseq_masked_f32(
+    const float* logits_d,
+    const float* mask_d, // [B,V] 1.0=legal / 0.0=illegal, or nullptr
+    int* out_tokens_d,
+    int B,
+    int V,
+    const float* temperature_d, // [B]
+    const float* top_p_d,       // [B]
+    const unsigned int*   top_k_d,       // [B]
+    uint64_t seed,
+    uint64_t token_pos,
+    int64_t stream_ptr)
+{
+    SamplerParamsPerSeq p;
+    p.B = B; p.V = V;
+    p.temperature_d = temperature_d;
+    p.top_p_d = top_p_d;
+    p.top_k_d = top_k_d;
+    p.seed = seed;
+    p.token_pos = token_pos;
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    gpu_topk_topp_sample_perseq<256, float>(logits_d, mask_d, out_tokens_d, p, stream);
 }
