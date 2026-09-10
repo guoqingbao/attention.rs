@@ -208,6 +208,75 @@ impl Sampler {
         Ok(host_out.into_iter().map(|x| x as u32).collect())
     }
 
+    /// Per-sequence sampling with a per-row grammar allow-mask (the additive path, the
+    /// QoS-gated): the temperature / top_p / top_k are per-batch-row tensors (the [B]),
+    /// and the mask is a [B, V] F32 allow-matrix (1.0 = legal, 0.0 = illegal). The
+    /// existing sample_cuda_masked (the single shared strategy) is unchanged.
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_perseq_masked(
+        &self,
+        logits: &Tensor,
+        mask: &Tensor, // [B, V] F32, 1.0=legal / 0.0=illegal
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+        seed: u64,
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+
+        let cuda_ptr_of = |tensor: &Tensor, name: &str| -> Result<*const core::ffi::c_void> {
+            let storage = tensor.storage_and_layout().0;
+            let cuda_storage = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("{name} expects a CUDA tensor"),
+            };
+            match &cuda_storage.slice {
+                CudaStorageSlice::F32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                CudaStorageSlice::U32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                _ => candle_core::bail!("{name} has unsupported storage dtype"),
+            }
+        };
+
+        let logits = if !logits.is_contiguous() { logits.contiguous()? } else { logits.clone() };
+        let mask = if !mask.is_contiguous() { mask.contiguous()? } else { mask.clone() };
+        let logits_ptr = cuda_ptr_of(&logits, "logits")? as *const f32;
+        let mask_ptr = cuda_ptr_of(&mask, "mask")? as *const f32;
+        let temperature_ptr = cuda_ptr_of(temperature_d, "temperature_d")? as *const f32;
+        let top_p_ptr = cuda_ptr_of(top_p_d, "top_p_d")? as *const f32;
+        let top_k_ptr = cuda_ptr_of(top_k_d, "top_k_d")? as *const u32;
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        unsafe {
+            ffi::sampling_perseq_masked_f32(
+                logits_ptr,
+                mask_ptr,
+                out_ptr as *mut i32,
+                b as i32,
+                v as i32,
+                temperature_ptr,
+                top_p_ptr,
+                top_k_ptr,
+                seed,
+                token_pos,
+                stream,
+            );
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
     /// Like `sample_cuda`, but applies a per-row grammar allow-mask in the top-k stage so
     /// disallowed tokens are never sampled. `mask` is `[b, v]` F32 (1.0 = legal, 0.0 =
     /// illegal); pass `None` for unmasked sampling (identical to `sample_cuda`).
