@@ -70,3 +70,26 @@ println!("Sampled tokens: {:?}", sampled_tokens); // Vec<u32> length 4
 - **Zero Latency**: No need to sync large logit tensors to the CPU.
 - **High Throughput**: Can sample for thousands of sequences in parallel.
 - **Deterministic**: Fully supports seeding for reproducible generation.
+
+## Per-Sequence Sampling (the additive path)
+
+The single-strategy `sample_cuda` applies one temperature / top_p / top_k to
+every row of the batch. When a batched decode step mixes requests with
+different per-request sampling params, that collapses every row onto the
+first request's strategy. `sample_cuda_perseq` adds a parallel path where the
+temperature, top_p, and top_k are per-batch-row device tensors (the `[B]`
+pointers), so each row samples with its own strategy.
+
+```rust
+use attention_rs::sampler::Sampler;
+
+// temperature_d / top_p_d / top_k_d are [B] CUDA tensors, one value per row
+let sampled = sampler.sample_cuda_perseq(
+    &logits, &temperature_d, &top_p_d, &top_k_d, seed,
+)?;
+```
+
+The existing `sample_cuda` (the single shared strategy) is unchanged; the
+per-sequence kernels (`stageA_local_topk_perseq`, `stageB_reduce_and_sample_perseq`)
+and FFI entries (`sampling_perseq_f32`, `sampling_perseq_masked_f32`) are added
+alongside them.
