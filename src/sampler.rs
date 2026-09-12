@@ -244,7 +244,16 @@ impl Sampler {
         };
 
         let logits = if !logits.is_contiguous() { logits.contiguous()? } else { logits.clone() };
-        let mask = if !mask.is_contiguous() { mask.contiguous()? } else { mask.clone() };
+        // The kernel (sampling_perseq_masked_f32) expects an F32 allow-mask
+        // (1.0=legal / 0.0=illegal). The caller may hand us a compact U8 mask
+        // (build_allow_mask), so coerce to F32 before extracting the pointer
+        // mirroring sample_cuda_masked. Without this the U8 storage slice hits
+        // the cuda_ptr_of fallback and bails "mask has unsupported storage dtype".
+        let mask = if mask.dtype() == candle_core::DType::F32 {
+            if !mask.is_contiguous() { mask.contiguous()? } else { mask.clone() }
+        } else {
+            mask.to_dtype(candle_core::DType::F32)?.contiguous()?
+        };
         let logits_ptr = cuda_ptr_of(&logits, "logits")? as *const f32;
         let mask_ptr = cuda_ptr_of(&mask, "mask")? as *const f32;
         let temperature_ptr = cuda_ptr_of(temperature_d, "temperature_d")? as *const f32;
@@ -512,5 +521,126 @@ impl Sampler {
     #[cfg(feature = "metal")]
     pub fn sample(&self, _: &Tensor, _: usize, _: f32, _: f32, _: u64) -> Result<Vec<u32>> {
         candle_core::bail!("Sampler requires CUDA or Metal device")
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use candle_core::{Device, DType, Tensor};
+
+    /// Regression test for the "mask has unsupported storage dtype" bug:
+    /// `build_allow_mask` hands the perseq-masked sampler a compact U8 mask, but
+    /// the kernel expects F32. `sample_cuda_perseq_masked` must coerce the mask
+    /// dtype (mirroring `sample_cuda_masked`) and still gate per-row.
+    #[test]
+    fn perseq_masked_accepts_u8_mask_and_gates_per_row() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        // Row 0: argmax is token 1, but the mask allows ONLY token 0 -> must pick 0.
+        // Row 1: argmax is token 4, and the mask allows ONLY token 4 -> must pick 4.
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, // row 1
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+
+        // U8 allow-mask: 1=legal / 0=illegal (the compact form build_allow_mask produces).
+        let mask_u8 = Tensor::from_vec(
+            vec![
+                1u8, 0, 0, 0, 0, 0, 0, 0, // row 0: only token 0
+                0, 0, 0, 0, 1, 0, 0, 0,   // row 1: only token 4
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        assert_eq!(mask_u8.dtype(), DType::U8, "test premise: the mask is U8");
+
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![v as u32, v as u32], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq_masked(&logits, &mask_u8, &temperature_d, &top_p_d, &top_k_d, 1234)
+            .expect("U8 mask must be accepted (regression: 'mask has unsupported storage dtype')");
+
+        assert_eq!(tokens.len(), b);
+        assert_eq!(tokens[0], 0, "row 0: mask gates only token 0 (argmax 1 is illegal)");
+        assert_eq!(tokens[1], 4, "row 1: mask allows only token 4");
+    }
+
+    /// The F32 mask path (the kernel's native dtype) must keep working after the
+    /// coercion fix.
+    #[test]
+    fn perseq_masked_f32_mask() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0,
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let mask_f32 = Tensor::from_vec(
+            vec![
+                1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![v as u32, v as u32], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq_masked(&logits, &mask_f32, &temperature_d, &top_p_d, &top_k_d, 42)
+            .unwrap();
+        assert_eq!(tokens[0], 0);
+        assert_eq!(tokens[1], 4);
+    }
+
+    /// Unmasked per-sequence path (commit dc28b45): each row samples with its own
+    /// temperature / top_p / top_k. Greedy per-row argmax must be respected.
+    #[test]
+    fn perseq_unmasked_per_row_strategy() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        let logits = Tensor::from_vec(
+            vec![
+                10.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0 argmax = 0
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, // row 1 argmax = 4
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![1u32, 1], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq(&logits, &temperature_d, &top_p_d, &top_k_d, 7)
+            .unwrap();
+        assert_eq!(tokens[0], 0, "row 0 greedy top-1 = argmax 0");
+        assert_eq!(tokens[1], 4, "row 1 greedy top-1 = argmax 4");
     }
 }
