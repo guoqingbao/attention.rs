@@ -29,3 +29,30 @@ struct maximum<void> {
 };
 }  // namespace cuda
 #endif
+
+// FlashInfer fastdiv.cuh (commit 2bfb9334+) uses cuda::fast_mod_div<uint32_t>
+// from CCCL. On CUDA 13+ (CCCL 3.0) this type is always on the include path
+// via <cuda/std/...>, so a polyfill would create an ambiguous overload.
+// On CUDA 12.x (CCCL 2.x) the type is internal and not found when CUTLASS's
+// bundled CUB shadows the system CCCL headers.
+//
+// CCCL timeline:
+//   CUDA 12.0 (CCCL 2.0): cuda::fast_mod_div introduced as internal type
+//   CUDA 13.0 (CCCL 3.0): promoted to public <cuda/std> header
+#if __CUDACC_VER_MAJOR__ < 13
+namespace cuda {
+template <typename T>
+struct fast_mod_div {
+  T divisor;
+  __host__ __device__ explicit fast_mod_div(T d) : divisor(d ? d : 1) {}
+};
+template <typename T>
+__host__ __device__ inline T operator/(T n, const fast_mod_div<T>& f) {
+  return n / f.divisor;
+}
+template <typename T>
+__host__ __device__ inline T operator%(T n, const fast_mod_div<T>& f) {
+  return n % f.divisor;
+}
+}  // namespace cuda
+#endif  // __CUDACC_VER_MAJOR__ < 13

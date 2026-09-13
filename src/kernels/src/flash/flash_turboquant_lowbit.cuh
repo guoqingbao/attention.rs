@@ -77,7 +77,9 @@ __global__ void flash_tq4_store(
     const unsigned int num_tokens,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
-    const unsigned int block_size
+    const unsigned int block_size,
+    const float c_k,
+    const float c_v
 ) {
     const unsigned int token_idx = blockIdx.x;
     const unsigned int head_idx = blockIdx.y;
@@ -112,11 +114,12 @@ __global__ void flash_tq4_store(
 
     unsigned long long am_off = (unsigned long long)block_idx * block_size * num_kv_heads
         + (unsigned long long)block_off * num_kv_heads + head_idx;
-    if (lane_id == 0) K_absmax[am_off] = k_absmax;
+    if (lane_id == 0) K_absmax[am_off] = c_k * k_absmax;
     k_absmax = __shfl_sync(0xffffffff, k_absmax, 0);
 
     // Quantize K to 4-bit and pack
-    float k_inv_absmax = (k_absmax > 0.f) ? (1.f / k_absmax) : 0.f;
+    float k_c_absmax = c_k * k_absmax;
+    float k_inv_absmax = (k_c_absmax > 0.f) ? (1.f / k_c_absmax) : 0.f;
     unsigned long long kq_off = (unsigned long long)block_idx * block_size * num_kv_heads * (head_dim / 2)
         + (unsigned long long)block_off * num_kv_heads * (head_dim / 2)
         + (unsigned long long)head_idx * (head_dim / 2);
@@ -144,11 +147,12 @@ __global__ void flash_tq4_store(
     for (int off = WARP_SIZE/2; off > 0; off >>= 1)
         v_absmax = fmaxf(v_absmax, __shfl_xor_sync(0xffffffff, v_absmax, off));
 
-    if (lane_id == 0) V_absmax[am_off] = v_absmax;
+    if (lane_id == 0) V_absmax[am_off] = c_v * v_absmax;
     v_absmax = __shfl_sync(0xffffffff, v_absmax, 0);
 
     // Quantize V to 4-bit
-    float v_inv_absmax = (v_absmax > 0.f) ? (1.f / v_absmax) : 0.f;
+    float v_c_absmax = c_v * v_absmax;
+    float v_inv_absmax = (v_c_absmax > 0.f) ? (1.f / v_c_absmax) : 0.f;
     unsigned long long vq_off = kq_off; // same layout
     #pragma unroll
     for (int i = 0; i < TQ4_VEC; i += 2) {

@@ -6,6 +6,11 @@
 #include <vector>
 #include <algorithm>
 
+// Providefill CCCL types (cuda::maximum, cuda::fast_mod_div) that FlashInfer
+// headers reference but which are not on the include path when using
+// CUTLASS's bundled CUB with CUDA 12.x.
+#include "flashinfer_cccl_compat.h"
+
 #ifdef USE_FLASHINFER
     #include <flashinfer/attention/decode.cuh>
     #include <flashinfer/attention/scheduler.cuh>

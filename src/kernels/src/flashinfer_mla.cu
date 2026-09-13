@@ -6,10 +6,11 @@
 #include <stdio.h>
 
 #ifdef USE_FLASHINFER
+#ifndef FLASHINFER_MLA_DISABLED
 
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/default_decode_params.cuh>
-#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/attention/scheduler.cuh>>
 #include <flashinfer/attention/mla.cuh>
 #include <flashinfer/attention/mla_params.cuh>
 #include <flashinfer/page.cuh>
@@ -294,7 +295,7 @@ void flashinfer_mla_decode_plan_wrapper(
     void* float_workspace, int64_t float_workspace_size,
     void* int_workspace, int64_t int_workspace_size,
     void* page_locked_buffer, int64_t page_locked_size,
-    bool enable_cuda_graph, uint32_t dtype,
+    bool enable_cuda_graph, unsigned int dtype,
     int64_t* plan_info_out, cudaStream_t stream)
 {
 #ifdef USE_FLASHINFER
@@ -330,7 +331,7 @@ void flashinfer_mla_decode_run_wrapper(
     void* float_workspace, int64_t float_workspace_size,
     void* int_workspace, int64_t int_workspace_size,
     const int64_t* plan_info,
-    uint32_t dtype, cudaStream_t stream)
+    unsigned int dtype, cudaStream_t stream)
 {
 #ifdef USE_FLASHINFER
     if (plan_info == nullptr) {
@@ -413,7 +414,7 @@ void flashinfer_mla_prefill_run_wrapper(
     void* int_workspace, int64_t int_workspace_size,
     const int64_t* plan_info,
     bool causal,
-    uint32_t dtype, cudaStream_t stream)
+    unsigned int dtype, cudaStream_t stream)
 {
 #ifdef USE_FLASHINFER
     if (plan_info == nullptr) {
@@ -440,4 +441,89 @@ void flashinfer_mla_prefill_run_wrapper(
 
 } // extern "C"
 
+#else // FLASHINFER_MLA_DISABLED
+
+// Stubs: match the C signatures above so the Rust FFI links.
+// The inference engine should check plan_info (all zeros) and fall
+// back to a non-MLA attention path when MLA is unavailable.
+extern "C" {
+
+void flashinfer_mla_decode_plan_wrapper(
+    const int32_t* kv_indptr_host,
+    int32_t batch_size, int32_t num_qo_heads, int32_t page_size,
+    void* float_workspace, int64_t float_workspace_size,
+    void* int_workspace, int64_t int_workspace_size,
+    void* page_locked_buffer, int64_t page_locked_size,
+    bool enable_cuda_graph, unsigned int dtype,
+    int64_t* plan_info_out, cudaStream_t stream)
+{
+    (void)kv_indptr_host; (void)batch_size; (void)num_qo_heads;
+    (void)page_size; (void)float_workspace; (void)float_workspace_size;
+    (void)int_workspace; (void)int_workspace_size;
+    (void)page_locked_buffer; (void)page_locked_size;
+    (void)enable_cuda_graph; (void)dtype; (void)stream;
+    if (plan_info_out) { for (int i = 0; i < 10; i++) plan_info_out[i] = 0; }
+}
+
+void flashinfer_mla_decode_run_wrapper(
+    void* o, const void* q_nope, const void* q_pe,
+    const void* ckv_cache, const void* kpe_cache,
+    const int32_t* kv_indptr, const int32_t* kv_indices,
+    const int32_t* kv_last_page_len,
+    int32_t batch_size, int32_t num_qo_heads, int32_t page_size,
+    float sm_scale, float rope_scale, float rope_theta,
+    void* float_workspace, int64_t float_workspace_size,
+    void* int_workspace, int64_t int_workspace_size,
+    const int64_t* plan_info, unsigned int dtype, cudaStream_t stream)
+{
+    (void)o; (void)q_nope; (void)q_pe; (void)ckv_cache; (void)kpe_cache;
+    (void)kv_indptr; (void)kv_indices; (void)kv_last_page_len;
+    (void)batch_size; (void)num_qo_heads; (void)page_size;
+    (void)sm_scale; (void)rope_scale; (void)rope_theta;
+    (void)float_workspace; (void)float_workspace_size;
+    (void)int_workspace; (void)int_workspace_size;
+    (void)plan_info; (void)dtype; (void)stream;
+}
+
+void flashinfer_mla_prefill_plan_wrapper(
+    const int32_t* qo_indptr_host,
+    const int32_t* kv_indptr_host,
+    const int32_t* kv_len_arr_host,
+    int32_t batch_size, int32_t num_heads, int32_t head_dim_ckv,
+    bool causal,
+    void* float_workspace, int64_t float_workspace_size,
+    void* int_workspace, int64_t int_workspace_size,
+    void* page_locked_buffer, int64_t page_locked_size,
+    int64_t* plan_info_out, cudaStream_t stream)
+{
+    (void)qo_indptr_host; (void)kv_indptr_host; (void)kv_len_arr_host;
+    (void)batch_size; (void)num_heads; (void)head_dim_ckv;
+    (void)causal; (void)float_workspace; (void)float_workspace_size;
+    (void)int_workspace; (void)int_workspace_size;
+    (void)page_locked_buffer; (void)page_locked_size; (void)stream;
+    if (plan_info_out) { for (int i = 0; i < 16; i++) plan_info_out[i] = 0; }
+}
+
+void flashinfer_mla_prefill_run_wrapper(
+    void* o, const void* q_nope, const void* q_pe,
+    const void* ckv_cache, const void* kpe_cache,
+    const int32_t* kv_indices, int32_t num_heads, int32_t page_size,
+    float sm_scale,
+    void* float_workspace, int64_t float_workspace_size,
+    void* int_workspace, int64_t int_workspace_size,
+    const int64_t* plan_info, int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads,
+    int32_t head_dim_ckv, unsigned int dtype, cudaStream_t stream)
+{
+    (void)o; (void)q_nope; (void)q_pe; (void)ckv_cache; (void)kpe_cache;
+    (void)kv_indices; (void)num_heads; (void)page_size; (void)sm_scale;
+    (void)float_workspace; (void)float_workspace_size;
+    (void)int_workspace; (void)int_workspace_size;
+    (void)plan_info; (void)batch_size; (void)num_qo_heads;
+    (void)num_kv_heads; (void)head_dim_ckv; (void)dtype; (void)stream;
+}
+
+} // extern "C"
+
+#endif // FLASHINFER_MLA_DISABLED
 #endif // USE_FLASHINFER

@@ -52,6 +52,11 @@
 #define flash_decode_paged_splitk_fp8 flash_decode_paged_splitk_fp8_128
 #define flash_reshape_and_cache flash_reshape_and_cache_128
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_128
+#define flash_fp8_rot_store flash_fp8_rot_store_128
+#define flash_nvfp4_kv_store flash_nvfp4_kv_store_128
+#define flash_nvfp4_kv_decode flash_nvfp4_kv_decode_128
+#define flash_nvfp4_kv_prefill flash_nvfp4_kv_prefill_128
+#define flash_fp8_rot_decode flash_fp8_rot_decode_128
 #define flash_bf16_absmax flash_bf16_absmax_128
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_128
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_128
@@ -95,6 +100,11 @@
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
 #include "flash_prefill_tq3.cuh"
+#include "flash_fp8_rot_store.cuh"
+#include "flash_nvfp4_kv_store.cuh"
+#include "flash_nvfp4_kv_decode.cuh"
+#include "flash_nvfp4_kv_prefill.cuh"
+#include "flash_fp8_rot_decode.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -104,6 +114,11 @@
 
 #undef flash_reshape_and_cache
 #undef flash_reshape_and_cache_fp8
+#undef flash_fp8_rot_store
+#undef flash_nvfp4_kv_store
+#undef flash_nvfp4_kv_decode
+#undef flash_nvfp4_kv_prefill
+#undef flash_fp8_rot_decode
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
 #undef flash_tq_decode_k8v4
@@ -178,6 +193,11 @@
 #define flash_decode_paged_splitk_fp8 flash_decode_paged_splitk_fp8_256
 #define flash_reshape_and_cache flash_reshape_and_cache_256
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_256
+#define flash_fp8_rot_store flash_fp8_rot_store_256
+#define flash_nvfp4_kv_store flash_nvfp4_kv_store_256
+#define flash_nvfp4_kv_decode flash_nvfp4_kv_decode_256
+#define flash_nvfp4_kv_prefill flash_nvfp4_kv_prefill_256
+#define flash_fp8_rot_decode flash_fp8_rot_decode_256
 #define flash_bf16_absmax flash_bf16_absmax_256
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_256
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_256
@@ -219,6 +239,11 @@
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
 #include "flash_prefill_tq3.cuh"
+#include "flash_fp8_rot_store.cuh"
+#include "flash_nvfp4_kv_store.cuh"
+#include "flash_nvfp4_kv_decode.cuh"
+#include "flash_nvfp4_kv_prefill.cuh"
+#include "flash_fp8_rot_decode.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -228,6 +253,11 @@
 
 #undef flash_reshape_and_cache
 #undef flash_reshape_and_cache_fp8
+#undef flash_fp8_rot_store
+#undef flash_nvfp4_kv_decode
+#undef flash_nvfp4_kv_prefill
+#undef flash_nvfp4_kv_store
+#undef flash_fp8_rot_decode
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
 #undef flash_tq_decode_k8v4
@@ -301,6 +331,12 @@
 #define flash_decode_paged_splitk_fp8 flash_decode_paged_splitk_fp8_512
 #define flash_reshape_and_cache flash_reshape_and_cache_512
 #define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_512
+#define flash_nvfp4_kv_decode flash_nvfp4_kv_decode_512
+#define flash_fp8_rot_store flash_fp8_rot_store_512
+#define flash_nvfp4_kv_store flash_nvfp4_kv_store_512
+#define flash_nvfp4_kv_decode flash_nvfp4_kv_decode_512
+#define flash_nvfp4_kv_prefill flash_nvfp4_kv_prefill_512
+#define flash_fp8_rot_decode flash_fp8_rot_decode_512
 #define flash_bf16_absmax flash_bf16_absmax_512
 #define flash_tq_store_k8v4 flash_tq_store_k8v4_512
 #define flash_tq_decode_k8v4 flash_tq_decode_k8v4_512
@@ -349,7 +385,12 @@
 #include "flash_turboquant.cuh"
 #include "flash_turboquant_lowbit.cuh"
 #include "flash_prefill_tq4.cuh"
+#include "flash_nvfp4_kv_decode.cuh"
+#include "flash_nvfp4_kv_prefill.cuh"
 #include "flash_prefill_tq3.cuh"
+#include "flash_fp8_rot_store.cuh"
+#include "flash_nvfp4_kv_store.cuh"
+#include "flash_fp8_rot_decode.cuh"
 
 #undef FLASH_HDIM
 #undef flash_prefill_paged
@@ -357,7 +398,11 @@
 #undef flash_decode_paged_fp8
 #undef flash_decode_paged_splitk_fp8
 
+#undef flash_nvfp4_kv_decode
 #undef flash_reshape_and_cache
+#undef flash_fp8_rot_store
+#undef flash_nvfp4_kv_store
+#undef flash_fp8_rot_decode
 #undef flash_reshape_and_cache_fp8
 #undef flash_bf16_absmax
 #undef flash_tq_store_k8v4
@@ -930,6 +975,7 @@ extern "C" void call_flash_tq4_store(
     const long long* slot_mapping,
     unsigned int num_tokens, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int block_size,
+    float c_k, float c_v,
     int dtype, int64_t stream
 ) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
@@ -941,7 +987,7 @@ extern "C" void call_flash_tq4_store(
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
-                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, c_k, c_v)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
         else { LAUNCH_STORE(512); }
@@ -957,7 +1003,7 @@ extern "C" void call_flash_tq4_store(
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
-                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, c_k, c_v)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
         else { LAUNCH_STORE(512); }
@@ -1394,3 +1440,371 @@ extern "C" void call_flash_tq3_prefill(
     }
 }
 
+
+
+extern "C" void call_flash_fp8_rot_store(
+    const void* key, const void* value, void* key_cache, void* value_cache,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int cache_block_size,
+    float c_k, float c_v, int rotate,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 31) / 32 * 32;
+        if (threads > 256) threads = 256;
+        if (threads < 32) threads = 32;
+        if (head_dim <= 128) {
+            flash_fp8_rot_store_128<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_fp8_rot_store_256<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        } else {
+            flash_fp8_rot_store_512<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        }
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+        unsigned int threads = (head_dim + 31) / 32 * 32;
+        if (threads > 256) threads = 256;
+        if (threads < 32) threads = 32;
+        if (head_dim <= 128) {
+            flash_fp8_rot_store_128<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_fp8_rot_store_256<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        } else {
+            flash_fp8_rot_store_512<HALF><<<grid, threads, 0, s>>>(
+                (const HALF*)key, (const HALF*)value,
+                key_cache, value_cache, slot_mapping,
+                num_tokens, num_kv_heads, head_dim, cache_block_size,
+                c_k, c_v, rotate != 0);
+        }
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_fp8_rot_store: unsupported dtype %d\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_fp8_rot_decode(
+    const void* Q,
+    const void* K_cache, const void* V_cache,
+    void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d, unsigned int q_stride,
+    float softcap, unsigned int sliding_window,
+    const float* k_scale_ptr, const float* v_scale_ptr,
+    unsigned long long fp8_cache_stride,
+    int rotate, int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, 1, 1);
+    if (dtype == 0) {
+#define HALF __half
+        if (head_dim <= 128) {
+            flash_fp8_rot_decode_128<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_fp8_rot_decode_256<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        } else {
+            flash_fp8_rot_decode_512<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        }
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        if (head_dim <= 128) {
+            flash_fp8_rot_decode_128<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_fp8_rot_decode_256<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        } else {
+            flash_fp8_rot_decode_512<HALF><<<grid, NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, K_cache, V_cache, (HALF*)O,
+                block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, q_stride, softcap, sliding_window,
+                k_scale_ptr, v_scale_ptr, fp8_cache_stride, rotate != 0);
+        }
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_fp8_rot_decode: unsupported dtype %d\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_nvfp4_kv_store(
+    const void* K, const void* V,
+    void* K_fp4, void* K_sf, void* V_fp4, void* V_sf,
+    const long long* slot_mapping,
+    unsigned int num_tokens, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float c_k, float c_v, int rotate,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    if (dtype == 0) {
+#define HALF __half
+        dim3 grid(num_tokens, num_kv_heads);
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_store_128<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_store_256<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        } else {
+            flash_nvfp4_kv_store_512<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        }
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        dim3 grid(num_tokens, num_kv_heads);
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_store_128<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_store_256<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        } else {
+            flash_nvfp4_kv_store_512<HALF><<<grid, 32, 0, s>>>(
+                (const HALF*)K, (const HALF*)V,
+                (unsigned char*)K_fp4, (unsigned char*)K_sf,
+                (unsigned char*)V_fp4, (unsigned char*)V_sf,
+                slot_mapping, num_tokens, num_kv_heads, head_dim, block_size,
+                c_k, c_v, rotate != 0);
+        }
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_nvfp4_kv_store: unsupported dtype %d\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_nvfp4_kv_decode(
+    const void* Q,
+    const void* K_fp4, const void* K_sf,
+    const void* V_fp4, const void* V_sf,
+    void* O,
+    const int* block_tables, const int* seq_lens,
+    unsigned int max_blocks_per_seq,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d, unsigned int num_seqs,
+    unsigned int q_stride, float softcap,
+    unsigned int sliding_window,
+    int rotate,
+    int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid(num_q_heads, num_seqs);
+    if (dtype == 0) {
+#define HALF __half
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_decode_128<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_decode_256<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        } else {
+            flash_nvfp4_kv_decode_512<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        }
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_decode_128<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_decode_256<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        } else {
+            flash_nvfp4_kv_decode_512<HALF><<<grid, TQ4_NUM_WARPS * WARP_SIZE, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window, rotate != 0);
+        }
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_nvfp4_kv_decode: unsupported dtype %d\n", (int)dtype);
+    }
+}
+
+extern "C" void call_flash_nvfp4_kv_prefill(
+    const void* Q,
+    const void* K_fp4, const void* K_sf,
+    const void* V_fp4, const void* V_sf,
+    void* O,
+    const int* block_tables, const int* seq_lens, const unsigned int* cu_seqlens_q,
+    unsigned int max_blocks_per_seq, unsigned int max_q_len,
+    unsigned int num_q_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int block_size,
+    float inv_sqrt_d, unsigned int num_seqs,
+    unsigned int q_stride, unsigned int kv_stride,
+    float softcap, unsigned int sliding_window,
+    int rotate, int dtype, int64_t stream
+) {
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    dim3 grid((max_q_len > 0 ? max_q_len : 1), num_q_heads, num_seqs);
+    if (dtype == 0) {
+#define HALF __half
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_prefill_128<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_prefill_256<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        } else {
+            flash_nvfp4_kv_prefill_512<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        }
+#undef HALF
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
+#define HALF __nv_bfloat16
+        if (head_dim <= 128) {
+            flash_nvfp4_kv_prefill_128<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        } else if (head_dim <= 256) {
+            flash_nvfp4_kv_prefill_256<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        } else {
+            flash_nvfp4_kv_prefill_512<HALF><<<grid, NVFP4_PREFILL_THREADS, 0, s>>>(
+                (const HALF*)Q, (const unsigned char*)K_fp4, (const unsigned char*)K_sf,
+                (const unsigned char*)V_fp4, (const unsigned char*)V_sf,
+                (HALF*)O, block_tables, seq_lens, cu_seqlens_q, max_blocks_per_seq,
+                num_q_heads, num_kv_heads, head_dim, block_size,
+                inv_sqrt_d, num_seqs, q_stride, kv_stride, softcap, sliding_window, rotate != 0);
+        }
+#undef HALF
+    }
+#endif
+    else {
+        printf("call_flash_nvfp4_kv_prefill: unsupported dtype %d\n", (int)dtype);
+    }
+}
