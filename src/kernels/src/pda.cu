@@ -320,12 +320,13 @@ __global__ void pda_fused_project_kernel(
     const uint32_t* __restrict__ ctrl_u32_offsets,
     const uint32_t* __restrict__ ctrl_counts,
     const uint32_t* __restrict__ forbid,
+    const uint32_t* __restrict__ k_actual, // [batch] the per-seq actual draft length
     uint32_t num_states,
     uint32_t num_stack_syms,
     uint32_t num_inputs,
     uint32_t words_per_vob,
     int batch,
-    int k,
+    int k_max,
     int d)
 {
     int seq = blockIdx.x * blockDim.x + threadIdx.x;
@@ -336,11 +337,22 @@ __global__ void pda_fused_project_kernel(
     uint32_t s = (sp != nullptr) ? sp[seq] : 1;
     uint32_t top = (s > 0 && stack != nullptr) ? stack[(size_t)seq * d + s - 1] : 0;
 
-    const uint32_t* draft_row = drafts + (size_t)seq * k;
+    // The per-seq actual draft length (the no-capturable: the k_max is fixed, the
+    // k_actual is read from the GPU tensor per step).
+    uint32_t k = (k_actual != nullptr) ? k_actual[seq] : (uint32_t)k_max;
+    if (k > (uint32_t)k_max) k = k_max;
 
-    for (int pos = 0; pos <= k; pos++) {
+    const uint32_t* draft_row = drafts + (size_t)seq * k_max;
+
+    for (int pos = 0; pos <= k_max; pos++) {
         // Emit the mask at the current (c, top).
-        uint32_t* out = out_masks + ((size_t)seq * (k + 1) + pos) * words_per_vob;
+        uint32_t* out = out_masks + ((size_t)seq * (k_max + 1) + pos) * words_per_vob;
+        if (pos > (int)k) {
+            // Beyond the actual draft length: emit the all-allowed mask (the no
+            // constraint, the positions are invalid).
+            for (uint32_t w = 0; w < words_per_vob; w++) out[w] = 0xFFFFFFFF;
+            continue;
+        }
         scan_mask(transitions, ctrl_u32_offsets, ctrl_counts, num_inputs, c, top, out, words_per_vob);
 
         // The anti-loop kick (the anchor only, the pos 0): clear the forbid bit in
@@ -362,8 +374,10 @@ __global__ void pda_fused_project_kernel(
             }
         }
 
-        if (pos == k) break;
-
+        if (pos == k_max) break;
+        // Advance only within the actual draft length (the positions >= k are
+        // already masked out as all-allowed).
+        if (pos >= (int)k) break;
         // Advance by draft[pos] (the epsilon-closure). Break on divergence (the no
         // terminal move, matching the CPU project_batch).
         uint32_t tok = draft_row[pos];
@@ -455,17 +469,18 @@ void pda_fused_project_masks(
     const uint32_t* transitions, const uint32_t* accepting,
     const uint32_t* ctrl_u32_offsets, const uint32_t* ctrl_counts,
     const uint32_t* forbid,
+    const uint32_t* k_actual,
     uint32_t num_states, uint32_t num_stack_syms, uint32_t num_inputs,
-    uint32_t words_per_vob, int batch, int k, int d, int64_t stream)
+    uint32_t words_per_vob, int batch, int k_max, int d, int64_t stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
     int threads = 256;
     int blocks = (batch + threads - 1) / threads;
     pda_fused_project_kernel<<<blocks, threads, 0, s>>>(
         ctrl, stack, sp, drafts, out_masks,
-        transitions, accepting, ctrl_u32_offsets, ctrl_counts, forbid,
+        transitions, accepting, ctrl_u32_offsets, ctrl_counts, forbid, k_actual,
         num_states, num_stack_syms, num_inputs,
-        words_per_vob, batch, k, d);
+        words_per_vob, batch, k_max, d);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[pda_fused_project_masks] launch error: %s\n", cudaGetErrorString(err));
