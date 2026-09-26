@@ -375,6 +375,26 @@ __global__ void pda_fused_project_kernel(
     }
 }
 
+// The VOB -> the F32 allow matrix expansion (the GPU, the no CPU round-trip).
+// The vob is [positions, words_per_vob] U32 (the 1 bit = the allowed token).
+// The allow is [positions, vocab] F32 (the 1.0 = allowed, the 0.0 = not).
+// One thread per (position, token) element.
+__global__ void pda_vob_to_allow_kernel(
+    const uint32_t* __restrict__ vob,
+    float* __restrict__ allow,
+    int positions,
+    int vocab,
+    uint32_t words_per_vob)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= positions * vocab) return;
+    int pos = idx / vocab;
+    int tok = idx % vocab;
+    uint word = tok / 32;
+    int bit = tok % 32;
+    allow[idx] = ((vob[(size_t)pos * words_per_vob + word] >> bit) & 1u) ? 1.0f : 0.0f;
+}
+
 extern "C" {
 
 void pda_fused_sample_f32(
@@ -449,6 +469,25 @@ void pda_fused_project_masks(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[pda_fused_project_masks] launch error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+void pda_vob_to_allow(
+    const uint32_t* vob,
+    float* allow,
+    int positions,
+    int vocab,
+    uint32_t words_per_vob,
+    int64_t stream)
+{
+    cudaStream_t s = (cudaStream_t)stream;
+    int total = positions * vocab;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    pda_vob_to_allow_kernel<<<blocks, threads, 0, s>>>(vob, allow, positions, vocab, words_per_vob);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[pda_vob_to_allow] launch error: %s\n", cudaGetErrorString(err));
     }
 }
 
