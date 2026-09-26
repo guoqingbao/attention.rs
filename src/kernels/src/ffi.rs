@@ -4962,4 +4962,13 @@ extern "C" {
         d: i32,
         stream: i64,
     );
+
+    pub fn pda_vob_to_allow(
+        vob: *const u32,
+        allow: *mut f32,
+        positions: i32,
+        vocab: i32,
+        words_per_vob: u32,
+        stream: i64,
+    );
 }

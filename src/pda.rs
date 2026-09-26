@@ -190,6 +190,13 @@ impl PdaPushdownTable {
             _ => candle_core::bail!("logits must be on CUDA"),
         }
     }
+    fn ptr_f32_mut(t: &Tensor) -> Result<*mut f32> {
+        let (s, _) = t.storage_and_layout();
+        match &*s {
+            Storage::Cuda(c) => Ok(*c.as_cuda_slice::<f32>()?.device_ptr() as *mut f32),
+            _ => candle_core::bail!("tensor must be on CUDA"),
+        }
+    }
 
     /// Fused PDA decode step: compute mask + sample + advance in ONE kernel launch.
     ///
@@ -350,30 +357,20 @@ impl PdaPushdownTable {
     /// conversion is never called (zero overhead).
     pub fn vob_to_allow(&self, vob: &Tensor, batch: usize, k: usize, vocab: usize) -> Result<Tensor> {
         let dev = vob.device();
-        let words = self.words_per_vob as usize;
         let positions = batch * (k + 1);
-        let mut allow = vec![0.0f32; positions * vocab];
-
-        // Read the VOB from GPU to CPU (small: positions * words u32s).
-        let vob_cpu = vob.to_device(&candle_core::Device::Cpu)?;
-        let vob_flat = vob_cpu.flatten_all().unwrap().to_vec1::<u32>().unwrap();
-
-        for pos in 0..positions {
-            for w in 0..words {
-                let word = vob_flat[pos * words + w];
-                for bit in 0..32 {
-                    let token_idx = w * 32 + bit;
-                    if token_idx >= vocab {
-                        break;
-                    }
-                    if (word >> bit) & 1 == 1 {
-                        allow[pos * vocab + token_idx] = 1.0;
-                    }
-                }
-            }
+        // The GPU kernel expands the VOB to the F32 allow matrix (the no CPU round-trip).
+        let allow = Tensor::zeros((positions, vocab), DType::F32, &dev)?;
+        unsafe {
+            ffi::pda_vob_to_allow(
+                Self::ptr_u32(vob)?,
+Self::ptr_f32_mut(&allow)?,
+                positions as i32,
+                vocab as i32,
+                self.words_per_vob,
+                *dev.as_cuda_device().unwrap().cu_stream() as i64,
+            );
         }
-
-        Tensor::from_vec(allow, (positions, vocab), dev)
+        Ok(allow)
     }
 }
 
@@ -589,5 +586,78 @@ mod tests {
         assert_eq!(out_sp2.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0], 0, "step 2 sp 1 -> 0 (pop, no push)");
         let _ = out_ctrl2;
         println!("PDA fused_sample cross-step stack sync OK");
+    }
+
+    /// The vob_to_allow GPU kernel must match the CPU reference expansion (the
+    /// VOB bits -> the F32 allow matrix). This is the accuracy oracle for the
+    /// GPU kernel (the no CPU round-trip).
+    #[test]
+    fn pda_vob_to_allow_matches_cpu_reference() {
+        let dev = Device::new_cuda(0).unwrap();
+        let vocab = 70; // not a multiple of 32 (exercises the partial last word)
+        let words = (vocab + 31) / 32;
+        let batch = 2;
+        let k = 3;
+        let positions = batch * (k + 1);
+
+        // A deterministic V VOB (the positions bits set).
+        let mut vob_cpu = vec![0u32; positions * words];
+        for pos in 0..positions {
+            for w in 0..words {
+                // Set a deterministic pattern: the bit (pos*7 + w*3 + bit) % 5 == 0.
+                for bit in 0..32 {
+                    let tok = w * 32 + bit;
+                    if tok >= vocab {
+                        break;
+                    }
+                    if (pos * 7 + w * 3 + bit) % 5 == 0 {
+                        vob_cpu[pos * words + w] |= 1u32 << bit;
+                    }
+                }
+            }
+        }
+        let vob = Tensor::from_vec(vob_cpu.clone(), (positions * words,), &dev).unwrap();
+
+// The GPU kernel (the vob_to_allow only needs the words_per_vob; the rest is
+        // dummy).
+        let table = PdaPushdownTable {
+            transitions: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            accepting: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            ctrl_offsets: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            ctrl_counts: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            num_states: 1,
+            num_inputs: vocab as u32,
+            num_stack_syms: 1,
+            num_transitions: 0,
+            start_state: 0,
+            start_stack: 0,
+            words_per_vob: words as u32,
+            max_stack_depth: 1,
+        };
+        let allow_gpu = table.vob_to_allow(&vob, batch, k, vocab).unwrap();
+
+        // The CPU reference (the same expansion, the no GPU).
+        let mut allow_cpu = vec![0.0f32; positions * vocab];
+        for pos in 0..positions {
+            for w in 0..words {
+                let word = vob_cpu[pos * words + w];
+                for bit in 0..32 {
+                    let tok = w * 32 + bit;
+                    if tok >= vocab {
+                        break;
+                    }
+                    if (word >> bit) & 1 == 1 {
+                        allow_cpu[pos * vocab + tok] = 1.0;
+                    }
+                }
+            }
+        }
+
+        let gpu_flat = allow_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(gpu_flat.len(), allow_cpu.len(), "same length");
+        for (i, (g, c)) in gpu_flat.iter().zip(allow_cpu.iter()).enumerate() {
+            assert_eq!(*g, *c, "mismatch at {i} (the GPU kernel must match the CPU reference)");
+        }
+        println!("PDA vob_to_allow GPU kernel matches the CPU reference ({} positions, vocab {})", positions, vocab);
     }
 }
