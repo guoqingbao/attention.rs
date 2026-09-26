@@ -311,20 +311,22 @@ impl PdaPushdownTable {
         stack: &Tensor,
         sp: &Tensor,
         draft: &Tensor,
+        k_actual: &Tensor,
         forbid: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dev = ctrl.device();
         let batch = ctrl.dim(0)?;
-        let k = draft.dim(1)?;
+        let k_max = draft.dim(1)?;
         let d = stack.dim(1).unwrap_or(self.max_stack_depth as usize).max(1);
         let stream = *dev.as_cuda_device()?.cu_stream() as i64;
-        let out = Tensor::zeros((batch * (k + 1) * self.words_per_vob as usize,), DType::U32, &dev)?;
+        let out = Tensor::zeros((batch * (k_max + 1) * self.words_per_vob as usize,), DType::U32, &dev)?;
 
         let p_ctrl = Self::ptr_u32(ctrl)?;
         let p_stack = Self::ptr_u32(stack)?;
         let p_sp = Self::ptr_u32(sp)?;
         let p_draft = Self::ptr_u32(draft)?;
         let p_out = Self::ptr_u32_mut(&out)?;
+        let p_k_actual = Self::ptr_u32(k_actual)?;
         let p_trans = Self::ptr_u32(&self.transitions)?;
         let p_accept = Self::ptr_u32(&self.accepting)?;
         let p_ctrl_offsets = Self::ptr_u32(&self.ctrl_offsets)?;
@@ -339,9 +341,9 @@ impl PdaPushdownTable {
         unsafe {
             ffi::pda_fused_project_masks(
                 p_ctrl, p_stack, p_sp, p_draft, p_out,
-                p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts, p_forbid,
+                p_trans, p_accept, p_ctrl_offsets, p_ctrl_counts, p_forbid, p_k_actual,
                 self.num_states, self.num_stack_syms, self.num_inputs,
-                self.words_per_vob, batch as i32, k as i32, d as i32, stream,
+                self.words_per_vob, batch as i32, k_max as i32, d as i32, stream,
             );
         }
         Ok(out)
@@ -463,8 +465,9 @@ mod tests {
         let stack = Tensor::zeros((1, 4), DType::U32, &dev).unwrap();
         let sp = Tensor::from_vec(vec![1u32], (1,), &dev).unwrap();
         let draft = Tensor::from_vec(vec![1u32, 2], (1, 2), &dev).unwrap();
+        let k_actual = Tensor::from_vec(vec![2u32], (1,), &dev).unwrap(); // the per-seq actual draft length
 
-        let out = table.fused_project(&ctrl, &stack, &sp, &draft, None).unwrap();
+        let out = table.fused_project(&ctrl, &stack, &sp, &draft, &k_actual, None).unwrap();
         let flat = out.flatten_all().unwrap().to_vec1::<u32>().unwrap();
         // K+1 = 3 masks, 1 word each: pos0=ctrl0{1}=2, pos1=ctrl1{2}=4, pos2=ctrl2{}=0
         assert_eq!(flat, vec![2u32, 4, 0], "projected masks must match the per-position control masks");
@@ -659,5 +662,70 @@ mod tests {
             assert_eq!(*g, *c, "mismatch at {i} (the GPU kernel must match the CPU reference)");
         }
         println!("PDA vob_to_allow GPU kernel matches the CPU reference ({} positions, vocab {})", positions, vocab);
+    }
+
+    /// Realistic-size vob_to_allow accuracy: the Qwen vocab (151936) + the real
+    /// words_per_vob (4748). The GPU kernel must match the CPU reference bit-exactly
+    /// at the real size (the no overflow, the no out-of-bounds).
+    #[test]
+    fn pda_vob_to_allow_realistic_vocab() {
+        let dev = Device::new_cuda(0).unwrap();
+        let vocab = 151936; // the Qwen vocab
+        let words = (vocab + 31) / 32; // 4748 words
+        let batch = 4;
+        let k = 4; // the MTP draft width
+        let positions = batch * (k + 1);
+
+        // A deterministic VOB (the positions bits set, the no overflow).
+        let mut vob_cpu = vec![0u32; positions * words];
+        for pos in 0..positions {
+            for w in 0..words {
+                // Set a deterministic pattern (the no overflow, the no OOB).
+                let seed = (pos * 31 + w * 7) as u32;
+                vob_cpu[pos * words + w] = seed.wrapping_mul(2654435761) >> 1;
+            }
+        }
+        let vob = Tensor::from_vec(vob_cpu.clone(), (positions * words,), &dev).unwrap();
+
+        let table = PdaPushdownTable {
+            transitions: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            accepting: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            ctrl_offsets: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            ctrl_counts: Tensor::from_vec(vec![0u32], (1,), &dev).unwrap(),
+            num_states: 1,
+            num_inputs: vocab as u32,
+            num_stack_syms: 1,
+            num_transitions: 0,
+            start_state: 0,
+            start_stack: 0,
+            words_per_vob: words as u32,
+            max_stack_depth: 1,
+        };
+        let allow_gpu = table.vob_to_allow(&vob, batch, k, vocab).unwrap();
+
+        // The CPU reference (the same expansion, the no GPU).
+        let mut allow_cpu = vec![0.0f32; positions * vocab];
+        for pos in 0..positions {
+            for w in 0..words {
+                let word = vob_cpu[pos * words + w];
+                for bit in 0..32 {
+                    let tok = w * 32 + bit;
+                    if tok >= vocab {
+                        break;
+                    }
+                    if (word >> bit) & 1 == 1 {
+                        allow_cpu[pos * vocab + tok] = 1.0;
+                    }
+                }
+            }
+        }
+
+        let gpu_flat = allow_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(gpu_flat.len(), allow_cpu.len(), "same length at the realistic vocab");
+        // Bit-exact match at the realistic size (the no overflow, the no OOB).
+        for (i, (g, c)) in gpu_flat.iter().zip(allow_cpu.iter()).enumerate() {
+            assert_eq!(*g, *c, "realistic-vocab mismatch at {i}");
+        }
+        println!("PDA vob_to_allow realistic vocab ({vocab}) matches the CPU reference");
     }
 }
