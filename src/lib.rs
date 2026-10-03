@@ -50,6 +50,8 @@ pub mod mxfp4_linear;
 pub mod nvfp4_linear;
 pub mod ops;
 pub mod qwen4;
+#[cfg(feature = "cuda")]
+pub mod ridge_gemm;
 pub mod silu_and_mul;
 pub mod swiglu;
 
