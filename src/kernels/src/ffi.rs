@@ -346,6 +346,24 @@ extern "C" {
         stream: i64,
     );
 
+    /// The big/little cross-model ridge GEMV (the fused-head W + b, the proportional
+    /// layer/head map). Computes dst = W*src + b for the cross-model KV translation.
+    pub fn ridge_gemm_f32(
+        src: *const c_void,
+        W: *const c_void,
+        b: *const c_void,
+        dst: *mut c_void,
+        num_src_layers: i32,
+        src_heads: i32,
+        num_tgt_layers: i32,
+        tgt_heads: i32,
+        num_blocks: i32,
+        block_size: i32,
+        d_s: i32,
+        d_t: i32,
+        stream: i64,
+    );
+
     pub fn mamba_scatter_rows_f16(
         src: *const c_void,
         dst: *mut c_void,
