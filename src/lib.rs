@@ -38,6 +38,8 @@ pub use metal_kernels;
 pub mod cache;
 #[cfg(feature = "cuda")]
 pub mod cuda_utils;
+#[cfg(feature = "cuda")]
+pub mod cuda_ipc;
 pub mod deepseek_v4;
 pub mod fp8_linear;
 pub mod gdn;
