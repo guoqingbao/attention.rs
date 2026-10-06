@@ -308,7 +308,9 @@ __global__ void chunked_prefill_paged_attention_kernel(
 
         // Update running maximum and normalization factors
         const float m_j = fmaxf(M, Smax);
-        const float alpha = __expf(M - m_j);
+        // Clamp expf input to prevent overflow/underflow
+        const float alpha_diff = fmaxf(fminf(M - m_j, 100.0f), -100.0f);
+        const float alpha = __expf(alpha_diff);
         M = m_j;
         L = L * alpha;
         #pragma unroll
@@ -321,7 +323,9 @@ __global__ void chunked_prefill_paged_attention_kernel(
         #pragma unroll
         for (int b = 0; b < BLOCK_SIZE; ++b) {
           if (in_contexts[b]) { // Uses the updated context check (window + valid)
-              const float P = __expf(qk_block[b] - M);
+              // Clamp expf input to prevent overflow/underflow
+              const float p_diff = fmaxf(fminf(qk_block[b] - M, 100.0f), -100.0f);
+              const float P = __expf(p_diff);
               reinterpret_cast<float*>(&p_vec[b/VEC_SIZE])[b % VEC_SIZE] = P;
               acc_lane += P;
           } else {
