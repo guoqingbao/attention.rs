@@ -54,6 +54,15 @@ pub struct PdaPushdownTable {
     pub words_per_vob: u32,
     /// Max stack depth (the bounded pushdown).
     pub max_stack_depth: u32,
+    /// Whether the machine is deterministic (a DPDA). The GPU settled-mask kernels
+    /// (fused_sample / fused_project) are sound ONLY for deterministic machines; a
+    /// non-deterministic machine must use the CPU epsilon-closure-union mask instead.
+    pub is_deterministic: bool,
+    /// The maximum epsilon-closure width (the distinct (state, top) pairs reachable via
+    /// epsilon moves from any single config). The GPU scan_mask / advance_pda BFS frontier
+    /// (the MAXF=64 cap) is sound ONLY when this width is <= 64; a wider closure truncates
+    /// the GPU mask (the under-approximation). The correct gate for the GPU projection.
+    pub max_closure_width: u32,
 }
 
 /// Sampling strategy for the PDA step.
@@ -80,6 +89,8 @@ impl PdaPushdownTable {
         start_state: u32,
         start_stack: u32,
         max_stack_depth: u32,
+        is_deterministic: bool,
+        max_closure_width: u32,
         device: &candle_core::Device,
     ) -> Result<Self> {
         let words_per_vob = (num_inputs + 31) / 32;
@@ -125,6 +136,8 @@ impl PdaPushdownTable {
             start_stack,
             words_per_vob,
             max_stack_depth,
+            is_deterministic,
+            max_closure_width,
         })
     }
 
@@ -135,6 +148,7 @@ impl PdaPushdownTable {
         device: &candle_core::Device,
     ) -> Result<Self> {
         use pushdown_rs::machine::PdaMachine;
+        use pushdown_rs::pda::Dpda;
         let machine = PdaMachine::from_bitvec(&pkg.bitvec)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
         // Flatten the transitions into the GPU array format:
@@ -158,6 +172,8 @@ impl PdaPushdownTable {
             machine.start_state,
             machine.start_stack,
             8, // the bounded stack depth (the D).
+            machine.is_deterministic(),
+            machine.max_closure_width() as u32,
             device,
         )
     }
