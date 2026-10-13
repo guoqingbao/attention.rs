@@ -423,6 +423,49 @@ pub fn swap_blocks(
     }
 }
 
+/// Build a block mapping from `(src_block, dst_block)` pairs.
+pub fn block_mapping_from_pairs(pairs: &[(usize, usize)]) -> HashMap<usize, usize> {
+    pairs.iter().copied().collect()
+}
+
+/// GPU → CPU copy for KV cache blocks.
+pub fn swap_blocks_out(gpu: &Tensor, cpu: &Tensor, pairs: &[(usize, usize)]) -> Result<()> {
+    let mapping = block_mapping_from_pairs(pairs);
+    swap_blocks(gpu, cpu, &mapping)
+}
+
+/// CPU → GPU copy for KV cache blocks.
+pub fn swap_blocks_in(cpu: &Tensor, gpu: &Tensor, pairs: &[(usize, usize)]) -> Result<()> {
+    let mapping = block_mapping_from_pairs(pairs);
+    swap_blocks(cpu, gpu, &mapping)
+}
+
+/// Swap K and V cache tensors for all layers using the same block mapping.
+pub fn swap_kv_layers(
+    gpu_layers: &[(Tensor, Tensor)],
+    cpu_layers: &[(Tensor, Tensor)],
+    pairs: &[(usize, usize)],
+    swap_in: bool,
+) -> Result<()> {
+    if gpu_layers.len() != cpu_layers.len() {
+        candle_core::bail!(
+            "swap_kv_layers layer count mismatch: gpu={}, cpu={}",
+            gpu_layers.len(),
+            cpu_layers.len()
+        );
+    }
+    for (gpu, cpu) in gpu_layers.iter().zip(cpu_layers.iter()) {
+        if swap_in {
+            swap_blocks_in(&cpu.0, &gpu.0, pairs)?;
+            swap_blocks_in(&cpu.1, &gpu.1, pairs)?;
+        } else {
+            swap_blocks_out(&gpu.0, &cpu.0, pairs)?;
+            swap_blocks_out(&gpu.1, &cpu.1, pairs)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
     use candle_core::DType;
     use half::{bf16, f16};
@@ -539,5 +582,19 @@ pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
         _ => {
             candle_core::bail!("clear_blocks only accept f16/bf16/u8 kvcache dtypes!")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_mapping_from_pairs;
+
+    #[test]
+    fn block_mapping_from_pairs_roundtrip() {
+        let pairs = [(3usize, 10usize), (5, 11)];
+        let map = block_mapping_from_pairs(&pairs);
+        assert_eq!(map.get(&3), Some(&10));
+        assert_eq!(map.get(&5), Some(&11));
+        assert_eq!(map.len(), 2);
     }
 }
