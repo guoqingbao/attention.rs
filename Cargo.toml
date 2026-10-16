@@ -23,7 +23,7 @@ rayon="1.10.0"
 kernels = { path = "./src/kernels", version="0.6.9", optional = true}
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 metal-kernels = { path = "./src/metal-kernels", version="0.2.6", optional = true}
-flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "7aef81b", optional = true }
+flashattn-rs = { git = "https://github.com/guoqingbao/flashattn.rs.git", version="0.1.1", rev = "c9f3545", optional = true }
 ureq = { version = "2.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 
