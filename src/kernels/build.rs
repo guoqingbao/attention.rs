@@ -124,7 +124,10 @@ fn main() -> Result<()> {
     // MSVC host defaults to C++14 and its traditional preprocessor; kernels need
     // C++20 (lambda template params) and CCCL (CUDA 13) rejects the old preprocessor.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        builder = builder.arg("-std=c++20").arg("-Xcompiler").arg("/Zc:preprocessor");
+        builder = builder
+            .arg("-std=c++20")
+            .arg("-Xcompiler")
+            .arg("/Zc:preprocessor");
     }
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
