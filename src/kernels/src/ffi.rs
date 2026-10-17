@@ -4746,4 +4746,31 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn expert_lru_ensure(
+        ids: *const u32,
+        n: i32,
+        slot_of: *mut u32,
+        expert_of: *mut u32,
+        last_used: *mut u32,
+        tick: *mut u32,
+        num_slots: i32,
+        out_ids: *mut u32,
+        miss_expert: *mut u32,
+        miss_slot: *mut u32,
+        miss_count: *mut u32,
+        stats: *mut u64,
+        stream: i64,
+    );
+
+    pub fn expert_gather_banks(
+        src: *const *const u8,
+        dst: *const *mut u8,
+        expert_bytes: *const u64,
+        num_banks: i32,
+        miss_expert: *const u32,
+        miss_slot: *const u32,
+        miss_count: *const u32,
+        max_misses: i32,
+        stream: i64,
+    );
 }
