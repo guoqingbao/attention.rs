@@ -114,7 +114,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
                 num_rows
             );
         }
-        let slots_ptr = *slots.device_ptr() as *const core::ffi::c_long;
+        let slots_ptr = *slots.device_ptr() as *const i64;
         let stream = *dst.device().cu_stream() as i64;
 
         unsafe {

@@ -963,7 +963,7 @@ impl ReshapeCache {
 
         let k_ptr = *k.device_ptr() as *const core::ffi::c_void;
         let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
-        let s_ptr = *s.device_ptr() as *const core::ffi::c_long;
+        let s_ptr = *s.device_ptr() as *const i64;
 
         let (k_scales_ptr, v_scales_ptr) =
             if let (Some(k_scales), Some(v_scales)) = (&self.k_scales, &self.v_scales) {

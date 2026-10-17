@@ -1,4 +1,4 @@
-use core::ffi::{c_int, c_long, c_void};
+use core::ffi::{c_int, c_void};
 #[allow(dead_code)]
 extern "C" {
     pub fn call_reshape_and_cache(
@@ -8,7 +8,7 @@ extern "C" {
         value_cache: *const c_void,
         k_scale: *const c_void,
         v_scale: *const c_void,
-        slot_mapping: *const c_long,
+        slot_mapping: *const i64,
 
         num_tokens: c_int,
         num_heads: c_int,
@@ -40,7 +40,7 @@ extern "C" {
         value_cache: *const c_void, // [num_blocks, block_size, num_heads, head_size]
         k_scale: *const c_void,
         v_scale: *const c_void,
-        slot_mapping: *const c_long, // [num_tokens]
+        slot_mapping: *const i64, // [num_tokens]
 
         num_tokens: c_int,
         num_heads: c_int,
@@ -186,7 +186,7 @@ extern "C" {
     pub fn update_kv_scales_per_head_f32(
         k: *const c_void,
         v: *const c_void,
-        num_tokens: c_long,
+        num_tokens: i64,
         num_heads: c_int,
         head_dim: c_int,
         k_scales: *const f32,
@@ -197,7 +197,7 @@ extern "C" {
     pub fn update_kv_scales_per_head_f16(
         k: *const c_void,
         v: *const c_void,
-        num_tokens: c_long,
+        num_tokens: i64,
         num_heads: c_int,
         head_dim: c_int,
         k_scales: *const f32,
@@ -208,7 +208,7 @@ extern "C" {
     pub fn update_kv_scales_per_head_bf16(
         k: *const c_void,
         v: *const c_void,
-        num_tokens: c_long,
+        num_tokens: i64,
         num_heads: c_int,
         head_dim: c_int,
         k_scales: *const f32,
@@ -349,7 +349,7 @@ extern "C" {
     pub fn mamba_scatter_rows_f16(
         src: *const c_void,
         dst: *mut c_void,
-        slots: *const c_long,
+        slots: *const i64,
         num_rows: i32,
         row_elems: i32,
         src_row_stride: i64,
@@ -359,7 +359,7 @@ extern "C" {
     pub fn mamba_scatter_rows_bf16(
         src: *const c_void,
         dst: *mut c_void,
-        slots: *const c_long,
+        slots: *const i64,
         num_rows: i32,
         row_elems: i32,
         src_row_stride: i64,
@@ -369,7 +369,7 @@ extern "C" {
     pub fn mamba_scatter_rows_f32(
         src: *const c_void,
         dst: *mut c_void,
-        slots: *const c_long,
+        slots: *const i64,
         num_rows: i32,
         row_elems: i32,
         src_row_stride: i64,
@@ -2134,7 +2134,7 @@ extern "C" {
         weight: *const f32,
         bias: *const f32,
         conv_state: *mut f32,
-        slots: *const c_long,
+        slots: *const i64,
         out: *mut f32,
         batch: c_int,
         d_conv: c_int,
@@ -2147,7 +2147,7 @@ extern "C" {
         weight: *const c_void,
         bias: *const c_void,
         conv_state: *mut f32,
-        slots: *const c_long,
+        slots: *const i64,
         out: *mut c_void,
         batch: c_int,
         d_conv: c_int,
@@ -2160,7 +2160,7 @@ extern "C" {
         weight: *const c_void,
         bias: *const c_void,
         conv_state: *mut f32,
-        slots: *const c_long,
+        slots: *const i64,
         out: *mut c_void,
         batch: c_int,
         d_conv: c_int,
