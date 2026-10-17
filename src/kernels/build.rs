@@ -15,7 +15,8 @@ fn main() -> Result<()> {
     // binary, still need the C++ ABI and standard-library symbols.
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=c++");
-    } else {
+    } else if !cfg!(target_env = "msvc") {
+        // MSVC links its C++ runtime implicitly; there is no stdc++.lib.
         println!("cargo:rustc-link-lib=stdc++");
     }
 
