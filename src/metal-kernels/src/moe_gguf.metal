@@ -64,7 +64,7 @@ template <typename T>
 
     if (expert_id < 0 || expert_id >= num_experts) {
         if (simd_lane_id == 0) {
-            output[m_out * size_n + n_out] = 0.0f;
+            output[token_id * size_n + n_out] = 0.0f;
         }
         return;
     }
@@ -510,7 +510,10 @@ template <typename T>
         if (has_topk_weights != 0) {
             tw = topk_weights[token_id];
         }
-        output[m_out * size_n + n_out] = sum_f * tw;
+        // Row = original flat index (token*topk + slot), not the sorted slot,
+        // so the caller's reshape((tokens, topk, n)).sum(1) and the weighted
+        // down-projection's input lookup (input row = token_id) line up.
+        output[token_id * size_n + n_out] = sum_f * tw;
     }
 }
 
@@ -920,7 +923,7 @@ template <typename T>
                 int global_c = col_base + local_c;
                 if (global_c < size_n) {
                     float val = s_out[local_r][local_c] * tw;
-                    output[global_r * size_n + global_c] = val;
+                    output[token_id * size_n + global_c] = val; // see GEMV note
                 }
             }
         }

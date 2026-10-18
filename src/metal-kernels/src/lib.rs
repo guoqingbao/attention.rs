@@ -1423,7 +1423,15 @@ pub fn call_moe_gguf_gemm(
     block_size_bytes: i32,
     qk: i32,
 ) -> Result<(), MetalKernelError> {
-    let use_gemv = !is_prefill && size_m <= 128;
+    // Always take the per-row GEMV path. The tiled GEMM below dequantises one
+    // "reference expert" per 32-row tile and applies it to every row in the
+    // tile, which is only right when all 32 sorted rows share an expert; with
+    // 256 experts and a few hundred rows that is essentially never true, and
+    // prefill produced garbage. GEMV handles one (row, expert) pair per
+    // simdgroup and matches a CPU reference to ~1e-3. Slower for very long
+    // prompts, but correct.
+    let _ = is_prefill;
+    let use_gemv = true;
     let has_topk_weights: i32 = if topk_weights.is_some() { 1 } else { 0 };
     let dummy_offset: usize = 0;
 
