@@ -3024,11 +3024,12 @@ pub fn moe_gemm(
     }
 
     let dev = input.device();
+    // See moe_gemm_gguf: allocate before fetching the command buffer.
+    let output = Tensor::zeros((size_m, size_n), dtype, dev)?;
+
     let metal_dev = dev.as_metal_device()?;
     let command_buffer = metal_dev.command_buffer()?;
     let command_buffer = command_buffer.as_ref();
-
-    let output = Tensor::zeros((size_m, size_n), dtype, dev)?;
 
     {
         let (input_s, input_l) = input.storage_and_layout();
@@ -3400,11 +3401,15 @@ pub fn moe_gemm_gguf(
     };
 
     let dev = input.device();
+    // Allocate before fetching the command buffer: `Tensor::zeros` is itself a
+    // Metal op and can make candle commit the current buffer and open a new
+    // one, after which encoding into the old handle aborts with
+    // "_status < MTLCommandBufferStatusCommitted".
+    let output = Tensor::zeros((size_m, size_n), DType::F32, dev)?;
+
     let metal_dev = dev.as_metal_device()?;
     let command_buffer = metal_dev.command_buffer()?;
     let command_buffer = command_buffer.as_ref();
-
-    let output = Tensor::zeros((size_m, size_n), DType::F32, dev)?;
 
     {
         let (input_s, input_l) = input_cast.storage_and_layout();
