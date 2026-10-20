@@ -364,6 +364,180 @@ extern "C" {
         stream: i64,
     );
 
+    // The fused batched LoRA shrink/expand GEMM (the multi-tenant serving). The
+    // `x` is the `[rows, in_features]` activation, the `a` is the stacked
+    // `[num_slots, in_features, rank]`, the `b` is the stacked `[num_slots, rank,
+    // out_features]`, the `scale` is the `[num_slots]` f32. The `slot_map` is the
+    // `[rows]` u32 compacted slot index (the `LORA_FUSED_BASE_SLOT` sentinel =
+    // the base model, no delta). The `active_slots` is the `[num_active]` u32 map
+    // from the compacted index to the actual bank slot. The `buf` is the
+    // `[rows, num_active, rank]` f32 scratch (compacted, only the full bank width).
+    // The shrink fills the buf; the expand writes the delta into the `out`
+    // (`[rows, out_features]`, fresh tensor, the caller adds it to the base).
+    pub fn lora_shrink_f16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_bf16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_f32(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_f16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_bf16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_f32(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+
+    // The stacked (additive multi-adapter) shrink/expand. The CSR layout:
+    // slot_offsets [rows+1] u32, slot_ids [total] u32 (compacted index per
+    // (row, adapter) pair), active_slots [num_active] u32 (compacted -> bank
+    // slot). The buf is [rows, max_stack, rank] f32; only the first
+    // stack_count[row] middle entries are used. The out is [rows, out_features]
+    // (the additive delta, written fresh).
+    pub fn lora_shrink_stacked_f16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_stacked_bf16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_stacked_f32(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_f16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_bf16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_f32(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+
     pub fn mamba_scatter_rows_f16(
         src: *const c_void,
         dst: *mut c_void,
