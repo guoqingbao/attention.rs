@@ -143,8 +143,504 @@ impl Sampler {
         Ok(host_out.into_iter().map(|x| x as u32).collect())
     }
 
+    /// Per-sequence sampling (the additive path, the QoS-gated): the temperature / top_p /
+    /// top_k are per-batch-row tensors (the [B]), so each sequence samples with its own
+    /// strategy. The existing `sample_cuda` (the single shared strategy) is unchanged.
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_perseq(
+        &self,
+        logits: &Tensor,
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,      // [B]
+        seed: u64,
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+
+        let cuda_ptr_of = |tensor: &Tensor, name: &str| -> Result<*const core::ffi::c_void> {
+            let storage = tensor.storage_and_layout().0;
+            let cuda_storage = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("{name} expects a CUDA tensor"),
+            };
+            match &cuda_storage.slice {
+                CudaStorageSlice::F32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                CudaStorageSlice::U32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                _ => candle_core::bail!("{name} has unsupported storage dtype"),
+            }
+        };
+
+        let logits = if !logits.is_contiguous() {
+            logits.contiguous()? } else { logits.clone() };
+        let logits_ptr = cuda_ptr_of(&logits, "logits")? as *const f32;
+        let temperature_ptr = cuda_ptr_of(temperature_d, "temperature_d")? as *const f32;
+        let top_p_ptr = cuda_ptr_of(top_p_d, "top_p_d")? as *const f32;
+        let top_k_ptr = cuda_ptr_of(top_k_d, "top_k_d")? as *const u32;
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        unsafe {
+            ffi::sampling_perseq_f32(
+                logits_ptr,
+                out_ptr as *mut i32,
+                b as i32,
+                v as i32,
+                temperature_ptr,
+                top_p_ptr,
+                top_k_ptr,
+                seed,
+                token_pos,
+                stream,
+            );
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
+    /// Per-sequence sampling with a per-row grammar allow-mask (the additive path, the
+    /// QoS-gated): the temperature / top_p / top_k are per-batch-row tensors (the [B]),
+    /// and the mask is a [B, V] F32 allow-matrix (1.0 = legal, 0.0 = illegal). The
+    /// existing sample_cuda_masked (the single shared strategy) is unchanged.
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_perseq_masked(
+        &self,
+        logits: &Tensor,
+        mask: &Tensor, // [B, V] F32, 1.0=legal / 0.0=illegal
+        temperature_d: &Tensor, // [B]
+        top_p_d: &Tensor,       // [B]
+        top_k_d: &Tensor,       // [B]
+        seed: u64,
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+
+        let cuda_ptr_of = |tensor: &Tensor, name: &str| -> Result<*const core::ffi::c_void> {
+            let storage = tensor.storage_and_layout().0;
+            let cuda_storage = match &*storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("{name} expects a CUDA tensor"),
+            };
+            match &cuda_storage.slice {
+                CudaStorageSlice::F32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                CudaStorageSlice::U32(inp) => Ok(*inp.device_ptr() as *const core::ffi::c_void),
+                _ => candle_core::bail!("{name} has unsupported storage dtype"),
+            }
+        };
+
+        let logits = if !logits.is_contiguous() { logits.contiguous()? } else { logits.clone() };
+        // The kernel (sampling_perseq_masked_f32) expects an F32 allow-mask
+        // (1.0=legal / 0.0=illegal). The caller may hand us a compact U8 mask
+        // (build_allow_mask), so coerce to F32 before extracting the pointer
+        // mirroring sample_cuda_masked. Without this the U8 storage slice hits
+        // the cuda_ptr_of fallback and bails "mask has unsupported storage dtype".
+        let mask = if mask.dtype() == candle_core::DType::F32 {
+            if !mask.is_contiguous() { mask.contiguous()? } else { mask.clone() }
+        } else {
+            mask.to_dtype(candle_core::DType::F32)?.contiguous()?
+        };
+        let logits_ptr = cuda_ptr_of(&logits, "logits")? as *const f32;
+        let mask_ptr = cuda_ptr_of(&mask, "mask")? as *const f32;
+        let temperature_ptr = cuda_ptr_of(temperature_d, "temperature_d")? as *const f32;
+        let top_p_ptr = cuda_ptr_of(top_p_d, "top_p_d")? as *const f32;
+        let top_k_ptr = cuda_ptr_of(top_k_d, "top_k_d")? as *const u32;
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        unsafe {
+            ffi::sampling_perseq_masked_f32(
+                logits_ptr,
+                mask_ptr,
+                out_ptr as *mut i32,
+                b as i32,
+                v as i32,
+                temperature_ptr,
+                top_p_ptr,
+                top_k_ptr,
+                seed,
+                token_pos,
+                stream,
+            );
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
+    /// Like `sample_cuda`, but applies a per-row grammar allow-mask in the top-k stage so
+    /// disallowed tokens are never sampled. `mask` is `[b, v]` F32 (1.0 = legal, 0.0 =
+    /// illegal); pass `None` for unmasked sampling (identical to `sample_cuda`).
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_masked(
+        &self,
+        logits: &Tensor,
+        k: usize,
+        p: f32,
+        temperature: f32,
+        seed: u64,
+        mask: Option<&Tensor>,
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+        use candle_core::DType;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+        let dtype = logits.dtype();
+
+        let logits = if !logits.is_contiguous() {
+            logits.contiguous()?
+        } else {
+            logits.clone()
+        };
+        let storage = logits.storage_and_layout().0;
+        let cuda_storage = match &*storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Sampler expects CUDA tensor"),
+        };
+
+        // Resolve the mask pointer (null when unmasked).
+        let mask_ptr: *const f32 = match mask {
+            Some(m) => {
+                let (mb, mv) = m.dims2()?;
+                if mb != b || mv != v {
+                    candle_core::bail!("mask shape [{}x{}] does not match logits [{}x{}]", mb, mv, b, v);
+                }
+                let m = if m.dtype() == DType::F32 {
+                    m.contiguous()?
+                } else {
+                    m.to_dtype(DType::F32)?.contiguous()?
+                };
+                let (mstorage, _) = m.storage_and_layout();
+                match &*mstorage {
+                    candle_core::Storage::Cuda(s) => {
+                        let slice = match &s.slice {
+                            CudaStorageSlice::F32(inp) => inp,
+                            _ => candle_core::bail!("mask must be F32 storage"),
+                        };
+                        *slice.device_ptr() as *const f32
+                    }
+                    _ => candle_core::bail!("mask must be a CUDA tensor"),
+                }
+            }
+            None => std::ptr::null(),
+        };
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        match dtype {
+            DType::F32 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F32(inp) => *inp.device_ptr() as *const f32,
+                    _ => candle_core::bail!("Dtype mismatch: expected F32 storage"),
+                };
+                unsafe {
+                    ffi::sampling_masked_f32(
+                        logits_ptr, mask_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::F16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected F16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_masked_f16(
+                        logits_ptr, mask_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected BF16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_masked_bf16(
+                        logits_ptr, mask_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            _ => candle_core::bail!(
+                "Sampler only supports F32, F16, and BF16 dtypes, got {:?}",
+                dtype
+            ),
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
+    /// Like `sample_cuda_masked`, but takes a precomputed VOB bitset (`[b, v/32]` u32
+    /// words) instead of a full F32 mask tensor. 8x less data to transfer.
+    /// Each u32 word covers 32 vocab entries: bit i set = token allowed.
+    #[cfg(feature = "cuda")]
+    pub fn sample_cuda_vob(
+        &self,
+        logits: &Tensor,
+        k: usize,
+        p: f32,
+        temperature: f32,
+        seed: u64,
+        vob: Option<&Tensor>, // [b, v/32] U32
+    ) -> Result<Vec<u32>> {
+        let token_pos = self.next_token_pos();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::WrapErr;
+        use candle_core::DType;
+
+        let (b, v) = logits.dims2()?;
+        let dev = logits.device().as_cuda_device()?;
+        let dtype = logits.dtype();
+
+        let logits = if !logits.is_contiguous() {
+            logits.contiguous()?
+        } else {
+            logits.clone()
+        };
+        let storage = logits.storage_and_layout().0;
+        let cuda_storage = match &*storage {
+            candle_core::Storage::Cuda(s) => s,
+            _ => candle_core::bail!("Sampler expects CUDA tensor"),
+        };
+
+        let vob_ptr: *const u32 = match vob {
+            Some(vob_tensor) => {
+                let (vb, vw) = vob_tensor.dims2()?;
+                if vb != b || vw != v.div_ceil(32) {
+                    candle_core::bail!(
+                        "VOB shape [{}x{}] does not match logits [{}x{}] (expected [{}x{}])",
+                        vb, vw, b, v, b, v.div_ceil(32)
+                    );
+                }
+                let vob_tensor = if vob_tensor.dtype() == DType::U32 {
+                    vob_tensor.contiguous()?
+                } else {
+                    vob_tensor.to_dtype(DType::U32)?.contiguous()?
+                };
+                let (vstorage, _) = vob_tensor.storage_and_layout();
+                match &*vstorage {
+                    candle_core::Storage::Cuda(s) => {
+                        let slice = match &s.slice {
+                            CudaStorageSlice::U32(inp) => inp,
+                            _ => candle_core::bail!("VOB must be U32 storage"),
+                        };
+                        *slice.device_ptr() as *const u32
+                    }
+                    _ => candle_core::bail!("VOB must be a CUDA tensor"),
+                }
+            }
+            None => std::ptr::null(),
+        };
+
+        let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let out_ptr = out_tokens.device_ptr();
+        let stream = *dev.cu_stream() as i64;
+        let out_ptr = *out_ptr as *mut core::ffi::c_void;
+
+        match dtype {
+            DType::F32 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F32(inp) => *inp.device_ptr() as *const f32,
+                    _ => candle_core::bail!("Dtype mismatch: expected F32 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_f32(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::F16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::F16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected F16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_f16(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let logits_ptr = match &cuda_storage.slice {
+                    CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
+                    _ => candle_core::bail!("Dtype mismatch: expected BF16 storage"),
+                };
+                unsafe {
+                    ffi::sampling_vob_bf16(
+                        logits_ptr, vob_ptr, out_ptr as *mut i32,
+                        b as i32, v as i32, k as i32, temperature, p, seed, token_pos, stream,
+                    );
+                }
+            }
+            _ => candle_core::bail!(
+                "Sampler only supports F32, F16, and BF16 dtypes, got {:?}",
+                dtype
+            ),
+        }
+
+        let mut host_out = vec![0i32; b];
+        dev.dtoh_sync_copy_into(&out_tokens, &mut host_out).w()?;
+
+        Ok(host_out.into_iter().map(|x| x as u32).collect())
+    }
+
     #[cfg(feature = "metal")]
     pub fn sample(&self, _: &Tensor, _: usize, _: f32, _: f32, _: u64) -> Result<Vec<u32>> {
         candle_core::bail!("Sampler requires CUDA or Metal device")
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use candle_core::{Device, DType, Tensor};
+
+    /// Regression test for the "mask has unsupported storage dtype" bug:
+    /// `build_allow_mask` hands the perseq-masked sampler a compact U8 mask, but
+    /// the kernel expects F32. `sample_cuda_perseq_masked` must coerce the mask
+    /// dtype (mirroring `sample_cuda_masked`) and still gate per-row.
+    #[test]
+    fn perseq_masked_accepts_u8_mask_and_gates_per_row() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        // Row 0: argmax is token 1, but the mask allows ONLY token 0 -> must pick 0.
+        // Row 1: argmax is token 4, and the mask allows ONLY token 4 -> must pick 4.
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, // row 1
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+
+        // U8 allow-mask: 1=legal / 0=illegal (the compact form build_allow_mask produces).
+        let mask_u8 = Tensor::from_vec(
+            vec![
+                1u8, 0, 0, 0, 0, 0, 0, 0, // row 0: only token 0
+                0, 0, 0, 0, 1, 0, 0, 0,   // row 1: only token 4
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        assert_eq!(mask_u8.dtype(), DType::U8, "test premise: the mask is U8");
+
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![v as u32, v as u32], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq_masked(&logits, &mask_u8, &temperature_d, &top_p_d, &top_k_d, 1234)
+            .expect("U8 mask must be accepted (regression: 'mask has unsupported storage dtype')");
+
+        assert_eq!(tokens.len(), b);
+        assert_eq!(tokens[0], 0, "row 0: mask gates only token 0 (argmax 1 is illegal)");
+        assert_eq!(tokens[1], 4, "row 1: mask allows only token 4");
+    }
+
+    /// The F32 mask path (the kernel's native dtype) must keep working after the
+    /// coercion fix.
+    #[test]
+    fn perseq_masked_f32_mask() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0,
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let mask_f32 = Tensor::from_vec(
+            vec![
+                1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![v as u32, v as u32], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq_masked(&logits, &mask_f32, &temperature_d, &top_p_d, &top_k_d, 42)
+            .unwrap();
+        assert_eq!(tokens[0], 0);
+        assert_eq!(tokens[1], 4);
+    }
+
+    /// Unmasked per-sequence path (commit dc28b45): each row samples with its own
+    /// temperature / top_p / top_k. Greedy per-row argmax must be respected.
+    #[test]
+    fn perseq_unmasked_per_row_strategy() {
+        let dev = Device::new_cuda(0).unwrap();
+        let b = 2;
+        let v = 8;
+        let sampler = Sampler::new();
+
+        let logits = Tensor::from_vec(
+            vec![
+                10.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0 argmax = 0
+                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, // row 1 argmax = 4
+            ],
+            (b, v),
+            &dev,
+        )
+        .unwrap();
+        let temperature_d = Tensor::from_vec(vec![0.01f32, 0.01], (b,), &dev).unwrap();
+        let top_p_d = Tensor::from_vec(vec![1.0f32, 1.0], (b,), &dev).unwrap();
+        let top_k_d = Tensor::from_vec(vec![1u32, 1], (b,), &dev).unwrap();
+
+        let tokens = sampler
+            .sample_cuda_perseq(&logits, &temperature_d, &top_p_d, &top_k_d, 7)
+            .unwrap();
+        assert_eq!(tokens[0], 0, "row 0 greedy top-1 = argmax 0");
+        assert_eq!(tokens[1], 4, "row 1 greedy top-1 = argmax 4");
     }
 }

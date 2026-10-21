@@ -346,6 +346,198 @@ extern "C" {
         stream: i64,
     );
 
+    /// The big/little cross-model ridge GEMV (the fused-head W + b, the proportional
+    /// layer/head map). Computes dst = W*src + b for the cross-model KV translation.
+    pub fn ridge_gemm_f32(
+        src: *const c_void,
+        W: *const c_void,
+        b: *const c_void,
+        dst: *mut c_void,
+        num_src_layers: i32,
+        src_heads: i32,
+        num_tgt_layers: i32,
+        tgt_heads: i32,
+        num_blocks: i32,
+        block_size: i32,
+        d_s: i32,
+        d_t: i32,
+        stream: i64,
+    );
+
+    // The fused batched LoRA shrink/expand GEMM (the multi-tenant serving). The
+    // `x` is the `[rows, in_features]` activation, the `a` is the stacked
+    // `[num_slots, in_features, rank]`, the `b` is the stacked `[num_slots, rank,
+    // out_features]`, the `scale` is the `[num_slots]` f32. The `slot_map` is the
+    // `[rows]` u32 compacted slot index (the `LORA_FUSED_BASE_SLOT` sentinel =
+    // the base model, no delta). The `active_slots` is the `[num_active]` u32 map
+    // from the compacted index to the actual bank slot. The `buf` is the
+    // `[rows, num_active, rank]` f32 scratch (compacted, only the full bank width).
+    // The shrink fills the buf; the expand writes the delta into the `out`
+    // (`[rows, out_features]`, fresh tensor, the caller adds it to the base).
+    pub fn lora_shrink_f16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_bf16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_f32(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_f16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_bf16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_f32(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_map: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        num_active: i32,
+        stream: i64,
+    );
+
+    // The stacked (additive multi-adapter) shrink/expand. The CSR layout:
+    // slot_offsets [rows+1] u32, slot_ids [total] u32 (compacted index per
+    // (row, adapter) pair), active_slots [num_active] u32 (compacted -> bank
+    // slot). The buf is [rows, max_stack, rank] f32; only the first
+    // stack_count[row] middle entries are used. The out is [rows, out_features]
+    // (the additive delta, written fresh).
+    pub fn lora_shrink_stacked_f16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_stacked_bf16(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_shrink_stacked_f32(
+        x: *const c_void,
+        a: *const c_void,
+        scale: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        buf: *mut c_void,
+        rows: i32,
+        in_features: i32,
+        rank: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_f16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_bf16(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+    pub fn lora_expand_stacked_f32(
+        buf: *const c_void,
+        b: *const c_void,
+        slot_offsets: *const c_void,
+        slot_ids: *const c_void,
+        active_slots: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        rank: i32,
+        out_features: i32,
+        max_stack: i32,
+        stream: i64,
+    );
+
     pub fn mamba_scatter_rows_f16(
         src: *const c_void,
         dst: *mut c_void,
@@ -838,6 +1030,125 @@ extern "C" {
         K: i32,
         temperature: f32,
         top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    // Masked sampling: `mask_d` is a [B,V] F32 grammar allow-matrix (1.0 = legal,
+    // 0.0 = illegal) applied in the top-k stage so disallowed tokens are never
+    // sampled. Pass null() for unmasked sampling (identical to the plain entries).
+    pub fn sampling_masked_f32(
+        logits_d: *const f32,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_masked_f16(
+        logits_d: *const c_void,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_masked_bf16(
+        logits_d: *const c_void,
+        mask_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    // VOB (Valid Output Boundary) sampling: `vob_d` is a [B, V/32] U32 bitset
+    // (bit i set = token allowed). 8x less data than the F32 mask path.
+    pub fn sampling_vob_f32(
+        logits_d: *const f32,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_f16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_vob_bf16(
+        logits_d: *const c_void,
+        vob_d: *const u32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        K: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    // Per-sequence sampling (the additive path, the QoS-gated): the temperature / top_p /
+    // top_k are per-batch-row device tensors (the [B]), so each sequence samples with its
+    // own strategy. The existing single-strategy entries are unchanged.
+    pub fn sampling_perseq_f32(
+        logits_d: *const f32,
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        temperature_d: *const f32, // [B]
+        top_p_d: *const f32,       // [B]
+        top_k_d: *const u32,       // [B]
+        seed: u64,
+        token_pos: u64,
+        stream: i64,
+    );
+
+    pub fn sampling_perseq_masked_f32(
+        logits_d: *const f32,
+        mask_d: *const f32, // [B,V] 1.0=legal 0.0=illegal, or null
+        out_tokens_d: *mut i32,
+        B: i32,
+        V: i32,
+        temperature_d: *const f32, // [B]
+        top_p_d: *const f32,       // [B]
+        top_k_d: *const u32,       // [B]
         seed: u64,
         token_pos: u64,
         stream: i64,
@@ -4696,6 +5007,22 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn dflash_select_candidates_masked(
+        hidden: *const c_void,
+        unary_logits: *const f32,
+        candidate_ids: *const u32,
+        predecessor_codebook: *const f32,
+        successor_codebook: *const f32,
+        anchor_token: *const u32,
+        allow: *const f32,
+        selected_tokens: *mut u32,
+        sequence_len: c_int,
+        rank: c_int,
+        topk: c_int,
+        vocab_size: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn dflash_grouped_conv_bf16(
         hidden: *const c_void,
         delta: *const c_void,
@@ -4746,4 +5073,95 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    // The pushdown-rs fused PDA kernels.
+    // One kernel launch does mask + sample + advance (the Pre3 fusion).
+    // The PDA dispatch is optional: if ctrl/stack/sp are null, the kernel
+    // runs plain sampling with zero PDA overhead.
+    pub fn pda_fused_sample_f32(
+        logits: *const f32,
+        ctrl: *const u32,
+        stack: *mut u32,
+        sp: *const u32,
+        out_ctrl: *mut u32,
+        out_sp: *mut u32,
+        out_tokens: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        vob_buf: *mut u32,
+        forbid: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        num_inputs: u32,
+        words_per_vob: u32,
+        batch: i32,
+        vocab: i32,
+        top_k: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        d: i32,
+        stream: i64,
+    );
+
+    pub fn pda_fused_sample_bf16(
+        logits: *const core::ffi::c_void,
+        ctrl: *const u32,
+        stack: *mut u32,
+        sp: *const u32,
+        out_ctrl: *mut u32,
+        out_sp: *mut u32,
+        out_tokens: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        vob_buf: *mut u32,
+        forbid: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        num_inputs: u32,
+        words_per_vob: u32,
+        batch: i32,
+        vocab: i32,
+        top_k: i32,
+        temperature: f32,
+        top_p: f32,
+        seed: u64,
+        d: i32,
+        stream: i64,
+    );
+
+    // The fused projection for drafting (MTP/DFlash): K+1 VOB masks in one launch.
+    pub fn pda_fused_project_masks(
+        ctrl: *const u32,
+        stack: *const u32,
+        sp: *const u32,
+        drafts: *const u32,
+        out_masks: *mut u32,
+        transitions: *const u32,
+        accepting: *const u32,
+        ctrl_u32_offsets: *const u32,
+        ctrl_counts: *const u32,
+        forbid: *const u32,
+        k_actual: *const u32,
+        num_states: u32,
+        num_stack_syms: u32,
+        num_inputs: u32,
+        words_per_vob: u32,
+        batch: i32,
+        k_max: i32,
+        d: i32,
+        stream: i64,
+    );
+
+    pub fn pda_vob_to_allow(
+        vob: *const u32,
+        allow: *mut f32,
+        positions: i32,
+        vocab: i32,
+        words_per_vob: u32,
+        stream: i64,
+    );
 }

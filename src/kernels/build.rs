@@ -28,6 +28,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn_opt.cu");
     println!("cargo:rerun-if-changed=src/copy_blocks_kernel.cu");
+    println!("cargo:rerun-if-changed=src/ridge_gemm_kernel.cu");
+    println!("cargo:rerun-if-changed=src/lora_fused_kernel.cu");
     println!("cargo:rerun-if-changed=src/mamba_scatter_kernel.cu");
     println!("cargo:rerun-if-changed=src/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/sort.cu");
@@ -44,6 +46,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/moe_wmma_gguf.cu");
     println!("cargo:rerun-if-changed=src/gpu_sampling.cuh");
     println!("cargo:rerun-if-changed=src/gpu_sampling.cu");
+    println!("cargo:rerun-if-changed=src/pda.cu");
     println!("cargo:rerun-if-changed=src/fused_rope.cu");
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
     println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
