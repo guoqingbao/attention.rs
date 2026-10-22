@@ -747,12 +747,108 @@ __global__ void gated_delta_rule_decode_slots_gqa_kernel(
     }
 }
 
+// Decode specialization for the Qwen3.5/Qwen3.8 GDN geometry.  The generic
+// kernel assigns one output column to one thread, which leaves a Hopper SM
+// with too little instruction-level parallelism: every thread executes both
+// 128-element dot products serially.  Here a warp computes four columns and
+// splits the recurrent dimension over eight lanes per column.  The recurrent
+// state and all arithmetic remain FP32; only the work assignment and the
+// FP32 reduction order change.
+template <typename T>
+__global__ void gated_delta_rule_decode_slots_gqa_128_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ state,
+    const int64_t* __restrict__ slots,
+    T* __restrict__ out,
+    int batch,
+    int num_v_heads,
+    int num_k_heads,
+    float q_scale) {
+    constexpr int K_DIM = 128;
+    constexpr int V_DIM = 128;
+    constexpr int COLS_PER_WARP = 4;
+    constexpr int LANES_PER_COL = GDN_WARP_SIZE / COLS_PER_WARP;
+    constexpr int ROWS_PER_LANE = K_DIM / LANES_PER_COL;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int col_in_warp = lane % COLS_PER_WARP;
+    const int lane_in_col = lane / COLS_PER_WARP;
+    const int v_idx = (blockIdx.x * blockDim.y + warp) * COLS_PER_WARP + col_in_warp;
+    const int bh = blockIdx.y;
+    if (bh >= batch * num_v_heads || v_idx >= V_DIM) return;
+
+    const int b = bh / num_v_heads;
+    const int v_head_idx = bh % num_v_heads;
+    const int kv_group_size = num_v_heads / num_k_heads;
+    const int k_head_idx = v_head_idx / kv_group_size;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    const T* q_head = q + (b * num_k_heads + k_head_idx) * K_DIM;
+    const T* k_head = k + (b * num_k_heads + k_head_idx) * K_DIM;
+    const T* v_head = v + (b * num_v_heads + v_head_idx) * V_DIM;
+    float* state_head = state + ((slot * num_v_heads + v_head_idx) * K_DIM * V_DIM);
+    const float decay = expf(g[b * num_v_heads + v_head_idx]);
+    const float beta_t = beta[b * num_v_heads + v_head_idx];
+
+    float s[ROWS_PER_LANE];
+    float kv_partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+        const int k_idx = r * LANES_PER_COL + lane_in_col;
+        s[r] = state_head[k_idx * V_DIM + v_idx] * decay;
+        kv_partial = __fmaf_rn(s[r], to_float(k_head[k_idx]), kv_partial);
+    }
+
+    // Lanes for one column are interleaved at a stride of COLS_PER_WARP.
+#pragma unroll
+    for (int offset = LANES_PER_COL / 2; offset > 0; offset >>= 1) {
+        kv_partial += __shfl_down_sync(0xffffffffu, kv_partial, offset * COLS_PER_WARP);
+    }
+    const float kv = __shfl_sync(0xffffffffu, kv_partial, col_in_warp);
+    const float delta = (to_float(v_head[v_idx]) - kv) * beta_t;
+
+    float y_partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+        const int k_idx = r * LANES_PER_COL + lane_in_col;
+        s[r] = __fmaf_rn(to_float(k_head[k_idx]), delta, s[r]);
+        y_partial = __fmaf_rn(s[r], to_float(q_head[k_idx]) * q_scale, y_partial);
+        state_head[k_idx * V_DIM + v_idx] = s[r];
+    }
+#pragma unroll
+    for (int offset = LANES_PER_COL / 2; offset > 0; offset >>= 1) {
+        y_partial += __shfl_down_sync(0xffffffffu, y_partial, offset * COLS_PER_WARP);
+    }
+    if (lane_in_col == 0) {
+        out[(b * num_v_heads + v_head_idx) * V_DIM + v_idx] = from_float<T>(y_partial);
+    }
+}
+
 template <typename T>
 void launch_gated_delta_rule_decode_slots_gqa(
     const T* q, const T* k, const T* v, const float* g, const float* beta,
     float* state, const int64_t* slots, T* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
+    if (k_dim == 128 && v_dim == 128) {
+        constexpr int WARPS_PER_BLOCK = 4;
+        constexpr int COLS_PER_WARP = 4;
+        dim3 grid((v_dim + WARPS_PER_BLOCK * COLS_PER_WARP - 1) /
+                      (WARPS_PER_BLOCK * COLS_PER_WARP),
+                  batch * num_v_heads);
+        dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
+        gated_delta_rule_decode_slots_gqa_128_kernel<T><<<grid, block, 0, stream>>>(
+            q, k, v, g, beta, state, slots, out,
+            batch, num_v_heads, num_k_heads, q_scale);
+        CHECK_CUDA(cudaGetLastError());
+        return;
+    }
     constexpr int BV = 64;
     dim3 grid((v_dim + BV - 1) / BV, batch * num_v_heads);
     dim3 block(BV);
