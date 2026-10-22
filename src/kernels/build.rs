@@ -15,7 +15,8 @@ fn main() -> Result<()> {
     // binary, still need the C++ ABI and standard-library symbols.
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=c++");
-    } else {
+    } else if !cfg!(target_env = "msvc") {
+        // MSVC links its C++ runtime implicitly; there is no stdc++.lib.
         println!("cargo:rustc-link-lib=stdc++");
     }
 
@@ -29,6 +30,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/prefill_paged_attn_opt.cu");
     println!("cargo:rerun-if-changed=src/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/mamba_scatter_kernel.cu");
+    println!("cargo:rerun-if-changed=src/expert_cache.cu");
     println!("cargo:rerun-if-changed=src/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/sort.cu");
     println!("cargo:rerun-if-changed=src/update_kvscales.cu");
@@ -118,6 +120,15 @@ fn main() -> Result<()> {
         .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
         .arg("-O3");
+
+    // MSVC host defaults to C++14 and its traditional preprocessor; kernels need
+    // C++20 (lambda template params) and CCCL (CUDA 13) rejects the old preprocessor.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        builder = builder
+            .arg("-std=c++20")
+            .arg("-Xcompiler")
+            .arg("/Zc:preprocessor");
+    }
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
 

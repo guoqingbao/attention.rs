@@ -68,7 +68,7 @@ template<typename T>
 __global__ void compute_and_update_scales_per_head_kernel(
     const T* __restrict__ k,
     const T* __restrict__ v,
-    long num_tokens,
+    int64_t num_tokens,
     int num_heads,
     int head_dim,
     float* __restrict__ k_scales,
@@ -79,17 +79,17 @@ __global__ void compute_and_update_scales_per_head_kernel(
     float* s_v = sdata + blockDim.x;
 
     const int head_idx = blockIdx.y;
-    const long numel_per_head = num_tokens * (long)head_dim;
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long stride = (long)blockDim.x * (long)gridDim.x;
+    const int64_t numel_per_head = num_tokens * (int64_t)head_dim;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
 
     float local_max_k = 0.0f;
     float local_max_v = 0.0f;
 
-    for (long i = idx; i < numel_per_head; i += stride) {
-        const long token = i / head_dim;
+    for (int64_t i = idx; i < numel_per_head; i += stride) {
+        const int64_t token = i / head_dim;
         const int d = (int)(i % head_dim);
-        const long base = token * (long)(num_heads * head_dim) + (long)head_idx * head_dim + d;
+        const int64_t base = token * (int64_t)(num_heads * head_dim) + (int64_t)head_idx * head_dim + d;
         float avk = to_float_abs<T>(k[base]);
         float avv = to_float_abs<T>(v[base]);
         if (avk > local_max_k) local_max_k = avk;
@@ -123,7 +123,7 @@ template<typename T>
 void update_scales_per_head_typed(
     T* k,
     T* v,
-    long num_tokens,
+    int64_t num_tokens,
     int num_heads,
     int head_dim,
     float* k_scales,
@@ -131,8 +131,8 @@ void update_scales_per_head_typed(
     int64_t stream_
 ) {
     const int threads = 256;
-    long numel_per_head = num_tokens * (long)head_dim;
-    long blocks = (numel_per_head + threads - 1) / threads;
+    int64_t numel_per_head = num_tokens * (int64_t)head_dim;
+    int64_t blocks = (numel_per_head + threads - 1) / threads;
     if (blocks == 0) blocks = 1;
     if (blocks > 65535) blocks = 65535;
     const cudaStream_t stream = (cudaStream_t)stream_;
@@ -144,7 +144,7 @@ void update_scales_per_head_typed(
 }
 
 extern "C" void update_kv_scales_per_head_f32(
-    void* k, void* v, const long num_tokens, int num_heads, int head_dim,
+    void* k, void* v, const int64_t num_tokens, int num_heads, int head_dim,
     float* k_scales, float* v_scales, int64_t stream_
 ) {
     update_scales_per_head_typed<float>(reinterpret_cast<float*>(k), reinterpret_cast<float*>(v),
@@ -153,7 +153,7 @@ extern "C" void update_kv_scales_per_head_f32(
 }
 
 extern "C" void update_kv_scales_per_head_f16(
-    void* k, void* v, const long num_tokens, int num_heads, int head_dim,
+    void* k, void* v, const int64_t num_tokens, int num_heads, int head_dim,
     float* k_scales, float* v_scales, int64_t stream_
 ) {
     update_scales_per_head_typed<__half>(reinterpret_cast<__half*>(k), reinterpret_cast<__half*>(v),
@@ -162,7 +162,7 @@ extern "C" void update_kv_scales_per_head_f16(
 }
 
 extern "C" void update_kv_scales_per_head_bf16(
-    void* k, void* v, const long num_tokens, int num_heads, int head_dim,
+    void* k, void* v, const int64_t num_tokens, int num_heads, int head_dim,
     float* k_scales, float* v_scales, int64_t stream_
 ) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
