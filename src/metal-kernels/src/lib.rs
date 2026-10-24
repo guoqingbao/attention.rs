@@ -2151,7 +2151,9 @@ pub fn flash_attention_prefill(
     kv_block_stride: i32,
     kv_head_stride: i32,
 ) -> Result<(), MetalKernelError> {
-    const BR: u64 = 64;
+    const TOKEN_TILE: u64 = 8;
+    let vectorized = matches!(head_size, 128 | 256);
+    let shared_kv = vectorized && num_seqs == 1 && num_query_tokens >= TOKEN_TILE as i32;
     let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     let type_prefix = match ty {
@@ -2161,10 +2163,22 @@ pub fn flash_attention_prefill(
     };
 
     let fp8_suffix = if quantized_cache { "_fp8" } else { "" };
-    let name = format!(
-        "flash_prefill_{}{}_hd{}_bs{}",
-        type_prefix, fp8_suffix, head_size, block_size
-    );
+    let name = if shared_kv {
+        format!(
+            "flash_prefill_vec_q2_{}{}_hd{}_bs{}",
+            type_prefix, fp8_suffix, head_size, block_size
+        )
+    } else if vectorized {
+        format!(
+            "flash_prefill_vec_{}{}_hd{}_bs{}",
+            type_prefix, fp8_suffix, head_size, block_size
+        )
+    } else {
+        format!(
+            "flash_prefill_{}{}_hd{}_bs{}",
+            type_prefix, fp8_suffix, head_size, block_size
+        )
+    };
 
     let pipeline = kernels.load_pipeline(device, name)?;
     let encoder = ep.encoder();
@@ -2252,10 +2266,23 @@ pub fn flash_attention_prefill(
     );
 
     let num_queries_per_kv = (num_query_heads / num_kv_heads) as u64;
-    let num_token_chunks = (num_query_tokens as u64 + BR - 1) / BR;
+    let token_tile = if shared_kv {
+        16
+    } else if vectorized {
+        TOKEN_TILE
+    } else {
+        64
+    };
+    let num_token_chunks = (num_query_tokens as u64 + token_tile - 1) / token_tile;
 
     let thread_group_size = MTLSize {
-        width: BR,
+        width: if shared_kv {
+            token_tile * 16
+        } else if vectorized {
+            TOKEN_TILE * 32
+        } else {
+            64
+        },
         height: 1,
         depth: 1,
     };
@@ -2409,9 +2436,7 @@ pub fn flash_attention_decode_splitk(
     kernels: &Kernels,
     ty: PagedAttentionDType,
     output: &Buffer,
-    partial_out: &Buffer,
-    partial_max: &Buffer,
-    partial_sum: &Buffer,
+    scratch: &Buffer,
     q: &Buffer,
     q_offset: usize,
     k_cache: &Buffer,
@@ -2436,8 +2461,21 @@ pub fn flash_attention_decode_splitk(
     sliding_window: i32,
     num_splits: i32,
 ) -> Result<(), MetalKernelError> {
-    const NUM_THREADS: u64 = 256;
+    let vectorized = matches!(head_size, 128 | 256);
+    let q_heads_per_kv = num_q_heads / num_kv_heads;
+    let vectorized_gqa = vectorized && q_heads_per_kv >= 4 && q_heads_per_kv % 4 == 0;
+    let num_threads = if vectorized_gqa {
+        128
+    } else if vectorized {
+        32
+    } else {
+        256
+    };
     let quantized_cache = k_scale.is_some() && v_scale.is_some();
+    let meta_bytes = (num_seqs as usize * num_q_heads as usize * num_splits as usize)
+        * std::mem::size_of::<f32>();
+    let max_offset = meta_bytes * head_size as usize;
+    let sum_offset = max_offset + meta_bytes;
 
     let type_prefix = match ty {
         PagedAttentionDType::BF16 => "bf16",
@@ -2449,8 +2487,18 @@ pub fn flash_attention_decode_splitk(
     // Phase 1: Split-K kernel
     {
         let name = format!(
-            "flash_decode_splitk_{}{}_hd{}_bs{}",
-            type_prefix, fp8_suffix, head_size, block_size
+            "flash_decode_splitk{}_{}{}_hd{}_bs{}",
+            if vectorized_gqa {
+                "_gqa"
+            } else if vectorized {
+                "_vec"
+            } else {
+                ""
+            },
+            type_prefix,
+            fp8_suffix,
+            head_size,
+            block_size
         );
         let pipeline = kernels.load_pipeline(device, name)?;
         let encoder = ep.encoder();
@@ -2458,14 +2506,20 @@ pub fn flash_attention_decode_splitk(
         encoder.set_compute_pipeline_state(&pipeline);
 
         // s_max(NUM_THREADS) + s_sum(NUM_THREADS) + s_reduce(NUM_SIMD_GROUPS * HEAD_DIM)
-        let num_simd_groups = NUM_THREADS / 32;
-        let smem_size = (NUM_THREADS * 2 + num_simd_groups * head_size as u64)
-            * std::mem::size_of::<f32>() as u64;
+        let num_simd_groups = num_threads / 32;
+        let smem_size = if vectorized_gqa {
+            2 * 4 * head_size as u64 * if quantized_cache { 1 } else { 2 }
+        } else if vectorized {
+            0
+        } else {
+            (num_threads * 2 + num_simd_groups * head_size as u64)
+                * std::mem::size_of::<f32>() as u64
+        };
         encoder.set_threadgroup_memory_length(0, smem_size);
 
-        encoder.set_buffer(0, Some(partial_out), 0);
-        encoder.set_buffer(1, Some(partial_max), 0);
-        encoder.set_buffer(2, Some(partial_sum), 0);
+        encoder.set_buffer(0, Some(scratch), 0);
+        encoder.set_buffer(1, Some(scratch), max_offset as NSUInteger);
+        encoder.set_buffer(2, Some(scratch), sum_offset as NSUInteger);
         encoder.set_buffer(3, Some(q), q_offset as NSUInteger);
         encoder.set_buffer(4, Some(k_cache), k_cache_offset as NSUInteger);
         encoder.set_buffer(5, Some(v_cache), v_cache_offset as NSUInteger);
@@ -2530,12 +2584,16 @@ pub fn flash_attention_decode_splitk(
         }
 
         let thread_groups_count = MTLSize {
-            width: num_q_heads as u64,
+            width: if vectorized_gqa {
+                (num_q_heads / 4) as u64
+            } else {
+                num_q_heads as u64
+            },
             height: num_seqs as u64,
             depth: num_splits as u64,
         };
         let thread_group_size = MTLSize {
-            width: NUM_THREADS,
+            width: num_threads,
             height: 1,
             depth: 1,
         };
@@ -2548,12 +2606,13 @@ pub fn flash_attention_decode_splitk(
         let pipeline = kernels.load_pipeline(device, name)?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+        encoder.memory_barrier_with_resources(&[scratch]);
         encoder.set_compute_pipeline_state(&pipeline);
 
         encoder.set_buffer(0, Some(output), 0);
-        encoder.set_buffer(1, Some(partial_out), 0);
-        encoder.set_buffer(2, Some(partial_max), 0);
-        encoder.set_buffer(3, Some(partial_sum), 0);
+        encoder.set_buffer(1, Some(scratch), 0);
+        encoder.set_buffer(2, Some(scratch), max_offset as NSUInteger);
+        encoder.set_buffer(3, Some(scratch), sum_offset as NSUInteger);
         encoder.set_bytes(
             4,
             size_of_val(&num_q_heads),
