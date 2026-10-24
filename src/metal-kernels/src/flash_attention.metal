@@ -241,6 +241,326 @@ template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZ
     }
 }
 
+// Vectorized prefill variant. Each SIMD group owns one query/head and spreads
+// its head dimensions over lanes. This keeps the same paged-cache semantics as
+// the reference kernel without placing a full HEAD_DIM accumulator in one
+// thread.
+template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZE>
+[[kernel]] void flash_attention_prefill_vec(
+    device T* output [[buffer(0)]],
+    device const T* q [[buffer(1)]],
+    device const cache_t* k_cache [[buffer(2)]],
+    device const cache_t* v_cache [[buffer(3)]],
+    const constant int& num_kv_heads [[buffer(4)]],
+    const constant float& scale [[buffer(5)]],
+    device const uint32_t* block_tables [[buffer(6)]],
+    device const uint32_t* seq_lens [[buffer(7)]],
+    const constant int& block_table_stride [[buffer(8)]],
+    const constant int& num_seqs [[buffer(9)]],
+    const constant int& num_q_heads [[buffer(10)]],
+    const constant int& num_q_tokens [[buffer(11)]],
+    const constant float& softcapping [[buffer(12)]],
+    const constant int& o_stride [[buffer(13)]],
+    device const uint32_t* query_start_len [[buffer(14)]],
+    device const float* alibi_slopes [[buffer(15)]],
+    device const float* k_scales [[buffer(16)]],
+    device const float* v_scales [[buffer(17)]],
+    device const uint32_t* sinks [[buffer(18)]],
+    const constant int& sliding_window [[buffer(19)]],
+    const constant int& total_num_blocks [[buffer(20)]],
+    const constant int& kv_block_stride [[buffer(21)]],
+    const constant int& kv_head_stride [[buffer(22)]],
+    threadgroup char* smem [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+    (void) o_stride;
+    (void) alibi_slopes;
+    (void) sinks;
+    (void) total_num_blocks;
+    (void) kv_block_stride;
+    (void) kv_head_stride;
+    (void) smem;
+    constexpr int QUERIES_PER_GROUP = 8;
+    constexpr int VECTORS_PER_LANE = HEAD_DIM / 128;
+    static_assert(HEAD_DIM % 128 == 0, "head dimension must be a multiple of 128");
+
+    const int q_head_within_kv = tgid.x;
+    const int kv_head_idx = tgid.y;
+    const int query_token_idx = tgid.z * QUERIES_PER_GROUP + simd_gid;
+    if (query_token_idx >= num_q_tokens || q_head_within_kv >= num_q_heads / num_kv_heads) {
+        return;
+    }
+
+    int seq_idx = 0;
+    int query_start = 0;
+    for (int s = 0; s < num_seqs; ++s) {
+        const int next_start = int(query_start_len[s + 1]);
+        if (query_token_idx < next_start) {
+            seq_idx = s;
+            break;
+        }
+        query_start = next_start;
+    }
+
+    const int local_q_idx = query_token_idx - query_start;
+    const int q_len = int(query_start_len[seq_idx + 1]) - int(query_start_len[seq_idx]);
+    const int context_len = int(seq_lens[seq_idx]);
+    const int kv_start = context_len - q_len;
+    const int causal_end = kv_start + local_q_idx + 1;
+    const int kv_begin = sliding_window > 0 ? max(0, causal_end - sliding_window) : 0;
+    const int kv_end = min(context_len, causal_end);
+    if (kv_begin >= kv_end) {
+        return;
+    }
+
+    const int q_head_idx = kv_head_idx * (num_q_heads / num_kv_heads) + q_head_within_kv;
+    const int dim_base = int(simd_lid) * VECTORS_PER_LANE * 4;
+    device const T* q_ptr = q + (query_token_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    float4 q_reg[VECTORS_PER_LANE];
+    float4 o_acc[VECTORS_PER_LANE];
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        q_reg[i] = float4(float(q_ptr[d + 0]), float(q_ptr[d + 1]),
+                          float(q_ptr[d + 2]), float(q_ptr[d + 3]));
+        o_acc[i] = float4(0.0f);
+    }
+
+    const float kscale = is_fp8 ? k_scales[kv_head_idx] : 1.0f;
+    const float vscale = is_fp8 ? v_scales[kv_head_idx] : 1.0f;
+    device const uint32_t* seq_block_table = block_tables + seq_idx * block_table_stride;
+    float m_prev = -INFINITY;
+    float l_prev = 0.0f;
+
+    for (int kv_idx = kv_begin; kv_idx < kv_end; ++kv_idx) {
+        const int block_idx = kv_idx / BLOCK_SIZE;
+        const int block_offset = kv_idx % BLOCK_SIZE;
+        const uint32_t physical_block = seq_block_table[block_idx];
+        device const cache_t* k_ptr = k_cache
+            + (physical_block * BLOCK_SIZE + block_offset) * (num_kv_heads * HEAD_DIM)
+            + kv_head_idx * HEAD_DIM;
+
+        float dot_qk = 0.0f;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = dim_base + i * 4;
+            float4 kv;
+            if (is_fp8) {
+                kv = float4(softmax_fp8_to_float(k_ptr[d + 0]),
+                            softmax_fp8_to_float(k_ptr[d + 1]),
+                            softmax_fp8_to_float(k_ptr[d + 2]),
+                            softmax_fp8_to_float(k_ptr[d + 3])) * kscale;
+            } else {
+                kv = float4(float(k_ptr[d + 0]), float(k_ptr[d + 1]),
+                            float(k_ptr[d + 2]), float(k_ptr[d + 3]));
+            }
+            dot_qk += dot(q_reg[i], kv);
+        }
+        dot_qk = simd_sum(dot_qk) * scale;
+        if (softcapping > 0.0f) {
+            dot_qk = softcapping * precise::tanh(dot_qk / softcapping);
+        }
+
+        const float m_new = max(m_prev, dot_qk);
+        const float scale_prev = exp(m_prev - m_new);
+        const float p = exp(dot_qk - m_new);
+        l_prev = l_prev * scale_prev + p;
+        m_prev = m_new;
+
+        device const cache_t* v_ptr = v_cache
+            + (physical_block * BLOCK_SIZE + block_offset) * (num_kv_heads * HEAD_DIM)
+            + kv_head_idx * HEAD_DIM;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = dim_base + i * 4;
+            float4 vv;
+            if (is_fp8) {
+                vv = float4(softmax_fp8_to_float(v_ptr[d + 0]),
+                            softmax_fp8_to_float(v_ptr[d + 1]),
+                            softmax_fp8_to_float(v_ptr[d + 2]),
+                            softmax_fp8_to_float(v_ptr[d + 3])) * vscale;
+            } else {
+                vv = float4(float(v_ptr[d + 0]), float(v_ptr[d + 1]),
+                            float(v_ptr[d + 2]), float(v_ptr[d + 3]));
+            }
+            o_acc[i] = o_acc[i] * scale_prev + vv * p;
+        }
+    }
+
+    const float inv_l = 1.0f / max(l_prev, 1e-10f);
+    const int o_offset = (query_token_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        const float4 out = o_acc[i] * inv_l;
+        output[o_offset + d + 0] = T(out.x);
+        output[o_offset + d + 1] = T(out.y);
+        output[o_offset + d + 2] = T(out.z);
+        output[o_offset + d + 3] = T(out.w);
+    }
+}
+
+// Share each K/V cache load between two adjacent query tokens. The two queries
+// have separate online softmax states because their causal limits differ.
+template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZE>
+[[kernel]] void flash_attention_prefill_vec_q2(
+    device T* output [[buffer(0)]],
+    device const T* q [[buffer(1)]],
+    device const cache_t* k_cache [[buffer(2)]],
+    device const cache_t* v_cache [[buffer(3)]],
+    const constant int& num_kv_heads [[buffer(4)]],
+    const constant float& scale [[buffer(5)]],
+    device const uint32_t* block_tables [[buffer(6)]],
+    device const uint32_t* seq_lens [[buffer(7)]],
+    const constant int& block_table_stride [[buffer(8)]],
+    const constant int& num_seqs [[buffer(9)]],
+    const constant int& num_q_heads [[buffer(10)]],
+    const constant int& num_q_tokens [[buffer(11)]],
+    const constant float& softcapping [[buffer(12)]],
+    const constant int& o_stride [[buffer(13)]],
+    device const uint32_t* query_start_len [[buffer(14)]],
+    device const float* alibi_slopes [[buffer(15)]],
+    device const float* k_scales [[buffer(16)]],
+    device const float* v_scales [[buffer(17)]],
+    device const uint32_t* sinks [[buffer(18)]],
+    const constant int& sliding_window [[buffer(19)]],
+    const constant int& total_num_blocks [[buffer(20)]],
+    const constant int& kv_block_stride [[buffer(21)]],
+    const constant int& kv_head_stride [[buffer(22)]],
+    threadgroup char* smem [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+    (void) block_table_stride;
+    (void) num_seqs;
+    (void) o_stride;
+    (void) alibi_slopes;
+    (void) sinks;
+    (void) total_num_blocks;
+    (void) kv_block_stride;
+    (void) kv_head_stride;
+    (void) smem;
+    constexpr int QUERIES_PER_GROUP = 16;
+    constexpr int VECTORS_PER_LANE = HEAD_DIM / 128;
+    static_assert(HEAD_DIM % 128 == 0, "head dimension must be a multiple of 128");
+
+    const int q_head_within_kv = tgid.x;
+    const int kv_head_idx = tgid.y;
+    const int q0_idx = int(tgid.z) * QUERIES_PER_GROUP + int(simd_gid) * 2;
+    const int q1_idx = q0_idx + 1;
+    if (q0_idx >= num_q_tokens || q_head_within_kv >= num_q_heads / num_kv_heads) {
+        return;
+    }
+    const bool q1_valid = q1_idx < num_q_tokens;
+    const int context_len = int(seq_lens[0]);
+    const int query_start = int(query_start_len[0]);
+    const int q_len = int(query_start_len[1]) - query_start;
+    const int kv_start = context_len - q_len;
+    const int end0 = min(context_len, kv_start + q0_idx - query_start + 1);
+    const int end1 = min(context_len, kv_start + q1_idx - query_start + 1);
+    const int begin0 = sliding_window > 0 ? max(0, end0 - sliding_window) : 0;
+    const int begin1 = sliding_window > 0 ? max(0, end1 - sliding_window) : 0;
+    const int kv_begin = min(begin0, begin1);
+    const int kv_end = q1_valid ? end1 : end0;
+    const int q_head_idx = kv_head_idx * (num_q_heads / num_kv_heads) + q_head_within_kv;
+    const int dim_base = int(simd_lid) * VECTORS_PER_LANE * 4;
+    device const T* q0_ptr = q + (q0_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    device const T* q1_ptr = q1_valid ? q + (q1_idx * num_q_heads + q_head_idx) * HEAD_DIM : q0_ptr;
+    float4 q0_reg[VECTORS_PER_LANE], q1_reg[VECTORS_PER_LANE];
+    float4 o0_acc[VECTORS_PER_LANE], o1_acc[VECTORS_PER_LANE];
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        q0_reg[i] = float4(float(q0_ptr[d]), float(q0_ptr[d + 1]),
+                            float(q0_ptr[d + 2]), float(q0_ptr[d + 3]));
+        q1_reg[i] = float4(float(q1_ptr[d]), float(q1_ptr[d + 1]),
+                            float(q1_ptr[d + 2]), float(q1_ptr[d + 3]));
+        o0_acc[i] = float4(0.0f);
+        o1_acc[i] = float4(0.0f);
+    }
+
+    const float kscale = is_fp8 ? k_scales[kv_head_idx] : 1.0f;
+    const float vscale = is_fp8 ? v_scales[kv_head_idx] : 1.0f;
+    float m0 = -INFINITY, m1 = -INFINITY;
+    float l0 = 0.0f, l1 = 0.0f;
+    for (int kv_idx = kv_begin; kv_idx < kv_end; ++kv_idx) {
+        const uint32_t physical_block = block_tables[kv_idx / BLOCK_SIZE];
+        const int cache_offset = (physical_block * BLOCK_SIZE + kv_idx % BLOCK_SIZE)
+            * (num_kv_heads * HEAD_DIM) + kv_head_idx * HEAD_DIM;
+        device const cache_t* k_ptr = k_cache + cache_offset;
+        float dot0 = 0.0f, dot1 = 0.0f;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = dim_base + i * 4;
+            float4 kv;
+            if (is_fp8) {
+                kv = float4(softmax_fp8_to_float(k_ptr[d]), softmax_fp8_to_float(k_ptr[d + 1]),
+                            softmax_fp8_to_float(k_ptr[d + 2]), softmax_fp8_to_float(k_ptr[d + 3])) * kscale;
+            } else {
+                kv = float4(float(k_ptr[d]), float(k_ptr[d + 1]),
+                            float(k_ptr[d + 2]), float(k_ptr[d + 3]));
+            }
+            dot0 += dot(q0_reg[i], kv);
+            dot1 += dot(q1_reg[i], kv);
+        }
+        dot0 = simd_sum(dot0) * scale;
+        dot1 = simd_sum(dot1) * scale;
+        if (softcapping > 0.0f) {
+            dot0 = softcapping * precise::tanh(dot0 / softcapping);
+            dot1 = softcapping * precise::tanh(dot1 / softcapping);
+        }
+
+        const bool active0 = kv_idx >= begin0 && kv_idx < end0;
+        const bool active1 = q1_valid && kv_idx >= begin1 && kv_idx < end1;
+        float scale0 = 1.0f, scale1 = 1.0f;
+        float p0 = 0.0f, p1 = 0.0f;
+        if (active0) {
+            const float new_m = max(m0, dot0);
+            scale0 = exp(m0 - new_m);
+            p0 = exp(dot0 - new_m);
+            l0 = l0 * scale0 + p0;
+            m0 = new_m;
+        }
+        if (active1) {
+            const float new_m = max(m1, dot1);
+            scale1 = exp(m1 - new_m);
+            p1 = exp(dot1 - new_m);
+            l1 = l1 * scale1 + p1;
+            m1 = new_m;
+        }
+
+        device const cache_t* v_ptr = v_cache + cache_offset;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = dim_base + i * 4;
+            float4 vv;
+            if (is_fp8) {
+                vv = float4(softmax_fp8_to_float(v_ptr[d]), softmax_fp8_to_float(v_ptr[d + 1]),
+                            softmax_fp8_to_float(v_ptr[d + 2]), softmax_fp8_to_float(v_ptr[d + 3])) * vscale;
+            } else {
+                vv = float4(float(v_ptr[d]), float(v_ptr[d + 1]),
+                            float(v_ptr[d + 2]), float(v_ptr[d + 3]));
+            }
+            o0_acc[i] = o0_acc[i] * scale0 + vv * p0;
+            o1_acc[i] = o1_acc[i] * scale1 + vv * p1;
+        }
+    }
+
+    const float inv_l0 = 1.0f / max(l0, 1e-10f);
+    const float inv_l1 = 1.0f / max(l1, 1e-10f);
+    const int o0_offset = (q0_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    const int o1_offset = (q1_idx * num_q_heads + q_head_idx) * HEAD_DIM;
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        const float4 out0 = o0_acc[i] * inv_l0;
+        output[o0_offset + d] = T(out0.x);
+        output[o0_offset + d + 1] = T(out0.y);
+        output[o0_offset + d + 2] = T(out0.z);
+        output[o0_offset + d + 3] = T(out0.w);
+        if (q1_valid) {
+            const float4 out1 = o1_acc[i] * inv_l1;
+            output[o1_offset + d] = T(out1.x);
+            output[o1_offset + d + 1] = T(out1.y);
+            output[o1_offset + d + 2] = T(out1.z);
+            output[o1_offset + d + 3] = T(out1.w);
+        }
+    }
+}
+
 // ============================================================================
 // Flash Attention Decode Kernel (Optimized)
 // ============================================================================
@@ -737,6 +1057,330 @@ template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZ
     }
 }
 
+// Split-K decode variant for Apple GPUs. One SIMD group owns one query head:
+// its 32 lanes cover the head dimensions, and each lane keeps only the four
+// output values assigned to it. The previous kernel assigned KV positions to
+// individual threads and kept a full HEAD_DIM accumulator in every thread,
+// causing large register spills for HEAD_DIM=128/256.
+template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZE>
+[[kernel]] void flash_attention_decode_splitk_vec(
+    device float* partial_out [[buffer(0)]],
+    device float* partial_max [[buffer(1)]],
+    device float* partial_sum [[buffer(2)]],
+    device const T* q [[buffer(3)]],
+    device const cache_t* k_cache [[buffer(4)]],
+    device const cache_t* v_cache [[buffer(5)]],
+    device const uint32_t* block_tables [[buffer(6)]],
+    device const uint32_t* context_lens [[buffer(7)]],
+    const constant int& max_blocks_per_seq [[buffer(8)]],
+    const constant int& num_q_heads [[buffer(9)]],
+    const constant int& num_kv_heads [[buffer(10)]],
+    const constant int& head_dim_const [[buffer(11)]],
+    const constant int& block_size_const [[buffer(12)]],
+    const constant float& scale [[buffer(13)]],
+    const constant int& num_seqs [[buffer(14)]],
+    const constant int& num_splits [[buffer(15)]],
+    const constant int& q_stride [[buffer(16)]],
+    const constant float& softcapping [[buffer(17)]],
+    const constant int& sliding_window [[buffer(18)]],
+    device const float* k_scales [[buffer(19)]],
+    device const float* v_scales [[buffer(20)]],
+    threadgroup char* smem [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+    (void) smem;
+    (void) head_dim_const;
+    (void) block_size_const;
+    constexpr int VECTORS_PER_LANE = HEAD_DIM / 128;
+    static_assert(HEAD_DIM % 128 == 0, "head dimension must be a multiple of 128");
+
+    const int head_idx = tgid.x;
+    const int seq_idx = tgid.y;
+    const int split_idx = tgid.z;
+    const int kv_head_idx = head_idx / (num_q_heads / num_kv_heads);
+    const uint32_t context_len = context_lens[seq_idx];
+    const int total_kv = int(context_len);
+    const int window_start = sliding_window > 0 ? max(0, total_kv - sliding_window) : 0;
+    const int window_len = total_kv - window_start;
+    const int tokens_per_split = (window_len + num_splits - 1) / num_splits;
+    const int split_start = window_start + split_idx * tokens_per_split;
+    const int split_end = min(window_start + window_len, split_start + tokens_per_split);
+    const int meta_offset = (seq_idx * num_q_heads + head_idx) * num_splits + split_idx;
+    const int out_offset = meta_offset * HEAD_DIM;
+
+    if (split_start >= split_end) {
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = simd_lid * (VECTORS_PER_LANE * 4) + i * 4;
+            partial_out[out_offset + d + 0] = 0.0f;
+            partial_out[out_offset + d + 1] = 0.0f;
+            partial_out[out_offset + d + 2] = 0.0f;
+            partial_out[out_offset + d + 3] = 0.0f;
+        }
+        if (simd_lid == 0) {
+            partial_max[meta_offset] = -INFINITY;
+            partial_sum[meta_offset] = 0.0f;
+        }
+        return;
+    }
+
+    const int dims_per_lane = VECTORS_PER_LANE * 4;
+    const int dim_base = simd_lid * dims_per_lane;
+    device const T* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_DIM;
+    float4 q_reg[VECTORS_PER_LANE];
+    float4 o_acc[VECTORS_PER_LANE];
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        q_reg[i] = float4(float(q_ptr[d + 0]), float(q_ptr[d + 1]),
+                          float(q_ptr[d + 2]), float(q_ptr[d + 3]));
+        o_acc[i] = float4(0.0f);
+    }
+
+    const float kscale = is_fp8 ? k_scales[kv_head_idx] : 1.0f;
+    const float vscale = is_fp8 ? v_scales[kv_head_idx] : 1.0f;
+    device const uint32_t* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+
+    for (int kv_idx = split_start; kv_idx < split_end; ++kv_idx) {
+        const int block_idx = kv_idx / BLOCK_SIZE;
+        const int block_offset = kv_idx % BLOCK_SIZE;
+        const uint32_t physical_block = seq_block_table[block_idx];
+        device const cache_t* k_ptr = k_cache
+            + (physical_block * BLOCK_SIZE + block_offset) * (num_kv_heads * HEAD_DIM)
+            + kv_head_idx * HEAD_DIM;
+
+        float dot_qk = 0.0f;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = i * 4;
+            float4 kv;
+            if (is_fp8) {
+                kv = float4(softmax_fp8_to_float(k_ptr[dim_base + d + 0]),
+                            softmax_fp8_to_float(k_ptr[dim_base + d + 1]),
+                            softmax_fp8_to_float(k_ptr[dim_base + d + 2]),
+                            softmax_fp8_to_float(k_ptr[dim_base + d + 3])) * kscale;
+            } else {
+                kv = float4(float(k_ptr[dim_base + d + 0]), float(k_ptr[dim_base + d + 1]),
+                            float(k_ptr[dim_base + d + 2]), float(k_ptr[dim_base + d + 3]));
+            }
+            dot_qk += dot(q_reg[i], kv);
+        }
+        dot_qk = simd_sum(dot_qk) * scale;
+        if (softcapping > 0.0f) {
+            dot_qk = softcapping * precise::tanh(dot_qk / softcapping);
+        }
+
+        const float m_new = max(m_local, dot_qk);
+        const float scale_old = exp(m_local - m_new);
+        const float p = exp(dot_qk - m_new);
+        l_local = l_local * scale_old + p;
+        m_local = m_new;
+
+        device const cache_t* v_ptr = v_cache
+            + (physical_block * BLOCK_SIZE + block_offset) * (num_kv_heads * HEAD_DIM)
+            + kv_head_idx * HEAD_DIM;
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = dim_base + i * 4;
+            float4 vv;
+            if (is_fp8) {
+                vv = float4(softmax_fp8_to_float(v_ptr[d + 0]),
+                            softmax_fp8_to_float(v_ptr[d + 1]),
+                            softmax_fp8_to_float(v_ptr[d + 2]),
+                            softmax_fp8_to_float(v_ptr[d + 3])) * vscale;
+            } else {
+                vv = float4(float(v_ptr[d + 0]), float(v_ptr[d + 1]),
+                            float(v_ptr[d + 2]), float(v_ptr[d + 3]));
+            }
+            o_acc[i] = o_acc[i] * scale_old + vv * p;
+        }
+    }
+
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        partial_out[out_offset + d + 0] = o_acc[i].x;
+        partial_out[out_offset + d + 1] = o_acc[i].y;
+        partial_out[out_offset + d + 2] = o_acc[i].z;
+        partial_out[out_offset + d + 3] = o_acc[i].w;
+    }
+    if (simd_lid == 0) {
+        partial_max[meta_offset] = m_local;
+        partial_sum[meta_offset] = l_local;
+    }
+}
+
+// Group four GQA query heads that share one KV head. The threadgroup loads a
+// small K/V tile once, then its four SIMD groups compute the four independent
+// query-head results from that shared tile.
+template <typename T, typename cache_t, bool is_fp8, int HEAD_DIM, int BLOCK_SIZE>
+[[kernel]] void flash_attention_decode_splitk_gqa(
+    device float* partial_out [[buffer(0)]],
+    device float* partial_max [[buffer(1)]],
+    device float* partial_sum [[buffer(2)]],
+    device const T* q [[buffer(3)]],
+    device const cache_t* k_cache [[buffer(4)]],
+    device const cache_t* v_cache [[buffer(5)]],
+    device const uint32_t* block_tables [[buffer(6)]],
+    device const uint32_t* context_lens [[buffer(7)]],
+    const constant int& max_blocks_per_seq [[buffer(8)]],
+    const constant int& num_q_heads [[buffer(9)]],
+    const constant int& num_kv_heads [[buffer(10)]],
+    const constant int& head_dim_const [[buffer(11)]],
+    const constant int& block_size_const [[buffer(12)]],
+    const constant float& scale [[buffer(13)]],
+    const constant int& num_seqs [[buffer(14)]],
+    const constant int& num_splits [[buffer(15)]],
+    const constant int& q_stride [[buffer(16)]],
+    const constant float& softcapping [[buffer(17)]],
+    const constant int& sliding_window [[buffer(18)]],
+    device const float* k_scales [[buffer(19)]],
+    device const float* v_scales [[buffer(20)]],
+    threadgroup char* smem [[threadgroup(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+    (void) head_dim_const;
+    (void) block_size_const;
+    constexpr int HEADS_PER_GROUP = 4;
+    constexpr int KV_TILE = 4;
+    constexpr int VECTORS_PER_LANE = HEAD_DIM / 128;
+    static_assert(HEAD_DIM % 128 == 0, "head dimension must be a multiple of 128");
+
+    const int head_idx = int(tgid.x) * HEADS_PER_GROUP + int(simd_gid);
+    const int seq_idx = tgid.y;
+    const int split_idx = tgid.z;
+    const int q_heads_per_kv = num_q_heads / num_kv_heads;
+    const int kv_head_idx = head_idx / q_heads_per_kv;
+    const uint32_t context_len = context_lens[seq_idx];
+    const int total_kv = int(context_len);
+    const int window_start = sliding_window > 0 ? max(0, total_kv - sliding_window) : 0;
+    const int window_len = total_kv - window_start;
+    const int tokens_per_split = (window_len + num_splits - 1) / num_splits;
+    const int split_start = window_start + split_idx * tokens_per_split;
+    const int split_end = min(window_start + window_len, split_start + tokens_per_split);
+    const int meta_offset = (seq_idx * num_q_heads + head_idx) * num_splits + split_idx;
+    const int out_offset = meta_offset * HEAD_DIM;
+
+    if (split_start >= split_end) {
+        for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+            const int d = int(simd_lid) * (VECTORS_PER_LANE * 4) + i * 4;
+            partial_out[out_offset + d + 0] = 0.0f;
+            partial_out[out_offset + d + 1] = 0.0f;
+            partial_out[out_offset + d + 2] = 0.0f;
+            partial_out[out_offset + d + 3] = 0.0f;
+        }
+        if (simd_lid == 0) {
+            partial_max[meta_offset] = -INFINITY;
+            partial_sum[meta_offset] = 0.0f;
+        }
+        return;
+    }
+
+    threadgroup cache_t* k_tile = (threadgroup cache_t*) smem;
+    threadgroup cache_t* v_tile = k_tile + KV_TILE * HEAD_DIM;
+    const int dim_base = int(simd_lid) * VECTORS_PER_LANE * 4;
+    device const T* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_DIM;
+    float4 q_reg[VECTORS_PER_LANE];
+    float4 o_acc[VECTORS_PER_LANE];
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        q_reg[i] = float4(float(q_ptr[d + 0]), float(q_ptr[d + 1]),
+                          float(q_ptr[d + 2]), float(q_ptr[d + 3]));
+        o_acc[i] = float4(0.0f);
+    }
+
+    const float kscale = is_fp8 ? k_scales[kv_head_idx] : 1.0f;
+    const float vscale = is_fp8 ? v_scales[kv_head_idx] : 1.0f;
+    device const uint32_t* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+
+    for (int tile_start = split_start; tile_start < split_end; tile_start += KV_TILE) {
+        for (int linear = int(tid); linear < KV_TILE * HEAD_DIM; linear += 128) {
+            const int tile_token = linear / HEAD_DIM;
+            const int d = linear % HEAD_DIM;
+            const int kv_idx = tile_start + tile_token;
+            if (kv_idx < split_end) {
+                const int block_idx = kv_idx / BLOCK_SIZE;
+                const int block_offset = kv_idx % BLOCK_SIZE;
+                const uint32_t physical_block = seq_block_table[block_idx];
+                const int cache_offset = (physical_block * BLOCK_SIZE + block_offset)
+                    * (num_kv_heads * HEAD_DIM) + kv_head_idx * HEAD_DIM + d;
+                k_tile[linear] = k_cache[cache_offset];
+                v_tile[linear] = v_cache[cache_offset];
+            } else {
+                k_tile[linear] = cache_t(0);
+                v_tile[linear] = cache_t(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int tile_token = 0; tile_token < KV_TILE; ++tile_token) {
+            const int kv_idx = tile_start + tile_token;
+            if (kv_idx >= split_end) {
+                continue;
+            }
+
+            float dot_qk = 0.0f;
+            for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+                const int d = dim_base + i * 4;
+                float4 kv;
+                if (is_fp8) {
+                    kv = float4(softmax_fp8_to_float(k_tile[tile_token * HEAD_DIM + d + 0]),
+                                softmax_fp8_to_float(k_tile[tile_token * HEAD_DIM + d + 1]),
+                                softmax_fp8_to_float(k_tile[tile_token * HEAD_DIM + d + 2]),
+                                softmax_fp8_to_float(k_tile[tile_token * HEAD_DIM + d + 3])) * kscale;
+                } else {
+                    kv = float4(float(k_tile[tile_token * HEAD_DIM + d + 0]),
+                                float(k_tile[tile_token * HEAD_DIM + d + 1]),
+                                float(k_tile[tile_token * HEAD_DIM + d + 2]),
+                                float(k_tile[tile_token * HEAD_DIM + d + 3]));
+                }
+                dot_qk += dot(q_reg[i], kv);
+            }
+            dot_qk = simd_sum(dot_qk) * scale;
+            if (softcapping > 0.0f) {
+                dot_qk = softcapping * precise::tanh(dot_qk / softcapping);
+            }
+
+            const float m_new = max(m_local, dot_qk);
+            const float scale_old = exp(m_local - m_new);
+            const float p = exp(dot_qk - m_new);
+            l_local = l_local * scale_old + p;
+            m_local = m_new;
+
+            for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+                const int d = dim_base + i * 4;
+                float4 vv;
+                if (is_fp8) {
+                    vv = float4(softmax_fp8_to_float(v_tile[tile_token * HEAD_DIM + d + 0]),
+                                softmax_fp8_to_float(v_tile[tile_token * HEAD_DIM + d + 1]),
+                                softmax_fp8_to_float(v_tile[tile_token * HEAD_DIM + d + 2]),
+                                softmax_fp8_to_float(v_tile[tile_token * HEAD_DIM + d + 3])) * vscale;
+                } else {
+                    vv = float4(float(v_tile[tile_token * HEAD_DIM + d + 0]),
+                                float(v_tile[tile_token * HEAD_DIM + d + 1]),
+                                float(v_tile[tile_token * HEAD_DIM + d + 2]),
+                                float(v_tile[tile_token * HEAD_DIM + d + 3]));
+                }
+                o_acc[i] = o_acc[i] * scale_old + vv * p;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = 0; i < VECTORS_PER_LANE; ++i) {
+        const int d = dim_base + i * 4;
+        partial_out[out_offset + d + 0] = o_acc[i].x;
+        partial_out[out_offset + d + 1] = o_acc[i].y;
+        partial_out[out_offset + d + 2] = o_acc[i].z;
+        partial_out[out_offset + d + 3] = o_acc[i].w;
+    }
+    if (simd_lid == 0) {
+        partial_max[meta_offset] = m_local;
+        partial_sum[meta_offset] = l_local;
+    }
+}
+
 // ============================================================================
 // Split-K Reduce Kernel
 // ============================================================================
@@ -800,6 +1444,30 @@ template [[host_name("flash_prefill_" SUFFIX)]] \
     const constant int&, \
     threadgroup char*, uint3, uint3, uint, uint);
 
+#define INSTANTIATE_FLASH_PREFILL_VEC(T, CACHE_T, IS_FP8, HD, BS, SUFFIX) \
+template [[host_name("flash_prefill_vec_" SUFFIX)]] \
+[[kernel]] void flash_attention_prefill_vec<T, CACHE_T, IS_FP8, HD, BS>( \
+    device T*, device const T*, device const CACHE_T*, device const CACHE_T*, \
+    const constant int&, const constant float&, device const uint32_t*, \
+    device const uint32_t*, const constant int&, const constant int&, \
+    const constant int&, const constant int&, const constant float&, \
+    const constant int&, device const uint32_t*, device const float*, \
+    device const float*, device const float*, device const uint32_t*, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant int&, threadgroup char*, uint3, uint, uint);
+
+#define INSTANTIATE_FLASH_PREFILL_VEC_Q2(T, CACHE_T, IS_FP8, HD, BS, SUFFIX) \
+template [[host_name("flash_prefill_vec_q2_" SUFFIX)]] \
+[[kernel]] void flash_attention_prefill_vec_q2<T, CACHE_T, IS_FP8, HD, BS>( \
+    device T*, device const T*, device const CACHE_T*, device const CACHE_T*, \
+    const constant int&, const constant float&, device const uint32_t*, \
+    device const uint32_t*, const constant int&, const constant int&, \
+    const constant int&, const constant int&, const constant float&, \
+    const constant int&, device const uint32_t*, device const float*, \
+    device const float*, device const float*, device const uint32_t*, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant int&, threadgroup char*, uint3, uint, uint);
+
 #define INSTANTIATE_FLASH_DECODE(T, CACHE_T, IS_FP8, HD, BS, NT, SUFFIX) \
 template [[host_name("flash_decode_" SUFFIX)]] \
 [[kernel]] void flash_attention_decode<T, CACHE_T, IS_FP8, HD, BS, NT>( \
@@ -824,6 +1492,32 @@ template [[host_name("flash_decode_splitk_" SUFFIX)]] \
     device const float*, device const float*, \
     threadgroup char*, uint3, uint3, uint, uint);
 
+#define INSTANTIATE_FLASH_DECODE_SPLITK_VEC(T, CACHE_T, IS_FP8, HD, BS, SUFFIX) \
+template [[host_name("flash_decode_splitk_vec_" SUFFIX)]] \
+[[kernel]] void flash_attention_decode_splitk_vec<T, CACHE_T, IS_FP8, HD, BS>( \
+    device float*, device float*, device float*, \
+    device const T*, device const CACHE_T*, device const CACHE_T*, \
+    device const uint32_t*, device const uint32_t*, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant int&, const constant int&, const constant float&, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant float&, const constant int&, \
+    device const float*, device const float*, \
+    threadgroup char*, uint3, uint);
+
+#define INSTANTIATE_FLASH_DECODE_SPLITK_GQA(T, CACHE_T, IS_FP8, HD, BS, SUFFIX) \
+template [[host_name("flash_decode_splitk_gqa_" SUFFIX)]] \
+[[kernel]] void flash_attention_decode_splitk_gqa<T, CACHE_T, IS_FP8, HD, BS>( \
+    device float*, device float*, device float*, \
+    device const T*, device const CACHE_T*, device const CACHE_T*, \
+    device const uint32_t*, device const uint32_t*, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant int&, const constant int&, const constant float&, \
+    const constant int&, const constant int&, const constant int&, \
+    const constant float&, const constant int&, \
+    device const float*, device const float*, \
+    threadgroup char*, uint3, uint, uint, uint);
+
 #define INSTANTIATE_FLASH_REDUCE(T, HD, SUFFIX) \
 template [[host_name("flash_decode_reduce_" SUFFIX)]] \
 [[kernel]] void flash_attention_decode_reduce<T, HD>( \
@@ -843,48 +1537,80 @@ template [[host_name("flash_reshape_cache_" SUFFIX)]] \
 
 // BF16 model, BF16 cache, HEAD_DIM=128, BLOCK_SIZE=32
 INSTANTIATE_FLASH_PREFILL(bfloat16_t, bfloat16_t, false, 128, 32, 64, 32, "bf16_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(bfloat16_t, bfloat16_t, false, 128, 32, "bf16_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(bfloat16_t, bfloat16_t, false, 128, 32, "bf16_hd128_bs32")
 INSTANTIATE_FLASH_DECODE(bfloat16_t, bfloat16_t, false, 128, 32, 256, "bf16_hd128_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(bfloat16_t, bfloat16_t, false, 128, 32, 256, "bf16_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(bfloat16_t, bfloat16_t, false, 128, 32, "bf16_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(bfloat16_t, bfloat16_t, false, 128, 32, "bf16_hd128_bs32")
 INSTANTIATE_FLASH_REDUCE(bfloat16_t, 128, "bf16_hd128")
 INSTANTIATE_FLASH_CACHE(bfloat16_t, bfloat16_t, false, "bf16_bf16")
 
 // F16 model, F16 cache
 INSTANTIATE_FLASH_PREFILL(half, half, false, 128, 32, 64, 32, "f16_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(half, half, false, 128, 32, "f16_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(half, half, false, 128, 32, "f16_hd128_bs32")
 INSTANTIATE_FLASH_DECODE(half, half, false, 128, 32, 256, "f16_hd128_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(half, half, false, 128, 32, 256, "f16_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(half, half, false, 128, 32, "f16_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(half, half, false, 128, 32, "f16_hd128_bs32")
 INSTANTIATE_FLASH_REDUCE(half, 128, "f16_hd128")
 INSTANTIATE_FLASH_CACHE(half, half, false, "f16_f16")
 
 // BF16 model, FP8 (uint8_t) cache
 INSTANTIATE_FLASH_PREFILL(bfloat16_t, uint8_t, true, 128, 32, 64, 32, "bf16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(bfloat16_t, uint8_t, true, 128, 32, "bf16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(bfloat16_t, uint8_t, true, 128, 32, "bf16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_DECODE(bfloat16_t, uint8_t, true, 128, 32, 256, "bf16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(bfloat16_t, uint8_t, true, 128, 32, 256, "bf16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(bfloat16_t, uint8_t, true, 128, 32, "bf16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(bfloat16_t, uint8_t, true, 128, 32, "bf16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_CACHE(bfloat16_t, uint8_t, true, "bf16_fp8")
 
 // F16 model, FP8 (uint8_t) cache
 INSTANTIATE_FLASH_PREFILL(half, uint8_t, true, 128, 32, 64, 32, "f16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(half, uint8_t, true, 128, 32, "f16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(half, uint8_t, true, 128, 32, "f16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_DECODE(half, uint8_t, true, 128, 32, 256, "f16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(half, uint8_t, true, 128, 32, 256, "f16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(half, uint8_t, true, 128, 32, "f16_fp8_hd128_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(half, uint8_t, true, 128, 32, "f16_fp8_hd128_bs32")
 INSTANTIATE_FLASH_CACHE(half, uint8_t, true, "f16_fp8")
 
 // HEAD_DIM=256 variants (for Qwen3.5, etc.)
 INSTANTIATE_FLASH_PREFILL(bfloat16_t, bfloat16_t, false, 256, 32, 32, 32, "bf16_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(bfloat16_t, bfloat16_t, false, 256, 32, "bf16_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(bfloat16_t, bfloat16_t, false, 256, 32, "bf16_hd256_bs32")
 INSTANTIATE_FLASH_DECODE(bfloat16_t, bfloat16_t, false, 256, 32, 256, "bf16_hd256_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(bfloat16_t, bfloat16_t, false, 256, 32, 256, "bf16_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(bfloat16_t, bfloat16_t, false, 256, 32, "bf16_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(bfloat16_t, bfloat16_t, false, 256, 32, "bf16_hd256_bs32")
 INSTANTIATE_FLASH_REDUCE(bfloat16_t, 256, "bf16_hd256")
 
 INSTANTIATE_FLASH_PREFILL(half, half, false, 256, 32, 32, 32, "f16_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(half, half, false, 256, 32, "f16_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(half, half, false, 256, 32, "f16_hd256_bs32")
 INSTANTIATE_FLASH_DECODE(half, half, false, 256, 32, 256, "f16_hd256_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(half, half, false, 256, 32, 256, "f16_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(half, half, false, 256, 32, "f16_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(half, half, false, 256, 32, "f16_hd256_bs32")
 INSTANTIATE_FLASH_REDUCE(half, 256, "f16_hd256")
 
 INSTANTIATE_FLASH_PREFILL(bfloat16_t, uint8_t, true, 256, 32, 32, 32, "bf16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(bfloat16_t, uint8_t, true, 256, 32, "bf16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(bfloat16_t, uint8_t, true, 256, 32, "bf16_fp8_hd256_bs32")
 INSTANTIATE_FLASH_DECODE(bfloat16_t, uint8_t, true, 256, 32, 256, "bf16_fp8_hd256_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(bfloat16_t, uint8_t, true, 256, 32, 256, "bf16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(bfloat16_t, uint8_t, true, 256, 32, "bf16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(bfloat16_t, uint8_t, true, 256, 32, "bf16_fp8_hd256_bs32")
 
 INSTANTIATE_FLASH_PREFILL(half, uint8_t, true, 256, 32, 32, 32, "f16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC(half, uint8_t, true, 256, 32, "f16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_PREFILL_VEC_Q2(half, uint8_t, true, 256, 32, "f16_fp8_hd256_bs32")
 INSTANTIATE_FLASH_DECODE(half, uint8_t, true, 256, 32, 256, "f16_fp8_hd256_bs32")
 INSTANTIATE_FLASH_DECODE_SPLITK(half, uint8_t, true, 256, 32, 256, "f16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_VEC(half, uint8_t, true, 256, 32, "f16_fp8_hd256_bs32")
+INSTANTIATE_FLASH_DECODE_SPLITK_GQA(half, uint8_t, true, 256, 32, "f16_fp8_hd256_bs32")
 
 // ============================================================================
 // TurboQuant k8v4: FP8 keys + 4-bit values

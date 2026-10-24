@@ -16,8 +16,12 @@ fn get_metal_device(t: &Tensor) -> Result<&candle::MetalDevice> {
     }
 }
 
-pub const SPLIT_K_THRESHOLD: usize = 8192;
-pub const NUM_SPLITS: i32 = 8;
+// A single decode threadgroup per query head leaves Apple GPUs underfilled at
+// the 4K context sizes common for interactive generation. Start partitioning
+// the KV scan earlier and choose enough splits to keep each partition near
+// 256 tokens (up to NUM_SPLITS).
+pub const SPLIT_K_THRESHOLD: usize = 1024;
+pub const NUM_SPLITS: i32 = 16;
 
 pub fn flash_reshape_and_cache_metal(
     key: &Tensor,
@@ -78,12 +82,11 @@ pub fn flash_reshape_and_cache_metal(
         None
     };
 
-    let command_buffer = device.command_buffer()?;
-    command_buffer.set_label("flash-reshape-cache");
+    let command_encoder = device.command_encoder()?;
 
     metal_kernels::flash_reshape_and_cache_metal(
         device.device(),
-        &command_buffer,
+        command_encoder.as_ref(),
         metal_kernels::Kernels::default(),
         ty,
         key_s.buffer(),
@@ -206,12 +209,11 @@ pub fn flash_prefill_metal(
             None
         };
 
-        let command_buffer = device.command_buffer()?;
-        command_buffer.set_label("flash-prefill");
+        let command_encoder = device.command_encoder()?;
 
         metal_kernels::flash_attention_prefill(
             device.device(),
-            &command_buffer,
+            command_encoder.as_ref(),
             metal_kernels::Kernels::default(),
             ty,
             o_s.buffer(),
@@ -330,27 +332,27 @@ pub fn flash_decode_metal(
 
     let use_splitk = max_context_len >= SPLIT_K_THRESHOLD;
 
-    let command_buffer = device.command_buffer()?;
-    command_buffer.set_label("flash-decode");
+    let command_encoder = device.command_encoder()?;
 
     if use_splitk {
-        let num_splits = NUM_SPLITS;
-        // Allocate temp buffers via device.new_buffer (no command encoding)
+        let num_splits = (max_context_len.div_ceil(256).clamp(2, NUM_SPLITS as usize)) as i32;
+        // Pack the three split-K outputs into one reusable allocation. Each
+        // layer used to perform three pool lookups for every decode token.
         let tmp_out_elems = num_seqs as usize * num_q_heads * num_splits as usize * head_dim;
         let tmp_meta_elems = num_seqs as usize * num_q_heads * num_splits as usize;
-        let tmp_out_buf = device.new_buffer(tmp_out_elems, candle::DType::F32, "splitk-out")?;
-        let tmp_max_buf = device.new_buffer(tmp_meta_elems, candle::DType::F32, "splitk-max")?;
-        let tmp_sum_buf = device.new_buffer(tmp_meta_elems, candle::DType::F32, "splitk-sum")?;
+        let scratch = device.new_buffer(
+            tmp_out_elems + 2 * tmp_meta_elems,
+            candle::DType::F32,
+            "splitk-scratch",
+        )?;
 
         metal_kernels::flash_attention_decode_splitk(
             device.device(),
-            &command_buffer,
+            command_encoder.as_ref(),
             metal_kernels::Kernels::default(),
             ty,
             o_s.buffer(),
-            &tmp_out_buf,
-            &tmp_max_buf,
-            &tmp_sum_buf,
+            &scratch,
             q_s.buffer(),
             q_l.start_offset() * query.dtype().size_in_bytes(),
             kc_s.buffer(),
@@ -379,7 +381,7 @@ pub fn flash_decode_metal(
     } else {
         metal_kernels::flash_attention_decode(
             device.device(),
-            &command_buffer,
+            command_encoder.as_ref(),
             metal_kernels::Kernels::default(),
             ty,
             o_s.buffer(),
