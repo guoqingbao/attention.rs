@@ -30,10 +30,104 @@ pub fn silu_and_mul(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
         return silu_and_mul_cuda(&gate_up, half_dim);
     }
 
+    #[cfg(feature = "metal")]
+    {
+        return silu_and_mul_metal(&gate_up, half_dim);
+    }
+
     #[allow(unreachable_code)]
     {
         silu_and_mul_cpu(&gate_up, half_dim)
     }
+}
+
+#[cfg(feature = "metal")]
+fn silu_and_mul_metal(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
+    use candle_core::DType;
+    use metal::MTLSize;
+
+    let dtype = gate_up.dtype();
+    let dims = gate_up.dims();
+    let mut out_dims: Vec<usize> = dims.to_vec();
+    *out_dims.last_mut().unwrap() = half_dim;
+    let nrows: usize = out_dims[..out_dims.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    // The kernel writes every output element.
+    let output = unsafe { Tensor::empty_(out_dims.as_slice(), dtype, gate_up.device())? };
+
+    let device = match gate_up.device() {
+        candle_core::Device::Metal(dev) => dev,
+        _ => candle_core::bail!("silu_and_mul: expected Metal device"),
+    };
+
+    let vectors_ok = half_dim % 4 == 0;
+    let kernel_name = match (dtype, vectors_ok) {
+        (DType::F32, true) => "silu_and_mul_float_vec4",
+        (DType::F16, true) => "silu_and_mul_half_vec4",
+        (DType::BF16, true) => "silu_and_mul_bfloat_vec4",
+        (DType::F32, false) => "silu_and_mul_float",
+        (DType::F16, false) => "silu_and_mul_half",
+        (DType::BF16, false) => "silu_and_mul_bfloat",
+        _ => candle_core::bail!("silu_and_mul: unsupported dtype {dtype:?}"),
+    };
+
+    let kernels = crate::metal_kernels::Kernels::default();
+    let pipeline = match kernels.load_pipeline(device.device(), kernel_name.to_string()) {
+        Ok(p) => p,
+        // Older GPUs may lack bf16 support; use the generic activation instead.
+        Err(_) => return silu_and_mul_cpu(gate_up, half_dim),
+    };
+
+    let command_buffer = device.command_buffer()?;
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    {
+        let (gu_storage, gu_layout) = gate_up.storage_and_layout();
+        let (out_storage, _) = output.storage_and_layout();
+        let gu_ms = match &*gu_storage {
+            candle_core::Storage::Metal(s) => s,
+            _ => candle_core::bail!("silu_and_mul: expected Metal storage"),
+        };
+        let out_ms = match &*out_storage {
+            candle_core::Storage::Metal(s) => s,
+            _ => candle_core::bail!("silu_and_mul: expected Metal storage"),
+        };
+        let gu_offset = (gu_layout.start_offset() * dtype.size_in_bytes()) as u64;
+        encoder.set_buffer(0, Some(gu_ms.buffer()), gu_offset);
+        encoder.set_buffer(1, Some(out_ms.buffer()), 0);
+        encoder.set_bytes(
+            2,
+            4,
+            &(half_dim as i32).to_ne_bytes() as *const _ as *const _,
+        );
+        let threads = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        let total = if vectors_ok {
+            let cols4 = half_dim / 4;
+            encoder.set_bytes(3, 4, &(cols4 as i32).to_ne_bytes() as *const _ as *const _);
+            (nrows * cols4) as u64
+        } else {
+            let total = nrows * half_dim;
+            encoder.set_bytes(3, 4, &(total as i32).to_ne_bytes() as *const _ as *const _);
+            total as u64
+        };
+        let groups = MTLSize {
+            width: total.div_ceil(256),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(groups, threads);
+    }
+    // The encoder is borrowed from the command buffer; close it so subsequent
+    // candle ops can open their own encoder on the same command buffer.
+    encoder.end_encoding();
+    Ok(output)
 }
 
 #[cfg(feature = "cuda")]
