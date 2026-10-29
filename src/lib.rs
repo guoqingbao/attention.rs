@@ -58,6 +58,9 @@ pub mod flash;
 #[cfg(feature = "metal-flash")]
 pub mod metal_flash;
 
+#[cfg(feature = "metal")]
+pub mod metal_cast;
+
 #[cfg(feature = "metal-flash")]
 fn metal_flash_supported_cache_dtype(dtype: DType, op: &str) -> Result<DType> {
     match dtype {
@@ -1408,6 +1411,59 @@ impl PagedAttention {
             let Some(value_cache) = value_cache.as_ref() else {
                 candle_core::bail!("metal-flash requires value_cache for paged attention")
             };
+
+            // A fresh single sequence can attend directly to its contiguous
+            // K/V tensors while the cache write above prepares later decode.
+            // The tiled Metal matrix kernel avoids repeatedly scanning paged
+            // K/V for every query in a long prompt.
+            if input_metadata.is_prefill
+                && query_p.dim(0)? >= 1024
+                && input_metadata.max_seqlen_q == query_p.dim(0)?
+                && input_metadata.max_seqlen_k == query_p.dim(0)?
+                && input_metadata.cu_seqlens_q.as_ref().map(|t| t.dim(0).ok()) == Some(Some(2))
+                && self.sliding_window.is_none()
+                && softcapping.is_none()
+                && tq_mode_metal.is_none()
+                && !fp8_cache_metal
+            {
+                let seq = query_p.dim(0)?;
+                let (_, q_heads, q_dim) = query_p.dims3()?;
+                let (_, kv_heads, kv_dim) = key_p.dims3()?;
+                let to_hsd = |t: &Tensor, heads: usize, dim: usize| -> Result<Tensor> {
+                    if let Some(r) =
+                        crate::metal_cast::seq_heads_to_heads_seq(t, seq, heads, dim, DType::F16)
+                    {
+                        r
+                    } else {
+                        t.to_dtype(DType::F16)?.transpose(0, 1)?.contiguous()
+                    }
+                };
+                let q = to_hsd(&query_p, q_heads, q_dim)?.unsqueeze(0)?;
+                let k = to_hsd(&key_p, kv_heads, kv_dim)?.unsqueeze(0)?;
+                let v = to_hsd(&value_p, kv_heads, kv_dim)?.unsqueeze(0)?;
+                let y = candle_nn::ops::sdpa_causal(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    softcapping.unwrap_or(1.0) as f32,
+                )?;
+                let y2 = y.squeeze(0)?;
+                let out = if let Some(r) = crate::metal_cast::heads_seq_to_seq_heads(
+                    &y2,
+                    seq,
+                    q_heads,
+                    q_dim,
+                    orig_query_dtype,
+                ) {
+                    r?
+                } else {
+                    y2.transpose(0, 1)?
+                        .contiguous()?
+                        .to_dtype(orig_query_dtype)?
+                };
+                return Ok(out);
+            }
 
             if input_metadata.is_prefill {
                 // Turbo4: prefill reads from TQ4 buffers (4-bit K + 4-bit V)
