@@ -560,6 +560,19 @@ extern "C" {
         stream: i64,
     );
 
+    // Small-M GGUF matmul (decode batches, M <= 32). Unpacks each weight
+    // subblock once and reuses it across all tokens.
+    pub fn gguf_gemm_multi(
+        input: *const f32,
+        weights: *const c_void,
+        output: *mut f32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        gguf_dtype: i32,
+        stream: i64,
+    );
+
     // Optimized kernel for small M (batch size 1-8) with input caching
     pub fn moe_gemm_gguf_small_m(
         input: *const f32,      // input [size_m, size_k]
