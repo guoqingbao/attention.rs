@@ -1176,9 +1176,13 @@ pub fn causal_conv1d_fwd(
             let stream = *dev.cu_stream() as i64;
 
             let state_f32_ptr = state_ptr as *mut f32;
-            unsafe {
+            // Token-parallel vectorized path.  It returns non-zero when the
+            // layout is unsupported (e.g. d_conv not divisible by the vector
+            // width or kernel_size > 4), in which case the reference kernel
+            // handles the call.
+            let status = unsafe {
                 match x.dtype() {
-                    DType::F16 => ffi::causal_conv1d_fwd_f16(
+                    DType::F16 => ffi::causal_conv1d_fwd_parallel_f16(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
@@ -1189,10 +1193,11 @@ pub fn causal_conv1d_fwd(
                         batch as c_int,
                         d_conv as c_int,
                         kernel_size as c_int,
+                        total_tokens as c_int,
                         activation_silu,
                         stream,
                     ),
-                    DType::BF16 => ffi::causal_conv1d_fwd_bf16(
+                    DType::BF16 => ffi::causal_conv1d_fwd_parallel_bf16(
                         x_ptr,
                         weight_ptr,
                         bias_ptr,
@@ -1203,10 +1208,11 @@ pub fn causal_conv1d_fwd(
                         batch as c_int,
                         d_conv as c_int,
                         kernel_size as c_int,
+                        total_tokens as c_int,
                         activation_silu,
                         stream,
                     ),
-                    DType::F32 => ffi::causal_conv1d_fwd_f32(
+                    DType::F32 => ffi::causal_conv1d_fwd_parallel_f32(
                         x_ptr as *const f32,
                         weight_ptr as *const f32,
                         bias_ptr as *const f32,
@@ -1217,10 +1223,60 @@ pub fn causal_conv1d_fwd(
                         batch as c_int,
                         d_conv as c_int,
                         kernel_size as c_int,
+                        total_tokens as c_int,
                         activation_silu,
                         stream,
                     ),
                     _ => unreachable!(),
+                }
+            };
+            if status != 0 {
+                unsafe {
+                    match x.dtype() {
+                        DType::F16 => ffi::causal_conv1d_fwd_f16(
+                            x_ptr,
+                            weight_ptr,
+                            bias_ptr,
+                            state_f32_ptr,
+                            out_ptr,
+                            snapshots_ptr,
+                            cu_ptr,
+                            batch as c_int,
+                            d_conv as c_int,
+                            kernel_size as c_int,
+                            activation_silu,
+                            stream,
+                        ),
+                        DType::BF16 => ffi::causal_conv1d_fwd_bf16(
+                            x_ptr,
+                            weight_ptr,
+                            bias_ptr,
+                            state_f32_ptr,
+                            out_ptr,
+                            snapshots_ptr,
+                            cu_ptr,
+                            batch as c_int,
+                            d_conv as c_int,
+                            kernel_size as c_int,
+                            activation_silu,
+                            stream,
+                        ),
+                        DType::F32 => ffi::causal_conv1d_fwd_f32(
+                            x_ptr as *const f32,
+                            weight_ptr as *const f32,
+                            bias_ptr as *const f32,
+                            state_f32_ptr,
+                            out_ptr as *mut f32,
+                            snapshots_ptr as *mut f32,
+                            cu_ptr,
+                            batch as c_int,
+                            d_conv as c_int,
+                            kernel_size as c_int,
+                            activation_silu,
+                            stream,
+                        ),
+                        _ => unreachable!(),
+                    }
                 }
             }
             Ok(out)
@@ -2598,10 +2654,10 @@ pub fn gated_delta_rule_prefill_flashinfer_gqa(
                         stream,
                     )
                 },
-                dt => candle_core::bail!(
-                    "gated_delta_rule_prefill_flashinfer_gqa: unsupported dtype {:?}",
-                    dt
-                ),
+                // F32 (GGUF GDN) and other dtypes are not supported by the
+                // chunked kernel; report unavailable so the caller falls back
+                // to the reference recurrence.
+                _ => return Ok(None),
             };
 
             if status == 0 {
@@ -2744,5 +2800,219 @@ pub fn gated_delta_rule_decode_slots_gqa(
         _ => {
             candle_core::bail!("Invalid device for gated_delta_rule_decode_slots_gqa");
         }
+    }
+}
+
+/// GDN decode on a packed convolution output.
+///
+/// `v_packed` is the packed `[batch, token_stride]` conv output and the value
+/// head block starts at `v_offset` with `v_row_stride` elements per batch row.
+/// This avoids narrowing/copying v into a compact tensor.  Returns `None` when
+/// the layout is unsupported (k/v head dim != 128 or non-CUDA), so callers can
+/// fall back to the generic path.
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_decode_slots_gqa_strided_v(
+    q: &Tensor,
+    k: &Tensor,
+    v_packed: &Tensor,
+    v_offset: usize,
+    v_row_stride: usize,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    q_scale: f32,
+) -> Result<Option<Tensor>> {
+    let Device::Cuda(dev) = q.device() else {
+        return Ok(None);
+    };
+    let q_c = ensure_contiguous(q)?;
+    let k_c = ensure_contiguous(k)?;
+    let v_c = if v_packed.is_contiguous() {
+        v_packed.clone()
+    } else {
+        v_packed.contiguous()?
+    };
+    let g_c = ensure_f32_contiguous(g)?;
+    let beta_c = ensure_f32_contiguous(beta)?;
+
+    let (batch, num_k_heads, k_dim) = q_c.dims3()?;
+    let v_dim = q_c.dim(2)?;
+    if v_c.dims().len() != 2 || v_c.dim(0)? != batch {
+        return Ok(None);
+    }
+    if v_row_stride > v_c.dim(1)? || v_offset + 1 > v_row_stride {
+        return Ok(None);
+    }
+    let value_elems = v_row_stride - v_offset;
+    if v_dim == 0 || value_elems == 0 || value_elems % v_dim != 0 {
+        return Ok(None);
+    }
+    let num_v_heads = value_elems / v_dim;
+    if num_v_heads % num_k_heads != 0 {
+        return Ok(None);
+    }
+    if slots.dtype() != DType::I64 || slots.dim(0)? != batch {
+        return Ok(None);
+    }
+    if state.dtype() != DType::F32 || !state.is_contiguous() {
+        return Ok(None);
+    }
+
+    let out = Tensor::zeros((batch, num_v_heads, v_dim), q.dtype(), q.device())?;
+    let q_ptr = get_cuda_const_ptr(&q_c)?;
+    let k_ptr = get_cuda_const_ptr(&k_c)?;
+    let v_ptr = get_cuda_const_ptr(&v_c)?;
+    let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
+    let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
+    let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+    let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+    let out_ptr = get_cuda_mut_ptr(&out)?;
+    let stream = *dev.cu_stream() as i64;
+
+    let status = unsafe {
+        match q.dtype() {
+            DType::BF16 => ffi::gated_delta_rule_decode_slots_gqa_strided_bf16(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                state_ptr,
+                slots_ptr,
+                out_ptr,
+                batch as c_int,
+                num_v_heads as c_int,
+                num_k_heads as c_int,
+                k_dim as c_int,
+                v_dim as c_int,
+                q_scale,
+                v_offset as i64,
+                v_row_stride as i64,
+                stream,
+            ),
+            DType::F16 => ffi::gated_delta_rule_decode_slots_gqa_strided_f16(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                g_ptr,
+                beta_ptr,
+                state_ptr,
+                slots_ptr,
+                out_ptr,
+                batch as c_int,
+                num_v_heads as c_int,
+                num_k_heads as c_int,
+                k_dim as c_int,
+                v_dim as c_int,
+                q_scale,
+                v_offset as i64,
+                v_row_stride as i64,
+                stream,
+            ),
+            DType::F32 => ffi::gated_delta_rule_decode_slots_gqa_strided_f32(
+                q_ptr as *const f32,
+                k_ptr as *const f32,
+                v_ptr as *const f32,
+                g_ptr,
+                beta_ptr,
+                state_ptr,
+                slots_ptr,
+                out_ptr as *mut f32,
+                batch as c_int,
+                num_v_heads as c_int,
+                num_k_heads as c_int,
+                k_dim as c_int,
+                v_dim as c_int,
+                q_scale,
+                v_offset as i64,
+                v_row_stride as i64,
+                stream,
+            ),
+            _ => return Ok(None),
+        }
+    };
+    if status == 0 {
+        Ok(Some(out))
+    } else {
+        Ok(None)
+    }
+}
+
+/// L2-normalize heads from a strided slice of a packed `[tokens, stride]`
+/// tensor into a compact `[tokens, heads, dim]` tensor.
+///
+/// Returns `None` for unsupported dims/devices so callers can fall back to
+/// narrow + contiguous + `l2_norm_last_dim`.
+#[cfg(feature = "cuda")]
+pub fn l2_norm_range(
+    input: &Tensor,
+    offset: usize,
+    heads: usize,
+    token_stride: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<Option<Tensor>> {
+    let Device::Cuda(dev) = input.device() else {
+        return Ok(None);
+    };
+    let input_c = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    if input_c.dims().len() != 2 || heads == 0 || dim == 0 || dim > 256 {
+        return Ok(None);
+    }
+    let tokens = input_c.dim(0)?;
+    if token_stride > input_c.dim(1)? || offset + heads * dim > token_stride {
+        return Ok(None);
+    }
+    let out = Tensor::zeros((tokens, heads, dim), input.dtype(), input.device())?;
+    let in_ptr = get_cuda_const_ptr(&input_c)?;
+    let out_ptr = get_cuda_mut_ptr(&out)?;
+    let stream = *dev.cu_stream() as i64;
+    let status = unsafe {
+        match input.dtype() {
+            DType::BF16 => ffi::l2_norm_range_bf16(
+                in_ptr,
+                out_ptr,
+                tokens as c_int,
+                heads as c_int,
+                token_stride as c_int,
+                offset as c_int,
+                dim as c_int,
+                eps,
+                stream,
+            ),
+            DType::F16 => ffi::l2_norm_range_f16(
+                in_ptr,
+                out_ptr,
+                tokens as c_int,
+                heads as c_int,
+                token_stride as c_int,
+                offset as c_int,
+                dim as c_int,
+                eps,
+                stream,
+            ),
+            DType::F32 => ffi::l2_norm_range_f32(
+                in_ptr as *const f32,
+                out_ptr as *mut f32,
+                tokens as c_int,
+                heads as c_int,
+                token_stride as c_int,
+                offset as c_int,
+                dim as c_int,
+                eps,
+                stream,
+            ),
+            _ => return Ok(None),
+        }
+    };
+    if status == 0 {
+        Ok(Some(out))
+    } else {
+        Ok(None)
     }
 }

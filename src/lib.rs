@@ -46,6 +46,7 @@ pub mod gguf_linear;
 pub mod mamba_cache;
 pub mod mla;
 pub mod mxfp4_linear;
+pub mod norm;
 pub mod nvfp4_linear;
 pub mod ops;
 pub mod qwen4;
