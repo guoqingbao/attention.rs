@@ -3201,6 +3201,14 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn silu_and_mul_f32(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        total_elems: i64,
+        N: i64,
+        stream: i64,
+    );
+
     // =========================================================================
     // MLA (Multi-head Latent Attention) cache update
     // =========================================================================
