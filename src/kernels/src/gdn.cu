@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 #define CHECK_CUDA(x)                                                           \
     do {                                                                        \
@@ -1000,13 +999,6 @@ static int launch_gdn_decode_smem(
     float q_scale, int64_t v_offset, int64_t v_row_stride,
     cudaStream_t stream) {
     if (k_dim != 128 || v_dim != 128 || num_v_heads % num_k_heads != 0) return 1;
-    // Debug/A-B switch: force the original register kernel.
-    static int force_register = -1;
-    if (force_register < 0) {
-        const char* e = getenv("XINFER_GDN_DECODE_REGISTER");
-        force_register = (e != nullptr && e[0] == '1') ? 1 : 0;
-    }
-    if (force_register) return 1;
     // One block per head needs enough batch to fill 114 SMs; below ~20
     // sequences the register kernel (8 blocks per head) hides latency better.
     if (batch < 20) return 1;
