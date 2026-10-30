@@ -35,7 +35,6 @@ pub use kernels;
 #[cfg(feature = "metal")]
 pub use metal_kernels;
 pub mod cache;
-#[cfg(feature = "cuda")]
 pub mod cuda_utils;
 pub mod deepseek_v4;
 #[cfg(feature = "cuda")]
@@ -46,6 +45,7 @@ pub mod gguf_linear;
 pub mod mamba_cache;
 pub mod mla;
 pub mod mxfp4_linear;
+pub mod norm;
 pub mod nvfp4_linear;
 pub mod ops;
 pub mod qwen4;

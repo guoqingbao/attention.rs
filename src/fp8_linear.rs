@@ -124,14 +124,14 @@ pub fn fp8_matmul_with_input_scale(
     #[cfg(all(feature = "cuda", feature = "flashinfer"))]
     {
         let (m, _) = input.dims2()?;
-        // Match FlashInferFp8DeepGEMMDynamicBlockScaledKernel bound:
-        // fp8_blockscale_gemm_sm90's M >= 32 half is the non-swapAB kernel,
-        // which SGLang documents as less accurate on some checkpoints.
-        let use_flashinfer = !is_prefill
-            && (1..32).contains(&m)
-            && (90..100).contains(&sm_version)
+        // Both prefill and decode route through the FlashInfer/DeepGEMM
+        // blockscale runner.  With the external per-token-group quant below
+        // the two paths produce bit-identical GEMMs (verified up to M=8192)
+        // while the runner is ~14% faster for large M.
+        let use_flashinfer = (90..100).contains(&sm_version)
             && DType::BF16 == input.dtype()
-            && block_size == [128, 128];
+            && block_size == [128, 128]
+            && (is_prefill || (1..32).contains(&m));
         if use_flashinfer {
             return fp8_matmul_flashinfer_with_input_scale(
                 &input,
@@ -601,30 +601,10 @@ fn fp8_matmul_flashinfer_with_input_scale(
     let out_ptr = get_cuda_slice::<half::bf16>(&out)? as *mut std::ffi::c_void;
     let inp_ptr = get_cuda_slice::<half::bf16>(input)? as *const std::ffi::c_void;
 
-    // Dynamic W8A8: match SGLang fp8_blockscale_gemm_sm90, which
-    // takes BF16 activations and quantizes inside FlashInfer (fp8CS1x128).
-    // Static ModelOpt scales still need the external per-group quant path.
-    let status = if input_scale.is_none() {
-        let required_ws = unsafe {
-            ffi::flashinfer_fp8_blockscale_workspace_size_bf16(m as i32, n as i32, k as i32)
-        };
-        let (workspace_ptr, workspace_size) =
-            get_or_init_flashinfer_fp8_workspace(cu_dev, required_ws)?;
-        unsafe {
-            ffi::flashinfer_fp8_blockscale_bf16(
-                inp_ptr,
-                weight_ptr,
-                weight_scale_ptr,
-                out_ptr,
-                m as i32,
-                n as i32,
-                k as i32,
-                workspace_ptr,
-                workspace_size,
-                stream,
-            )
-        }
-    } else {
+    // W8A8 blockscale GEMM.  Static ModelOpt scales and dynamic activations
+    // are quantized externally with the vectorized per-token-group kernel; the
+    // FP8-input DeepGEMM runner then performs the matmul directly.
+    let status = {
         let m_padded = (m + 4 - 1) / 4 * 4;
         let k_over_128 = k / 128;
         let input_q_bytes = m * k;
@@ -634,19 +614,34 @@ fn fp8_matmul_flashinfer_with_input_scale(
         let scale_stride = m_padded as i32;
         let num_groups = m * k_over_128;
         unsafe {
-            ffi::fp8_quantize_per_token_group_static_launch(
-                inp_ptr,
-                q_ptr,
-                s_ptr,
-                num_groups as i32,
-                128,
-                k_over_128 as i32,
-                scale_stride,
-                false,
-                true,
-                input_scale.unwrap(),
-                stream,
-            );
+            if let Some(input_scale) = input_scale {
+                ffi::fp8_quantize_per_token_group_static_launch(
+                    inp_ptr,
+                    q_ptr,
+                    s_ptr,
+                    num_groups as i32,
+                    128,
+                    k_over_128 as i32,
+                    scale_stride,
+                    false,
+                    true,
+                    input_scale,
+                    stream,
+                );
+            } else {
+                ffi::fp8_quantize_per_token_group_launch(
+                    inp_ptr,
+                    q_ptr,
+                    s_ptr,
+                    num_groups as i32,
+                    128,
+                    k_over_128 as i32,
+                    scale_stride,
+                    false,
+                    true,
+                    stream,
+                );
+            }
         }
         let required_ws = unsafe {
             ffi::flashinfer_fp8_blockscale_workspace_size_fp8(m as i32, n as i32, k as i32)

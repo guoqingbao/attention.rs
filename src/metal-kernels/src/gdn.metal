@@ -280,6 +280,52 @@ kernel void l2_norm_last_dim_kernel(
     }
 }
 
+template <typename T>
+kernel void l2_norm_range_kernel(
+    const device T* input [[buffer(0)]],
+    device T* output [[buffer(1)]],
+    constant int& tokens [[buffer(2)]],
+    constant int& heads [[buffer(3)]],
+    constant int& token_stride [[buffer(4)]],
+    constant int& offset [[buffer(5)]],
+    constant int& dim [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 threads3 [[threads_per_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]) {
+    const uint tid = tid3.x;
+    const uint threads = threads3.x;
+    const uint row = tgid.x;
+    if (row >= static_cast<uint>(tokens * heads)) {
+        return;
+    }
+    const uint token = row / static_cast<uint>(heads);
+    const uint head = row % static_cast<uint>(heads);
+    const uint input_base = token * static_cast<uint>(token_stride)
+        + static_cast<uint>(offset) + head * static_cast<uint>(dim);
+    const uint output_base = row * static_cast<uint>(dim);
+
+    threadgroup float partial[GDN_THREADS];
+    float sumsq = 0.0f;
+    for (uint i = tid; i < static_cast<uint>(dim); i += threads) {
+        const float value = gdn_to_float(input[input_base + i]);
+        sumsq += value * value;
+    }
+    partial[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = rsqrt(max(partial[0], 0.0f) + eps);
+    for (uint i = tid; i < static_cast<uint>(dim); i += threads) {
+        output[output_base + i] = gdn_from_float<T>(
+            gdn_to_float(input[input_base + i]) * scale);
+    }
+}
+
 template <typename T, typename W>
 kernel void gated_rmsnorm_silu_mul_kernel(
     const device T* x [[buffer(0)]],
@@ -518,6 +564,8 @@ kernel void gated_delta_rule_decode_slots_gqa_kernel(
     constant int& k_dim [[buffer(11)]],
     constant int& v_dim [[buffer(12)]],
     constant float& q_scale [[buffer(13)]],
+    constant int& v_offset [[buffer(14)]],
+    constant int& v_row_stride [[buffer(15)]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
@@ -568,7 +616,8 @@ kernel void gated_delta_rule_decode_slots_gqa_kernel(
         }
     }
 
-    const uint v_base = bh * v_dim;
+    const uint v_base = b * static_cast<uint>(v_row_stride)
+        + static_cast<uint>(v_offset) + v_head_idx * static_cast<uint>(v_dim);
     const float delta = (gdn_to_float(v[v_base + v_idx]) - kv_mem) * scalars[1];
     float y = 0.0f;
     for (uint j = 0; j < BK; ++j) {
@@ -578,7 +627,7 @@ kernel void gated_delta_rule_decode_slots_gqa_kernel(
             state_head[j * v_dim + v_idx] = s[j];
         }
     }
-    out[v_base + v_idx] = gdn_from_float<T>(y);
+    out[bh * v_dim + v_idx] = gdn_from_float<T>(y);
 }
 
 template <typename T, uint BK>
@@ -896,6 +945,21 @@ template [[host_name("gdn_l2_norm_last_dim_" #type)]] \
     uint3 threads_per_threadgroup3 [[threads_per_threadgroup]], \
     uint3 tgid [[threadgroup_position_in_grid]]);
 
+#define INSTANTIATE_L2_RANGE(type) \
+template [[host_name("gdn_l2_norm_range_" #type)]] \
+[[kernel]] void l2_norm_range_kernel<type>( \
+    const device type* input [[buffer(0)]], \
+    device type* output [[buffer(1)]], \
+    constant int& tokens [[buffer(2)]], \
+    constant int& heads [[buffer(3)]], \
+    constant int& token_stride [[buffer(4)]], \
+    constant int& offset [[buffer(5)]], \
+    constant int& dim [[buffer(6)]], \
+    constant float& eps [[buffer(7)]], \
+    uint3 tid3 [[thread_position_in_threadgroup]], \
+    uint3 threads3 [[threads_per_threadgroup]], \
+    uint3 tgid [[threadgroup_position_in_grid]]);
+
 #define INSTANTIATE_RMSNORM(type, wtype, name) \
 template [[host_name(name)]] \
 [[kernel]] void gated_rmsnorm_silu_mul_kernel<type, wtype>( \
@@ -1007,6 +1071,9 @@ INSTANTIATE_GATING(bfloat16_t, "gdn_fused_gating_bfloat16_t")
 INSTANTIATE_L2(float)
 INSTANTIATE_L2(half)
 INSTANTIATE_L2(bfloat16_t)
+INSTANTIATE_L2_RANGE(float)
+INSTANTIATE_L2_RANGE(half)
+INSTANTIATE_L2_RANGE(bfloat16_t)
 
 INSTANTIATE_RMSNORM(float, float, "gdn_gated_rmsnorm_silu_mul_float")
 INSTANTIATE_RMSNORM(half, half, "gdn_gated_rmsnorm_silu_mul_half")
@@ -1074,6 +1141,8 @@ template [[host_name("gdn_gated_delta_rule_decode_slots_gqa_" #type "_k" #bk)]] 
     constant int& k_dim [[buffer(11)]], \
     constant int& v_dim [[buffer(12)]], \
     constant float& q_scale [[buffer(13)]], \
+    constant int& v_offset [[buffer(14)]], \
+    constant int& v_row_stride [[buffer(15)]], \
     uint3 tid3 [[thread_position_in_threadgroup]], \
     uint3 tgid [[threadgroup_position_in_grid]]);
 

@@ -767,7 +767,9 @@ __global__ void gated_delta_rule_decode_slots_gqa_128_kernel(
     int batch,
     int num_v_heads,
     int num_k_heads,
-    float q_scale) {
+    float q_scale,
+    int64_t v_offset,
+    int64_t v_row_stride) {
     constexpr int K_DIM = 128;
     constexpr int V_DIM = 128;
     constexpr int COLS_PER_WARP = 4;
@@ -791,7 +793,8 @@ __global__ void gated_delta_rule_decode_slots_gqa_128_kernel(
 
     const T* q_head = q + (b * num_k_heads + k_head_idx) * K_DIM;
     const T* k_head = k + (b * num_k_heads + k_head_idx) * K_DIM;
-    const T* v_head = v + (b * num_v_heads + v_head_idx) * V_DIM;
+    const T* v_head = v + v_offset + static_cast<int64_t>(b) * v_row_stride +
+                      v_head_idx * V_DIM;
     float* state_head = state + ((slot * num_v_heads + v_head_idx) * K_DIM * V_DIM);
     const float decay = expf(g[b * num_v_heads + v_head_idx]);
     const float beta_t = beta[b * num_v_heads + v_head_idx];
@@ -831,12 +834,25 @@ __global__ void gated_delta_rule_decode_slots_gqa_128_kernel(
 }
 
 template <typename T>
+static int launch_gdn_decode_smem(
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, T* out, int batch, int num_v_heads,
+    int num_k_heads, int k_dim, int v_dim, float q_scale, int64_t v_offset,
+    int64_t v_row_stride, cudaStream_t stream);
+
+template <typename T>
 void launch_gated_delta_rule_decode_slots_gqa(
     const T* q, const T* k, const T* v, const float* g, const float* beta,
     float* state, const int64_t* slots, T* out,
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
     if (k_dim == 128 && v_dim == 128) {
+        if (launch_gdn_decode_smem(
+                q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+                k_dim, v_dim, q_scale, 0,
+                static_cast<int64_t>(num_v_heads) * v_dim, stream) == 0) {
+            return;
+        }
         constexpr int WARPS_PER_BLOCK = 4;
         constexpr int COLS_PER_WARP = 4;
         dim3 grid((v_dim + WARPS_PER_BLOCK * COLS_PER_WARP - 1) /
@@ -845,7 +861,8 @@ void launch_gated_delta_rule_decode_slots_gqa(
         dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
         gated_delta_rule_decode_slots_gqa_128_kernel<T><<<grid, block, 0, stream>>>(
             q, k, v, g, beta, state, slots, out,
-            batch, num_v_heads, num_k_heads, q_scale);
+            batch, num_v_heads, num_k_heads, q_scale, 0,
+            static_cast<int64_t>(num_v_heads) * v_dim);
         CHECK_CUDA(cudaGetLastError());
         return;
     }
@@ -898,6 +915,216 @@ extern "C" void gated_delta_rule_decode_slots_gqa_f16(
     launch_gated_delta_rule_decode_slots_gqa(
         q, k, v, g, beta, state, slots, out,
         batch, num_v_heads, num_k_heads, k_dim, v_dim, q_scale, stream);
+}
+
+// Coalesced one-block-per-head GDN decode.
+//
+// The register kernel assigns each block 16 value columns and 128 threads;
+// global state accesses touch 16B per row with a 512B stride, wasting DRAM
+// sectors.  This kernel keeps the whole [K=128, V=128] head state in 64 KiB of
+// shared memory, loads and stores it with fully coalesced per-row accesses
+// (one thread per value column), and performs the two recurrence passes in
+// shared memory.  Global traffic stays one read + one write per element.
+template <typename T>
+__global__ void gdn_decode_smem_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ state,
+    const int64_t* __restrict__ slots,
+    T* __restrict__ out,
+    int num_v_heads,
+    int num_k_heads,
+    float q_scale,
+    int64_t v_offset,
+    int64_t v_row_stride) {
+    constexpr int K_DIM = 128;
+    constexpr int V_DIM = 128;
+    extern __shared__ float smem[];
+
+    const int bh = blockIdx.x;
+    const int b = bh / num_v_heads;
+    const int vh = bh - b * num_v_heads;
+    const int64_t slot = slots[b];
+    if (slot < 0) return;
+
+    const int c = threadIdx.x;
+    const int kv_group = num_v_heads / num_k_heads;
+    const int kh = vh / kv_group;
+    const T* q_head = q + (static_cast<size_t>(b) * num_k_heads + kh) * K_DIM;
+    const T* k_head = k + (static_cast<size_t>(b) * num_k_heads + kh) * K_DIM;
+    const T* v_head = v + v_offset + static_cast<int64_t>(b) * v_row_stride +
+                      static_cast<int64_t>(vh) * V_DIM;
+    float* state_head =
+        state + (static_cast<size_t>(slot) * num_v_heads + vh) * K_DIM * V_DIM;
+    const float decay = expf(g[b * num_v_heads + vh]);
+    const float beta_t = beta[b * num_v_heads + vh];
+
+    // Coalesced load: warp lanes read consecutive value columns of one row.
+    for (int r = 0; r < K_DIM; ++r) {
+        smem[r * V_DIM + c] = state_head[static_cast<size_t>(r) * V_DIM + c];
+    }
+    __syncthreads();
+
+    const float v_val = to_float(v_head[c]);
+    float kv = 0.0f;
+    for (int r = 0; r < K_DIM; ++r) {
+        const float sd = smem[r * V_DIM + c] * decay;
+        smem[r * V_DIM + c] = sd;
+        kv = __fmaf_rn(sd, to_float(k_head[r]), kv);
+    }
+    const float delta = (v_val - kv) * beta_t;
+
+    float y = 0.0f;
+    for (int r = 0; r < K_DIM; ++r) {
+        const float sv = __fmaf_rn(to_float(k_head[r]), delta, smem[r * V_DIM + c]);
+        smem[r * V_DIM + c] = sv;
+        y = __fmaf_rn(sv, to_float(q_head[r]) * q_scale, y);
+    }
+    __syncthreads();
+
+    for (int r = 0; r < K_DIM; ++r) {
+        state_head[static_cast<size_t>(r) * V_DIM + c] = smem[r * V_DIM + c];
+    }
+    out[static_cast<size_t>(bh) * V_DIM + c] = from_float<T>(y);
+}
+
+template <typename T>
+static int launch_gdn_decode_smem(
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, T* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    if (k_dim != 128 || v_dim != 128 || num_v_heads % num_k_heads != 0) return 1;
+    // One block per head needs enough batch to fill 114 SMs; below ~20
+    // sequences the register kernel (8 blocks per head) hides latency better.
+    if (batch < 20) return 1;
+    // 64 KiB of dynamic shared memory per block is only comfortable on
+    // Ampere+; on SM70/SM75 it would occupy the whole SM and slow down.
+    static int sm_major = -1;
+    if (sm_major < 0) {
+        int dev = 0;
+        sm_major = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) ==
+                cudaSuccess) {
+                sm_major = major;
+            }
+        }
+    }
+    if (sm_major < 8) return 1;
+    constexpr int smem_bytes = 128 * 128 * sizeof(float);
+    static bool attr_set = false;
+    if (!attr_set) {
+        if (cudaFuncSetAttribute(
+                gdn_decode_smem_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return 1;
+        }
+        attr_set = true;
+    }
+    gdn_decode_smem_kernel<T><<<batch * num_v_heads, 128, smem_bytes, stream>>>(
+        q, k, v, g, beta, state, slots, out, num_v_heads, num_k_heads, q_scale,
+        v_offset, v_row_stride);
+    CHECK_CUDA(cudaGetLastError());
+    return 0;
+}
+
+extern "C" int gdn_decode_smem_f32(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, float* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gdn_decode_smem(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
+}
+
+extern "C" int gdn_decode_smem_f16(
+    const half* q, const half* k, const half* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, half* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gdn_decode_smem(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
+}
+
+extern "C" int gdn_decode_smem_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const float* g, const float* beta, float* state, const int64_t* slots,
+    __nv_bfloat16* out, int batch, int num_v_heads, int num_k_heads, int k_dim,
+    int v_dim, float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gdn_decode_smem(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
+}
+
+template <typename T>
+static int launch_gated_delta_rule_decode_slots_gqa_strided(
+    const T* q, const T* k, const T* v, const float* g, const float* beta,
+    float* state, const int64_t* slots, T* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    if (k_dim != 128 || v_dim != 128) return 1;
+    if (launch_gdn_decode_smem(
+            q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+            k_dim, v_dim, q_scale, v_offset, v_row_stride, stream) == 0) {
+        return 0;
+    }
+    constexpr int WARPS_PER_BLOCK = 4;
+    constexpr int COLS_PER_WARP = 4;
+    dim3 grid((v_dim + WARPS_PER_BLOCK * COLS_PER_WARP - 1) /
+                  (WARPS_PER_BLOCK * COLS_PER_WARP),
+              batch * num_v_heads);
+    dim3 block(GDN_WARP_SIZE, WARPS_PER_BLOCK);
+    gated_delta_rule_decode_slots_gqa_128_kernel<T><<<grid, block, 0, stream>>>(
+        q, k, v, g, beta, state, slots, out,
+        batch, num_v_heads, num_k_heads, q_scale, v_offset, v_row_stride);
+    CHECK_CUDA(cudaGetLastError());
+    return 0;
+}
+
+extern "C" int gated_delta_rule_decode_slots_gqa_strided_f32(
+    const float* q, const float* k, const float* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, float* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gated_delta_rule_decode_slots_gqa_strided(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
+}
+
+extern "C" int gated_delta_rule_decode_slots_gqa_strided_f16(
+    const half* q, const half* k, const half* v, const float* g,
+    const float* beta, float* state, const int64_t* slots, half* out,
+    int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
+    float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gated_delta_rule_decode_slots_gqa_strided(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
+}
+
+extern "C" int gated_delta_rule_decode_slots_gqa_strided_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const float* g, const float* beta, float* state, const int64_t* slots,
+    __nv_bfloat16* out, int batch, int num_v_heads, int num_k_heads, int k_dim,
+    int v_dim, float q_scale, int64_t v_offset, int64_t v_row_stride,
+    cudaStream_t stream) {
+    return launch_gated_delta_rule_decode_slots_gqa_strided(
+        q, k, v, g, beta, state, slots, out, batch, num_v_heads, num_k_heads,
+        k_dim, v_dim, q_scale, v_offset, v_row_stride, stream);
 }
 
 extern "C" void gated_delta_rule_decode_slots_gqa_f32(
@@ -1034,6 +1261,261 @@ extern "C" void causal_conv1d_fwd_f32(
     int d_conv, int kernel_size, bool silu, cudaStream_t stream) {
     launch_causal_conv1d_fwd_varlen(x, weight, bias, conv_state, out, state_snapshots, cu_seqlens,
                                     batch, d_conv, kernel_size, silu, stream);
+}
+
+// =============================================================================
+// Causal Conv1d Forward (Prefill, varlen) - token-parallel, vectorized
+// =============================================================================
+// The reference kernel walks the whole sequence in one thread per channel.
+// Each output element needs only the current input plus K-1 history values, so
+// the work is embarrassingly parallel over tokens once history is read back
+// from x (or from the carried state at a sequence boundary).  One block per
+// token with 16-byte channel vectors lifts this kernel from ~80 GB/s to near
+// HBM bandwidth on Hopper.
+
+template <typename T, int VEC>
+union ConvAlignedVec {
+    uint4 raw;
+    T val[VEC];
+};
+
+template <typename T, int K, int VEC>
+__global__ void causal_conv1d_fwd_parallel_kernel(
+    const T* __restrict__ x,                 // [total_tokens, d_conv]
+    const T* __restrict__ weight,            // [d_conv, K]
+    const T* __restrict__ bias,              // [d_conv] or nullptr
+    float* __restrict__ conv_state,          // [batch, d_conv, K-1], F32
+    T* __restrict__ out,                     // [total_tokens, d_conv]
+    T* __restrict__ state_snapshots,         // optional [total_tokens, d_conv, K-1]
+    const uint32_t* __restrict__ cu_seqlens, // [batch + 1]
+    int batch,
+    int d_conv,
+    int total_tokens,
+    bool silu) {
+    const int t = blockIdx.x;
+    if (t >= total_tokens) return;
+
+    // Locate the sequence containing this token.
+    int lo = 0;
+    int hi = batch - 1;
+    int s = 0;
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        if (static_cast<int>(cu_seqlens[mid]) <= t) {
+            s = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    const int start = static_cast<int>(cu_seqlens[s]);
+    const int end = static_cast<int>(cu_seqlens[s + 1]);
+    const int pos = t - start;
+
+    const int vecs = d_conv / VEC;
+    for (int g = threadIdx.x; g < vecs; g += blockDim.x) {
+        const int c0 = g * VEC;
+        ConvAlignedVec<T, VEC> cur;
+        cur.raw = *reinterpret_cast<const uint4*>(x + static_cast<size_t>(t) * d_conv + c0);
+
+        float acc[VEC];
+        {
+            const T* wp = weight + static_cast<size_t>(c0) * K + (K - 1);
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                acc[j] = to_float(cur.val[j]) * to_float(wp[j * K]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i) {
+            const int jpos = pos - (K - 1) + i;
+            float hv[VEC];
+            if (jpos >= 0) {
+                ConvAlignedVec<T, VEC> h;
+                h.raw = *reinterpret_cast<const uint4*>(
+                    x + static_cast<size_t>(start + jpos) * d_conv + c0);
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) hv[j] = to_float(h.val[j]);
+            } else {
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    hv[j] = conv_state[(static_cast<size_t>(s) * d_conv + c0 + j) * (K - 1) +
+                                       (jpos + (K - 1))];
+                }
+            }
+            const T* wp = weight + static_cast<size_t>(c0) * K + i;
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                acc[j] += hv[j] * to_float(wp[j * K]);
+            }
+        }
+        if (bias != nullptr) {
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) acc[j] += to_float(bias[c0 + j]);
+        }
+
+        ConvAlignedVec<T, VEC> ov;
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            const float v = silu ? silu_float(acc[j]) : acc[j];
+            ov.val[j] = from_float<T>(v);
+        }
+        *reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * d_conv + c0) = ov.raw;
+
+        if (state_snapshots != nullptr) {
+            // History carried after this token: x_ext[pos-K+2 .. pos].
+#pragma unroll
+            for (int i = 0; i < K - 1; ++i) {
+                const int jpos = pos - (K - 2) + i;
+                T* sp = state_snapshots +
+                        (static_cast<size_t>(t) * d_conv + c0) * (K - 1) + i;
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    if (jpos >= 0) {
+                        sp[static_cast<size_t>(j) * (K - 1)] =
+                            x[static_cast<size_t>(start + jpos) * d_conv + c0 + j];
+                    } else {
+                        sp[static_cast<size_t>(j) * (K - 1)] = from_float<T>(
+                            conv_state[(static_cast<size_t>(s) * d_conv + c0 + j) * (K - 1) +
+                                       (jpos + (K - 1))]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Runs after the main kernel (same stream): commits each sequence's trailing
+// K-1 inputs into the carried state.  Kept separate so blocks handling the
+// first tokens can still read the previous state without a race.
+template <typename T, int K, int VEC>
+__global__ void causal_conv1d_state_commit_kernel(
+    const T* __restrict__ x,
+    float* __restrict__ conv_state,
+    const uint32_t* __restrict__ cu_seqlens,
+    int d_conv,
+    int batch,
+    int batch_limit) {
+    const int s = blockIdx.x;
+    if (s >= batch || s >= batch_limit) return;
+    const int start = static_cast<int>(cu_seqlens[s]);
+    const int end = static_cast<int>(cu_seqlens[s + 1]);
+    const int seq_len = end - start;
+    const int vecs = d_conv / VEC;
+
+    for (int g = threadIdx.x; g < vecs; g += blockDim.x) {
+        const int c0 = g * VEC;
+        float vals[K - 1][VEC];
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i) {
+            const int jpos = seq_len - (K - 1) + i;
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                if (jpos >= 0) {
+                    vals[i][j] =
+                        to_float(x[static_cast<size_t>(start + jpos) * d_conv + c0 + j]);
+                } else {
+                    vals[i][j] = conv_state[(static_cast<size_t>(s) * d_conv + c0 + j) *
+                                                (K - 1) +
+                                            (jpos + (K - 1))];
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i) {
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                conv_state[(static_cast<size_t>(s) * d_conv + c0 + j) * (K - 1) + i] =
+                    vals[i][j];
+            }
+        }
+    }
+}
+
+template <typename T, int K, int VEC>
+static int launch_causal_conv1d_fwd_parallel_dtype(
+    const T* x,
+    const T* weight,
+    const T* bias,
+    float* conv_state,
+    T* out,
+    T* state_snapshots,
+    const uint32_t* cu_seqlens,
+    int batch,
+    int d_conv,
+    int total_tokens,
+    bool silu,
+    cudaStream_t stream) {
+    if (d_conv % VEC != 0 || batch <= 0 || total_tokens <= 0) return 1;
+    const int threads = 256;
+    causal_conv1d_fwd_parallel_kernel<T, K, VEC><<<total_tokens, threads, 0, stream>>>(
+        x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv,
+        total_tokens, silu);
+    causal_conv1d_state_commit_kernel<T, K, VEC><<<batch, threads, 0, stream>>>(
+        x, conv_state, cu_seqlens, d_conv, batch, batch);
+    CHECK_CUDA(cudaGetLastError());
+    return 0;
+}
+
+template <typename T, int VEC>
+static int launch_causal_conv1d_fwd_parallel(
+    const T* x,
+    const T* weight,
+    const T* bias,
+    float* conv_state,
+    T* out,
+    T* state_snapshots,
+    const uint32_t* cu_seqlens,
+    int batch,
+    int d_conv,
+    int kernel_size,
+    int total_tokens,
+    bool silu,
+    cudaStream_t stream) {
+    switch (kernel_size) {
+        case 2:
+            return launch_causal_conv1d_fwd_parallel_dtype<T, 2, VEC>(
+                x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch,
+                d_conv, total_tokens, silu, stream);
+        case 3:
+            return launch_causal_conv1d_fwd_parallel_dtype<T, 3, VEC>(
+                x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch,
+                d_conv, total_tokens, silu, stream);
+        case 4:
+            return launch_causal_conv1d_fwd_parallel_dtype<T, 4, VEC>(
+                x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch,
+                d_conv, total_tokens, silu, stream);
+        default:
+            return 1;
+    }
+}
+
+extern "C" int causal_conv1d_fwd_parallel_f32(
+    const float* x, const float* weight, const float* bias, float* conv_state,
+    float* out, float* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int d_conv, int kernel_size, int total_tokens, bool silu, cudaStream_t stream) {
+    return launch_causal_conv1d_fwd_parallel<float, 4>(
+        x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv,
+        kernel_size, total_tokens, silu, stream);
+}
+
+extern "C" int causal_conv1d_fwd_parallel_f16(
+    const half* x, const half* weight, const half* bias, float* conv_state,
+    half* out, half* state_snapshots, const uint32_t* cu_seqlens, int batch,
+    int d_conv, int kernel_size, int total_tokens, bool silu, cudaStream_t stream) {
+    return launch_causal_conv1d_fwd_parallel<half, 8>(
+        x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv,
+        kernel_size, total_tokens, silu, stream);
+}
+
+extern "C" int causal_conv1d_fwd_parallel_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    float* conv_state, __nv_bfloat16* out, __nv_bfloat16* state_snapshots,
+    const uint32_t* cu_seqlens, int batch, int d_conv, int kernel_size,
+    int total_tokens, bool silu, cudaStream_t stream) {
+    return launch_causal_conv1d_fwd_parallel<__nv_bfloat16, 8>(
+        x, weight, bias, conv_state, out, state_snapshots, cu_seqlens, batch, d_conv,
+        kernel_size, total_tokens, silu, stream);
 }
 
 extern "C" void causal_conv1d_fwd_f16(
@@ -1803,6 +2285,81 @@ extern "C" void l2_norm_last_dim_bf16(
     const __nv_bfloat16* input, __nv_bfloat16* output, int rows, int dim,
     float eps, cudaStream_t stream) {
     launch_l2_norm_last_dim(input, output, rows, dim, eps, stream);
+}
+
+// L2Norm over the last dim of a strided slice of a packed [tokens, token_stride]
+// matrix: output row (t*heads + h) is normalized from
+// input[t*token_stride + offset + h*dim .. +dim].  Used by the GDN decode path
+// to normalize q/k in place from the packed convolution output, avoiding
+// per-tensor narrow+contiguous copies.
+template <typename T, int WARPS_PER_BLOCK>
+__global__ void l2_norm_range_warp_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    int tokens,
+    int heads,
+    int token_stride,
+    int offset,
+    int dim,
+    float eps) {
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int total_rows = tokens * heads;
+    if (row >= total_rows) return;
+    const int t = row / heads;
+    const int h = row - t * heads;
+    const T* in_row = input + static_cast<size_t>(t) * token_stride + offset + h * dim;
+    T* out_row = output + static_cast<size_t>(row) * dim;
+
+    float sumsq = 0.0f;
+    for (int i = lane_id; i < dim; i += 32) {
+        const float v = to_float(in_row[i]);
+        sumsq = __fmaf_rn(v, v, sumsq);
+    }
+    for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+        sumsq += __shfl_down_sync(0xffffffff, sumsq, offset_);
+    }
+    const float row_sumsq = __shfl_sync(0xffffffff, sumsq, 0);
+    const float inv_norm = rsqrtf(fmaxf(row_sumsq, 0.0f) + eps);
+    for (int i = lane_id; i < dim; i += 32) {
+        out_row[i] = from_float<T>(to_float(in_row[i]) * inv_norm);
+    }
+}
+
+template <typename T>
+static int launch_l2_norm_range(
+    const T* input, T* output, int tokens, int heads, int token_stride,
+    int offset, int dim, float eps, cudaStream_t stream) {
+    if (dim > 256 || tokens <= 0 || heads <= 0) return 1;
+    constexpr int WARPS_PER_BLOCK = 8;
+    const int rows = tokens * heads;
+    const int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    l2_norm_range_warp_kernel<T, WARPS_PER_BLOCK><<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        input, output, tokens, heads, token_stride, offset, dim, eps);
+    CHECK_CUDA(cudaGetLastError());
+    return 0;
+}
+
+extern "C" int l2_norm_range_f32(
+    const float* input, float* output, int tokens, int heads, int token_stride,
+    int offset, int dim, float eps, cudaStream_t stream) {
+    return launch_l2_norm_range(input, output, tokens, heads, token_stride, offset, dim, eps,
+                                stream);
+}
+
+extern "C" int l2_norm_range_f16(
+    const half* input, half* output, int tokens, int heads, int token_stride,
+    int offset, int dim, float eps, cudaStream_t stream) {
+    return launch_l2_norm_range(input, output, tokens, heads, token_stride, offset, dim, eps,
+                                stream);
+}
+
+extern "C" int l2_norm_range_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* output, int tokens, int heads,
+    int token_stride, int offset, int dim, float eps, cudaStream_t stream) {
+    return launch_l2_norm_range(input, output, tokens, heads, token_stride, offset, dim, eps,
+                                stream);
 }
 
 // =============================================================================

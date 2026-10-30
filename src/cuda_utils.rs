@@ -43,3 +43,10 @@ pub fn sm_version(dev: &CudaDevice) -> Option<i32> {
 
     computed
 }
+
+// Keep architecture checks available to backend-independent call sites. On a
+// non-CUDA build there is no CUDA device whose compute capability can be read.
+#[cfg(not(feature = "cuda"))]
+pub fn sm_version<T>(_: &T) -> Option<i32> {
+    None
+}

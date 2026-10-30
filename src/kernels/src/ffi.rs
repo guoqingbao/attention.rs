@@ -2092,6 +2092,52 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn causal_conv1d_fwd_parallel_f32(
+        x: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        conv_state: *mut f32,
+        out: *mut f32,
+        state_snapshots: *mut f32,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        total_tokens: c_int,
+        silu: bool,
+        stream: i64,
+    ) -> c_int;
+    pub fn causal_conv1d_fwd_parallel_f16(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        conv_state: *mut f32,
+        out: *mut c_void,
+        state_snapshots: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        total_tokens: c_int,
+        silu: bool,
+        stream: i64,
+    ) -> c_int;
+    pub fn causal_conv1d_fwd_parallel_bf16(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        conv_state: *mut f32,
+        out: *mut c_void,
+        state_snapshots: *mut c_void,
+        cu_seqlens: *const u32,
+        batch: c_int,
+        d_conv: c_int,
+        kernel_size: c_int,
+        total_tokens: c_int,
+        silu: bool,
+        stream: i64,
+    ) -> c_int;
+
     pub fn causal_conv1d_update_f32(
         x: *const f32,
         weight: *const f32,
@@ -3148,6 +3194,14 @@ extern "C" {
     );
 
     pub fn silu_and_mul_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        total_elems: i64,
+        N: i64,
+        stream: i64,
+    );
+
+    pub fn silu_and_mul_f32(
         gate_up: *const c_void,
         output: *mut c_void,
         total_elems: i64,
@@ -4773,4 +4827,157 @@ extern "C" {
         max_misses: i32,
         stream: i64,
     );
+
+    pub fn attention_rms_norm_f32(
+        x: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+    pub fn attention_rms_norm_f16(
+        x: *const c_void,
+        weight: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+    pub fn attention_rms_norm_bf16(
+        x: *const c_void,
+        weight: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+    pub fn attention_add_rms_norm_f32(
+        x: *const f32,
+        residual: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        residual_out: *mut f32,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+    pub fn attention_add_rms_norm_f16(
+        x: *const c_void,
+        residual: *const c_void,
+        weight: *const f32,
+        out: *mut c_void,
+        residual_out: *mut c_void,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+    pub fn attention_add_rms_norm_bf16(
+        x: *const c_void,
+        residual: *const c_void,
+        weight: *const f32,
+        out: *mut c_void,
+        residual_out: *mut c_void,
+        rows: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    );
+
+    pub fn gated_delta_rule_decode_slots_gqa_strided_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut f32,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        v_offset: i64,
+        v_row_stride: i64,
+        stream: i64,
+    ) -> c_int;
+    pub fn gated_delta_rule_decode_slots_gqa_strided_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        v_offset: i64,
+        v_row_stride: i64,
+        stream: i64,
+    ) -> c_int;
+    pub fn gated_delta_rule_decode_slots_gqa_strided_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        slots: *const i64,
+        out: *mut c_void,
+        batch: c_int,
+        num_v_heads: c_int,
+        num_k_heads: c_int,
+        k_dim: c_int,
+        v_dim: c_int,
+        q_scale: f32,
+        v_offset: i64,
+        v_row_stride: i64,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn l2_norm_range_f32(
+        input: *const f32,
+        output: *mut f32,
+        tokens: c_int,
+        heads: c_int,
+        token_stride: c_int,
+        offset: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+    pub fn l2_norm_range_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        tokens: c_int,
+        heads: c_int,
+        token_stride: c_int,
+        offset: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+    pub fn l2_norm_range_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        tokens: c_int,
+        heads: c_int,
+        token_stride: c_int,
+        offset: c_int,
+        dim: c_int,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
 }

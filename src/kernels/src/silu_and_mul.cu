@@ -30,6 +30,11 @@ template <typename T>
 __device__ __forceinline__ float to_float_val(T x);
 
 template <>
+__device__ __forceinline__ float to_float_val<float>(float x) {
+  return x;
+}
+
+template <>
 __device__ __forceinline__ float to_float_val<half>(half x) {
   return __half2float(x);
 }
@@ -43,6 +48,11 @@ __device__ __forceinline__ float to_float_val<__nv_bfloat16>(__nv_bfloat16 x) {
 
 template <typename T>
 __device__ __forceinline__ T from_float_val(float x);
+
+template <>
+__device__ __forceinline__ float from_float_val<float>(float x) {
+  return x;
+}
 
 template <>
 __device__ __forceinline__ half from_float_val<half>(float x) {
@@ -145,6 +155,55 @@ __global__ void silu_and_mul_vec_kernel(
   }
 
   *reinterpret_cast<Vec4 *>(&output[elem_start]) = *reinterpret_cast<const Vec4 *>(out_v2);
+}
+
+// F32 path: four elements per thread (16-byte float4 accesses).
+__global__ void silu_and_mul_vec4_f32_kernel(
+    const float *__restrict__ gate_up,
+    float *__restrict__ output,
+    const int64_t total_elems,
+    const int64_t N) {
+  constexpr int VEC = 4;
+  const int64_t elem_start =
+      ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+  if (elem_start >= total_elems) return;
+
+  const int64_t row = elem_start / N;
+  const int64_t col = elem_start % N;
+  const int64_t gate_start = row * 2 * N + col;
+
+  const float4 g = *reinterpret_cast<const float4 *>(&gate_up[gate_start]);
+  const float4 u =
+      *reinterpret_cast<const float4 *>(&gate_up[gate_start + N]);
+  float4 o;
+  o.x = silu_f(g.x) * u.x;
+  o.y = silu_f(g.y) * u.y;
+  o.z = silu_f(g.z) * u.z;
+  o.w = silu_f(g.w) * u.w;
+  *reinterpret_cast<float4 *>(&output[elem_start]) = o;
+}
+
+extern "C" void silu_and_mul_f32(
+    const void *gate_up,
+    void *output,
+    int64_t total_elems,
+    int64_t N,
+    int64_t stream) {
+  constexpr int BLOCK = 256;
+  if (N % 4 == 0 && total_elems % 4 == 0) {
+    const int64_t vec_count = total_elems / 4;
+    const int64_t grid = (vec_count + BLOCK - 1) / BLOCK;
+    silu_and_mul_vec4_f32_kernel<<<grid, BLOCK, 0, (cudaStream_t)stream>>>(
+        reinterpret_cast<const float *>(gate_up),
+        reinterpret_cast<float *>(output),
+        total_elems, N);
+  } else {
+    const int64_t grid = (total_elems + BLOCK - 1) / BLOCK;
+    silu_and_mul_kernel<float><<<grid, BLOCK, 0, (cudaStream_t)stream>>>(
+        reinterpret_cast<const float *>(gate_up),
+        reinterpret_cast<float *>(output),
+        total_elems, N);
+  }
 }
 
 extern "C" void silu_and_mul_f16(

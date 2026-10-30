@@ -164,6 +164,10 @@ fn silu_and_mul_cuda(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
                 let s = gu_cuda.as_cuda_slice::<half::bf16>()?;
                 *s.slice(gu_layout.start_offset()..).device_ptr() as u64
             }
+            DType::F32 => {
+                let s = gu_cuda.as_cuda_slice::<f32>()?;
+                *s.slice(gu_layout.start_offset()..).device_ptr() as u64
+            }
             _ => candle_core::bail!("silu_and_mul: unsupported dtype {:?}", dtype),
         };
         (ptr, stream)
@@ -193,6 +197,24 @@ fn silu_and_mul_cuda(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
             let out_ptr = *output.device_ptr() as *mut core::ffi::c_void;
             unsafe {
                 ffi::silu_and_mul_bf16(
+                    gu_ptr as *const core::ffi::c_void,
+                    out_ptr,
+                    total_elems as i64,
+                    half_dim as i64,
+                    stream,
+                );
+            }
+            let storage = candle::CudaStorage::wrap_cuda_slice(output, dev);
+            Ok(Tensor::from_storage(
+                candle::Storage::Cuda(storage),
+                out_shape,
+            )?)
+        }
+        DType::F32 => {
+            let output = unsafe { dev.alloc::<f32>(total_elems) }.w()?;
+            let out_ptr = *output.device_ptr() as *mut core::ffi::c_void;
+            unsafe {
+                ffi::silu_and_mul_f32(
                     gu_ptr as *const core::ffi::c_void,
                     out_ptr,
                     total_elems as i64,

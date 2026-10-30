@@ -42,6 +42,69 @@ impl<T> From<std::sync::PoisonError<T>> for MetalKernelError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn call_attention_add_rms_norm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    x: &Buffer,
+    x_offset: usize,
+    residual: &Buffer,
+    residual_offset: usize,
+    weight: &Buffer,
+    weight_offset: usize,
+    output: &Buffer,
+    output_offset: usize,
+    sum: &Buffer,
+    sum_offset: usize,
+    rows: i32,
+    dim: i32,
+    eps: f32,
+) -> Result<(), MetalKernelError> {
+    let ty_name = match ty {
+        DType::F32 => "float",
+        DType::F16 => "half",
+        DType::BF16 => "bfloat16_t",
+        other => {
+            return Err(MetalKernelError::DTypeMismatch {
+                expected: vec![DType::F32, DType::F16, DType::BF16],
+                got: other,
+            })
+        }
+    };
+    let pipeline = kernels.load_pipeline(device, format!("attention_add_rms_norm_{ty_name}"))?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (x, x_offset),
+            (residual, residual_offset),
+            (weight, weight_offset),
+            (output, output_offset),
+            (sum, sum_offset),
+            rows,
+            dim,
+            eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 type Pipelines = HashMap<(String, Option<ConstantValues>), ComputePipelineState>;
 
 #[derive(Debug)]
@@ -3876,6 +3939,56 @@ pub fn call_gdn_l2_norm_last_dim(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn call_gdn_l2_norm_range(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    input: &Buffer,
+    input_offset: usize,
+    output: &Buffer,
+    output_offset: usize,
+    tokens: i32,
+    heads: i32,
+    token_stride: i32,
+    offset: i32,
+    dim: i32,
+    eps: f32,
+) -> Result<(), MetalKernelError> {
+    let name = format!("gdn_l2_norm_range_{}", gdn_type_name(ty)?);
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (input, input_offset),
+            (output, output_offset),
+            tokens,
+            heads,
+            token_stride,
+            offset,
+            dim,
+            eps
+        )
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: (tokens * heads) as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn call_gdn_gated_rmsnorm_silu_mul(
     device: &Device,
     ep: impl EncoderProvider,
@@ -4098,6 +4211,69 @@ pub fn call_gdn_gated_delta_rule_decode_slots_gqa(
     v_dim: i32,
     q_scale: f32,
 ) -> Result<(), MetalKernelError> {
+    call_gdn_gated_delta_rule_decode_slots_gqa_strided(
+        device,
+        ep,
+        kernels,
+        ty,
+        q,
+        q_offset,
+        k,
+        k_offset,
+        v,
+        v_offset,
+        g,
+        g_offset,
+        beta,
+        beta_offset,
+        state,
+        state_offset,
+        slots,
+        slots_offset,
+        out,
+        out_offset,
+        batch,
+        num_v_heads,
+        num_k_heads,
+        k_dim,
+        v_dim,
+        q_scale,
+        0,
+        num_v_heads * v_dim,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_gdn_gated_delta_rule_decode_slots_gqa_strided(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch: i32,
+    num_v_heads: i32,
+    num_k_heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+    q_scale: f32,
+    v_value_offset: i32,
+    v_row_stride: i32,
+) -> Result<(), MetalKernelError> {
     let name = gdn_recurrence_kernel_name("gdn_gated_delta_rule_decode_slots_gqa", ty, k_dim)?;
     let pipeline = kernels.load_pipeline(device, name)?;
     let encoder = ep.encoder();
@@ -4119,7 +4295,9 @@ pub fn call_gdn_gated_delta_rule_decode_slots_gqa(
             num_k_heads,
             k_dim,
             v_dim,
-            q_scale
+            q_scale,
+            v_value_offset,
+            v_row_stride
         )
     );
 
@@ -4135,6 +4313,69 @@ pub fn call_gdn_gated_delta_rule_decode_slots_gqa(
     };
     encoder.dispatch_thread_groups(thread_groups_count, thread_group_size);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_delta_rule_decode_slots_gqa_strided_v(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: DType,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v_packed: &Buffer,
+    v_packed_offset: usize,
+    g: &Buffer,
+    g_offset: usize,
+    beta: &Buffer,
+    beta_offset: usize,
+    state: &Buffer,
+    state_offset: usize,
+    slots: &Buffer,
+    slots_offset: usize,
+    out: &Buffer,
+    out_offset: usize,
+    batch: i32,
+    num_v_heads: i32,
+    num_k_heads: i32,
+    k_dim: i32,
+    v_dim: i32,
+    q_scale: f32,
+    v_offset: i32,
+    v_row_stride: i32,
+) -> Result<(), MetalKernelError> {
+    call_gdn_gated_delta_rule_decode_slots_gqa_strided(
+        device,
+        ep,
+        kernels,
+        ty,
+        q,
+        q_offset,
+        k,
+        k_offset,
+        v_packed,
+        v_packed_offset,
+        g,
+        g_offset,
+        beta,
+        beta_offset,
+        state,
+        state_offset,
+        slots,
+        slots_offset,
+        out,
+        out_offset,
+        batch,
+        num_v_heads,
+        num_k_heads,
+        k_dim,
+        v_dim,
+        q_scale,
+        v_offset,
+        v_row_stride,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
