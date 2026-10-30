@@ -409,10 +409,27 @@ __device__ __forceinline__ void fp8x4_dot_half2(
       static_cast<__nv_fp8x2_storage_t>((packed >> 16) & 0xFFFF), __NV_E4M3);
   float2 wf01 = __half22float2(*reinterpret_cast<half2*>(&pair));
   float2 wf23 = __half22float2(*reinterpret_cast<half2*>(&pair2));
-  acc = fmaf(smem_to_float(smem[offset + 0]), wf01.x, acc);
-  acc = fmaf(smem_to_float(smem[offset + 1]), wf01.y, acc);
-  acc = fmaf(smem_to_float(smem[offset + 2]), wf23.x, acc);
-  acc = fmaf(smem_to_float(smem[offset + 3]), wf23.y, acc);
+  // Read the cached activation row as two packed 32-bit values instead of four
+  // scalar 16-bit shared-memory loads: this kernel is L1/LSU bound (ncu: 97%
+  // l1tex throughput on MoE decode), not DRAM bound.
+  float2 in01, in23;
+#ifndef NO_BF16_KERNEL
+  if constexpr (std::is_same<T, nv_bfloat16>::value) {
+    in01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&smem[offset]));
+    in23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&smem[offset + 2]));
+  } else
+#endif
+  if constexpr (std::is_same<T, half>::value) {
+    in01 = __half22float2(*reinterpret_cast<const half2*>(&smem[offset]));
+    in23 = __half22float2(*reinterpret_cast<const half2*>(&smem[offset + 2]));
+  } else {
+    in01 = make_float2(smem[offset + 0], smem[offset + 1]);
+    in23 = make_float2(smem[offset + 2], smem[offset + 3]);
+  }
+  acc = fmaf(in01.x, wf01.x, acc);
+  acc = fmaf(in01.y, wf01.y, acc);
+  acc = fmaf(in23.x, wf23.x, acc);
+  acc = fmaf(in23.y, wf23.y, acc);
 #else
   float wf0, wf1, wf2, wf3;
   vllm_rs::fp8x4_to_float4(packed, wf0, wf1, wf2, wf3);

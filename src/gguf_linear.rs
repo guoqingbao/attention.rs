@@ -9,7 +9,10 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::DType;
 use candle_core::{Result, Tensor};
 
-/// IQ GGUF dtypes that should use [`gguf_iq_matmul`] instead of Candle `QMatMul`.
+/// IQ GGUF dtypes (kept packed and run through the native `vec_dot` kernel).
+///
+/// Plain K-quants (Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K) are intentionally excluded:
+/// they are handled either by the dedicated small-M kernel or by Candle.
 pub fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
@@ -25,9 +28,30 @@ pub fn is_iq_gguf_dtype(dtype: GgmlDType) -> bool {
     )
 }
 
+/// Dtypes handled by the dedicated small-M kernel (`gguf_gemm_multi`).
+/// Q2K/Q3K are not implemented there yet; they stay on Candle for decode.
+pub fn has_small_m_gguf_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+    )
+}
+
+/// GGUF dtypes routed to [`gguf_matmul`] instead of Candle `QMatMul` for
+/// decode-sized batches.
+pub fn is_native_gguf_dtype(dtype: GgmlDType) -> bool {
+    has_small_m_gguf_kernel(dtype) || is_iq_gguf_dtype(dtype)
+}
+
 #[cfg(feature = "cuda")]
-fn iq_gguf_dtype_code(dtype: GgmlDType) -> Result<i32> {
+fn gguf_dtype_code(dtype: GgmlDType) -> Result<i32> {
     Ok(match dtype {
+        GgmlDType::Q8_0 => 0,
+        GgmlDType::Q4K => 1,
+        GgmlDType::Q2K => 2,
+        GgmlDType::Q3K => 3,
+        GgmlDType::Q5K => 4,
+        GgmlDType::Q6K => 5,
         GgmlDType::IQ2_XXS => 6,
         GgmlDType::IQ2_XS => 7,
         GgmlDType::IQ3_XXS => 8,
@@ -37,7 +61,7 @@ fn iq_gguf_dtype_code(dtype: GgmlDType) -> Result<i32> {
         GgmlDType::IQ3_S => 12,
         GgmlDType::IQ2_S => 13,
         GgmlDType::IQ1_M => 14,
-        dtype => candle_core::bail!("unsupported IQ GGUF dtype {dtype:?}"),
+        dtype => candle_core::bail!("unsupported native GGUF dtype {dtype:?}"),
     })
 }
 
@@ -51,6 +75,20 @@ pub fn gguf_iq_matmul(input: &Tensor, weight: &QTensor) -> Result<Tensor> {
             weight.dtype()
         );
     }
+    gguf_matmul(input, weight)
+}
+
+/// F32 activations `[..., K]` × packed GGUF weight `[N, K]` → F32 `[..., N]`.
+///
+/// Supports the plain K-quants and IQ types. Activations must be F32; the
+/// kernel quantizes them to Q8_1 internally.
+pub fn gguf_matmul(input: &Tensor, weight: &QTensor) -> Result<Tensor> {
+    if !is_native_gguf_dtype(weight.dtype()) {
+        candle_core::bail!(
+            "gguf_matmul only supports native GGUF dtypes, got {:?}",
+            weight.dtype()
+        );
+    }
     #[cfg(feature = "cuda")]
     {
         let (size_n, size_k) = weight.shape().dims2()?;
@@ -58,7 +96,7 @@ pub fn gguf_iq_matmul(input: &Tensor, weight: &QTensor) -> Result<Tensor> {
             weight_ptr: weight.device_ptr()? as u64,
             size_n,
             size_k,
-            dtype: iq_gguf_dtype_code(weight.dtype())?,
+            dtype: gguf_dtype_code(weight.dtype())?,
         };
         input.apply_op1_no_bwd(&op)
     }
@@ -126,16 +164,32 @@ impl GgufIqMatMul {
         let output_ptr = *output.device_ptr() as *mut f32;
 
         unsafe {
-            gguf_gemm(
-                input_ptr,
-                weight_ptr,
-                output_ptr,
-                size_m as i32,
-                self.size_n as i32,
-                size_k as i32,
-                self.dtype,
-                stream,
-            );
+            // Decode-sized batches use the multi-token kernel that unpacks each
+            // weight subblock once; larger M keeps the tiled prefill kernel.
+            let use_multi = size_m <= 32 && matches!(self.dtype, 0 | 1 | 4 | 5);
+            if use_multi {
+                crate::kernels::ffi::gguf_gemm_multi(
+                    input_ptr,
+                    weight_ptr,
+                    output_ptr,
+                    size_m as i32,
+                    self.size_n as i32,
+                    size_k as i32,
+                    self.dtype,
+                    stream,
+                );
+            } else {
+                gguf_gemm(
+                    input_ptr,
+                    weight_ptr,
+                    output_ptr,
+                    size_m as i32,
+                    self.size_n as i32,
+                    size_k as i32,
+                    self.dtype,
+                    stream,
+                );
+            }
         }
         Ok((CudaStorage::wrap_cuda_slice(output, dev), output_shape))
     }
