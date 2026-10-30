@@ -88,6 +88,16 @@ fn ensure_contiguous(t: &Tensor) -> Result<Tensor> {
     }
 }
 
+#[cfg(feature = "metal")]
+fn ensure_f32_contiguous(t: &Tensor) -> Result<Tensor> {
+    let t = if t.dtype() == DType::F32 {
+        t.clone()
+    } else {
+        t.to_dtype(DType::F32)?
+    };
+    ensure_contiguous(&t)
+}
+
 #[cfg(feature = "cuda")]
 fn ensure_f32_contiguous(t: &Tensor) -> Result<Tensor> {
     let t = if t.dtype() == DType::F32 {
@@ -2808,7 +2818,7 @@ pub fn gated_delta_rule_decode_slots_gqa(
 /// `v_packed` is the packed `[batch, token_stride]` conv output and the value
 /// head block starts at `v_offset` with `v_row_stride` elements per batch row.
 /// This avoids narrowing/copying v into a compact tensor.  Returns `None` when
-/// the layout is unsupported (k/v head dim != 128 or non-CUDA), so callers can
+/// the layout is unsupported, so callers can
 /// fall back to the generic path.
 #[cfg(feature = "cuda")]
 pub fn gated_delta_rule_decode_slots_gqa_strided_v(
@@ -2939,6 +2949,127 @@ pub fn gated_delta_rule_decode_slots_gqa_strided_v(
     }
 }
 
+#[cfg(feature = "metal")]
+pub fn gated_delta_rule_decode_slots_gqa_strided_v(
+    q: &Tensor,
+    k: &Tensor,
+    v_packed: &Tensor,
+    v_offset: usize,
+    v_row_stride: usize,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    slots: &Tensor,
+    q_scale: f32,
+) -> Result<Option<Tensor>> {
+    let candle_core::Device::Metal(device) = q.device() else {
+        return Ok(None);
+    };
+    let q_c = ensure_contiguous(q)?;
+    let k_c = ensure_contiguous(k)?;
+    let v_c = ensure_contiguous(v_packed)?;
+    let g_c = ensure_f32_contiguous(g)?;
+    let beta_c = ensure_f32_contiguous(beta)?;
+    let slots_c = ensure_contiguous(slots)?;
+    let (batch, num_k_heads, k_dim) = q_c.dims3()?;
+    if k_c.dims() != q_c.dims()
+        || q_c.dtype() != k_c.dtype()
+        || v_c.dtype() != q_c.dtype()
+        || !matches!(q_c.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        || !matches!(k_dim, 64 | 128)
+        || v_c.dims().len() != 2
+        || v_c.dim(0)? != batch
+        || v_row_stride > v_c.dim(1)?
+        || v_offset >= v_row_stride
+    {
+        return Ok(None);
+    }
+    let v_dim = q_c.dim(2)?;
+    let value_elems = v_row_stride - v_offset;
+    if v_dim == 0 || value_elems == 0 || value_elems % v_dim != 0 {
+        return Ok(None);
+    }
+    let num_v_heads = value_elems / v_dim;
+    if num_k_heads == 0
+        || num_v_heads % num_k_heads != 0
+        || v_offset + num_v_heads * v_dim > v_row_stride
+        || slots_c.dtype() != DType::I64
+        || slots_c.dims() != [batch]
+        || g_c.dims() != [batch, num_v_heads]
+        || beta_c.dims() != [batch, num_v_heads]
+        || state.dtype() != DType::F32
+        || !state.is_contiguous()
+        || state.dims().len() != 4
+        || state.dim(1)? != num_v_heads
+        || state.dim(2)? != k_dim
+        || state.dim(3)? != v_dim
+    {
+        return Ok(None);
+    }
+
+    let slots_c = ensure_contiguous(&slots_c)?;
+    let output = Tensor::zeros((batch, num_v_heads, v_dim), q.dtype(), q.device())?;
+    let q_m = get_metal_slice(&q_c)?;
+    let k_m = get_metal_slice(&k_c)?;
+    let v_m = get_metal_slice(&v_c)?;
+    let g_m = get_metal_slice(&g_c)?;
+    let beta_m = get_metal_slice(&beta_c)?;
+    let state_m = get_metal_slice(state)?;
+    let slots_m = get_metal_slice_with_dtype_size(&slots_c, std::mem::size_of::<i64>())?;
+    let out_m = get_metal_slice(&output)?;
+    let command_buffer = device.command_buffer()?;
+    command_buffer.set_label("gdn-decode-slots-gqa-strided-v");
+    metal_kernels::call_gdn_gated_delta_rule_decode_slots_gqa_strided_v(
+        device.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        q_c.dtype(),
+        q_m.storage.buffer(),
+        q_m.offset_in_bytes,
+        k_m.storage.buffer(),
+        k_m.offset_in_bytes,
+        v_m.storage.buffer(),
+        v_m.offset_in_bytes,
+        g_m.storage.buffer(),
+        g_m.offset_in_bytes,
+        beta_m.storage.buffer(),
+        beta_m.offset_in_bytes,
+        state_m.storage.buffer(),
+        state_m.offset_in_bytes,
+        slots_m.storage.buffer(),
+        slots_m.offset_in_bytes,
+        out_m.storage.buffer(),
+        out_m.offset_in_bytes,
+        batch as i32,
+        num_v_heads as i32,
+        num_k_heads as i32,
+        k_dim as i32,
+        v_dim as i32,
+        q_scale,
+        v_offset as i32,
+        v_row_stride as i32,
+    )
+    .map_err(candle_core::Error::wrap)?;
+    Ok(Some(output))
+}
+
+/// Non-CUDA, non-Metal builds use the caller's generic GDN decode path.
+#[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+pub fn gated_delta_rule_decode_slots_gqa_strided_v(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v_packed: &Tensor,
+    _v_offset: usize,
+    _v_row_stride: usize,
+    _g: &Tensor,
+    _beta: &Tensor,
+    _state: &mut Tensor,
+    _slots: &Tensor,
+    _q_scale: f32,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
 /// L2-normalize heads from a strided slice of a packed `[tokens, stride]`
 /// tensor into a compact `[tokens, heads, dim]` tensor.
 ///
@@ -3015,4 +3146,72 @@ pub fn l2_norm_range(
     } else {
         Ok(None)
     }
+}
+
+#[cfg(feature = "metal")]
+pub fn l2_norm_range(
+    input: &Tensor,
+    offset: usize,
+    heads: usize,
+    token_stride: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<Option<Tensor>> {
+    if !matches!(input.device(), candle_core::Device::Metal(_)) {
+        return Ok(None);
+    }
+    let input_c = ensure_contiguous(input)?;
+    if input_c.dims().len() != 2
+        || heads == 0
+        || dim == 0
+        || dim > 256
+        || token_stride > input_c.dim(1)?
+        || offset
+            .checked_add(heads.saturating_mul(dim))
+            .map_or(true, |end| end > token_stride)
+        || !matches!(input_c.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    {
+        return Ok(None);
+    }
+    let tokens = input_c.dim(0)?;
+    let output = unsafe { Tensor::empty_((tokens, heads, dim), input.dtype(), input.device())? };
+    let input_m = get_metal_slice(&input_c)?;
+    let output_m = get_metal_slice(&output)?;
+    let device = match input_c.device() {
+        candle_core::Device::Metal(device) => device,
+        _ => return Ok(None),
+    };
+    let command_buffer = device.command_buffer()?;
+    command_buffer.set_label("gdn-l2-norm-range");
+    metal_kernels::call_gdn_l2_norm_range(
+        device.device(),
+        &*command_buffer,
+        metal_kernels::Kernels::default(),
+        input_c.dtype(),
+        input_m.storage.buffer(),
+        input_m.offset_in_bytes,
+        output_m.storage.buffer(),
+        output_m.offset_in_bytes,
+        tokens as i32,
+        heads as i32,
+        token_stride as i32,
+        offset as i32,
+        dim as i32,
+        eps,
+    )
+    .map_err(candle_core::Error::wrap)?;
+    Ok(Some(output))
+}
+
+/// Non-CUDA, non-Metal builds use narrow + contiguous + `l2_norm_last_dim`.
+#[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+pub fn l2_norm_range(
+    _input: &Tensor,
+    _offset: usize,
+    _heads: usize,
+    _token_stride: usize,
+    _dim: usize,
+    _eps: f32,
+) -> Result<Option<Tensor>> {
+    Ok(None)
 }

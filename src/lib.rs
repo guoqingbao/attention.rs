@@ -35,7 +35,6 @@ pub use kernels;
 #[cfg(feature = "metal")]
 pub use metal_kernels;
 pub mod cache;
-#[cfg(feature = "cuda")]
 pub mod cuda_utils;
 pub mod deepseek_v4;
 #[cfg(feature = "cuda")]
